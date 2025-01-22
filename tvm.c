@@ -5400,8 +5400,15 @@ char *ptsname(int fd)
 
 pid_t tcgetpgrp(int fd)
 {
-    if (!main_task || !islocaltty(fd))
+    if (!main_task)
         return CALL_FUNC(tcgetpgrp, t_fd(fd));
+    
+    if (!islocaltty(fd)) {
+        pid_t p = CALL_FUNC(tcgetpgrp, t_fd(fd));
+        if (p == CALL_FUNC(getpid))
+            return main_task->tsk_pid;
+        return p;
+    }
     
     pid_t ret;
     if (0 != ttyop_ioctl(t_fd(fd), TIOCGPGRP, &ret))
@@ -5411,8 +5418,14 @@ pid_t tcgetpgrp(int fd)
 
 int tcsetpgrp(int fd, pid_t pgrp)
 {
-    if (!main_task || !islocaltty(fd))
+    if (!main_task)
         return CALL_FUNC(tcsetpgrp, t_fd(fd), pgrp);
+    
+    if (!islocaltty(fd)) {
+        if (pgrp == main_task->tsk_pgid)
+            pgrp = CALL_FUNC(getpid);
+        return CALL_FUNC(tcsetpgrp, t_fd(fd), pgrp);
+    }
     
     return ttyop_ioctl(t_fd(fd), TIOCSPGRP, &pgrp); 
 }
