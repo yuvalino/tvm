@@ -20,7 +20,7 @@ void xxd(void *addr, int len)
         printf("%08x: ", off);
 
         memset(currptr, ' ', sizeof(currptr)-1); currptr[sizeof(currptr)-1] = 0;
-        for (int i = 0; off < len, i < 8; off++, i++) {
+        for (int i = 0; off < len && i < 8; off++, i++) {
             char a[3];
             snprintf(a, 3, "%02hhx", caddr[off]);
             memcpy(currptr + (2*(7-i)), a, 2);
@@ -31,7 +31,7 @@ void xxd(void *addr, int len)
 
         memset(currptr, ' ', sizeof(currptr)-1);
         if (off < len) {
-            for (int i = 0; off < len, i < 8; off++, i++) {
+            for (int i = 0; off < len && i < 8; off++, i++) {
                 char a[3];
                 snprintf(a, 3, "%02hhx", caddr[off]);
                 memcpy(currptr + (2*(7-i)), a, 2);
@@ -49,7 +49,8 @@ void xxd(void *addr, int len)
     }
 }
 
-int mksh_main(int argc, char **argv);
+//int mksh_main(int argc, char **argv);
+int rmsh_main(int argc, char **argv);
 int dropbear_main(int argc, char **argv);
 int scp_main(int argc, char **argv);
 int _toybox_main(int argc, char **argv);
@@ -65,7 +66,12 @@ static void add_toy(const char *toy_name, void *arg)
 int main(int argc, char **argv)
 {
     tvm_init("forkless");
-    tvm_register_program("/bin/sh", (main_func_t) mksh_main);
+
+    int (*default_shell_main)(int argc, char **argv) = rmsh_main;
+
+    tvm_register_program("/bin/sh", (main_func_t) default_shell_main);
+    tvm_register_program("/bin/rmsh", (main_func_t) rmsh_main);
+    //tvm_register_program("/bin/mksh", (main_func_t) mksh_main);
     tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
     tvm_register_program("/usr/bin/toybox", (main_func_t) _toybox_main);
     toybox_iter_toy_names(add_toy, NULL);
@@ -87,7 +93,7 @@ int main(int argc, char **argv)
         return 0;
     }
     else if (0 == strcmp(argv[1], "sh")) {
-        return mksh_main(argc - 1, argv + 1);
+        return default_shell_main(argc - 1, argv + 1);
     }
     else if (0 == strcmp(argv[1], "sshd")) {
         char *addr_port = (char *)"2222";
