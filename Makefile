@@ -1,4 +1,5 @@
-.PHONY: first all clean mksh forkless dropbear dummy toybox
+
+.PHONY: first all clean mksh forkless dropbear dummy toybox rmsh
 
 first: all
 
@@ -18,8 +19,8 @@ clean:
 	@rm dropbear/Makefile || true
 	@rm mksh/Rebuild.sh || true
 
-forkless: dropbear mksh toybox
-	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+forkless: dropbear toybox rmsh
+	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -lrmsh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
 
 test:
 	gcc -g -rdynamic -I. tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
@@ -27,6 +28,11 @@ test:
 mksh:
 	if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="-g -I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
 	find mksh/ -type f -name '*.o' | xargs ar rcs libmksh.a
+
+rmsh:
+	make -C rmsh/ librmsh
+	cp rmsh/librmsh.a .
+
 
 dropbear: dummy
 	if [ ! -f dropbear/Makefile ]; then cd dropbear && CFLAGS="-g -I$(realpath .)" ./configure; fi
