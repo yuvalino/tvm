@@ -2071,12 +2071,13 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
         }
         is_master = 0;
     }
-    
+
     pid_t pgid;
     struct task *t;
 
     int ret = -1;
 
+    request &= 0xffffffff;
     switch (request) {
 #if defined(__linux__)
         case TCGETS:
