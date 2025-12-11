@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+
 #include <limits.h>
 #include <termios.h>
 #include <getopt.h>
@@ -35,6 +36,9 @@
 #include <libproc.h>
 #elif defined(__linux__)
 #include <pty.h>
+#include <sys/vfs.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
 #endif
 
 #include "tvm.h"
@@ -361,6 +365,17 @@ DECL_FUNC(getopt_long_only);
 DECL_FUNC(mknodat);
 DECL_FUNC(clearenv);
 DECL_FUNC(execvpe);
+DECL_FUNC(epoll_create);
+DECL_FUNC(epoll_create1);
+DECL_FUNC(timerfd_create);
+DECL_FUNC(pipe2);
+DECL_FUNC(fstatfs);
+DECL_FUNC(fstatfs64);
+DECL_FUNC(open64);
+DECL_FUNC(openat64);
+DECL_FUNC(fstatat64);
+DECL_FUNC(lseek64);
+DECL_FUNC(ftruncate64);
 #endif
 
 __attribute__((constructor))
@@ -1474,13 +1489,94 @@ static const int default_signal_actions[MAX_SIGNALS] = {
 
 static __thread int sigshutup = 0;
 
+struct safeio_ctx
+{
+    int p[2];
+};
+
+#define SAFEIO_NULL {-1,-1}
+
+static int safeio_open(struct safeio_ctx *out)
+{
+    if (-1 == CALL_FUNC(pipe, out->p))
+        return -1;
+    return 0;
+}
+
+static ssize_t safeio_copy(struct safeio_ctx *ctx, void *dst, void *src, size_t size)
+{
+    if (size != CALL_FUNC(write, ctx->p[1], src, size))
+        return -1;
+
+    if (size != CALL_FUNC(read, ctx->p[0], dst, size))
+        return -1;
+
+    return size;
+}
+
+static void safeio_close(struct safeio_ctx *ctx)
+{
+    if (-1 != ctx->p[0]) {
+        CALL_FUNC(close, ctx->p[0]);
+        ctx->p[0] = -1;
+    }
+
+    if (-1 != ctx->p[1]) {
+        CALL_FUNC(close, ctx->p[1]);
+        ctx->p[1] = -1;
+    }
+}
+
+static size_t get_stacktrace(void **out_buf, size_t size)
+{
+    size_t ret = 0;
+    struct safeio_ctx safeio = SAFEIO_NULL;
+    void **frame = __builtin_frame_address(0);
+
+    if (0 != safeio_open(&safeio))
+        goto out;
+
+    for (int i = 0; i < size; i++) {
+        if (sizeof(void *) != safeio_copy(&safeio, &out_buf[i], (frame + 1), sizeof(void *)))
+            goto out;
+        ret++;
+
+        if (sizeof(void *) != safeio_copy(&safeio, &frame, frame, sizeof(void *)))
+            goto out;
+    }
+
+out:
+    safeio_close(&safeio);
+    return ret;
+}
+
+static void dump_stacktrace()
+{
+    void *stack[16];
+    Dl_info dlinfo;
+    size_t nstack = get_stacktrace(stack, sizeof(stack)/sizeof(*stack));
+
+    for (int i = 0; i < nstack; i++) {
+        memset(&dlinfo, 0, sizeof(dlinfo));
+        if (0 == dladdr(stack[i], &dlinfo) || (!dlinfo.dli_fname))
+            INFO("  stacktrace[% 2d] = %08lx", i, (long)stack[i]);
+        else if (!dlinfo.dli_sname)
+            INFO("  stacktrace[% 2d] = %s + %lx", i, dlinfo.dli_fname, (long)stack[i] - (long)dlinfo.dli_fbase);
+        else
+            INFO("  stacktrace[% 2d] = %s : %s + %lx", i, dlinfo.dli_fname, dlinfo.dli_sname, (long)stack[i] - (long)dlinfo.dli_saddr);
+    }
+}
+
 void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
     if (!sigshutup) {
         if (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL)
             INFO("signum=%d at %p", signum, siginfo->si_addr);
-        else if (signum != SIGCHLD)
+        else if (signum != SIGCHLD) {
             INFO("signum=%d", signum);
+            if (signum == SIGABRT)
+                dump_stacktrace();
+        }
     }
 
     if (!current)
@@ -3801,7 +3897,7 @@ static void __panic(const char *msg, const char *file, int line)
  * Some code needs to alter the task-specific file-descriptors/signal-handlers table.
  * Also, handle variadic arguments when passing through... thats a big bummer.
  * 
- * TODO:
+ * TODO:`
  * - _FORTIFY_SOURCE - `__printf_chk()`, `__dup_chk()` etc (for now just don't compile with -Os)
  * - Large-File-Support - `open64()`, `openat64()`, `fopen64()`, `lseek64()` etc (for now just don't compile with it)
  */
@@ -4155,6 +4251,7 @@ int openat(int dirfd, const char *pathname, int flags, ...)
         CALL_FUNC(close, r);
         errno = ENOMEM;
     }
+
     return f;
 }
 
@@ -5776,4 +5873,177 @@ int clearenv(void)
 
     return 0;
 }
+
+int epoll_create(int size)
+{
+    int r = CALL_FUNC(epoll_create, size);
+    if (!main_task)
+        return r;
+    if (r == -1) {
+        return r;
+    }
+
+    int f = task_new_fd(current, 0, r);
+    if (f == -1) {
+        CALL_FUNC(close, r);
+        errno = ENOMEM;
+    }
+    return f;
+}
+
+int epoll_create1(int flags)
+{
+    int r = CALL_FUNC(epoll_create1, flags);
+    if (!main_task)
+        return r;
+    if (r == -1) {
+        return r;
+    }
+
+    int f = task_new_fd(current, 0, r);
+    if (f == -1) {
+        CALL_FUNC(close, r);
+        errno = ENOMEM;
+    }
+    return f;
+}
+
+int timerfd_create(int clockid, int flags)
+{
+    int r = CALL_FUNC(timerfd_create, clockid, flags);
+    if (!main_task)
+        return r;
+    if (r == -1) {
+        return r;
+    }
+
+    int f = task_new_fd(current, 0, r);
+    if (f == -1) {
+        CALL_FUNC(close, r);
+        errno = ENOMEM;
+    }
+
+    return f;
+}
+
+int pipe2(int pipefd[2], int flags)
+{
+    if (!main_task)
+        return CALL_FUNC(pipe2, pipefd, flags);
+    
+    int p[2];
+    if (0 != CALL_FUNC(pipe2, p, flags))
+        return -1;
+    
+    pipefd[0] = task_new_fd(current, 0, p[0]);
+    if (pipefd[0] == -1) {
+        CALL_FUNC(close, p[0]);
+        CALL_FUNC(close, p[1]);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    pipefd[1] = task_new_fd(current, 0, p[1]);
+    if (pipefd[1] == -1) {
+        close(pipefd[0]);
+        CALL_FUNC(close, p[1]);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    return 0;
+}
+
+int fstatfs(int fd, struct statfs *buf)
+{
+    return CALL_FUNC(fstatfs, t_fd(fd), buf);
+}
+
+int fstatfs64(int fd, struct statfs64 *buf)
+{
+    return CALL_FUNC(fstatfs64, t_fd(fd), buf);
+}
+
+int open64(const char *pathname, int flags, ...)
+{
+    flags |= O_LARGEFILE;
+
+    int f = task_reserve_fd(current, 0);
+    if (f == -1) {
+        errno = EMFILE;
+        return -1;
+    }
+
+    struct fops *fops = fops_for_open(pathname);
+
+    int r;
+    if (__OPEN_NEEDS_MODE(flags)) {
+        va_list ap;
+        va_start(ap, flags);
+        mode_t m = va_arg(ap, int);
+        va_end(ap);
+        
+        if (fops && fops->f_open)
+            r = fops->f_open(pathname, flags, m) | fops->f_fdflag;
+        else
+            r = CALL_FUNC(open, pathname, flags, m);
+    }
+    else {
+        if (fops && fops->f_open)
+            r = fops->f_open(pathname, flags, 0) | fops->f_fdflag;
+        else
+            r = CALL_FUNC(open, pathname, flags);
+    }
+    
+    if (r == -1) {
+        task_set_fd(current, f, -1);
+        return r;
+    }
+
+    task_set_fd(current, f, r);
+    return f;
+}
+
+int openat64(int dirfd, const char *pathname, int flags, ...)
+{
+    flags |= O_LARGEFILE;
+
+    int r;
+    if (__OPEN_NEEDS_MODE(flags)) {
+        va_list ap;
+        va_start(ap, flags);
+        mode_t m = va_arg(ap, int);
+        va_end(ap);
+        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags, m);
+    }
+    else
+        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags);
+    
+    if (r == -1) {
+        return r;
+    }
+
+    int f = task_new_fd(current, 0, r);
+    if (f == -1) {
+        CALL_FUNC(close, r);
+        errno = ENOMEM;
+    }
+
+    return f;
+}
+
+int __openat64_2(int fd, const char *file, int oflag)
+{
+    return openat64(fd, file, oflag);
+}
+
+int fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
+{ return CALL_FUNC(fstatat64, t_fd(dirfd), pathname, statbuf, flags); }
+
+off_t lseek64(int fd, off64_t offset, int whence)
+{ return CALL_FUNC(lseek64, t_fd(fd), offset, whence); }
+
+int ftruncate64(int fd, off64_t length)
+{ return CALL_FUNC(ftruncate64, t_fd(fd), length); }
+
 #endif
