@@ -3,5 +3,6 @@
 *.o
 forkless
 test_tvm
+test_rmem
 __pycache__
 *.dSYM/
