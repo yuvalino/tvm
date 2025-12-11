@@ -263,6 +263,11 @@ struct rmem_arena *rmem_arena_create(void *private) {
 }
 
 void rmem_arena_destroy(struct rmem_arena *ar) {
+    while (ar->ar_slabs) {
+        struct rmem_slab *sl = ar->ar_slabs;
+        ar->ar_slabs = sl->sl_next;
+        rmem_slab_destroy(sl);
+    }
     pthread_mutex_destroy(&ar->ar_lock);
     munmap(ar, sizeof(struct rmem_arena));
 }
@@ -322,4 +327,41 @@ void rmem_arena_free(struct rmem_arena *ar, void *p) {
         return;
     }
     ABORT("invalid pointer %p", p);
+}
+
+struct rmem_arena *rmem_arena_duplicate(struct rmem_arena *ar, void *private, void (*dup_cb)(void *, void *, void *, size_t), void (*done_cb)(void *), void *arg)
+{
+    struct rmem_arena *ar2 = rmem_arena_create(private);
+    if (!ar2)
+        return NULL;
+
+    pthread_mutex_lock(&ar->ar_lock);
+
+    struct rmem_slab *prev_sl2 = NULL;
+    for (struct rmem_slab *sl = ar->ar_slabs; sl; sl = sl->sl_next) {
+        struct rmem_slab *sl2 = rmem_slab_create(sl->sl_size, sl->sl_objsize);
+        if (!sl2) {
+            rmem_arena_destroy(ar2);
+            pthread_mutex_unlock(&ar->ar_lock);
+            return NULL;
+        }
+
+        memcpy(sl2->sl_bitmap, sl->sl_bitmap, sl->sl_bitmap_words * sizeof(BITMAP_WORD));
+        memcpy(sl2->sl_base, sl->sl_base, sl->sl_nobj * sl->sl_objsize);
+
+        if (prev_sl2)
+            prev_sl2->sl_next = sl2;
+        else
+            ar2->ar_slabs = sl2;
+        prev_sl2 = sl2;
+
+        if (dup_cb)
+            dup_cb(arg, sl->sl_base, sl2->sl_base, sl->sl_nobj * sl->sl_objsize);
+    }
+
+    if (done_cb)
+        done_cb(arg);
+
+    pthread_mutex_unlock(&ar->ar_lock);
+    return ar2;
 }
