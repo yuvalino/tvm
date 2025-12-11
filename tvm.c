@@ -357,6 +357,8 @@ DECL_FUNC(malloc);
 DECL_FUNC(realloc);
 DECL_FUNC(free);
 
+DECL_FUNC(mmap);
+
 DECL_FUNC(getopt);
 DECL_FUNC(getopt_long);
 DECL_FUNC(getopt_long_only);
@@ -5770,6 +5772,11 @@ void free(void *ptr)
         return CALL_FUNC(free, p);
     
     return CALL_FUNC(free, p-1);
+}
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    return CALL_FUNC(mmap, addr, length, prot, flags, t_fd(fd), offset);
 }
 
 void *realloc(void *ptr, size_t size)
