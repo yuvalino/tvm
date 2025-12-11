@@ -159,7 +159,7 @@ static size_t bitmap_find_run_zero(
     return SIZE_MAX;
 }
 
-static int bitmap_test_range_set(BITMAP_WORD *bitmap, size_t start, size_t len) {
+static int bitmap_test_range(BITMAP_WORD *bitmap, size_t start, size_t len) {
     if (len == 0) return 1;
 
     size_t end = start + len;
@@ -272,15 +272,13 @@ void rmem_arena_destroy(struct rmem_arena *ar) {
     munmap(ar, sizeof(struct rmem_arena));
 }
 
-void *rmem_arena_alloc(struct rmem_arena *ar, size_t size) {
+static void *rmem_arena_alloc_locked(struct rmem_arena *ar, size_t size) {
     if (!size)
         return NULL;
 
     size = round_up_objsize(size);
 
     size_t need = 1;
-
-    pthread_mutex_lock(&ar->ar_lock);
 
     for (struct rmem_slab *sl = ar->ar_slabs; sl; sl = sl->sl_next) {
         if (sl->sl_objsize != size)
@@ -289,20 +287,25 @@ void *rmem_arena_alloc(struct rmem_arena *ar, size_t size) {
         size_t idx = bitmap_find_run_zero(sl->sl_bitmap, sl->sl_bitmap_words, sl->sl_nobj, need);
         if (idx != SIZE_MAX) {
             bitmap_set_range(sl->sl_bitmap, idx, need, 1);
-            void *p = (char*)sl->sl_base + idx * sl->sl_objsize;
-            pthread_mutex_unlock(&ar->ar_lock);
-            return p;
+            return (char*)sl->sl_base + idx * sl->sl_objsize;
         }
     }
 
     // need new slab
     struct rmem_slab *sl = rmem_slab_create(get_slab_size(size), size);
-    if (!sl) { pthread_mutex_unlock(&ar->ar_lock); return NULL; }
+    if (!sl)
+        return NULL;
+
     sl->sl_next = ar->ar_slabs;
     ar->ar_slabs = sl;
 
     bitmap_set_range(sl->sl_bitmap, 0, need, 1);
-    void *p = sl->sl_base;
+    return sl->sl_base;
+}
+
+void *rmem_arena_alloc(struct rmem_arena *ar, size_t size) {
+    pthread_mutex_lock(&ar->ar_lock);
+    void *p = rmem_arena_alloc_locked(ar, size);
     pthread_mutex_unlock(&ar->ar_lock);
     return p;
 }
@@ -319,7 +322,7 @@ void rmem_arena_free(struct rmem_arena *ar, void *p) {
             ABORT("p %p objsize 0x%zx remainder 0x%zx", p, sl->sl_objsize, off % sl->sl_objsize);
 
         size_t idx = off / sl->sl_objsize;
-        if (!bitmap_test_range_set(sl->sl_bitmap, idx, 1))
+        if (!bitmap_test_range(sl->sl_bitmap, idx, 1))
             ABORT("detected double free on %p (objsize 0x%zx)", p, sl->sl_objsize);
 
         bitmap_set_range(sl->sl_bitmap, idx, 1, 0);
@@ -327,6 +330,60 @@ void rmem_arena_free(struct rmem_arena *ar, void *p) {
         return;
     }
     ABORT("invalid pointer %p", p);
+}
+
+void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
+{
+    if (!p)
+        return rmem_arena_alloc(ar, size);
+
+    if (size == 0) {
+        rmem_arena_free(ar, p);
+        return NULL;
+    }
+
+    size_t objsize = round_up_objsize(size);
+
+    size_t idx;
+    size_t old_objsize;
+    struct rmem_slab *prev_sl = NULL;
+    pthread_mutex_lock(&ar->ar_lock);
+    for (struct rmem_slab *sl = ar->ar_slabs; sl; sl = sl->sl_next) {
+        if ((uintptr_t)p < (uintptr_t)sl->sl_base || (uintptr_t)p >= ((uintptr_t)sl->sl_base + sl->sl_nobj * sl->sl_objsize))
+            continue;
+
+        uintptr_t off = (uintptr_t)p - (uintptr_t)sl->sl_base;
+        if (off % sl->sl_objsize != 0)
+            ABORT("p %p objsize 0x%zx remainder 0x%zx", p, sl->sl_objsize, off % sl->sl_objsize);
+
+        idx = off / sl->sl_objsize;
+        if (!bitmap_test_range(sl->sl_bitmap, idx, 1))
+            ABORT("detected double free on %p (objsize 0x%zx)", p, sl->sl_objsize);
+
+        // short circuit, keep in same slab
+        if (objsize == sl->sl_objsize) {
+            pthread_mutex_unlock(&ar->ar_lock);
+            return p;
+        }
+        
+        old_objsize = sl->sl_objsize;
+        prev_sl = sl;
+        break;
+    }
+
+    if (!prev_sl)
+        ABORT("invalid pointer %p", p);
+
+    void *newp = rmem_arena_alloc_locked(ar, size);
+    if (!newp) {
+        pthread_mutex_unlock(&ar->ar_lock);
+        return NULL;
+    }
+
+    memcpy(newp, p, (old_objsize < size ? old_objsize : size));
+    bitmap_set_range(prev_sl->sl_bitmap, idx, 1, 0);
+    pthread_mutex_unlock(&ar->ar_lock);
+    return newp;
 }
 
 struct rmem_arena *rmem_arena_duplicate(struct rmem_arena *ar, void *private, void (*dup_cb)(void *, void *, void *, size_t), void (*done_cb)(void *), void *arg)

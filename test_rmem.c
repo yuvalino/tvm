@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -280,6 +281,165 @@ TEST(InvalidFreeAligned) {
     ASSERT_SIG(SIGABRT, {
         rmem_arena_free(ar, (void *)((char *)p + 1)); // free not in start of obj
     });
+
+    rmem_arena_destroy(ar);
+}
+
+static void fill_pattern(void *p, size_t n, uint8_t seed)
+{
+    uint8_t *c = p;
+    for (size_t i = 0; i < n; i++)
+        c[i] = (seed + i) & 0xFF;
+}
+
+static int check_pattern(void *p, size_t n, uint8_t seed)
+{
+    uint8_t *c = p;
+    for (size_t i = 0; i < n; i++)
+        if (c[i] != ((seed + i) & 0xFF))
+            return 0;
+    return 1;
+}
+
+TEST(ReallocFromNull)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_realloc(ar, NULL, 64);
+    ASSERT_NEQ(p, NULL);
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocZeroFrees)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_alloc(ar, 64);
+    ASSERT_NEQ(p, NULL);
+
+    void *r = rmem_arena_realloc(ar, p, 0);
+    ASSERT_EQ(r, NULL);
+
+    /* Ensure it's freed by trying to free again */
+    ASSERT_SIG(SIGABRT, {
+        rmem_arena_free(ar, p);
+    });
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocSameSizeReturnsSamePointer)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_alloc(ar, 48);
+    ASSERT_NEQ(p, NULL);
+
+    void *r = rmem_arena_realloc(ar, p, 48);
+    ASSERT_EQ(r, p);
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocShrink)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_alloc(ar, 128);
+    ASSERT_NEQ(p, NULL);
+
+    fill_pattern(p, 128, 0x5A);
+
+    void *r = rmem_arena_realloc(ar, p, 32);
+    ASSERT_NEQ(r, NULL);
+
+    ASSERT_EQ(check_pattern(r, 32, 0x5A), 1);
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocGrowSameSlabSizeClass)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_alloc(ar, 60);
+    ASSERT_NEQ(p, NULL);
+
+    fill_pattern(p, 60, 0x11);
+
+    void *r = rmem_arena_realloc(ar, p, 63);
+    ASSERT_EQ(r, p);
+    ASSERT_EQ(check_pattern(r, 60, 0x11), 1);
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocGrowToNewSlab)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_alloc(ar, 40);
+    ASSERT_NEQ(p, NULL);
+
+    fill_pattern(p, 40, 0x22);
+
+    void *r = rmem_arena_realloc(ar, p, 300);
+    ASSERT_NEQ(r, NULL);
+    ASSERT_NEQ(r, p);
+
+    ASSERT_EQ(check_pattern(r, 40, 0x22), 1);
+
+    /* Old pointer should have been freed */
+    ASSERT_SIG(SIGABRT, {
+        rmem_arena_free(ar, p);
+    });
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocInvalidPointer)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    int bogus = 123;
+
+    ASSERT_SIG(SIGABRT, {
+        rmem_arena_realloc(ar, &bogus, 100);
+    });
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocAfterFree)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_alloc(ar, 80);
+    ASSERT_NEQ(p, NULL);
+
+    rmem_arena_free(ar, p);
+
+    ASSERT_SIG(SIGABRT, {
+        rmem_arena_realloc(ar, p, 100);
+    });
+
+    rmem_arena_destroy(ar);
+}
+
+TEST(ReallocLarge)
+{
+    struct rmem_arena *ar = rmem_arena_create(NULL);
+
+    void *p = rmem_arena_alloc(ar, 512);
+    ASSERT_NEQ(p, NULL);
+
+    fill_pattern(p, 512, 0x33);
+
+    void *r = rmem_arena_realloc(ar, p, 2000);
+    ASSERT_NEQ(r, NULL);
+
+    ASSERT_EQ(check_pattern(r, 512, 0x33), 1);
 
     rmem_arena_destroy(ar);
 }
