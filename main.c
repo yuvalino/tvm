@@ -81,6 +81,7 @@ int main(int argc, char **argv)
         printf("COMMANDs:\n");
         printf("  sh   [ARG...]  shell\n");
         printf("  sshd [PORT]    ssh server\n");
+        printf("  dump           dump tvm diagnostics\n");
         printf("\n");
         printf("Options:\n");
         printf("  -h             display this help and exit\n");
@@ -119,6 +120,10 @@ int main(int argc, char **argv)
             NULL
         };
         return dropbear_main(sizeof(nargv)/sizeof(char *) - 1, nargv);
+    }
+    else if (0 == strcmp(argv[1], "dump")) {
+        tvm_dump(TVM_DUMP_FUNCS);
+        return 0;
     }
     
     fprintf(stderr, "forkless: invalid argument '%s'\n", argv[1]);

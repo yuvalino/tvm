@@ -19,10 +19,10 @@ clean:
 	@rm mksh/Rebuild.sh || true
 
 forkless: dropbear mksh toybox
-	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+	gcc -g -rdynamic -I. rmem.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
 
 test_tvm:
-	gcc -g -rdynamic -I. tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
+	gcc -g -rdynamic -I. rmem.c tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
 
 test_rmem: rmem.c test_rmem.c
 	gcc -g -rdynamic -I. rmem.c test_rmem.c -o test_rmem -lpthread $(LDFLAGS)

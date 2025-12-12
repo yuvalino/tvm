@@ -31,3 +31,10 @@ extern __thread int tvm_optind;
 extern __thread int tvm_opterr;
 extern __thread int tvm_optopt;
 
+void tvm_log(const char *function, const char *msg, ...);
+#define TVM_INFO(_msg, ...) tvm_log(__func__, _msg, ##__VA_ARGS__)
+
+enum {
+    TVM_DUMP_FUNCS
+};
+void tvm_dump(int mode);

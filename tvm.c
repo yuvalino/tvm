@@ -42,6 +42,7 @@
 #endif
 
 #include "tvm.h"
+#include "rmem.h"
 
 /**
  * Instructions unclear, ended up implementing a kernel.
@@ -80,9 +81,9 @@ static void __panic(const char *m, const char *f, int l);
         const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
         (type *)((char *)__mptr - offsetof(type,member));})
 
-#define INFO(Msg, ...) do { CALL_FUNC(printf, "Kernel(%d): %s: " Msg "\n", __gettid(), __FUNCTION__, ##__VA_ARGS__); } while (0)
+static __thread char msgbuf[0x1000];
 
-#define MALLOC_MAGIC ((uintptr_t) 0xFACEFACE)
+#define INFO(Msg, ...) do { int __num = snprintf(msgbuf, sizeof(msgbuf), "Kernel(%d): %s: " Msg "\n", __gettid(), __FUNCTION__, ##__VA_ARGS__); CALL_FUNC(write, 1, msgbuf, __num); } while (0)
 
 #define ALIGN(x,a)              __ALIGN_MASK(x,(typeof(x))(a)-1)
 #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
@@ -354,8 +355,16 @@ DECL_FUNC(tcflush);
 DECL_FUNC(tcflow);
 
 DECL_FUNC(malloc);
+DECL_FUNC(calloc);
 DECL_FUNC(realloc);
 DECL_FUNC(free);
+
+DECL_FUNC(strdup);
+DECL_FUNC(strndup);
+DECL_FUNC(asprintf);
+DECL_FUNC(vasprintf);
+DECL_FUNC(getline);
+DECL_FUNC(getdelim);
 
 DECL_FUNC(mmap);
 
@@ -390,6 +399,27 @@ static void init_funcs()
             panic("function '%s' not found", curr_func->name);
     }
 };
+
+/////////////
+// Declarations
+/////////////
+
+/**
+ * Just needed this for code in `Task` section.
+ */
+
+struct fops;
+struct task;
+
+struct fops *fops_for_fd_locked(struct task *t, int fd);
+int fops_fdflag(struct fops *fops);
+int fops_dup(struct fops *fops, int oldfd, int newfd);
+
+void *kalloc(size_t size);
+void kfree(void *p);
+void *krealloc(void *ptr, size_t size);
+
+int can_enter_tvm(void *lr);
 
 /////////////
 // Helpers
@@ -686,17 +716,13 @@ static void *jmpbuf_getstack(jmp_buf *jmpbuf)
 static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
 {
     uintptr_t *jb = (uintptr_t*) (jmpbuf);
-    intptr_t diff = old_stack - new_stack;
+    uintptr_t diff = old_stack - new_stack;
+    INFO("setstack new 0x%08zx old 0x%08zx", new_stack, old_stack);
  
     for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
     {
         if (jb[i] >= old_stack && jb[i] < (old_stack + stack_size))
             jb[i] -= diff;
-    }
-
-    for (uintptr_t *p = (uintptr_t *)new_stack; p < (uintptr_t *)(new_stack + stack_size); p++) {
-        if ((*p >= old_stack) && (*p < (old_stack + stack_size)))
-            *p -= diff;
     }
 }
 
@@ -749,7 +775,7 @@ static size_t envsize(char **env)
     return sz;
 }
 
-static char **copyenv(char **env)
+static char **copyenv(struct rmem_arena *ar, char **env)
 {
     if (!env)
         return NULL;
@@ -757,16 +783,18 @@ static char **copyenv(char **env)
     int ok = 0;
     int sz = envsize(env);
 
-    char **r = malloc(sizeof(char *) * (sz+1));
+    char **r = rmem_arena_alloc(ar, sizeof(char *) * (sz+1));
     if (!r)
         goto out;
     memset(r, 0, sizeof(char *) * (sz+1));
     
     for (int i = 0; i < sz; i++) {
-        r[i] = strdup(env[i]);
+        int len = strlen(env[i]);
+        r[i] = rmem_arena_alloc(ar, len + 1);
         if (!r[i]) {
             goto out;
         }
+        memcpy(r[i], env[i], len + 1);
     }
 
     ok = 1;
@@ -776,8 +804,8 @@ out:
     if (!ok) {
         if (r) {
             for (char **e = r; *e != NULL; e++)
-                free(e);
-            free(r);
+                rmem_arena_free(ar, e);
+            rmem_arena_free(ar, r);
         }
         return NULL;
     }
@@ -820,21 +848,6 @@ static char **findenv(char **env, const char *name, size_t name_len)
 }
 
 /////////////
-// Declarations
-/////////////
-
-/**
- * Just needed this for code in `Task` section.
- */
-
-struct fops;
-struct task;
-
-struct fops *fops_for_fd_locked(struct task *t, int fd);
-int fops_fdflag(struct fops *fops);
-int fops_dup(struct fops *fops, int oldfd, int newfd);
-
-/////////////
 // Task
 /////////////
 
@@ -874,7 +887,7 @@ struct pthread_entry {
 
 struct pthread_entry *make_pthread_entry(pthread_t t)
 {
-    struct pthread_entry *pentry = malloc(sizeof(struct pthread_entry));
+    struct pthread_entry *pentry = kalloc(sizeof(struct pthread_entry));
     if (pentry) {
         INIT_LIST_HEAD(&pentry->ptl_entry);
         pentry->ptl_value = t;
@@ -900,8 +913,11 @@ struct task {
     pid_t tsk_pgid;
     char **tsk_environ;
     char tsk_comm[16];
+    struct rmem_arena *tsk_ar;
 };
 
+static Dl_info main_dlinfo = {0};
+static struct rmem_arena *global_arena = NULL;
 static pthread_t main_pthread;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -921,12 +937,12 @@ static int t_fd(int fd)
 {
     if (!main_task)
         return fd;
-    
-    if (!current)
-        panic("t_fd");
-    
+
     if (fd < 0)
         return fd;
+
+    if (!current)
+        panic("t_fd");
     
     if (fd >= MAX_FILES)
         return -1;
@@ -964,7 +980,7 @@ static int t_fdr(int fd, int lock)
  */
 static struct task *taskalloc()
 {
-    struct task *t = malloc(sizeof(struct task));
+    struct task *t = kalloc(sizeof(struct task));
     if (!t)
         panic("taskalloc");
     
@@ -975,6 +991,9 @@ static struct task *taskalloc()
     t->tsk_refcount = 1;
     t->tsk_state = 0;
     t->tsk_pthreads_count = 0;
+    t->tsk_ar = rmem_arena_create(t);
+    if (!t->tsk_ar)
+        panic("taskalloc::rmem_arena_create");
 
     if (pthread_mutex_init(&t->tsk_lock, NULL) != 0) {
         panic("taskalloc::pthread_mutex_init(lock)");
@@ -999,7 +1018,7 @@ static struct task *taskalloc()
         t->tsk_f[1] = stdout;
         t->tsk_f[2] = stderr;
 
-        t->tsk_environ = copyenv(environ);
+        t->tsk_environ = copyenv(t->tsk_ar, environ);
         if (!t->tsk_environ)
             panic("copyenv");
 
@@ -1017,7 +1036,7 @@ static struct task *taskalloc()
         t->tsk_state = current->tsk_state & TS_CTTY;
         memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
 
-        t->tsk_environ = copyenv(current->tsk_environ);
+        t->tsk_environ = copyenv(t->tsk_ar, current->tsk_environ);
         if (!t->tsk_environ)
             panic("copyenv");
 
@@ -1065,19 +1084,19 @@ static void taskdealloc(struct task *t)
     
     struct pthread_entry *pentry = list_entry(t->tsk_pthreads.next, struct pthread_entry, ptl_entry);
     list_del(&pentry->ptl_entry);
-    free(pentry);
+    kfree(pentry);
     if (!list_empty(&t->tsk_pthreads))
         panic("taskalloc tsk_pthreads not one");
 
     // TODO might be bad to free env
     //for (char **e = t->tsk_environ; *e != NULL; e++)
-        //free(*e);
+        //kfree(*e);
 
     pthread_cond_destroy(&t->tsk_wait_cond);
     pthread_mutex_unlock(&t->tsk_lock);
     pthread_mutex_destroy(&t->tsk_lock);
 
-    free(t);
+    kfree(t);
 }
 
 /**
@@ -1404,6 +1423,40 @@ static FILE *t_f(FILE *f)
     if (f == stderr)
         return current->tsk_f[2];
     return f;
+}
+
+/////////////
+// Allocator
+/////////////
+
+static struct rmem_arena *arena_for_task(struct task *task)
+{
+    return (task ? task->tsk_ar : global_arena);
+}
+
+void *kalloc(size_t size)
+{
+    return rmem_arena_alloc(global_arena, size);
+}
+
+void kfree(void *p)
+{
+    rmem_arena_free(global_arena, p);
+}
+
+void *krealloc(void *ptr, size_t size)
+{
+    return rmem_arena_realloc(global_arena, ptr, size);
+}
+
+char *kstrdup(const char *s)
+{
+    int len = strlen(s);
+    char *p = kalloc(len + 1);
+    if (!p)
+        return NULL;
+    memcpy(p, s, len + 1);
+    return p;
 }
 
 /////////////
@@ -1863,7 +1916,7 @@ static struct tty *ttyalloc()
     if (-1 == CALL_FUNC(socketpair, AF_UNIX, SOCK_STREAM, 0, ends))
         return NULL;
     
-    struct tty *tt = malloc(sizeof(*tt));
+    struct tty *tt = kalloc(sizeof(*tt));
     if (!tt) {
         CALL_FUNC(close, ends[0]);
         CALL_FUNC(close, ends[1]);
@@ -1918,7 +1971,7 @@ fail:
 
     CALL_FUNC(close, ends[0]);
     CALL_FUNC(close, ends[1]);
-    free(tt);
+    kfree(tt);
 
     return NULL;
 }
@@ -1937,7 +1990,7 @@ static void ttydealloc(struct tty *tt)
     pthread_mutex_unlock(&tt->t_lock);
     pthread_mutex_destroy(&tt->t_lock);
 
-    free(tt);
+    kfree(tt);
 }
 
 /**
@@ -2794,9 +2847,9 @@ static int tty_slavename(int fd, char *buf, size_t buflen)
  * - Support multi-threading, we can force dynamic tlsmodel and override _get_tls_data() resolve function.
  */
 
-#define COW_DEEPCOPY 0x1
+#define COW_FIXUP 0x1
 
-struct cow_variable_t {
+struct cow_data_variable_t {
     struct list_head list;
     void *(*getptr_fn)();
     void (*init_fn)();
@@ -2804,78 +2857,35 @@ struct cow_variable_t {
     size_t size;
     int flags;
 };
-static LIST_HEAD(cow_variables);
+static LIST_HEAD(cow_data_variables);
 
 void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)(), int deepcopy, char *name)
 {
-    struct cow_variable_t *cowvar;
-    if (NULL == (cowvar = malloc(sizeof(*cowvar))))
-        panic("cowvar");
+    struct cow_data_variable_t *cow_data_var;
+    if (NULL == (cow_data_var = CALL_FUNC(malloc, sizeof(*cow_data_var))))
+        panic("cow_data_var");
     
-    list_add_tail(&cowvar->list, &cow_variables);
-    cowvar->getptr_fn = getptr_fn;
-    cowvar->init_fn = init_fn;
-    cowvar->name = name;
-    cowvar->size = size;
+    list_add_tail(&cow_data_var->list, &cow_data_variables);
+    cow_data_var->getptr_fn = getptr_fn;
+    cow_data_var->init_fn = init_fn;
+    cow_data_var->name = name;
+    cow_data_var->size = size;
     if (deepcopy) 
-        cowvar->flags |= COW_DEEPCOPY;
+        cow_data_var->flags |= COW_FIXUP;
 }
 
-static int cow_get_thread_ptrs(void ***out_data)
+static void cow_run_init_funcs()
 {
-    size_t cows = 0;
-    struct cow_variable_t *cow;
-
-    list_for_each_entry(cow, &cow_variables, list)
-        cows++;
-    
-    void **data = malloc((cows+1)*sizeof(void *));
-    if (!data)
-        return 1;
-    memset(data, 0, (cows+1)*sizeof(void *));
-    
-    int i = 0;
-    list_for_each_entry(cow, &cow_variables, list) {
-        if (i >= (cows)) {
-            free(data);
-            return 2;
-        }
-        data[i] = cow->getptr_fn();
-        if (data[i++] == NULL) {
-            free(data);
-            return 3;
-        }
+    struct cow_data_variable_t *cow;
+    list_for_each_entry(cow, &cow_data_variables, list) {
+        if (cow->init_fn)
+            cow->init_fn();
+        else
+            memset(cow->getptr_fn(), 0, cow->size);
     }
-
-    if (i != (cows)) {
-        free(data);
-        return 4;
-    }
-
-    *out_data = data;
-    return 0;
 }
 
-static int is_valid_ptr(void *ptr)
-{
-    int r = 0;
-    int p[2];
-    if (-1 == CALL_FUNC(pipe, p))
-        return 0;
-
-    if (1 != CALL_FUNC(write, p[1], ptr, 1))
-        goto out;
-
-    r = 1;
-
-out:
-    CALL_FUNC(close, p[0]);
-    CALL_FUNC(close, p[1]);
-
-    return r;
-}
-
-struct cow_deepcopy_ctx {
+struct cow_fixup_context {
     struct {
         void *new;
         void *old;
@@ -2884,133 +2894,86 @@ struct cow_deepcopy_ctx {
     size_t count;
 };
 
-static void *cow_deepcopy_ctx_find(struct cow_deepcopy_ctx *dctx, void *needle)
+static int cow_fixup_load_data_variables(struct cow_fixup_context *ctx, int new)
 {
-    for (int i = 0; i < dctx->count; i++) {
-        uintptr_t off = ((uintptr_t) needle) - ((uintptr_t) dctx->ptrs[i].new);
-        if (off < dctx->ptrs[i].size)
-            return (void *) ((dctx->ptrs[i].new) + off);
-        
-        off = ((uintptr_t) needle) - ((uintptr_t) dctx->ptrs[i].old);
-        if (off < dctx->ptrs[i].size)
-            return (void *) ((dctx->ptrs[i].new) + off);
+    size_t data_variable_count = 0;
+    struct cow_data_variable_t *cow;
+
+    list_for_each_entry(cow, &cow_data_variables, list)
+        data_variable_count++;
+    
+    if (ctx->count == 0) {
+        ctx->ptrs = kalloc(data_variable_count * sizeof(*ctx->ptrs));
+        if (!ctx->ptrs) {
+            errno = ENOMEM;
+            return -1;
+        }
+        ctx->count = data_variable_count;
+    }
+    else if (ctx->count != data_variable_count)
+        panic("data variable count mismatch (%zu != %zu)", data_variable_count, ctx->count);
+    
+    int i = 0;
+    list_for_each_entry(cow, &cow_data_variables, list) {
+        if (i >= (data_variable_count))
+            panic("data variable count mismatch in iteration (%d !+ %zu)", (i+1), data_variable_count);
+
+        ctx->ptrs[i].size = cow->size;
+        void *p = cow->getptr_fn();
+        if (new)
+            ctx->ptrs[i].new = cow->getptr_fn();
+        else
+            ctx->ptrs[i].old = cow->getptr_fn();
+
+        i++;
     }
 
-    return NULL;
+    if (i != (data_variable_count))
+        panic("data variable coumt mismatch after iteration (%d != %zu)", i, data_variable_count);
+    
+    return 0;
 }
 
-static void cow_deepcopy_ctx_add(struct cow_deepcopy_ctx *dctx, void *new, void *old, size_t size)
+static int cow_fixup_ctx_add(struct cow_fixup_context *dctx, void *new, void *old, size_t size)
 {
-    dctx->ptrs = realloc(dctx->ptrs, sizeof(dctx->ptrs[0]) * (dctx->count + 1));
-    if (!dctx->ptrs)
-        panic("realloc ptrs count %zu", dctx->count);
-    
+    void *nptrs = krealloc(dctx->ptrs, sizeof(dctx->ptrs[0]) * (dctx->count + 1));
+    if (!nptrs) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    dctx->ptrs = nptrs; 
     dctx->ptrs[dctx->count].new = new;
     dctx->ptrs[dctx->count].old = old;
     dctx->ptrs[dctx->count].size = size;
     dctx->count++;
-}
-
-static int heap_offset(uintptr_t *p)
-{
-    int check = 1;
-    // must make sure `p` is pointer-aligned (since the MALLOC_MAGIC is pointer-sized) or we might miss it
-    for (uintptr_t *pp = (uintptr_t *)(((uintptr_t) p) & ~(7UL)); pp >= (p - (0x1000 / sizeof(uintptr_t))); pp--)
-    {
-        // only perform valid ptrs on first pointer or when crossing to a new page
-        // since checking VERY pointer is waste of time
-        if ((check || ((((uintptr_t) pp) & 0xfff) == 0xff8)) && !is_valid_ptr(pp))
-            break;
-        check = 0;
-
-        if (((*pp) & 0xffffffff) == MALLOC_MAGIC) {
-            // some of our functions that use `MALLOC_MAGIC` may have that magic near its instructions (generated by the compiler)
-            // for now we just hard-coded ignore places near those functions but should probably find a better solution
-            if ((((uintptr_t) pp) - ((uintptr_t) &calloc)) < 0x1000)
-                return -1;
-            if ((((uintptr_t) pp) - ((uintptr_t) &free)) < 0x1000)
-                return -1;
-            if ((((uintptr_t) pp) - ((uintptr_t) &heap_offset)) < 0x1000)
-                return -1;
-            
-            return (((uintptr_t) p) - ((uintptr_t) pp));
-        }
-    }
-
-    return -1;
-}
-
-static void cow_deepcopy(void *buffer, size_t size, struct cow_deepcopy_ctx *dctx)
-{
-    uintptr_t **end = (uintptr_t **) (((char *) buffer) + size);
-
-    for (uintptr_t **p = (uintptr_t **)buffer; (p+1) <= end; p++) {
-        // fight circular dependency!
-        uintptr_t *cached = (uintptr_t *) cow_deepcopy_ctx_find(dctx, (void *)*p);
-        if (cached) {
-            *p = cached;
-            continue;
-        }
-
-        int heapoff = heap_offset(*p);
-        if (-1 == heapoff)
-            continue;
-
-        uint64_t *p_heapbase = (uint64_t *) (((uintptr_t) (*p)) - heapoff);
-        size_t heap_size = (size_t) ((*p_heapbase) >> 32); // we stash the size near the MALLOC_MAGIC
-        if (!heap_size)
-            continue;
-
-        uintptr_t *newptr = CALL_FUNC(malloc, heap_size);
-        if (!newptr)
-            panic("newptr = malloc(0x%zx)", heap_size);
-        memset(newptr, 0, heap_size);
-        
-        cow_deepcopy_ctx_add(dctx, (void *) newptr, p_heapbase, heap_size);
-        memcpy(newptr, p_heapbase, heap_size);
-        *p = (uintptr_t *) (((uintptr_t) newptr) + heapoff);
-        cow_deepcopy(newptr+1, heap_size-sizeof(uintptr_t), dctx);
-    }
-}
-
-static int cow_set_thread_ptrs(void **data, struct cow_deepcopy_ctx *dctx)
-{
-    struct cow_variable_t *cow;
-
-    void **d = data;
-    list_for_each_entry(cow, &cow_variables, list) {
-        if (*d == NULL)
-            return 1;
-
-        void *ptr = cow->getptr_fn();
-        memcpy(ptr, *d, cow->size);
-        cow_deepcopy_ctx_add(dctx, ptr, *d, cow->size);
-        
-        d++;
-    }
-
-    // deep copy on a second pass after the dctx is built
-    d = data;
-    list_for_each_entry(cow, &cow_variables, list) {
-        if (cow->flags & COW_DEEPCOPY)
-            cow_deepcopy(cow->getptr_fn(), cow->size, dctx);
-        d++;
-    }
-
-    if (*d != NULL)
-        return 2;
 
     return 0;
 }
 
-static void cow_run_init_funcs()
+static void *cow_fixup_translate(struct cow_fixup_context *dctx, void *p)
 {
-    struct cow_variable_t *cow;
-    list_for_each_entry(cow, &cow_variables, list) {
-        if (cow->init_fn)
-            cow->init_fn();
-        else
-            memset(cow->getptr_fn(), 0, cow->size);
+    for (int i = 0; i < dctx->count; i++)
+    {
+        if ((uintptr_t)p < (uintptr_t)dctx->ptrs[i].old || (uintptr_t)p >= (uintptr_t)dctx->ptrs[i].old + dctx->ptrs[i].size)
+            continue;
+
+        return (void *)((uintptr_t)p - (uintptr_t)dctx->ptrs[i].old + (uintptr_t)dctx->ptrs[i].new);
+    }
+
+    return p;
+}
+
+static void cow_fixup_process(struct cow_fixup_context *dctx)
+{
+    for (int i = 0; i < dctx->count; i++) {
+        for (
+            void **p = (void **)dctx->ptrs[i].new;
+            (uintptr_t)(p + 1) <= (uintptr_t)dctx->ptrs[i].new + dctx->ptrs[i].size;
+            p++
+        ) {
+            *p = cow_fixup_translate(dctx, *p);
+        }
     }
 }
 
@@ -3129,7 +3092,6 @@ static const char *find_program_pathname(const char *file)
 struct thread_create_arg
 {
     int flags;
-    struct cow_deepcopy_ctx *cow_context;
 };
 
 struct thread_arg
@@ -3142,7 +3104,6 @@ struct thread_arg
     pthread_mutex_t wake_mtx;
     pthread_cond_t  wake_cond;
     int wake;
-    void **cow_data;
 };
 
 static void *thread_entry(struct thread_arg *arg)
@@ -3160,17 +3121,6 @@ static void *thread_entry(struct thread_arg *arg)
 
     task_unlock(current);
 
-    struct cow_deepcopy_ctx dctx = {0};
-
-    if (0 != cow_set_thread_ptrs(arg->cow_data, &dctx))
-        panic("cow_set_thread_ptrs");
-
-    // `fork()` needs dctx, so it will use it and free it in the `start_routine`
-    if (arg->create_arg.cow_context)
-        memcpy(arg->create_arg.cow_context, &dctx, sizeof(dctx));
-    else
-        free(dctx.ptrs);
-
     void *(*start_routine)(void *) = arg->start_routine;
     void *routine_arg = arg->arg;
     
@@ -3187,7 +3137,7 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
 {
     int ret = ENOMEM;
 
-    struct thread_arg *targ = malloc(sizeof(struct thread_arg));
+    struct thread_arg *targ = kalloc(sizeof(struct thread_arg));
     if (!targ)
         goto out;
 
@@ -3197,7 +3147,7 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
     if (0 != pthread_cond_init(&targ->wake_cond, NULL))
         goto out;
 
-    targ->pentry = malloc(sizeof(struct pthread_entry));
+    targ->pentry = kalloc(sizeof(struct pthread_entry));
     if (!targ->pentry)
         goto out;
 
@@ -3207,10 +3157,6 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
         targ->task = taskalloc();
         if (!targ->task)
             goto out;
-        
-        if (0 != cow_get_thread_ptrs(&targ->cow_data)) {
-            goto out;
-        }
     }
     else
     {
@@ -3218,8 +3164,6 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
         ++current->tsk_refcount;
         targ->task = current;
         task_unlock(current);
-        
-        targ->cow_data = NULL;
     }
 
     targ->start_routine = start_routine;
@@ -3257,28 +3201,13 @@ out:
             }
 
             if (targ->pentry)
-            free(targ->pentry);
+            kfree(targ->pentry);
         }
 
-        if (targ->cow_data)
-            free(targ->cow_data);
-
-        free(targ);
+        kfree(targ);
     }
 
     return ret;
-}
-
-int tvm_pthread_fork(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
-{
-    struct thread_create_arg create_arg = { .flags = TVM_PTHREAD_FORK };
-    return tvm_pthread_create_ex(thread, attr, start_routine, arg, &create_arg);
-}
-
-int tvm_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
-{
-    struct thread_create_arg create_arg = { .flags = 0 };
-    return tvm_pthread_create_ex(thread, attr, start_routine, arg, &create_arg);
 }
 
 __attribute__ ((noreturn))
@@ -3308,101 +3237,404 @@ void tvm_pthread_exit(void *retval)
 #define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
 #define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
 
+#define TEMP_STACK_SIZE DEFAULT_STACK_SIZE
+
 struct forkless_arg {
-    jmp_buf jmpbuf;
-    void **fork_fp;
-    void **caller_fp;
-    struct cow_deepcopy_ctx dctx;
+    int result;
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+    jmp_buf jmpbuf_parent;
+    jmp_buf jmpbuf_tmp;
+    jmp_buf jmpbuf_fail;
+    void *tmp_stack;
+    void *caller_fp;
+    struct cow_fixup_context fixup;
+    struct rmem_arena *parent_ar;
+    size_t duplicate_errors;
 };
 
-#define FRAME_SIZE 0x1000
+static void forkless_dup_cb(struct forkless_arg *arg, void *old_slab, void *new_slab, size_t slabsize)
+{
+    if (0 != cow_fixup_ctx_add(&arg->fixup, new_slab, old_slab, slabsize))
+        arg->duplicate_errors++;
+}
+
+static void forkless_done_cb(struct forkless_arg *arg)
+{
+    if (arg->duplicate_errors == 0)
+        cow_fixup_process(&arg->fixup);
+}
 
 static void *forkless_entry(struct forkless_arg *arg)
 {
-    void *curr_fp = (void **)__builtin_frame_address(0);
-    char fake_frame[FRAME_SIZE] __attribute__((aligned(16))) = {0};
+    uintptr_t curr_fp = (uintptr_t)__builtin_frame_address(0);
 
-    uintptr_t jmpbuf_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf);
-    uintptr_t caller_frame = (uintptr_t)arg->caller_fp;
-    void **new_caller_frame = (void **) (fake_frame + caller_frame - jmpbuf_sp);
-    void **new_fork_frame = (void **) (((char *) arg->fork_fp) + ((uintptr_t) fake_frame) - jmpbuf_sp);
+    // move to temporary stack
+    if (0 == setjmp(arg->jmpbuf_tmp))
+    {
+        /**
+         * this code moves to a temporary stack, since we're gonna modify our own stack.
+         *
+         *   ._______. 0x0000
+         *   |       |
+         *   |       |
+         *   |       |
+         *   |       |        <- sp
+         *   |       | 
+         *   '_______' 0xffff <- fp
+         * 
+         * NOTE: `fp` points to a 2-dword structure
+         *   struct prologue {
+         *     void *fp;
+         *     void *lr;
+         *   }
+         * 
+         * This means an additional 2-dword needs to be added to the frame on top of `fp - sp`.
+         * We don't copy it, but rather forge it to values we can detect if a return is attempted.
+         * 
+         *   ^         ^  ^- sp is up there
+         *   |         |
+         *   |         |_
+         *   | prev fp | '- fp points here 
+         *   | prev lr |
+         *   |         |
+         */
+        jmpbuf_demangle(&arg->jmpbuf_tmp);
+        uintptr_t curr_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_tmp);
+        // `fp` is just before the value of `fp` itself, so keep room for `fp` on the stack
+        uintptr_t next_fp = (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE - 2 * sizeof(uintptr_t);
+        uintptr_t next_sp = next_fp - (curr_fp - curr_sp);
 
-    memcpy(fake_frame, (void *)jmpbuf_sp, caller_frame + sizeof(void *) - jmpbuf_sp);
-    *new_caller_frame = curr_fp;
+        memcpy((void *)next_sp, (void *)curr_sp, curr_fp - curr_sp);
+        // forge prologue so if a return occurs we can detect it
+        *(uintptr_t *)(next_fp) = 0xDEADBEEF46464646;
+        *(uintptr_t *)(next_fp + 8) = 0xDEADBEEF42424242;
 
-    cow_deepcopy((void *) new_fork_frame, ((uintptr_t) new_caller_frame) - ((uintptr_t) new_fork_frame), &arg->dctx);
-    free(arg->dctx.ptrs);
+        // include prologue (fp + lr) when adjusting jmpbuf context regs
+        jmpbuf_setstack(&arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
+        jmpbuf_mangle(&arg->jmpbuf_tmp);
 
-    jmpbuf_setstack(
-        &arg->jmpbuf,
-        (uintptr_t) fake_frame,
-        (uintptr_t) jmpbuf_sp,
-        caller_frame + sizeof(void *) - jmpbuf_sp
+        longjmp(arg->jmpbuf_tmp, 1);
+    }
+
+    // running on a temporary stack until the next longjmp
+
+    // load and copy all data vars
+    if (0 != cow_fixup_load_data_variables(&arg->fixup, 1)) {
+        // TODO: handle?
+        panic("TODO");
+        // pthread_mutex_lock(&arg->mtx);
+        // arg->done = errno;
+        // pthread_cond_broadcast(&arg->cond);
+        // pthread_mutex_unlock(&arg->mtx);
+        // pthread_exit(NULL);
+    }
+    for (int i = 0; i < arg->fixup.count; i++)
+        memcpy(arg->fixup.ptrs[i].new, arg->fixup.ptrs[i].old, arg->fixup.ptrs[i].size);
+
+    /**
+     * setup child stack as a copy of a few important frames from parent stack
+     *
+     *                       parent               child
+     *                     ._______.   0x0000   ._______.
+     *                     |       |            |       |
+     *        .--<  sp ->  |-------| -> -\      |       |
+     *  stack |            |       |      -> -> |-------|  <- sp  >--.
+     *  copy  |            |       |   memcpy   |       |            |  stack
+     *  size  '-->  fp ->  |-------| -> -\      |       |            |  copy
+     *                     '_______'      -> -> '_______'  <- fp  <--'  size
+     */
+
+    uintptr_t parent_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_parent);
+    uintptr_t parent_fp = (uintptr_t)arg->caller_fp;
+
+    // its important to "link" the new frames copied from parent to the current stack for `pthread_exit()` to work
+    // as `pthread_exit()` throws a C++ exception on some implmentations that is meant to be caught
+    // by pthread's `__thread_entry` func (which calls the start routine)
+    uintptr_t child_fp = curr_fp;
+    uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
+
+    INFO("PARENT STACK 0x%08zx - 0x%08zx", parent_fp, parent_sp);
+    INFO("CHILD  STACK 0x%08zx - 0x%08zx", child_fp, child_sp);
+
+    memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
+
+    // include prologue (fp + lr) when adjusting jmpbuf context regs (important for fixing up pointers to rbp)
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)child_sp, (void *)parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t)))
+    {
+        // TODO: handle?
+        panic("TODO");
+    }
+    INFO("rmem_arena_duplicate task %p ar %p", current, current->tsk_ar);
+    int ret = rmem_arena_duplicate(
+        current->tsk_ar,
+        arg->parent_ar,
+        (void (*)(void *, void *, void *, size_t))forkless_dup_cb,
+        (void (*)(void *))forkless_done_cb,
+        (void *)arg
     );
-    jmpbuf_mangle(&arg->jmpbuf);
 
-    longjmp(arg->jmpbuf, 1);
+    if (ret)
+    {
+        // TODO: handle?
+        panic("TODO");
+    }
+
+    if (arg->duplicate_errors)
+        panic("got %zu duplicate errors", arg->duplicate_errors);
+
+    // include prologue (fp + lr) when adjusting jmpbuf context regs
+    jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
+    jmpbuf_mangle(&arg->jmpbuf_parent);
+
+    longjmp(arg->jmpbuf_parent, 1);
 }
-
-struct pidcond_t {
-    pid_t pid;
-    pthread_mutex_t mtx;
-    pthread_cond_t cond;
-};
 
 pid_t fork(void)
 {
-    if (!main_task)
+    if (!main_task || !can_enter_tvm(__builtin_return_address(0)))
         return CALL_FUNC(fork);
     
-    struct pidcond_t pidcond = {-1};
-    pthread_mutex_init(&pidcond.mtx, NULL);
-    pthread_cond_init(&pidcond.cond, NULL);
-    struct pidcond_t *pidcondaddr = &pidcond;
+    struct rmem_arena *parent_ar = arena_for_task(current);
+    if (!parent_ar)
+        panic("parent task %p arena not found", current);
 
-    void **curr_fp = (void **)__builtin_frame_address(0);
-    struct forkless_arg arg = {
-        .fork_fp = curr_fp,
-        .caller_fp = (void **)(*curr_fp)
-    };
-    pidcondaddr = (struct pidcond_t *) (((uintptr_t) pidcondaddr) ^ FORKLESS_STACK_MAGIC);
-    
-    // NOTE: Why do we xor `pidaddr`?
-    //       `jmpbuf_setstack` fixes up every pointer in the old stack to the new stack.
-    //       This would also make `pidaddr` point to the new stack. But we don't want that,
-    //       because we're notifying the parent the child has finished setting up.
+    struct forkless_arg *arg = kalloc(sizeof(struct forkless_arg));
+    if (!arg) {
+        errno = ENOMEM;
+        return -1;
+    }
 
-    if (0 != setjmp(arg.jmpbuf)) {
-        pidcondaddr = (struct pidcond_t *) (((uintptr_t) pidcondaddr) ^ FORKLESS_STACK_MAGIC);
-        pthread_mutex_lock(&pidcondaddr->mtx);
-        pidcondaddr->pid = __gettid();
-        pthread_cond_broadcast(&pidcondaddr->cond);
-        pthread_mutex_unlock(&pidcondaddr->mtx);
+    arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (arg->tmp_stack == MAP_FAILED) {
+        kfree(arg);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    if (0 != cow_fixup_load_data_variables(&arg->fixup, 0)) {
+        munmap(arg->tmp_stack, TEMP_STACK_SIZE);
+        kfree(arg);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    arg->result = 0;
+    pthread_mutex_init(&arg->mtx, NULL);
+    pthread_cond_init(&arg->cond, NULL);
+    arg->caller_fp = *(void **)__builtin_frame_address(0);
+    arg->parent_ar = parent_ar;
+
+    if (0 != setjmp(arg->jmpbuf_parent)) {
+        // child
+        pthread_mutex_lock(&arg->mtx);
+        arg->result = __gettid();
+        pthread_cond_broadcast(&arg->cond);
+        pthread_mutex_unlock(&arg->mtx);
         return 0;
     }
-    jmpbuf_demangle(&arg.jmpbuf);
+
+    // parent
+
+    jmpbuf_demangle(&arg->jmpbuf_parent);
+
+    arg->parent_ar = arena_for_task(current);
 
     pthread_t thr;
     struct thread_create_arg create_arg = {
-        .flags = TVM_PTHREAD_FORK,
-        .cow_context = &arg.dctx,
+        .flags = TVM_PTHREAD_FORK
     };
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE);
-    tvm_pthread_create_ex(&thr, &attr, (void *(*)(void *)) forkless_entry, (void *)&arg, &create_arg);
+    int ret = tvm_pthread_create_ex(&thr, &attr, (void *(*)(void *)) forkless_entry, (void *)arg, &create_arg);
     pthread_attr_destroy(&attr);
-    
-    pthread_mutex_lock(&pidcond.mtx);
-    while (pidcond.pid == -1) {
-        pthread_cond_wait(&pidcond.cond, &pidcond.mtx);
-    }
-    pthread_mutex_unlock(&pidcond.mtx);
 
-    pthread_mutex_destroy(&pidcond.mtx);
-    pthread_cond_destroy(&pidcond.cond);
-    return pidcond.pid;
+    if (ret == 0) {
+        pthread_mutex_lock(&arg->mtx);
+        while (arg->result == 0) {
+            pthread_cond_wait(&arg->cond, &arg->mtx);
+        }
+        pthread_mutex_unlock(&arg->mtx);
+        if (arg->result > 0) {
+            ret = arg->result;
+        }
+        else {
+            ret = -1;
+            errno = -arg->result;
+        }
+    }
+
+    pthread_mutex_destroy(&arg->mtx);
+    pthread_cond_destroy(&arg->cond);
+    munmap(arg->tmp_stack, TEMP_STACK_SIZE);
+    kfree(arg);
+    return ret;
 }
+
+/////////////
+// Hooks API
+/////////////
+
+struct tvm_call {
+    struct tvm_call *prev;
+    void *lr;
+};
+static __thread struct tvm_call *call = NULL;
+
+int can_enter_tvm(void *lr) {
+    // not initialized
+    if (!main_task)
+        return 0;
+
+    if (!lr) {
+        if (!call)
+            return 0;
+        lr = call->lr;
+    }
+
+    Dl_info dlinfo;
+    if (0 == dladdr(lr, &dlinfo))
+        return 0;
+
+    if (dlinfo.dli_fbase != main_dlinfo.dli_fbase)
+        return 0;
+
+    // fork() does not use call (for now)
+    if (!call)
+        return 1;
+
+    // if this isn't an inner call, just go
+    if (!call->prev)
+        return 1;
+
+    // if this is an inner call, check first call
+    struct tvm_call *call_itr = call;
+    while (call_itr) {
+        lr = call_itr->lr;
+        call_itr = call_itr->prev;
+    }
+
+    if (0 == dladdr(lr, &dlinfo))
+        return 0;
+
+    return (dlinfo.dli_fbase == main_dlinfo.dli_fbase);
+}
+
+struct function_metadata {
+    struct list_head fm_list;
+    const char *fm_name;
+    void *fm_ptr;
+};
+
+static LIST_HEAD(all_function_metadata);
+
+#define FUNCTION_METADATA(_name, _ptr) \
+static struct function_metadata _fm_##_name = { .fm_name = #_name, .fm_ptr = (void *)_ptr }; \
+__attribute__((constructor)) \
+static void _fmc_ ## _name () { list_add_tail( & (_fm_ ## _name).fm_list, &all_function_metadata); }
+
+
+
+#define __MAP0(m,...)
+#define __MAP1(m,t,a,...) m(t,a)
+#define __MAP2(m,t,a,...) m(t,a), __MAP1(m,__VA_ARGS__)
+#define __MAP3(m,t,a,...) m(t,a), __MAP2(m,__VA_ARGS__)
+#define __MAP4(m,t,a,...) m(t,a), __MAP3(m,__VA_ARGS__)
+#define __MAP5(m,t,a,...) m(t,a), __MAP4(m,__VA_ARGS__)
+#define __MAP6(m,t,a,...) m(t,a), __MAP5(m,__VA_ARGS__)
+#define __MAP(n,...) __MAP##n(__VA_ARGS__)
+
+#define __LAST1(m,t,a,...) m(t,a)
+#define __LAST2(m,t,a,...) __LAST1(m,__VA_ARGS__)
+#define __LAST3(m,t,a,...) __LAST2(m,__VA_ARGS__)
+#define __LAST4(m,t,a,...) __LAST3(m,__VA_ARGS__)
+#define __LAST5(m,t,a,...) __LAST4(m,__VA_ARGS__)
+#define __LAST6(m,t,a,...) __LAST5(m,__VA_ARGS__)
+#define __LAST(n,...) __LAST##n(__VA_ARGS__)
+
+#define __FN_DECL(t, a)	t a
+#define __FN_ARGS(t, a)	a
+
+#define __FUNCTION_DEFINEx(_x, _rettype, _name, ...) \
+_rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
+_rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
+    struct tvm_call __call = { call, __builtin_return_address(0) }; \
+    call = &__call; \
+    _rettype __r; \
+    if (!can_enter_tvm(NULL)) { __r = CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
+    else { __r = __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
+    call = call->prev; \
+    return __r; \
+} \
+FUNCTION_METADATA(_name, &_name); \
+_rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
+
+#define __FUNCTION_DEFINE_VOIDx(_x, _name, ...) \
+void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
+void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
+    struct tvm_call __call = { call, __builtin_return_address(0) }; \
+    call = &__call; \
+    if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
+    else { __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
+    call = call->prev; \
+} \
+FUNCTION_METADATA(_name, &_name); \
+void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
+
+#define __FUNCTION_DEFINE_NORETx(_x, _name, ...) \
+void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
+void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
+    struct tvm_call __call = { call, __builtin_return_address(0) }; \
+    call = &__call; \
+    if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
+    else {__tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
+    panic("returned"); \
+    __builtin_unreachable(); \
+} \
+FUNCTION_METADATA(_name, &_name); \
+void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
+
+#define __FUNCTION_DEFINE_VAx(_x, _rettype, _name, ...) \
+_rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
+_rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
+    struct tvm_call __call = { call, __builtin_return_address(0) }; \
+    call = &__call; \
+    va_list __ap; \
+    va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
+    _rettype __r = __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
+    va_end(__ap); \
+    call = call->prev; \
+    return __r; \
+} \
+FUNCTION_METADATA(_name, &_name); \
+_rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
+
+#define FUNCTION_DEFINE0(_rettype, _name)      __FUNCTION_DEFINEx(0, _rettype, _name)
+#define FUNCTION_DEFINE1(_rettype, _name, ...) __FUNCTION_DEFINEx(1, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE2(_rettype, _name, ...) __FUNCTION_DEFINEx(2, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE3(_rettype, _name, ...) __FUNCTION_DEFINEx(3, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE4(_rettype, _name, ...) __FUNCTION_DEFINEx(4, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE5(_rettype, _name, ...) __FUNCTION_DEFINEx(5, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE6(_rettype, _name, ...) __FUNCTION_DEFINEx(6, _rettype, _name, __VA_ARGS__)
+
+#define FUNCTION_DEFINE_VOID0(_name)      __FUNCTION_DEFINE_VOIDx(0, _name)
+#define FUNCTION_DEFINE_VOID1(_name, ...) __FUNCTION_DEFINE_VOIDx(1, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VOID2(_name, ...) __FUNCTION_DEFINE_VOIDx(2, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VOID3(_name, ...) __FUNCTION_DEFINE_VOIDx(3, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VOID4(_name, ...) __FUNCTION_DEFINE_VOIDx(4, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VOID5(_name, ...) __FUNCTION_DEFINE_VOIDx(5, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VOID6(_name, ...) __FUNCTION_DEFINE_VOIDx(6, _name, __VA_ARGS__)
+
+#define FUNCTION_DEFINE_NORET0(_name)      __FUNCTION_DEFINE_NORETx(0, _name)
+#define FUNCTION_DEFINE_NORET1(_name, ...) __FUNCTION_DEFINE_NORETx(1, _name, __VA_ARGS__)
+
+#define FUNCTION_DEFINE_VA1(_name, ...) __FUNCTION_DEFINE_VAx(1, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA2(_name, ...) __FUNCTION_DEFINE_VAx(2, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA3(_name, ...) __FUNCTION_DEFINE_VAx(3, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA4(_name, ...) __FUNCTION_DEFINE_VAx(4, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA5(_name, ...) __FUNCTION_DEFINE_VAx(5, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA6(_name, ...) __FUNCTION_DEFINE_VAx(6, _name, __VA_ARGS__)
 
 /////////////
 // TVM builtins
@@ -3832,10 +4064,24 @@ static int tvm_main(int argc, char **argv)
  * I have no idea why `__panic()` is here and at this point, I'm too afraid to ask.
  */
 
+static void rmem_print_cb(char *msg) { int __num = snprintf(msgbuf, sizeof(msgbuf), "Kernel(%d): RMEM: %s\n", __gettid(), msg); CALL_FUNC(write, 1, msgbuf, __num); }
+
 void tvm_init(const char *init_comm)
 {
+    rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
+
+    if (0 == dladdr(tvm_init, &main_dlinfo))
+        panic("dladdr(tvm_init) failed");
+
+    global_arena = rmem_arena_create(NULL);
+    if (!global_arena)
+        panic("couldn't create global arena");
+
     main_pthread = pthread_self();
     current = taskalloc();  // special initialization for main thread
+
+    if (!current->tsk_ar)
+        panic("couldn't create main task arena");
     strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
 
     cow_run_init_funcs(); // initialize copy-on-write vars with init statements
@@ -3869,6 +4115,32 @@ char ***_tvm_environ()
     return &current->tsk_environ;
 }
 
+void tvm_log(const char *function, const char *msg, ...)
+{
+    int n = snprintf(msgbuf, sizeof(msgbuf), "%s(%d): %s: ", (current ? current->tsk_comm : "<null>"), __gettid(), function);
+
+    va_list ap;
+    va_start(ap, msg);
+    n += vsnprintf(msgbuf + n, sizeof(msgbuf) - n, msg, ap);
+    va_end(ap);
+
+    n += snprintf(msgbuf + n, sizeof(msgbuf) - n, "\n");
+
+    CALL_FUNC(write, 1, msgbuf, n);
+}
+
+void tvm_dump(int mode)
+{
+    if (mode == TVM_DUMP_FUNCS) {
+        printf("tvm functions:\n");
+        struct function_metadata *fm;
+        list_for_each_entry(fm, &all_function_metadata, fm_list) {
+            printf("  %08zx  %s\n", (uintptr_t)fm->fm_ptr, fm->fm_name);
+        }
+        printf("\n");
+    }
+}
+
 #define MAX_BT 16
 
 static void __panic(const char *msg, const char *file, int line)
@@ -3885,12 +4157,17 @@ static void __panic(const char *msg, const char *file, int line)
     CALL_FUNC(fprintf, stderr, " errno: %d (%s)\n", errno, strerror(errno));
     CALL_FUNC(fprintf, stderr, "\n");
 
-    CALL_FUNC(exit, 255);
+    CALL_FUNC(fprintf, stderr, "Stacktrace:\n");
+    dump_stacktrace();
+
+    CALL_FUNC(raise, SIGABRT);
 }
 
 /////////////
 // Hooks
 /////////////
+
+
 
 /**
  * Oh yeah, there are SOOOO many more functions to hook.
@@ -3901,19 +4178,19 @@ static void __panic(const char *msg, const char *file, int line)
  * 
  * TODO:`
  * - _FORTIFY_SOURCE - `__printf_chk()`, `__dup_chk()` etc (for now just don't compile with -Os)
- * - Large-File-Support - `open64()`, `openat64()`, `fopen64()`, `lseek64()` etc (for now just don't compile with it)
  */
 
-FILE *fdopen(int fd, const char *mode)
-{ return CALL_FUNC(fdopen, t_fd(fd), mode); }
+FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
+    return CALL_FUNC(fdopen, t_fd(fd), mode);
+}
 
-DIR *fdopendir(int fd)
-{ return CALL_FUNC(fdopendir, t_fd(fd)); }
+FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
+    return CALL_FUNC(fdopendir, t_fd(fd));
+}
 
-size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
-{
+FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb, FILE *, stream) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
+    if (!(fops = fops_for_stream(current, stream)))
         return CALL_FUNC(fwrite, ptr, size, nmemb, t_f(stream));
     
     if (!size)
@@ -3926,10 +4203,9 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
     return r / size;
 }
 
-size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
-{
+FUNCTION_DEFINE4(size_t, fread, void *, ptr, size_t, size, size_t, nmemb, FILE *, stream) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
+    if (!(fops = fops_for_stream(current, stream)))
         return CALL_FUNC(fread, ptr, size, nmemb, t_f(stream));
     
     if (!size)
@@ -3942,39 +4218,45 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
     return r / size;
 }
 
-int fseek(FILE *stream, long offset, int whence)
-{ return CALL_FUNC(fseek, t_f(stream), offset, whence); }
+FUNCTION_DEFINE3(int, fseek, FILE *, stream, long, offset, int, whence) {
+    return CALL_FUNC(fseek, t_f(stream), offset, whence);
+}
 
-long ftell(FILE *stream)
-{ return CALL_FUNC(ftell, t_f(stream)); }
+FUNCTION_DEFINE1(long, ftell, FILE *, stream) {
+    return CALL_FUNC(ftell, t_f(stream));
+}
 
-int fflush(FILE *stream)
-{ return CALL_FUNC(fflush, t_f(stream)); }
+FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
+    return CALL_FUNC(fflush, t_f(stream));
+}
 
-void setbuf(FILE *stream, char *buf)
-{ return CALL_FUNC(setbuf, t_f(stream), buf); }
-
-#if defined(__linux__)
-void setbuffer(FILE *stream, char *buf, size_t size)
-#elif defined(__APPLE__)
-void setbuffer(FILE *stream, char *buf, int size)
-#endif
-{ return CALL_FUNC(setbuffer, t_f(stream), buf, size); }
+FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
+    return CALL_FUNC(setbuf, t_f(stream), buf);
+}
 
 #if defined(__linux__)
-void setlinebuf(FILE *stream)
+FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, size_t, size) {
 #elif defined(__APPLE__)
-int setlinebuf(FILE *stream)
+FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
 #endif
-{ return CALL_FUNC(setlinebuf, t_f(stream)); }
+    return CALL_FUNC(setbuffer, t_f(stream), buf, size);
+}
 
-int setvbuf(FILE *stream, char *buf, int mode, size_t size)
-{ return CALL_FUNC(setvbuf, t_f(stream), buf, mode, size); }
+#if defined(__linux__)
+FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
+#elif defined(__APPLE__)
+FUNCTION_DEFINE1(int, setlinebuf, FILE *, stream) {
+#endif
+    return CALL_FUNC(setlinebuf, t_f(stream));
+}
 
-int fputc(int c, FILE *stream)
-{
+FUNCTION_DEFINE4(int, setvbuf, FILE *, stream, char *, buf, int, mode, size_t, size) {
+    return CALL_FUNC(setvbuf, t_f(stream), buf, mode, size);
+}
+
+FUNCTION_DEFINE2(int, fputc, int, c, FILE *, stream) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
+    if (!(fops = fops_for_stream(current, stream)))
         return CALL_FUNC(fputc, c, t_f(stream));
     
     if (1 == fops_write(fops, fileno(stream), &c, 1))
@@ -3982,10 +4264,9 @@ int fputc(int c, FILE *stream)
     return EOF;
 }
 
-int fputs(const char *s, FILE *stream)
-{
+FUNCTION_DEFINE2(int, fputs, const char *, s, FILE *, stream) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
+    if (!(fops = fops_for_stream(current, stream)))
         return CALL_FUNC(fputs, s, t_f(stream));
     
     ssize_t r = fops_write(fops, fileno(stream), s, strlen(s));
@@ -3994,23 +4275,23 @@ int fputs(const char *s, FILE *stream)
     return EOF;
 }
 
-int putc(int c, FILE *stream)
-{ return fputc(c, stream); }
+FUNCTION_DEFINE2(int, putc, int, c, FILE *, stream) {
+    return fputc(c, stream);
+}
 
-int putchar(int c)
-{ return fputc(c, stdout); }
+FUNCTION_DEFINE1(int, putchar, int, c) {
+    return fputc(c, stdout);
+}
 
-int puts(const char *s)
-{
+FUNCTION_DEFINE1(int, puts, const char *, s) {
     if (EOF == fputs(s, stdout))
         return EOF;
     return fputc('\n', stdout);
 }
 
-int fgetc(FILE *stream)
-{
+FUNCTION_DEFINE1(int, fgetc, FILE *, stream) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
+    if (!(fops = fops_for_stream(current, stream)))
         return CALL_FUNC(fgetc, t_f(stream));
     
     char c;
@@ -4019,10 +4300,9 @@ int fgetc(FILE *stream)
     return EOF;
 }
 
-char *fgets(char *s, int size, FILE *stream)
-{
+FUNCTION_DEFINE3(char *, fgets, char *, s, int, size, FILE *, stream) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
+    if (!(fops = fops_for_stream(current, stream)))
         return  CALL_FUNC(fgets, s, size, t_f(stream));
     
     if (size <= 0)
@@ -4054,76 +4334,62 @@ char *fgets(char *s, int size, FILE *stream)
     return s;
 }
 
-int getc(FILE *stream)
-{ return fgetc(stream); }
-
-int getchar(void)
-{ return fgetc(stdin); }
-
-int ungetc(int c, FILE *stream)
-{ return CALL_FUNC(ungetc, c, t_f(stream)); }
-
-void clearerr(FILE *stream)
-{ return CALL_FUNC(clearerr, t_f(stream)); }
-
-int feof(FILE *stream)
-{ return CALL_FUNC(feof, t_f(stream)); }
-
-int ferror(FILE *stream)
-{ return CALL_FUNC(ferror, t_f(stream)); }
-
-int fileno(FILE *stream)
-{ return CALL_FUNC(fileno, t_f(stream)); }
-
-
-
-int printf(const char *format, ...)
-{
-    va_list arg;
-    int done;
-    va_start (arg, format);
-    done = vfprintf(stdout, format, arg);
-    va_end (arg);
-    return done;
+FUNCTION_DEFINE1(int, getc, FILE *, stream) {
+    return fgetc(stream);
 }
 
-int fprintf(FILE *stream, const char *format, ...)
-{
-    va_list arg;
-    int done;
-    va_start (arg, format);
-    done = vfprintf(stream, format, arg);
-    va_end (arg);
-    return done;
+FUNCTION_DEFINE0(int, getchar) {
+    return fgetc(stdin);
 }
 
-int dprintf(int fd, const char *format, ...)
-{
-    va_list arg;
-    int done;
-    va_start (arg, format);
-    done = vdprintf(fd, format, arg);
-    va_end (arg);
-    return done;
+FUNCTION_DEFINE2(int, ungetc, int, c, FILE *, stream) {
+    return CALL_FUNC(ungetc, c, t_f(stream));
 }
 
-int vprintf(const char *format, va_list ap)
-{ return vfprintf(stdout, format, ap); }
+FUNCTION_DEFINE_VOID1(clearerr, FILE *, stream) {
+    return CALL_FUNC(clearerr, t_f(stream));
+}
 
-int vfprintf(FILE *stream, const char *format, va_list ap)
-{
+FUNCTION_DEFINE1(int, feof, FILE *, stream) {
+    return CALL_FUNC(feof, t_f(stream));
+}
+
+FUNCTION_DEFINE1(int, ferror, FILE *, stream) {
+    return CALL_FUNC(ferror, t_f(stream));
+}
+
+FUNCTION_DEFINE1(int, fileno, FILE *, stream) {
+    return CALL_FUNC(fileno, t_f(stream));
+}
+
+FUNCTION_DEFINE_VA1(int, printf, const char *, format) {
+    return vfprintf(stdout, format, __ap);
+}
+
+FUNCTION_DEFINE_VA2(int, fprintf, FILE *, stream, const char *, format) {
+    return vfprintf(stream, format, __ap);
+}
+
+FUNCTION_DEFINE_VA2(int, dprintf, int, fd, const char *, format) {
+    return vdprintf(fd, format, __ap);
+}
+
+FUNCTION_DEFINE2(int, vprintf, const char *, format, va_list, ap) {
+    return vfprintf(stdout, format, ap);
+}
+
+FUNCTION_DEFINE3(int, vfprintf, FILE *, stream, const char *, format, va_list, ap) {
     struct fops *fops;
     int fd = t_fdr(fileno(stream), 1);
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(vfprintf, t_f(stream), format, ap);
     
     return vdprintf(fd, format, ap);
 }
 
-int vdprintf(int fd, const char *format, va_list ap)
-{
+FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(vdprintf, t_fd(fd), format, ap);
     
     va_list ap2;
@@ -4144,42 +4410,31 @@ int vdprintf(int fd, const char *format, va_list ap)
     return wsize;
 }
 
-int scanf(const char *format, ...)
-{
-    va_list arg;
-    int done;
-    va_start (arg, format);
-    done = CALL_FUNC(vfscanf, t_f(stdin), format, arg);
-    va_end (arg);
-    return done;
+FUNCTION_DEFINE_VA1(int, scanf, const char *, format) {
+    return vfscanf(stdin, format, __ap);
 }
 
-int fscanf(FILE *stream, const char *format, ...)
-{
-    va_list arg;
-    int done;
-    va_start (arg, format);
-    done = CALL_FUNC(vfscanf, t_f(stream), format, arg);
-    va_end (arg);
-    return done;
+FUNCTION_DEFINE_VA2(int, fscanf, FILE *, stream, const char *, format) {
+    return vfscanf(stream, format, __ap);
 }
 
-int vscanf(const char *format, va_list ap)
-{ return CALL_FUNC(vfscanf, t_f(stdin), format, ap); }
+FUNCTION_DEFINE2(int, vscanf, const char *, format, va_list, ap) {
+    return CALL_FUNC(vfscanf, t_f(stdin), format, ap);
+}
 
-int vfscanf(FILE *stream, const char *format, va_list ap)
-{ return CALL_FUNC(vfscanf, t_f(stream), format, ap); }
+FUNCTION_DEFINE3(int, vfscanf, FILE *, stream, const char *, format, va_list, ap) {
+    return CALL_FUNC(vfscanf, t_f(stream), format, ap);
+}
 
-void perror(const char *s)
-{
-    if (!main_task)
-        return CALL_FUNC(perror, s);
-    
+FUNCTION_DEFINE_VOID1(perror, const char *, s) {
     fprintf(stderr, "%s: %s\n", s, strerror(errno));
 }
 
-int open(const char *pathname, int flags, ...)
-{
+FUNCTION_DEFINE_VA2(int, open, const char *, pathname, int, flags) {
+    mode_t mode = va_arg(__ap, int);
+    if (!can_enter_tvm(NULL))
+        return CALL_FUNC(open, pathname, flags, mode);
+
     int f = task_reserve_fd(current, 0);
     if (f == -1) {
         errno = EMFILE;
@@ -4189,23 +4444,10 @@ int open(const char *pathname, int flags, ...)
     struct fops *fops = fops_for_open(pathname);
 
     int r;
-    if (__OPEN_NEEDS_MODE(flags)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode_t m = va_arg(ap, int);
-        va_end(ap);
-        
-        if (fops && fops->f_open)
-            r = fops->f_open(pathname, flags, m) | fops->f_fdflag;
-        else
-            r = CALL_FUNC(open, pathname, flags, m);
-    }
-    else {
-        if (fops && fops->f_open)
-            r = fops->f_open(pathname, flags, 0) | fops->f_fdflag;
-        else
-            r = CALL_FUNC(open, pathname, flags);
-    }
+    if (fops && fops->f_open)
+        r = fops->f_open(pathname, flags, mode) | fops->f_fdflag;
+    else
+        r = CALL_FUNC(open, pathname, flags, mode);
     
     if (r == -1) {
         task_set_fd(current, f, -1);
@@ -4216,8 +4458,7 @@ int open(const char *pathname, int flags, ...)
     return f;
 }
 
-int creat(const char *pathname, mode_t mode)
-{
+FUNCTION_DEFINE2(int, creat, const char *, pathname, mode_t, mode) {
     int r = CALL_FUNC(creat, pathname, mode);
     if (r == -1) {
         return r;
@@ -4231,55 +4472,45 @@ int creat(const char *pathname, mode_t mode)
     return f;
 }
 
-int openat(int dirfd, const char *pathname, int flags, ...)
-{
-    int r;
-    if (__OPEN_NEEDS_MODE(flags)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode_t m = va_arg(ap, int);
-        va_end(ap);
-        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags, m);
+FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags) {
+    mode_t mode = va_arg(__ap, int);
+    if (!can_enter_tvm(NULL))
+        return CALL_FUNC(openat, dirfd, pathname, flags, mode);
+
+    int f = task_reserve_fd(current, 0);
+    if (f == -1) {
+        errno = EMFILE;
+        return -1;
     }
-    else
-        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags);
+
+    int r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags, mode);
     
     if (r == -1) {
+        task_set_fd(current, f, -1);
         return r;
     }
 
-    int f = task_new_fd(current, 0, r);
-    if (f == -1) {
-        CALL_FUNC(close, r);
-        errno = ENOMEM;
-    }
-
+    task_set_fd(current, f, r);
     return f;
 }
 
-ssize_t read(int fd, void *buf, size_t count)
-{
+FUNCTION_DEFINE3(ssize_t, read, int, fd, void *, buf, size_t, count) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(read, t_fd(fd), buf, count);
     
     return fops_read(fops, t_fd(fd), buf, count);
 }
 
-ssize_t write(int fd, const void *buf, size_t count)
-{
+FUNCTION_DEFINE3(ssize_t, write, int, fd, const void *, buf, size_t, count) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(write, t_fd(fd), buf, count);
     
     return fops_write(fops, t_fd(fd), buf, count);
 }
 
-int close(int fd)
-{
-    if (!main_task)
-        return CALL_FUNC(close, fd);
-    
+FUNCTION_DEFINE1(int, close, int, fd) {
     task_lock(current);
     struct fops *f = fops_for_fd_locked(current, fd);
     int rfd = t_fd(fd);
@@ -4305,10 +4536,9 @@ int close(int fd)
     return r;
 }
 
-ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
-{
+FUNCTION_DEFINE3(ssize_t, readv, int, fd, const struct iovec *, iov, int, iovcnt) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(readv, t_fd(fd), iov, iovcnt);
     
     // TODO: scatter-gather needs to be "atomic", maybe IO-lock per fops or per device instance?
@@ -4332,10 +4562,9 @@ ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     return total;
 }
 
-ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
-{
+FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcnt) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(writev, t_fd(fd), iov, iovcnt);
     
     // TODO: see readv()
@@ -4359,25 +4588,19 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
     return total;
 }
 
-off_t lseek(int fd, off_t offset, int whence)
-{ return CALL_FUNC(lseek, t_fd(fd), offset, whence); }
+FUNCTION_DEFINE3(off_t, lseek, int, fd, off_t, offset, int, whence) {
+    return CALL_FUNC(lseek, t_fd(fd), offset, whence);
+}
 
-int fsync(int fd)
-{ return CALL_FUNC(fsync, t_fd(fd)); }
+FUNCTION_DEFINE1(int, fsync, int, fd) {
+    return CALL_FUNC(fsync, t_fd(fd));
+}
 
-int dup(int oldfd)
-{
-    if (!main_task)
-        return CALL_FUNC(dup, oldfd);
-    
+FUNCTION_DEFINE1(int, dup, int, oldfd) {
     return fcntl(oldfd, F_DUPFD, 0);
 }
 
-int dup2(int oldfd, int newfd)
-{
-    if (!main_task)
-        return CALL_FUNC(dup2, oldfd, newfd);
-    
+FUNCTION_DEFINE2(int, dup2, int, oldfd, int, newfd) {
     task_lock(current);
     int oldfd_real = t_fd(oldfd);
     int newfd_realprev = t_fd(newfd);
@@ -4439,11 +4662,7 @@ int dup2(int oldfd, int newfd)
     return newfd;
 }
 
-int pipe(int pipefd[2])
-{
-    if (!main_task)
-        return CALL_FUNC(pipe, pipefd);
-    
+FUNCTION_DEFINE1(int, pipe, int *, pipefd) {
     int p[2];
     if (0 != CALL_FUNC(pipe, p))
         return -1;
@@ -4467,11 +4686,7 @@ int pipe(int pipefd[2])
     return 0;
 }
 
-int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout)
-{
-    if (!main_task)
-        return CALL_FUNC(select, nfds, readfds, writefds, exceptfds, timeout);
-    
+FUNCTION_DEFINE5(int, select, int, nfds, fd_set *, readfds, fd_set *, writefds, fd_set *, exceptfds, struct timeval *, timeout) {
     int fdcount = 0;
     struct pollfd *fds = NULL;
 
@@ -4537,11 +4752,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struc
     return r;
 }
 
-int poll(struct pollfd *fds, nfds_t nfds, int timeout)
-{
-    if (!main_task)
-        return CALL_FUNC(poll, fds, nfds, timeout);
-    
+FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
     int ret = -1;
     struct pollfd *realfds = malloc(nfds * sizeof(*fds));
     if (!realfds) {
@@ -4563,15 +4774,9 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
     return ret;
 }
 
-int fcntl(int fd, int cmd, ... /* arg */ )
-{
-    va_list ap;
-
-    va_start (ap, cmd);
-    void *arg = va_arg (ap, void *);
-    va_end (ap);
-
-    if (!main_task)
+FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
+    void *arg = va_arg (__ap, void *);
+    if (!can_enter_tvm(NULL))
         return CALL_FUNC(fcntl, fd, cmd, arg);
     
     if (cmd == F_DUPFD) {
@@ -4604,14 +4809,11 @@ int fcntl(int fd, int cmd, ... /* arg */ )
     return CALL_FUNC(fcntl, t_fd(fd), cmd, arg);
 }
 
-int ftruncate(int fd, off_t length)
-{ return CALL_FUNC(ftruncate, t_fd(fd), length); }
+FUNCTION_DEFINE2(int, ftruncate, int, fd, off_t, length) {
+    return CALL_FUNC(ftruncate, t_fd(fd), length);
+}
 
-int stat(const char *pathname, struct stat *statbuf)
-{
-    if (!main_task)
-        return CALL_FUNC(stat, pathname, statbuf);
-
+FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
     struct fops *fops;
     if ((fops = fops_for_pathname(pathname))) {
         FOPS_PATH(fops, f_stat, pathname, statbuf);
@@ -4625,10 +4827,9 @@ int stat(const char *pathname, struct stat *statbuf)
     return CALL_FUNC(stat, pathname, statbuf);
 }
 
-int fstat(int fd, struct stat *statbuf)
-{
+FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(fstat, t_fd(fd), statbuf);
     
     if (!fops->f_stat) {
@@ -4639,14 +4840,11 @@ int fstat(int fd, struct stat *statbuf)
     return fops->f_stat(t_fd(fd), statbuf);
 }
 
-int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
-{ return CALL_FUNC(fstatat, t_fd(dirfd), pathname, statbuf, flags); }
+FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *, statbuf, int, flags) {
+    return CALL_FUNC(fstatat, t_fd(dirfd), pathname, statbuf, flags);
+}
 
-int access(const char *pathname, int mode)
-{
-    if (!main_task)
-        return CALL_FUNC(access, pathname, mode);
-    
+FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
     // make sure the shell finds our programs
     if (find_program(pathname))
         return 0;
@@ -4654,22 +4852,21 @@ int access(const char *pathname, int mode)
     return CALL_FUNC(access, pathname, mode);
 }
 
-int faccessat(int dirfd, const char *pathname, int mode, int flags)
-{ return CALL_FUNC(faccessat, t_fd(dirfd), pathname, mode, flags); }
+FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, int, flags) {
+    return CALL_FUNC(faccessat, t_fd(dirfd), pathname, mode, flags);
+}
 
-int chmod(const char *pathname, mode_t mode)
-{
+FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_pathname(pathname)))
+    if (!(fops = fops_for_pathname(pathname)))
         return CALL_FUNC(chmod, pathname, mode);
 
     FOPS_PATH(fops, f_chmod, pathname, mode);
 }
 
-int fchmod(int fd, mode_t mode)
-{
+FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(fchmod, t_fd(fd), mode);
     
     if (!fops->f_chmod) {
@@ -4681,22 +4878,21 @@ int fchmod(int fd, mode_t mode)
 }
 
 // TODO support dirfd properly
-int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags)
-{ return CALL_FUNC(fchmodat, t_fd(dirfd), pathname, mode, flags); }
+FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode, int, flags) {
+    return CALL_FUNC(fchmodat, t_fd(dirfd), pathname, mode, flags);
+}
 
-int chown(const char *pathname, uid_t owner, gid_t group)
-{
+FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_pathname(pathname)))
+    if (!(fops = fops_for_pathname(pathname)))
         return CALL_FUNC(chown, pathname, owner, group);
 
     FOPS_PATH(fops, f_chown, pathname, owner, group);
 }
 
-int fchown(int fd, uid_t owner, gid_t group)
-{
+FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+    if (!(fops = fops_for_fd(current, fd)))
         return CALL_FUNC(fchown, t_fd(fd), owner, group);
     
     if (!fops->f_chown) {
@@ -4707,38 +4903,44 @@ int fchown(int fd, uid_t owner, gid_t group)
     return fops->f_chown(t_fd(fd), owner, group);
 }
 
-int fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags)
-{ return CALL_FUNC(fchownat, t_fd(dirfd), pathname, owner, group, flags); }
+FUNCTION_DEFINE5(int, fchownat, int, dirfd, const char *, pathname, uid_t, owner, gid_t, group, int, flags) {
+    return CALL_FUNC(fchownat, t_fd(dirfd), pathname, owner, group, flags);
+}
 
-int flock(int fd, int operation)
-{ return CALL_FUNC(flock, t_fd(fd), operation); }
+FUNCTION_DEFINE2(int, flock, int, fd, int, operation) {
+    return CALL_FUNC(flock, t_fd(fd), operation);
+}
 
-int lockf(int fd, int cmd, off_t len)
-{ return CALL_FUNC(lockf, t_fd(fd), cmd, len); }
+FUNCTION_DEFINE3(int, lockf, int, fd, int, cmd, off_t, len) {
+    return CALL_FUNC(lockf, t_fd(fd), cmd, len);
+}
 
-ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
-{ return CALL_FUNC(readlinkat, t_fd(dirfd), pathname, buf, bufsiz); }
+FUNCTION_DEFINE4(ssize_t, readlinkat, int, dirfd, const char *, pathname, char *, buf, size_t, bufsiz) {
+    return CALL_FUNC(readlinkat, t_fd(dirfd), pathname, buf, bufsiz);
+}
 
-int symlinkat(const char *target, int newdirfd, const char *linkpath)
-{ return CALL_FUNC(symlinkat, target, t_fd(newdirfd), linkpath); }
+FUNCTION_DEFINE3(int, symlinkat, const char *, target, int, newdirfd, const char *, linkpath) {
+    return CALL_FUNC(symlinkat, target, t_fd(newdirfd), linkpath);
+}
 
-int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags)
-{ return CALL_FUNC(linkat, t_fd(olddirfd), oldpath, t_fd(newdirfd), newpath, flags); }
+FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath, int, flags) {
+    return CALL_FUNC(linkat, t_fd(olddirfd), oldpath, t_fd(newdirfd), newpath, flags);
+}
 
-int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath)
-{ return CALL_FUNC(renameat, t_fd(olddirfd), oldpath, t_fd(newdirfd), newpath); }
+FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath) {
+    return CALL_FUNC(renameat, t_fd(olddirfd), oldpath, t_fd(newdirfd), newpath);
+}
 
-int unlinkat(int dirfd, const char *pathname, int flags)
-{ return CALL_FUNC(unlinkat, t_fd(dirfd), pathname, flags); }
+FUNCTION_DEFINE3(int, unlinkat, int, dirfd, const char *, pathname, int, flags) {
+    return CALL_FUNC(unlinkat, t_fd(dirfd), pathname, flags);
+}
 
-int mkdirat(int dirfd, const char *pathname, mode_t mode)
-{ return CALL_FUNC(mkdirat, t_fd(dirfd), pathname, mode); }
+FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode) {
+    return CALL_FUNC(mkdirat, t_fd(dirfd), pathname, mode);
+}
 
-int socket(int domain, int type, int protocol)
-{
+FUNCTION_DEFINE3(int,  socket, int, domain, int, type, int, protocol) {
     int r = CALL_FUNC(socket, domain, type, protocol);
-    if (!main_task)
-        return r;
     if (r == -1) {
         return r;
     }
@@ -4751,11 +4953,8 @@ int socket(int domain, int type, int protocol)
     return f;
 }
 
-int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
-{
+FUNCTION_DEFINE3(int, accept, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen) {
     int r = CALL_FUNC(accept, t_fd(sockfd), addr, addrlen);
-    if (!main_task)
-        return r;
     if (r == -1) {
         return r;
     }
@@ -4769,53 +4968,63 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     return f;
 }
 
-int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
-{ return CALL_FUNC(bind, t_fd(sockfd), addr, addrlen); }
+FUNCTION_DEFINE3(int, bind, int, sockfd, const struct sockaddr *, addr, socklen_t, addrlen) {
+    return CALL_FUNC(bind, t_fd(sockfd), addr, addrlen);
+}
 
-int listen(int sockfd, int backlog)
-{ return CALL_FUNC(listen, t_fd(sockfd), backlog); }
+FUNCTION_DEFINE2(int, listen, int, sockfd, int,  backlog) {
+    return CALL_FUNC(listen, t_fd(sockfd), backlog);
+}
 
-int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
-{ return CALL_FUNC(connect, t_fd(sockfd), addr, addrlen); }
+FUNCTION_DEFINE3(int, connect, int, sockfd, const struct sockaddr *, addr, socklen_t, addrlen) {
+    return CALL_FUNC(connect, t_fd(sockfd), addr, addrlen);
+}
 
-int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
-{ return CALL_FUNC(getpeername, t_fd(sockfd), addr, addrlen); }
+FUNCTION_DEFINE3(int, getpeername, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen) {
+    return CALL_FUNC(getpeername, t_fd(sockfd), addr, addrlen);
+}
 
-int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
-{ return CALL_FUNC(getsockname, t_fd(sockfd), addr, addrlen); }
+FUNCTION_DEFINE3(int, getsockname, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen) {
+    return CALL_FUNC(getsockname, t_fd(sockfd), addr, addrlen);
+}
 
-int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen)
-{ return CALL_FUNC(getsockopt, t_fd(sockfd), level, optname, optval, optlen); }
+FUNCTION_DEFINE5(int, getsockopt, int, sockfd, int, level, int, optname, void *, optval, socklen_t *, optlen) {
+    return CALL_FUNC(getsockopt, t_fd(sockfd), level, optname, optval, optlen);
+}
 
-int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)
-{ return CALL_FUNC(setsockopt, t_fd(sockfd), level, optname, optval, optlen); }
+FUNCTION_DEFINE5(int, setsockopt, int, sockfd, int, level, int, optname, const void *, optval, socklen_t, optlen) {
+    return CALL_FUNC(setsockopt, t_fd(sockfd), level, optname, optval, optlen);
+}
 
-ssize_t send(int sockfd, const void *buf, size_t len, int flags)
-{ return CALL_FUNC(send, t_fd(sockfd), buf, len, flags); }
+FUNCTION_DEFINE4(ssize_t, send, int, sockfd, const void *, buf, size_t, len, int, flags) {
+    return CALL_FUNC(send, t_fd(sockfd), buf, len, flags);
+}
 
-ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen)
-{ return CALL_FUNC(sendto, t_fd(sockfd), buf, len, flags, dest_addr, addrlen); }
+FUNCTION_DEFINE6(ssize_t, sendto, int, sockfd, const void *, buf, size_t, len, int, flags, const struct sockaddr *, dest_addr, socklen_t, addrlen) {
+    return CALL_FUNC(sendto, t_fd(sockfd), buf, len, flags, dest_addr, addrlen);
+}
 
-ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)
-{ return CALL_FUNC(sendmsg, t_fd(sockfd), msg, flags); }
+FUNCTION_DEFINE3(ssize_t, sendmsg, int, sockfd, const struct msghdr *, msg, int, flags) {
+    return CALL_FUNC(sendmsg, t_fd(sockfd), msg, flags);
+}
 
-ssize_t recv(int sockfd, void *buf, size_t len, int flags)
-{ return CALL_FUNC(recv, t_fd(sockfd), buf, len, flags); }
+FUNCTION_DEFINE4(ssize_t, recv, int, sockfd, void *, buf, size_t, len, int, flags) {
+    return CALL_FUNC(recv, t_fd(sockfd), buf, len, flags);
+}
 
-ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)
-{ return CALL_FUNC(recvfrom, t_fd(sockfd), buf, len, flags, src_addr, addrlen); }
+FUNCTION_DEFINE6(ssize_t, recvfrom, int, sockfd, void *, buf, size_t, len, int, flags, struct sockaddr *, src_addr, socklen_t *, addrlen) {
+    return CALL_FUNC(recvfrom, t_fd(sockfd), buf, len, flags, src_addr, addrlen);
+}
 
-ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
-{ return CALL_FUNC(recvmsg, t_fd(sockfd), msg, flags); }
+FUNCTION_DEFINE3(ssize_t, recvmsg, int, sockfd, struct msghdr *, msg, int, flags) {
+    return CALL_FUNC(recvmsg, t_fd(sockfd), msg, flags);
+}
 
-int shutdown(int sockfd, int how)
-{ return CALL_FUNC(shutdown, t_fd(sockfd), how); }
+FUNCTION_DEFINE2(int, shutdown, int, sockfd, int, how) {
+    return CALL_FUNC(shutdown, t_fd(sockfd), how);
+}
 
-int socketpair(int domain, int type, int protocol, int sv[2])
-{
-    if (!main_task)
-        return CALL_FUNC(socketpair, domain, type, protocol, sv);
-    
+FUNCTION_DEFINE4(int, socketpair, int, domain, int, type, int, protocol, int *, sv) {
     int p[2];
     if (0 != CALL_FUNC(socketpair, domain, type, protocol, p))
         return -1;
@@ -4839,17 +5048,14 @@ int socketpair(int domain, int type, int protocol, int sv[2])
     return 0;
 }
 
-int ioctl(int fd, unsigned long request, ...)
-{
-    va_list ap;
-    va_start(ap, request);
-    void* arg = va_arg(ap, void*);
-    va_end(ap);
-
-    // TODO can't there be ioctls with multiple args?
-    struct fops *fops;
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
+FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
+    void* arg = va_arg(__ap, void*);
+    if (!can_enter_tvm(NULL))
         return CALL_FUNC(ioctl, fd, request, arg);
+
+    struct fops *fops;
+    if (!(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(ioctl, t_fd(fd), request, arg);
     
     if (!fops->f_ioctl) {
         errno = ENOTSUP;
@@ -4860,16 +5066,22 @@ int ioctl(int fd, unsigned long request, ...)
     
 }
 
-int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg) {
-    return tvm_pthread_create(thread, attr, start_routine, arg);
+typedef void *(*start_routine_fn)(void *);
+
+FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t *, attr, start_routine_fn, start_routine, void *, arg) {
+    struct thread_create_arg create_arg = { .flags = 0 };
+    return tvm_pthread_create_ex(thread, attr, start_routine, arg, &create_arg);
 }
 
-void pthread_exit(void *retval) { tvm_pthread_exit(retval); }
+FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
+    tvm_pthread_exit(retval);
+}
 
-void exit(int status) { if (!main_task) CALL_FUNC(exit, status); _exit(status); }
+FUNCTION_DEFINE_NORET1(exit, int, status) {
+    _exit(status);
+}
 
-void _exit(int status)
-{
+FUNCTION_DEFINE_NORET1(_exit, int, status) {
     if (pthread_self() == main_pthread)
         CALL_FUNC(exit, status);
     
@@ -4879,28 +5091,21 @@ void _exit(int status)
     terminate_current_locked(mkwstatus(1, status));
 }
 
-void _Exit(int status) { _exit(status); }
+FUNCTION_DEFINE_NORET1(_Exit, int, status) {
+    _exit(status);
+}
 
-void abort(void)
-{
-    if (!main_task)
-        CALL_FUNC(abort);
-    
+FUNCTION_DEFINE_NORET0(abort) {
     raise(SIGABRT);
     exit(1); // unreachable
 }
 
-pid_t getpid()
-{
-    if (!main_task)
-        return CALL_FUNC(getpid);
-    
+FUNCTION_DEFINE0(pid_t, getpid) {
     return current->tsk_pid;
 }
 
-pid_t getppid()
-{
-    if (!main_task || (main_task == current))
+FUNCTION_DEFINE0(pid_t, getppid) {
+    if (main_task == current)
         return CALL_FUNC(getppid);
 
     task_lock(current);
@@ -4910,14 +5115,11 @@ pid_t getppid()
     return ppid;
 }
 
-pid_t wait(int *wstatus)
-{ return waitpid(-1, wstatus, 0); }
+FUNCTION_DEFINE1(pid_t, wait, int *, wstatus) {
+    return waitpid(-1, wstatus, 0);
+}
 
-pid_t waitpid(pid_t pid, int *wstatus, int options)
-{
-    if (!main_task)
-        return CALL_FUNC(waitpid, pid, wstatus, options);
-
+FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     struct task *zombiet = NULL;
     int found;
 
@@ -4962,10 +5164,7 @@ pid_t waitpid(pid_t pid, int *wstatus, int options)
     return childpid;
 }
 
-pid_t setsid(void) {
-    if (!main_task)
-        return CALL_FUNC(setsid);
-    
+FUNCTION_DEFINE0(pid_t, setsid) {
     pthread_mutex_lock(&tasks_lock);
     task_lock(current);
 
@@ -4985,11 +5184,7 @@ pid_t setsid(void) {
     return current->tsk_pid;
 }
 
-pid_t getsid(pid_t pid)
-{
-    if (!main_task)
-        return CALL_FUNC(getsid, pid);
-    
+FUNCTION_DEFINE1(pid_t, getsid, pid_t, pid) {
     if (!pid)
         pid = current->tsk_pid;
     
@@ -5002,11 +5197,7 @@ pid_t getsid(pid_t pid)
     return sid;
 }
 
-int setpgid(pid_t pid, pid_t pgid)
-{
-    if (!main_task)
-        return CALL_FUNC(setpgid, pid, pgid);
-    
+FUNCTION_DEFINE2(int, setpgid, pid_t, pid, pid_t, pgid) {
     if (pgid < 0) {
         errno = EINVAL;
         return -1;
@@ -5032,11 +5223,7 @@ int setpgid(pid_t pid, pid_t pgid)
     return ret;
 }
 
-pid_t getpgid(pid_t pid)
-{
-    if (!main_task)
-        return CALL_FUNC(getpgid, pid);
-    
+FUNCTION_DEFINE1(pid_t, getpgid, pid_t, pid) {
     if (!pid)
         pid = current->tsk_pid;
     
@@ -5049,28 +5236,19 @@ pid_t getpgid(pid_t pid)
     return pgid;
 }
 
-pid_t getpgrp(void)
-{
-    if (!main_task)
-        return CALL_FUNC(getpgrp);
-    
+FUNCTION_DEFINE0(pid_t, getpgrp) {
     return getpgid(0);
 }
 
-int setpgrp(void)
-{
-    if (!main_task)
-        return CALL_FUNC(setpgrp);
-    
+FUNCTION_DEFINE0(int, setpgrp) {
     return setpgid(0, 0);
 }
 
 #if defined(__linux__)
-sighandler_t signal(int signum, sighandler_t handler)
+FUNCTION_DEFINE2(sighandler_t, signal, int, signum, sighandler_t, handler) {
 #elif defined(__APPLE__)
-sig_t signal(int signum, sig_t handler)
+FUNCTION_DEFINE2(sig_t, signal, int, signum, sig_t, handler) {
 #endif
-{
     struct sigaction oldact, act = {
         .sa_handler = handler,
         .sa_flags = SA_RESTART,
@@ -5083,8 +5261,7 @@ sig_t signal(int signum, sig_t handler)
     return oldact.sa_handler;
 }
 
-int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
-{
+FUNCTION_DEFINE3(int, sigaction, int, signum, const struct sigaction *, act, struct sigaction *, oldact) {
     if (signum >= MAX_SIGNALS || signum < 1 ||
         signum == SIGKILL || signum == SIGSTOP) {
         errno = EINVAL;
@@ -5101,7 +5278,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
     return 0;
 }
 
-int raise(int sig) {
+FUNCTION_DEFINE1(int, raise, int, sig) {
     int r = pthread_kill(pthread_self(), sig);
     if (r != 0) {
         errno = r;
@@ -5110,10 +5287,7 @@ int raise(int sig) {
     return r;
 }
 
-int kill(pid_t pid, int sig) {
-    if (!main_task)
-        return CALL_FUNC(kill, pid, sig);
-    
+FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
     if (pid == 0) {
         task_lock(current);
         pid = -current->tsk_pgid;
@@ -5168,11 +5342,7 @@ int kill(pid_t pid, int sig) {
     return (kills_confirmed ? 0 : -1);
 }
 
-char *getenv(const char *name)
-{
-    if (!main_task)
-        return CALL_FUNC(getenv, name);
-
+FUNCTION_DEFINE1(char *, getenv, const char *, name) {
     task_lock(current);
     char **env = NULL;
     if (current->tsk_environ)
@@ -5191,11 +5361,7 @@ char *getenv(const char *name)
     return ret;
 }
 
-int putenv(char *string)
-{
-    if (!main_task)
-        return CALL_FUNC(putenv, string);
-
+FUNCTION_DEFINE1(int, putenv, char *, string) {
     char *value = strchr(string, '=');
     size_t klen;
     if (NULL == value) {
@@ -5233,11 +5399,7 @@ int putenv(char *string)
     return 0;
 }
 
-int setenv(const char *name, const char *value, int overwrite)
-{
-    if (!main_task)
-        return CALL_FUNC(setenv, name, value, overwrite);
-
+FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, overwrite) {
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
     char *string = malloc(name_len + value_len + 2);
@@ -5279,11 +5441,7 @@ int setenv(const char *name, const char *value, int overwrite)
     return 0;
 }
 
-int unsetenv(const char *name)
-{
-    if (!main_task)
-        return CALL_FUNC(unsetenv, name);
-    
+FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
     if (name == NULL || *name == '\0' || strchr(name, '=') != NULL)
     {
         errno = EINVAL;
@@ -5312,11 +5470,7 @@ int unsetenv(const char *name)
     return 0;
 }
 
-int execve(const char *pathname, char *const argv[], char *const envp[])
-{
-    if (!main_task)
-        return CALL_FUNC(execve, pathname, argv, envp);
-
+FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     INFO("execve(\"%s\")", pathname);
 
     int argc = 0;
@@ -5380,12 +5534,11 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
     exit(main_func(argc, argv, envp));
 }
 
-int execl(const char *pathname, const char *arg, ... /*, (char *) NULL */)
-{
+FUNCTION_DEFINE_VA2(int, execl, const char *, pathname, const char *, arg/*, ... , (char *) NULL */) {
     size_t argc;
     va_list ap;
     
-    va_start(ap, arg);
+    va_copy(ap, __ap);
     for (argc = 1; va_arg(ap, const char *) && argc < INT_MAX;)
         argc++;
     va_end(ap);
@@ -5402,23 +5555,20 @@ int execl(const char *pathname, const char *arg, ... /*, (char *) NULL */)
     }
     argv[argc] = NULL;
     
-    va_start(ap, arg);
     argv[0] = (char *)arg;
     for (char **a = (argv+1); a < (argv + argc); a++)
-        *a = va_arg(ap, char *);
-    va_end(ap);
+        *a = va_arg(__ap, char *);
 
     int r = execv(pathname, argv);
     free(argv);
     return r;
 }
 
-int execlp(const char *file, const char *arg, ... /*, (char *) NULL */)
-{
+FUNCTION_DEFINE_VA2(int, execlp, const char *, file, const char *, arg/*, ... , (char *) NULL */) {
     size_t argc;
     va_list ap;
     
-    va_start(ap, arg);
+    va_copy(ap, __ap);
     for (argc = 0; va_arg(ap, const char *) && argc < INT_MAX;)
         argc++;
     va_end(ap);
@@ -5435,22 +5585,19 @@ int execlp(const char *file, const char *arg, ... /*, (char *) NULL */)
     }
     argv[argc] = NULL;
 
-    va_start(ap, arg);
     for (char **a = argv; a < (argv + argc); a++)
-        *a = va_arg(ap, char *);
-    va_end(ap);
+        *a = va_arg(__ap, char *);
 
     int r = execvp(file, argv);
     free(argv);
     return r;
 }
 
-int execle(const char *pathname, const char *arg, ... /*, (char *) NULL, char *const envp[] */)
-{
+FUNCTION_DEFINE_VA2(int, execle, const char *, pathname, const char *, arg/*, ... , (char *) NULL, char *const envp[] */) {
     size_t argc;
     va_list ap;
     
-    va_start(ap, arg);
+    va_copy(ap, __ap);
     for (argc = 0; va_arg(ap, const char *) && argc < INT_MAX;)
         argc++;
     va_end(ap);
@@ -5467,30 +5614,20 @@ int execle(const char *pathname, const char *arg, ... /*, (char *) NULL, char *c
     }
     argv[argc] = NULL;
 
-    va_start(ap, arg);
     for (char **a = argv; a < (argv + argc); a++)
-        *a = va_arg(ap, char *);
-    char **envp = va_arg(ap, char **);
-    va_end(ap);
+        *a = va_arg(__ap, char *);
+    char **envp = va_arg(__ap, char **);
 
     int r = execve(pathname, argv, envp);
     free(argv);
     return r;
 }
 
-int execv(const char *pathname, char *const argv[])
-{
-    if (!main_task)
-        return CALL_FUNC(execv, pathname, argv);
-    
+FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
     return execve(pathname, argv, tvm_environ);
 }
 
-int execvp(const char *file, char *const argv[])
-{
-    if (!main_task)
-        return CALL_FUNC(execvp, file, argv);
-    
+FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
     const char *pathname = find_program_pathname(file);
     if (!pathname) {
         errno = ENOENT;
@@ -5500,17 +5637,11 @@ int execvp(const char *file, char *const argv[])
     return execve(pathname, argv, tvm_environ);
 }
 
-int openpty(int *amaster, int *aslave, char *name,
 #if defined(__linux__)
-    const struct termios *termp, const struct winsize *winp
+FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, const struct termios *, termp, const struct winsize *, winp) {
 #elif defined(__APPLE__)
-    struct termios *termp, struct winsize *winp
+FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, struct termios *, termp, struct winsize *, winp) {
 #endif
-)
-{
-    if (!main_task)
-        return CALL_FUNC(openpty, amaster, aslave, name, termp, winp);
-
     // TODO
     if (name || termp || winp)
         panic("openpty todo");
@@ -5541,20 +5672,15 @@ int openpty(int *amaster, int *aslave, char *name,
     return 0;
 }
 
-int isatty(int fd)
-{
-    if (!main_task)
-        return CALL_FUNC(isatty, t_fd(fd));
-    
+FUNCTION_DEFINE1(int, isatty, int, fd) {
     if (islocaltty(fd))
         return 1;
     
     return CALL_FUNC(isatty, t_fd(fd));
 }
 
-int ttyname_r(int fd, char *buf, size_t buflen)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE3(int, ttyname_r, int, fd, char *, buf, size_t, buflen) {
+    if (!islocaltty(fd))
         return CALL_FUNC(ttyname_r, t_fd(fd), buf, buflen);
     
     struct tty *tt = tty_for_fd(t_fd(fd), TTM_MASTER);
@@ -5567,9 +5693,8 @@ int ttyname_r(int fd, char *buf, size_t buflen)
     return tty_slavename(t_fd(fd), buf, buflen);
 }
 
-char *ttyname(int fd)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE1(char *, ttyname, int, fd) {
+    if (!islocaltty(fd))
         return CALL_FUNC(ttyname, t_fd(fd));
 
     int r = ttyname_r(fd, tty_name, sizeof(tty_name));
@@ -5581,17 +5706,15 @@ char *ttyname(int fd)
     return tty_name;
 }
 
-int ptsname_r(int fd, char *buf, size_t buflen)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE3(int, ptsname_r, int, fd, char *, buf, size_t, buflen) {
+    if (!islocaltty(fd))
         return CALL_FUNC(ptsname_r, t_fd(fd), buf, buflen);
     
     return tty_slavename(t_fd(fd), buf, buflen);
 }
 
-char *ptsname(int fd)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE1(char *, ptsname, int, fd) {
+    if (!islocaltty(fd))
         return CALL_FUNC(ptsname, t_fd(fd));
 
     int r = ptsname_r(fd, pts_name, sizeof(pts_name));
@@ -5603,9 +5726,8 @@ char *ptsname(int fd)
     return pts_name;
 }
 
-pid_t tcgetpgrp(int fd)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE1(pid_t, tcgetpgrp, int, fd) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcgetpgrp, t_fd(fd));
     
     pid_t ret;
@@ -5614,17 +5736,15 @@ pid_t tcgetpgrp(int fd)
     return ret;
 }
 
-int tcsetpgrp(int fd, pid_t pgrp)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE2(int, tcsetpgrp, int, fd, pid_t, pgrp) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcsetpgrp, t_fd(fd), pgrp);
     
     return ttyop_ioctl(t_fd(fd), TIOCSPGRP, &pgrp); 
 }
 
-int tcgetattr(int fd, struct termios *termios_p)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcgetattr, t_fd(fd), termios_p);
 
 #if defined(__linux__)
@@ -5634,9 +5754,8 @@ int tcgetattr(int fd, struct termios *termios_p)
 #endif
 }
 
-int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct termios *, termios_p) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcsetattr, t_fd(fd), optional_actions, termios_p);
     
     int request;
@@ -5673,9 +5792,8 @@ int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
     return ttyop_ioctl(t_fd(fd), request, (void *)termios_p);
 }
 
-int tcsendbreak(int fd, int duration)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE2(int, tcsendbreak, int, fd, int, duration) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcsendbreak, t_fd(fd), duration);
     
 #if defined(__linux__)
@@ -5690,9 +5808,8 @@ int tcsendbreak(int fd, int duration)
 #endif
 }
 
-int tcdrain(int fd)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE1(int, tcdrain, int, fd) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcdrain, t_fd(fd));
     
 #if defined(__linux__)
@@ -5702,9 +5819,8 @@ int tcdrain(int fd)
 #endif
 }
 
-int tcflush(int fd, int queue_selector)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE2(int, tcflush, int, fd, int, queue_selector) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcflush, t_fd(fd), queue_selector);
 
 #if defined(__linux__)
@@ -5719,9 +5835,8 @@ int tcflush(int fd, int queue_selector)
 #endif
 }
 
-int tcflow(int fd, int action)
-{
-    if (!main_task || !islocaltty(fd))
+FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
+    if (!islocaltty(fd))
         return CALL_FUNC(tcflow, t_fd(fd), action);
 
 #if defined(__linux__)
@@ -5746,55 +5861,124 @@ int tcflow(int fd, int action)
 #endif
 }
 
-void *malloc(size_t size)
-{
+FUNCTION_DEFINE1(void *, malloc, size_t, size) {
     return calloc(1, size);
 }
 
-void *calloc(size_t nmemb, size_t size)
-{
+FUNCTION_DEFINE2(void *, calloc, size_t, nmemb, size_t, size) {
     if (0 == (nmemb * size))
         return NULL;
-    
-    uint64_t *p = CALL_FUNC(malloc, (nmemb * size) + sizeof(uint64_t));
+
+    struct rmem_arena *ar = arena_for_task(current);
+    if (!ar)
+        return NULL;
+
+    void *p = rmem_arena_alloc(ar, nmemb * size);
     if (NULL == p)
-        return p;
+        return NULL;
     
-    *p = MALLOC_MAGIC | (((nmemb * size) + sizeof(uint64_t)) << 32);
-    memset(p+1, 0, nmemb * size);
-    return p+1;
+    memset(p, 0, nmemb * size);
+    return p;
 }
 
-void free(void *ptr)
-{
-    uint64_t *p = (uint64_t *)ptr;
-    if (NULL == p || (p[-1] & 0xffffffff) != MALLOC_MAGIC)
-        return CALL_FUNC(free, p);
-    
-    return CALL_FUNC(free, p-1);
+FUNCTION_DEFINE_VOID1(free, void *, ptr) {
+    struct rmem_arena *ar = arena_for_task(current);
+    if (!ar)
+        panic("free for task without arena %p", current);
+
+    rmem_arena_free(ar, ptr);
 }
 
-void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
-{
+FUNCTION_DEFINE2(void *, realloc, void *, ptr, size_t, size) {
+    struct rmem_arena *ar = arena_for_task(current);
+    if (!ar)
+        panic("realloc for task without arena %p", current);
+
+    return rmem_arena_realloc(ar, ptr, size);
+}
+
+FUNCTION_DEFINE1(char *, strdup, const char *, s) {
+    size_t len = strlen(s);
+    char *p = malloc(len + 1);
+    if (!p)
+        return NULL;
+    memcpy(p, s, len);
+    p[len] = 0;
+    return p;
+}
+
+FUNCTION_DEFINE2(char *, strndup, const char *, s, size_t, n) {
+    size_t len = strnlen(s, n);
+    char *p = malloc(len + 1);
+    if (!p)
+        return NULL;
+    memcpy(p, s, len);
+    p[len] = 0;
+    return p;
+}
+
+FUNCTION_DEFINE_VA2(int, asprintf, char **, strp, const char *, format) {
+    return vasprintf(strp, format, __ap);
+}
+
+FUNCTION_DEFINE3(int, vasprintf, char **, strp, const char *, format, va_list, ap) {
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, format, ap2);
+    va_end(ap2);
+
+    if (n < 0)
+        return -1;
+
+    void *s = malloc(n + 1);
+    if (!s)
+        return -1;
+    
+    int n2 = vsnprintf(s, n + 1, format, ap);
+    if (n != n2) {
+        free(s);
+        return -1;
+    }
+
+    *strp = s;
+    return n;
+}
+
+FUNCTION_DEFINE3(ssize_t, getline, char **, lineptr, size_t *, n, FILE *, stream) {
+    return getdelim(lineptr, n, '\n', stream);
+}
+
+FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, FILE *, stream) {
+    char *tmp = NULL;
+    size_t tmpn = 0;
+
+    ssize_t r = CALL_FUNC(getdelim, &tmp, &tmpn, delim, t_f(stream));
+    if (r < 0) {
+        CALL_FUNC(free, tmp);
+        return -1;
+    }
+
+    if (!*lineptr || *n < (size_t)r + 1) {
+        char *newp = realloc(*lineptr, (size_t)r + 1);
+        if (!newp) {
+            CALL_FUNC(free, tmp);
+            return -1;
+        }
+        *lineptr = newp;
+        *n = (size_t)r + 1;
+    }
+
+    memcpy(*lineptr, tmp, (size_t)r + 1);
+    CALL_FUNC(free, tmp);
+
+    return r;
+}
+
+FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, flags, int, fd, off_t, offset) {
     return CALL_FUNC(mmap, addr, length, prot, flags, t_fd(fd), offset);
 }
 
-void *realloc(void *ptr, size_t size)
-{
-    void *nptr = malloc(size);
-    if (ptr != NULL) {
-        if (nptr != NULL)
-            memmove(nptr, ptr, size);
-        free(ptr);
-    }
-    return nptr;
-}
-
-int getopt(int argc, char * const argv[], const char *optstring)
-{
-    if (!main_task)
-        return CALL_FUNC(getopt, argc, argv, optstring);
-    
+FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, optstring) {
     pthread_mutex_lock(&getopt_lock);
     optarg = tvm_optarg;
     optind = tvm_optind;
@@ -5809,10 +5993,7 @@ int getopt(int argc, char * const argv[], const char *optstring)
     return r;
 }
 
-int getopt_long(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
-{
-    if (!main_task)
-        return CALL_FUNC(getopt_long, argc, argv, optstring, longopts, longindex);
+FUNCTION_DEFINE5(int, getopt_long, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
     pthread_mutex_lock(&getopt_lock);
     optarg = tvm_optarg;
     optind = tvm_optind;
@@ -5827,11 +6008,7 @@ int getopt_long(int argc, char * const argv[], const char *optstring, const stru
     return r;
 }
 
-int getopt_long_only(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
-{
-    if (!main_task)
-        return CALL_FUNC(getopt_long_only, argc, argv, optstring, longopts, longindex);
-    
+FUNCTION_DEFINE5(int, getopt_long_only, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
     pthread_mutex_lock(&getopt_lock);
     optarg = tvm_optarg;
     optind = tvm_optind;
@@ -5852,14 +6029,11 @@ int getopt_long_only(int argc, char * const argv[], const char *optstring, const
 // Linux-specific hooks
 /////////////
 
-int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev)
-{ return CALL_FUNC(mknodat, t_fd(dirfd), pathname, mode, dev); }
+FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode, dev_t, dev) {
+    return CALL_FUNC(mknodat, t_fd(dirfd), pathname, mode, dev);
+}
 
-int execvpe(const char *file, char *const argv[], char *const envp[])
-{
-    if (!main_task)
-        return CALL_FUNC(execvpe, file, argv, envp);
-    
+FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {
     const char *pathname = find_program_pathname(file);
     if (!pathname) {
         errno = ENOENT;
@@ -5869,11 +6043,7 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
     return execve(pathname, argv, envp);
 }
 
-int clearenv(void)
-{
-    if (!main_task)
-        return CALL_FUNC(clearenv);
-    
+FUNCTION_DEFINE0(int, clearenv) {
     task_lock(current);
     current->tsk_environ = NULL;
     task_unlock(current);
@@ -5881,11 +6051,8 @@ int clearenv(void)
     return 0;
 }
 
-int epoll_create(int size)
-{
+FUNCTION_DEFINE1(int, epoll_create, int, size) {
     int r = CALL_FUNC(epoll_create, size);
-    if (!main_task)
-        return r;
     if (r == -1) {
         return r;
     }
@@ -5898,11 +6065,8 @@ int epoll_create(int size)
     return f;
 }
 
-int epoll_create1(int flags)
-{
+FUNCTION_DEFINE1(int, epoll_create1, int, flags) {
     int r = CALL_FUNC(epoll_create1, flags);
-    if (!main_task)
-        return r;
     if (r == -1) {
         return r;
     }
@@ -5915,11 +6079,8 @@ int epoll_create1(int flags)
     return f;
 }
 
-int timerfd_create(int clockid, int flags)
-{
+FUNCTION_DEFINE2(int, timerfd_create, int, clockid, int, flags) {
     int r = CALL_FUNC(timerfd_create, clockid, flags);
-    if (!main_task)
-        return r;
     if (r == -1) {
         return r;
     }
@@ -5933,11 +6094,7 @@ int timerfd_create(int clockid, int flags)
     return f;
 }
 
-int pipe2(int pipefd[2], int flags)
-{
-    if (!main_task)
-        return CALL_FUNC(pipe2, pipefd, flags);
-    
+FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
     int p[2];
     if (0 != CALL_FUNC(pipe2, p, flags))
         return -1;
@@ -5961,19 +6118,18 @@ int pipe2(int pipefd[2], int flags)
     return 0;
 }
 
-int fstatfs(int fd, struct statfs *buf)
-{
+FUNCTION_DEFINE2(int, fstatfs, int, fd, struct statfs *, buf) {
     return CALL_FUNC(fstatfs, t_fd(fd), buf);
 }
 
-int fstatfs64(int fd, struct statfs64 *buf)
-{
+FUNCTION_DEFINE2(int, fstatfs64, int, fd, struct statfs64 *, buf) {
     return CALL_FUNC(fstatfs64, t_fd(fd), buf);
 }
 
-int open64(const char *pathname, int flags, ...)
-{
-    flags |= O_LARGEFILE;
+FUNCTION_DEFINE_VA2(int, open64, const char *, pathname, int, flags) {
+    mode_t mode = va_arg(__ap, int);
+    if (!can_enter_tvm(NULL))
+        return CALL_FUNC(open64, pathname, flags, mode);
 
     int f = task_reserve_fd(current, 0);
     if (f == -1) {
@@ -5984,23 +6140,10 @@ int open64(const char *pathname, int flags, ...)
     struct fops *fops = fops_for_open(pathname);
 
     int r;
-    if (__OPEN_NEEDS_MODE(flags)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode_t m = va_arg(ap, int);
-        va_end(ap);
-        
-        if (fops && fops->f_open)
-            r = fops->f_open(pathname, flags, m) | fops->f_fdflag;
-        else
-            r = CALL_FUNC(open, pathname, flags, m);
-    }
-    else {
-        if (fops && fops->f_open)
-            r = fops->f_open(pathname, flags, 0) | fops->f_fdflag;
-        else
-            r = CALL_FUNC(open, pathname, flags);
-    }
+    if (fops && fops->f_open)
+        r = fops->f_open(pathname, flags | O_LARGEFILE, mode) | fops->f_fdflag;
+    else
+        r = CALL_FUNC(open, pathname, flags | O_LARGEFILE, mode);
     
     if (r == -1) {
         task_set_fd(current, f, -1);
@@ -6011,46 +6154,38 @@ int open64(const char *pathname, int flags, ...)
     return f;
 }
 
-int openat64(int dirfd, const char *pathname, int flags, ...)
-{
-    flags |= O_LARGEFILE;
+FUNCTION_DEFINE_VA3(int, openat64, int, dirfd, const char *, pathname, int, flags) {
+    mode_t mode = va_arg(__ap, int);
+    if (!can_enter_tvm(NULL))
+        return CALL_FUNC(openat64, dirfd, pathname, flags, mode);
 
-    int r;
-    if (__OPEN_NEEDS_MODE(flags)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode_t m = va_arg(ap, int);
-        va_end(ap);
-        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags, m);
+    int f = task_reserve_fd(current, 0);
+    if (f == -1) {
+        errno = EMFILE;
+        return -1;
     }
-    else
-        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags);
-    
+
+    int r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags | O_LARGEFILE, mode);
+
     if (r == -1) {
+        task_set_fd(current, f, -1);
         return r;
     }
 
-    int f = task_new_fd(current, 0, r);
-    if (f == -1) {
-        CALL_FUNC(close, r);
-        errno = ENOMEM;
-    }
-
+    task_set_fd(current, f, r);
     return f;
 }
 
-int __openat64_2(int fd, const char *file, int oflag)
-{
-    return openat64(fd, file, oflag);
+FUNCTION_DEFINE4(int, fstatat64, int, dirfd, const char *, pathname, struct stat64 *, statbuf, int, flags) {
+    return CALL_FUNC(fstatat64, t_fd(dirfd), pathname, statbuf, flags);
 }
 
-int fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
-{ return CALL_FUNC(fstatat64, t_fd(dirfd), pathname, statbuf, flags); }
+FUNCTION_DEFINE3(off_t, lseek64, int, fd, off64_t, offset, int, whence) {
+    return CALL_FUNC(lseek64, t_fd(fd), offset, whence);
+}
 
-off_t lseek64(int fd, off64_t offset, int whence)
-{ return CALL_FUNC(lseek64, t_fd(fd), offset, whence); }
-
-int ftruncate64(int fd, off64_t length)
-{ return CALL_FUNC(ftruncate64, t_fd(fd), length); }
+FUNCTION_DEFINE2(int, ftruncate64, int, fd, off64_t, length) {
+    return CALL_FUNC(ftruncate64, t_fd(fd), length);
+}
 
 #endif
