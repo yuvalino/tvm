@@ -3510,6 +3510,19 @@ struct tvm_call {
 };
 static __thread struct tvm_call *call = NULL;
 
+extern char etext;
+extern char __executable_start;
+
+uintptr_t get_text_start()
+{
+    return (uintptr_t)&__executable_start;
+}
+
+uintptr_t get_text_end()
+{
+    return (uintptr_t)&etext;
+}
+
 int can_enter_tvm(void *lr) {
     // not initialized
     if (!main_task)
@@ -3521,11 +3534,10 @@ int can_enter_tvm(void *lr) {
         lr = call->lr;
     }
 
-    Dl_info dlinfo;
-    if (0 == dladdr(lr, &dlinfo))
-        return 0;
+    uintptr_t text_start = get_text_start();
+    uintptr_t text_end = get_text_end();
 
-    if (dlinfo.dli_fbase != main_dlinfo.dli_fbase)
+    if ((uintptr_t)lr < text_start || (uintptr_t)lr >= text_end)
         return 0;
 
     // fork() does not use call (for now)
@@ -3543,10 +3555,9 @@ int can_enter_tvm(void *lr) {
         call_itr = call_itr->prev;
     }
 
-    if (0 == dladdr(lr, &dlinfo))
+    if ((uintptr_t)lr < text_start || (uintptr_t)lr >= text_end)
         return 0;
-
-    return (dlinfo.dli_fbase == main_dlinfo.dli_fbase);
+    return 1;
 }
 
 struct function_metadata {
