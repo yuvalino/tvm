@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <sys/time.h>
 
 #include <limits.h>
 #include <termios.h>
@@ -83,7 +84,34 @@ static void __panic(const char *m, const char *f, int l);
 
 static __thread char msgbuf[0x1000];
 
-#define INFO(Msg, ...) do { int __num = snprintf(msgbuf, sizeof(msgbuf), "Kernel(%d): %s: " Msg "\n", __gettid(), __FUNCTION__, ##__VA_ARGS__); CALL_FUNC(write, 1, msgbuf, __num); } while (0)
+static void format_time(char *buf, size_t buflen)
+{
+    struct timeval tv;
+    struct tm tm;
+
+    gettimeofday(&tv, NULL);
+    localtime_r(&tv.tv_sec, &tm);
+
+    int ms = tv.tv_usec / 1000;
+
+    snprintf(buf, buflen,
+        "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        ms
+    );
+}
+
+#define INFO(Msg, ...) do { \
+    char __ts[32]; \
+    format_time(__ts, sizeof(__ts)); \
+    int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
+    CALL_FUNC(write, 1, msgbuf, __num); \
+} while (0)
 
 #define ALIGN(x,a)              __ALIGN_MASK(x,(typeof(x))(a)-1)
 #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
@@ -4064,7 +4092,12 @@ static int tvm_main(int argc, char **argv)
  * I have no idea why `__panic()` is here and at this point, I'm too afraid to ask.
  */
 
-static void rmem_print_cb(char *msg) { int __num = snprintf(msgbuf, sizeof(msgbuf), "Kernel(%d): RMEM: %s\n", __gettid(), msg); CALL_FUNC(write, 1, msgbuf, __num); }
+static void rmem_print_cb(char *msg) {
+    char __ts[32];
+    format_time(__ts, sizeof(__ts));
+    int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
+    CALL_FUNC(write, 1, msgbuf, __num);
+}
 
 void tvm_init(const char *init_comm)
 {
