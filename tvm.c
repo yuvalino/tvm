@@ -745,7 +745,6 @@ static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
 {
     uintptr_t *jb = (uintptr_t*) (jmpbuf);
     uintptr_t diff = old_stack - new_stack;
-    INFO("setstack new 0x%08zx old 0x%08zx", new_stack, old_stack);
  
     for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
     {
@@ -3382,9 +3381,6 @@ static void *forkless_entry(struct forkless_arg *arg)
     uintptr_t child_fp = curr_fp;
     uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
 
-    INFO("PARENT STACK 0x%08zx - 0x%08zx", parent_fp, parent_sp);
-    INFO("CHILD  STACK 0x%08zx - 0x%08zx", child_fp, child_sp);
-
     memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
 
     // include prologue (fp + lr) when adjusting jmpbuf context regs (important for fixing up pointers to rbp)
@@ -3393,7 +3389,7 @@ static void *forkless_entry(struct forkless_arg *arg)
         // TODO: handle?
         panic("TODO");
     }
-    INFO("rmem_arena_duplicate task %p ar %p", current, current->tsk_ar);
+
     int ret = rmem_arena_duplicate(
         current->tsk_ar,
         arg->parent_ar,
