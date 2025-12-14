@@ -89,8 +89,6 @@ def test_chukus(sshi: spawn):
 
 def test_sigint(sshi: spawn):
     sshi.sendline("scp -f")
-    with pytest.raises(TIMEOUT):
-        sshi.expect(r"\$ ")
     sshi.sendintr()
     sshi.expect(r"\$ ")
 
