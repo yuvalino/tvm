@@ -2332,6 +2332,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             }
             task_unlock(current);
 
+            tty_unlock(tt);
             pthread_mutex_lock(&tasks_lock);
             list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
                 task_lock(t);
@@ -2340,7 +2341,8 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
                 task_unlock(t);
             }
             pthread_mutex_unlock(&tasks_lock);
-
+            tty_lock(tt);
+            
             pgid = tt->t_pgid;
             tty_unlock(tt);
             kill(-pgid, SIGHUP);
@@ -2373,6 +2375,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             }
             task_unlock(current);
 
+            tty_unlock(tt);
             pthread_mutex_lock(&tasks_lock);
             list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
                 if (t->tsk_pgid == *((pid_t *)arg)) {
@@ -2380,6 +2383,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
                 }
             }
             pthread_mutex_unlock(&tasks_lock);
+            tty_lock(tt);
 
             // group non-existed / empty
             if (t == main_task && main_task->tsk_pgid != *((pid_t *) arg)) {
