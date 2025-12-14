@@ -38,4 +38,4 @@ jobs:
       with:
         submodules: 'true'
     - name: test
-      run: make test -j && ./test_tvm
+      run: make test_tvm -j && ./test_tvm
