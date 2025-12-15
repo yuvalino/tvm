@@ -35,6 +35,7 @@
 #if defined(__APPLE__)
 #include <util.h>
 #include <libproc.h>
+#include <mach-o/getsect.h>
 #elif defined(__linux__)
 #include <pty.h>
 #include <sys/vfs.h>
@@ -113,7 +114,6 @@ static void format_time(char *buf, size_t buflen)
     CALL_FUNC(write, 1, msgbuf, __num); \
 } while (0)
 
-#define ALIGN(x,a)              __ALIGN_MASK(x,(typeof(x))(a)-1)
 #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
 
 /////////////
@@ -3510,18 +3510,43 @@ struct tvm_call {
 };
 static __thread struct tvm_call *call = NULL;
 
+#if defined(__linux__)
 extern char etext;
 extern char __executable_start;
 
-uintptr_t get_text_start()
+void get_text(uintptr_t *out_start, uintptr_t *out_end)
 {
-    return (uintptr_t)&__executable_start;
+    *out_start = (uintptr_t)&__executable_start;
+    *out_end = (uintptr_t)&etext;
 }
 
-uintptr_t get_text_end()
+#elif defined(__APPLE__)
+
+extern const struct mach_header_64 _mh_execute_header;
+
+static uintptr_t text_start = 0;
+static size_t text_size = 0;
+
+void get_text(uintptr_t *out_start, uintptr_t *out_end)
 {
-    return (uintptr_t)&etext;
+    if (!text_start) {
+        unsigned long size;
+        void *text = getsectiondata(
+            &_mh_execute_header,
+            "__TEXT",
+            "__text",
+            &size
+        );
+
+        text_start = (uintptr_t)text;
+        text_size = (size_t)size;
+    }
+
+    *out_start = text_start;
+    *out_end = text_start + text_size;
 }
+
+#endif
 
 int can_enter_tvm(void *lr) {
     // not initialized
@@ -3534,8 +3559,10 @@ int can_enter_tvm(void *lr) {
         lr = call->lr;
     }
 
-    uintptr_t text_start = get_text_start();
-    uintptr_t text_end = get_text_end();
+
+    uintptr_t text_start;
+    uintptr_t text_end;
+    get_text(&text_start, &text_end);
 
     if ((uintptr_t)lr < text_start || (uintptr_t)lr >= text_end)
         return 0;
@@ -3712,7 +3739,7 @@ struct cli_table {
     (Head)++  )
 #define CT_IS_CELL(Tbl, Cell, ColNameToCheck) (0 == strcmp(ColNameToCheck, CT_COL_FOR_CELL((Tbl), (Cell))->desc.cc_title))
 
-static int cli_table_dealloc(struct cli_table *tbl)
+static void cli_table_dealloc(struct cli_table *tbl)
 {
     if (tbl->ct_rows) {
         for (int i = 0; i < (tbl->ct_coln * tbl->ct_rown); i++)
@@ -3944,7 +3971,7 @@ static int tvm_lsof(int argc, char **argv)
 
         int nfd;
         struct task *t;
-        if (t = task_for_rfd(fdr[i].rfd, 0, &nfd)) {
+        if ((t = task_for_rfd(fdr[i].rfd, 0, &nfd))) {
             fdr[i].type = LSOFT_PROC;
             fdr[i].proc.nfd = nfd;
             fdr[i].proc.fdtype = "unknown_type";
@@ -3962,7 +3989,7 @@ static int tvm_lsof(int argc, char **argv)
         }
         
         struct tty *tt;
-        if (tt = tty_for_fd(fdr[i].rfd, TTM_MASTER)) {
+        if ((tt = tty_for_fd(fdr[i].rfd, TTM_MASTER))) {
             fdr[i].type = LSOFT_PTY;
             fdr[i].tty.mfd = tt->t_mfd;
             fdr[i].tty.sid = tt->t_sid;
@@ -3970,7 +3997,7 @@ static int tvm_lsof(int argc, char **argv)
             tty_unlock(tt);
             continue;
         }
-        if (tt = tty_for_fd(fdr[i].rfd, TTM_SLAVE)) {
+        if ((tt = tty_for_fd(fdr[i].rfd, TTM_SLAVE))) {
             fdr[i].type = LSOFT_PTY;
             fdr[i].tty.mfd = tt->t_mfd;
             fdr[i].tty.sid = tt->t_pgid;

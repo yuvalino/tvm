@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <inttypes.h>
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -677,7 +678,7 @@ int rmem_arena_duplicate(struct rmem_arena *dst_ar, struct rmem_arena *src_ar, v
         done_cb(arg);
 
     uint64_t end_ms = TIME_MS();
-    PRINT("duplicate mid %zu ms last %zu ms", mid_ms - start_ms, end_ms - mid_ms);
+    PRINT("duplicate mid %" PRIu64 " ms last %" PRIu64 " ms", mid_ms - start_ms, end_ms - mid_ms);
 
     pthread_mutex_unlock(&src_ar->ar_lock);
     pthread_mutex_unlock(&dst_ar->ar_lock);
