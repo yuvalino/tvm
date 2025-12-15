@@ -663,8 +663,10 @@ int rmem_arena_duplicate(struct rmem_arena *dst_ar, struct rmem_arena *src_ar, v
         (*prev_sl2) = sl2;
         prev_sl2 = &sl2->sl_next;
 
-        sl2->sl_low = (char *)sl2->sl_base + ((char *)sl->sl_low - (char *)sl->sl_base);
-        sl2->sl_high = (char *)sl2->sl_base + ((char *)sl->sl_high - (char *)sl->sl_base);
+        if (sl->sl_low)
+            sl2->sl_low = (char *)sl2->sl_base + ((char *)sl->sl_low - (char *)sl->sl_base);
+        if (sl->sl_high)
+            sl2->sl_high = (char *)sl2->sl_base + ((char *)sl->sl_high - (char *)sl->sl_base);
 
         if (sl->sl_low && sl->sl_high && sl->sl_low != sl->sl_high) {
             if (dup_cb)
