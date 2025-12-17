@@ -106,3 +106,8 @@ Run tests
 ## Etymology
 
 TembleOS is a play on a few things. First and foremost a tribute to Terry A. Davis, the developer of [TempleOS](https://simple.wikipedia.org/wiki/TempleOS). Temble is hebrew for "dummy", which also is a name of an Israeli [hat](https://en.wikipedia.org/wiki/Tembel_hat) popular in mid-20th century.
+
+## Commands
+
+iOS compilation:
+CC="$(xcrun --sdk iphoneos --find clang)" CFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" LDFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" CONFFLAGS="--host=arm-apple-darwin" make libtvm && cp libtvm.a libtoybox.a libmksh.a libdropbear.a ../devtool/tvm

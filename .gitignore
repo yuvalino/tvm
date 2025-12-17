@@ -6,3 +6,5 @@ test_tvm
 test_rmem
 __pycache__
 *.dSYM/
+.DS_Store
+__.SYM*

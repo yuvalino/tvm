@@ -1,4 +1,4 @@
-.PHONY: first all clean mksh forkless dropbear dummy toybox
+.PHONY: first all clean mksh forkless dropbear dummy toybox libtvm
 
 first: all
 
@@ -12,33 +12,46 @@ ifeq ($(UNAME_S), Darwin)
 	LDFLAGS +=
 endif
 
+CC ?= gcc
+CFLAGS ?=
+LDFLAGS ?=
+CONFFLAGS ?=
+
 clean:
 	@make -C dropbear/ clean || true
 	@make -C toybox/ clean || true
 	@rm dropbear/Makefile || true
 	@rm mksh/Rebuild.sh || true
+	@rm *.a *.o || true
+	@rm test_tvm || true
+	@rm test_rmem || true
+	@rm forkless || true
+
+libtvm: dropbear mksh toybox
+	$(CC) $(CFLAGS) -g -I. -c rmem.c tvm.c main.c
+	ar rcs libtvm.a rmem.o tvm.o main.o
 
 forkless: dropbear mksh toybox
-	gcc -g -rdynamic -I. rmem.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
 
 test_tvm:
-	gcc -g -rdynamic -I. rmem.c tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
 
 test_rmem: rmem.c test_rmem.c
-	gcc -g -rdynamic -I. rmem.c test_rmem.c -o test_rmem -lpthread $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c test_rmem.c -o test_rmem -lpthread $(LDFLAGS)
 
 mksh:
-	if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="-g -I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
+	if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="$(CFLAGS) -g -I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
 	find mksh/ -type f -name '*.o' | xargs ar rcs libmksh.a
 
 dropbear: dummy
-	if [ ! -f dropbear/Makefile ]; then cd dropbear && CFLAGS="-g -I$(realpath .)" ./configure; fi
-	make -C dropbear/ PROGRAMS="dropbear scp" MULTI=1 LDFLAGS="/tmp/dummy.o -o /tmp/dummy.out && echo"
+	if [ ! -f dropbear/Makefile ]; then cd dropbear && ./configure CFLAGS="$(CFLAGS) -g -I$(realpath .)" ac_cv_type_socklen_t=yes ac_cv_type_uid_t=yes $(CONFFLAGS); fi
+	make -C dropbear/ PROGRAMS="dropbear scp" MULTI=1 LDFLAGS="$(LDFLAGS) /tmp/dummy.o -o /tmp/dummy.out && echo"
 	find dropbear/ -type f -name '*.o' | xargs ar rcs libdropbear.a
 
 toybox:
-	CFLAGS="-g -I$(realpath .) -DTOYBOX_FORKLESS=1" V=1 make -C toybox
+	CFLAGS="$(CFLAGS) -g -I$(realpath .) -DTOYBOX_FORKLESS=1" V=1 make -C toybox
 	find toybox/ -type f -name '*.o' | xargs ar rcs libtoybox.a
 
 dummy:
-	@gcc dummy/dummy.c -c -o /tmp/dummy.o
+	@$(CC) $(CFLAGS) dummy/dummy.c -c -o /tmp/dummy.o

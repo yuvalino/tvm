@@ -34,7 +34,6 @@
 
 #if defined(__APPLE__)
 #include <util.h>
-#include <libproc.h>
 #include <mach-o/getsect.h>
 #elif defined(__linux__)
 #include <pty.h>
@@ -551,6 +550,16 @@ err:
     return ret;
 }
 #elif defined(__APPLE__)
+
+// libproc.h not in iPhoneOS sdk
+#define PROC_PIDLISTFDS                 1
+int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+
+struct proc_fdinfo {
+	int32_t                 proc_fd;
+	uint32_t                proc_fdtype;
+};
+
 static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
 {
     int ret = -1;
@@ -681,7 +690,7 @@ static void *jmpbuf_getstack(jmp_buf *jmpbuf)
 
 static uint64_t
 xpaci(uint64_t pointer) {
-	asm("xpaci %[value]\n" : [value] "+r"(pointer));
+	//asm("xpaci %[value]\n" : [value] "+r"(pointer));
 	return pointer;
 }
 
@@ -692,7 +701,7 @@ pacibsp(uint64_t pointer, uint64_t context) {
         "mov x3, lr\n"
         "mov sp, %[context]\n"
         "mov lr, %[pointer]\n"
-        "pacibsp\n"
+        //"pacibsp\n"
         "mov %[pointer], lr\n"
         "mov sp, x2\n"
         "mov lr, x3\n"
@@ -704,7 +713,7 @@ pacibsp(uint64_t pointer, uint64_t context) {
 
 static uint64_t
 xpacd(uint64_t pointer) {
-	asm("xpacd %[value]\n" : [value] "+r"(pointer));
+	//asm("xpacd %[value]\n" : [value] "+r"(pointer));
 	return pointer;
 }
 
@@ -3522,17 +3531,24 @@ void get_text(uintptr_t *out_start, uintptr_t *out_end)
 
 #elif defined(__APPLE__)
 
-extern const struct mach_header_64 _mh_execute_header;
-
 static uintptr_t text_start = 0;
 static size_t text_size = 0;
+
+static const struct mach_header_64 *current_header(void)
+{
+    Dl_info info;
+    if (dladdr((void *)&current_header, &info)) {
+        return (const struct mach_header_64 *)info.dli_fbase;
+    }
+    return NULL;
+}
 
 void get_text(uintptr_t *out_start, uintptr_t *out_end)
 {
     if (!text_start) {
         unsigned long size;
         void *text = getsectiondata(
-            &_mh_execute_header,
+            current_header(),
             "__TEXT",
             "__text",
             &size
