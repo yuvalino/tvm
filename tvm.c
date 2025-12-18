@@ -1124,9 +1124,9 @@ static void taskdealloc(struct task *t)
     if (!list_empty(&t->tsk_pthreads))
         panic("taskalloc tsk_pthreads not one");
 
-    // TODO might be bad to free env
-    //for (char **e = t->tsk_environ; *e != NULL; e++)
-        //kfree(*e);
+    rmem_arena_destroy(t->tsk_ar);
+    t->tsk_ar = NULL;
+    t->tsk_environ = NULL; // allocated in the task arena
 
     pthread_cond_destroy(&t->tsk_wait_cond);
     pthread_mutex_unlock(&t->tsk_lock);
@@ -3307,6 +3307,8 @@ static void forkless_done_cb(struct forkless_arg *arg)
 
 static void *forkless_entry(struct forkless_arg *arg)
 {
+    // TODO: do NOT copy the environ of parent task, or atleast free it after duplication
+
     uintptr_t curr_fp = (uintptr_t)__builtin_frame_address(0);
 
     // move to temporary stack
