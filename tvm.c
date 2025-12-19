@@ -1072,9 +1072,11 @@ static struct task *taskalloc()
         t->tsk_state = current->tsk_state & TS_CTTY;
         memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
 
-        t->tsk_environ = copyenv(t->tsk_ar, current->tsk_environ);
-        if (!t->tsk_environ)
-            panic("copyenv");
+        // TODO 
+        // t->tsk_environ = copyenv(t->tsk_ar, current->tsk_environ);
+        // if (!t->tsk_environ)
+        //     panic("copyenv");
+        t->tsk_environ = NULL;
 
         for (int i = 0; i < MAX_FILES; i++) {
             if (t_fd(i) == -1)
@@ -3283,6 +3285,7 @@ struct forkless_arg {
     int result;
     pthread_mutex_t mtx;
     pthread_cond_t cond;
+    char ***parent_environ;
     jmp_buf jmpbuf_parent;
     jmp_buf jmpbuf_tmp;
     jmp_buf jmpbuf_fail;
@@ -3405,6 +3408,14 @@ static void *forkless_entry(struct forkless_arg *arg)
         panic("TODO");
     }
 
+    // fix the environ pointer (which is allocated on the task heap)
+    current->tsk_environ = *arg->parent_environ;
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&current->tsk_environ, (void *)arg->parent_environ, sizeof(current->tsk_environ)))
+    {
+        // TODO: handle?
+        panic("TODO");
+    }
+
     int ret = rmem_arena_duplicate(
         current->tsk_ar,
         arg->parent_ar,
@@ -3463,6 +3474,7 @@ pid_t fork(void)
     pthread_cond_init(&arg->cond, NULL);
     arg->caller_fp = *(void **)__builtin_frame_address(0);
     arg->parent_ar = parent_ar;
+    arg->parent_environ = &current->tsk_environ;
 
     if (0 != setjmp(arg->jmpbuf_parent)) {
         // child
