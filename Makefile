@@ -28,14 +28,14 @@ clean:
 	@rm forkless || true
 
 libtvm: dropbear mksh toybox
-	$(CC) $(CFLAGS) -g -I. -c rmem.c tvm.c main.c
-	ar rcs libtvm.a rmem.o tvm.o main.o
+	$(CC) $(CFLAGS) -g -I. -c rmem.c ulinker.c tvm.c main.c
+	ar rcs libtvm.a rmem.o ulinker.o tvm.o main.o
 
 forkless: dropbear mksh toybox
-	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c ulinker.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
 
 test_tvm:
-	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c ulinker.c tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
 
 test_rmem: rmem.c test_rmem.c
 	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c test_rmem.c -o test_rmem -lpthread $(LDFLAGS)

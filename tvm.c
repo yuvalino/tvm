@@ -44,6 +44,7 @@
 
 #include "tvm.h"
 #include "rmem.h"
+#include "ulinker.h"
 
 /**
  * Instructions unclear, ended up implementing a kernel.
@@ -399,6 +400,13 @@ DECL_FUNC(getopt);
 DECL_FUNC(getopt_long);
 DECL_FUNC(getopt_long_only);
 
+// never decl those
+// DECL_FUNC(dlopen);
+// DECL_FUNC(dlclose);
+// DECL_FUNC(dlsym);
+// DECL_FUNC(dlerror);
+// DECL_FUNC(dladdr);
+
 #if defined(__linux__)
 DECL_FUNC(mknodat);
 DECL_FUNC(clearenv);
@@ -421,7 +429,7 @@ static void init_funcs()
 {
     struct original_func_t *curr_func;
     list_for_each_entry(curr_func, &original_functions, list) {
-        *curr_func->ptrdest = dlsym(RTLD_NEXT, curr_func->name );
+        *curr_func->ptrdest = dlsym(RTLD_NEXT, curr_func->name);
         if (NULL == *curr_func->ptrdest)
             panic("function '%s' not found", curr_func->name);
     }
@@ -950,6 +958,7 @@ struct task {
     char **tsk_environ;
     char tsk_comm[16];
     struct rmem_arena *tsk_ar;
+    struct ulinker *tsk_linker;
 };
 
 static Dl_info main_dlinfo = {0};
@@ -1027,9 +1036,14 @@ static struct task *taskalloc()
     t->tsk_refcount = 1;
     t->tsk_state = 0;
     t->tsk_pthreads_count = 0;
+
     t->tsk_ar = rmem_arena_create(t);
     if (!t->tsk_ar)
         panic("taskalloc::rmem_arena_create");
+
+    t->tsk_linker = ulinker_create((void *)t);
+    if (!t->tsk_linker)
+        panic("taskalloc::ulinker_create");
 
     if (pthread_mutex_init(&t->tsk_lock, NULL) != 0) {
         panic("taskalloc::pthread_mutex_init(lock)");
@@ -1125,6 +1139,11 @@ static void taskdealloc(struct task *t)
     kfree(pentry);
     if (!list_empty(&t->tsk_pthreads))
         panic("taskalloc tsk_pthreads not one");
+
+    if (t->tsk_linker) {
+        ulinker_destroy(t->tsk_linker);
+        t->tsk_linker = NULL;
+    }
 
     rmem_arena_destroy(t->tsk_ar);
     t->tsk_ar = NULL;
@@ -3578,6 +3597,65 @@ void get_text(uintptr_t *out_start, uintptr_t *out_end)
 
 #endif
 
+struct ulinker_loaded_range {
+    struct list_head ulr_list;
+    struct ulinker_load_event ulr_event;
+};
+
+static LIST_HEAD(all_ulinker_loaded_ranges);
+static pthread_mutex_t all_ulinker_loaded_ranges_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void add_ulinker_loaded_range(struct ulinker_load_event *ule) {
+    struct ulinker_loaded_range *ulr = kalloc(sizeof(*ulr));
+    if (!ulr)
+        panic("add_ulinker_loaded_range");
+
+    memcpy(&ulr->ulr_event, ule, sizeof(*ule));
+
+    pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
+    list_add(&ulr->ulr_list, &all_ulinker_loaded_ranges);
+    pthread_mutex_unlock(&all_ulinker_loaded_ranges_lock);
+}
+
+void remove_ulinker_loaded_range(struct ulinker_load_event *ule) {
+    struct ulinker_loaded_range *ulr;
+    pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
+    list_for_each_entry(ulr, &all_ulinker_loaded_ranges, ulr_list) {
+        if (0 == memcpy(&ulr->ulr_event, ule, sizeof(*ule))) {
+            list_del(&ulr->ulr_list);
+            kfree(ulr);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&all_ulinker_loaded_ranges_lock);
+}
+
+struct ulinker_loaded_range *find_containing_ulinker_loaded_range_locked(void *addr) {
+    struct ulinker_loaded_range *ulr;
+    list_for_each_entry(ulr, &all_ulinker_loaded_ranges, ulr_list) {
+        if ((uintptr_t)addr >= (uintptr_t)ulr->ulr_event.ule_base && (uintptr_t)addr < ((uintptr_t)ulr->ulr_event.ule_base) + ulr->ulr_event.ule_size) {
+            return ulr;
+        }
+    }
+
+    return NULL;
+}
+
+int in_tvm_range(void *lr) {
+    uintptr_t text_start;
+    uintptr_t text_end;
+    get_text(&text_start, &text_end);
+
+    if ((uintptr_t)lr >= text_start && (uintptr_t)lr < text_end)
+        return 1;
+
+    pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
+    int r = (NULL != find_containing_ulinker_loaded_range_locked(lr));
+    pthread_mutex_unlock(&all_ulinker_loaded_ranges_lock);
+
+    return r;
+}
+
 int can_enter_tvm(void *lr) {
     // not initialized
     if (!main_task)
@@ -3590,11 +3668,7 @@ int can_enter_tvm(void *lr) {
     }
 
 
-    uintptr_t text_start;
-    uintptr_t text_end;
-    get_text(&text_start, &text_end);
-
-    if ((uintptr_t)lr < text_start || (uintptr_t)lr >= text_end)
+    if (!(in_tvm_range(lr)))
         return 0;
 
     // fork() does not use call (for now)
@@ -3612,9 +3686,7 @@ int can_enter_tvm(void *lr) {
         call_itr = call_itr->prev;
     }
 
-    if ((uintptr_t)lr < text_start || (uintptr_t)lr >= text_end)
-        return 0;
-    return 1;
+    return in_tvm_range(lr);
 }
 
 struct function_metadata {
@@ -4127,6 +4199,31 @@ err:
     return ret;
 }
 
+static int tvm_sorunner(int argc, char **argv)
+{
+    int ret = 1;
+    
+    if (argc < 2) {
+        fprintf(stderr, "USAGE: tvm sorunner LIBRARY\n");
+        return 1;
+    }
+
+    void *handle = ulinker_dlopen(current->tsk_linker, argv[1], 0);
+    if (!handle) {
+        fprintf(stderr, "failed to open \"%s\": %s\n", argv[1], ulinker_dlerror());
+        return 1;
+    }
+
+    void *sym = ulinker_dlsym(current->tsk_linker, handle, "main");
+    if (!sym) {
+        fprintf(stderr, "sym \"%s\" main not found: %s\n", argv[1], ulinker_dlerror());
+        return 1;
+    }
+
+    printf("sorunner %s %s %p\n", argv[1], "main", sym);
+    return ((main_func_t)sym)(argc - 1, argv + 1, tvm_environ);
+}
+
 static int tvm_main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -4146,6 +4243,7 @@ static int tvm_main(int argc, char **argv)
 
     if (0 == strcmp(argv[1], "ps")) return tvm_ps(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "lsof")) return tvm_lsof(argc - 1, argv + 1);
+    if (0 == strcmp(argv[1], "sorunner")) return tvm_sorunner(argc - 1, argv + 1);
     
     fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
     fprintf(stderr, "Try 'tvm -h' for more information.\n");
@@ -4167,6 +4265,64 @@ static void rmem_print_cb(char *msg) {
     CALL_FUNC(write, 1, msgbuf, __num);
 }
 
+static void ulinker_print_cb(char *msg) {
+    char __ts[32];
+    format_time(__ts, sizeof(__ts));
+    int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
+    CALL_FUNC(write, 1, msgbuf, __num);
+}
+
+#define ULINKER_ARENA(_arg) ((_arg) ? ((struct task *)arg)->tsk_ar : global_arena)
+
+static void *ulinker_malloc(void *arg, size_t size)             { return rmem_arena_alloc(ULINKER_ARENA(arg), size); }
+static void  ulinker_free(void *arg, void *ptr)                 { rmem_arena_free(ULINKER_ARENA(arg), ptr); }
+static void *ulinker_realloc(void *arg, void *ptr, size_t size) { return rmem_arena_realloc(ULINKER_ARENA(arg), ptr, size); }
+
+static int     ulinker_open(void *, const char *name)                { return open(name, O_RDONLY); }
+static int     ulinker_close(void *, int fd)                         { return close(fd); }
+static ssize_t ulinker_read(void *, int fd, void *buf, size_t count) { return read(fd, buf, count); }
+static int     ulinker_fstat(void *, int fd, struct stat *statbuf)   { return fstat(fd, statbuf); }
+
+static void *ulinker_mmap(void *, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return mmap(hint, length, prot, flags, fd, offset); }
+static int   ulinker_munmap(void *, void *addr, size_t size)                                            { return munmap(addr, size); }
+static int   ulinker_mprotect(void *, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
+
+static struct ulinker_ops ulinker_ops = {
+    .uo_malloc = ulinker_malloc,
+    .uo_free = ulinker_free,
+    .uo_realloc = ulinker_realloc,
+
+    .uo_open = ulinker_open,
+    .uo_close = ulinker_close,
+    .uo_read = ulinker_read,
+    .uo_fstat = ulinker_fstat,
+
+    .uo_mmap = ulinker_mmap,
+    .uo_munmap = ulinker_munmap,
+    .uo_mprotect = ulinker_mprotect
+};
+
+static void *ulinker_emulated_dlsym(void *arg, const char *s)
+{
+    return dlsym(RTLD_DEFAULT, s);
+}
+
+static struct ulinker_emulated_dlinfo_args ulinker_tvm_emulated_args = {
+    .ue_private = NULL,
+    .ue_name = "libtvm",
+    .ue_dlsym = ulinker_emulated_dlsym,
+};
+
+static void ulinker_event_cb(int event, void *arg)
+{
+    if (event == ULEVENT_LOAD) {
+        add_ulinker_loaded_range((struct ulinker_load_event *)arg);
+    }
+    else if (event == ULEVENT_UNLOAD) {
+        remove_ulinker_loaded_range((struct ulinker_load_event *)arg);
+    }
+}
+
 void tvm_init(const char *init_comm)
 {
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
@@ -4177,6 +4333,11 @@ void tvm_init(const char *init_comm)
     global_arena = rmem_arena_create(NULL);
     if (!global_arena)
         panic("couldn't create global arena");
+
+    ulinker_setopt(ULINKER_PRINT_CB, (void *)ulinker_print_cb);
+    ulinker_setopt(ULINKER_OPS, &ulinker_ops);
+    ulinker_setopt(ULINKER_ADD_EMULATED_DLINFO, &ulinker_tvm_emulated_args);
+    ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
 
     main_pthread = pthread_self();
     current = taskalloc();  // special initialization for main thread
@@ -5585,6 +5746,11 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     }
 
     main_func_t main_func = find_program(pathname);
+    if (!main_func) {
+        // if (0 == strcmp(pathname, "/tmp/a.out"))
+        //     main_func = (main_func_t)ulinker_dlopen_executable(current->tsk_linker, pathname);
+    }
+
     if (!main_func) {
         INFO("  failed(ENOENT)");
         errno = ENOENT;
