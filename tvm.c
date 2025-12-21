@@ -4210,13 +4210,13 @@ static int tvm_sorunner(int argc, char **argv)
 
     void *handle = ulinker_dlopen(current->tsk_linker, argv[1], 0);
     if (!handle) {
-        fprintf(stderr, "failed to open \"%s\": %s\n", argv[1], ulinker_dlerror());
+        fprintf(stderr, "failed to exec \"%s\": %s\n", argv[1], ulinker_dlerror());
         return 1;
     }
 
     void *sym = ulinker_dlsym(current->tsk_linker, handle, "main");
     if (!sym) {
-        fprintf(stderr, "sym \"%s\" main not found: %s\n", argv[1], ulinker_dlerror());
+        fprintf(stderr, "failed to exec \"%s\": %s\n", argv[1], ulinker_dlerror());
         return 1;
     }
 
@@ -5747,8 +5747,8 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
-        // if (0 == strcmp(pathname, "/tmp/a.out"))
-        //     main_func = (main_func_t)ulinker_dlopen_executable(current->tsk_linker, pathname);
+        if (0 == strcmp(pathname, "/tmp/a.out"))
+            main_func = (main_func_t)ulinker_dlopen_executable(current->tsk_linker, pathname);
     }
 
     if (!main_func) {

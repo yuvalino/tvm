@@ -26,7 +26,7 @@ static __thread char msgbuf[4096] = {0};
 } while (0)
 
 static __thread char errormsg[4096] = {0};
-#define ERROR(_msg, ...) do { snprintf(errormsg, sizeof(errormsg), (_msg), ##__VA_ARGS__); PRINT("%s\n", errormsg); } while (0)
+#define ERROR(_msg, ...) do { snprintf(errormsg, sizeof(errormsg), (_msg), ##__VA_ARGS__); PRINT("%s", errormsg); } while (0)
 
 static void (*event_cb)(int, void *);
 
@@ -855,6 +855,53 @@ static void *lookup_symbol(struct dlinfo *dl, const char *s)
     return NULL;
 }
 
+static size_t address_in_library(struct dlinfo *dl, void *addr) {
+    if ((uintptr_t)addr >= (uintptr_t)dl->dl_base &&
+        (uintptr_t)addr < (uintptr_t)dl->dl_base + dl->dl_size) {
+        return (uintptr_t)addr - (uintptr_t)dl->dl_base;
+    }
+
+    return SIZE_MAX;
+}
+
+static struct dlinfo *library_for_address(struct ulinker *ulinker, void *addr) {
+    struct dlinfo *dl = ulinker->ul_dlinfo;
+    while (dl) {
+        if (address_in_library(dl, addr) != SIZE_MAX)
+            return dl;
+    }
+    return NULL;
+}
+
+static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *symbol, void *lr, int emulated)
+{
+    DLINFO_LOCK(ulinker);
+    struct dlinfo *dl = (struct dlinfo *)handle;
+    if (RTLD_DEFAULT == handle) {
+        dl = ulinker->ul_dlinfo;
+    }
+    else if (RTLD_NEXT == handle) {
+        dl = library_for_address(ulinker, lr);
+        if (dl)
+            dl = dl->dl_next;
+    }
+
+    while (dl) {
+        if (!emulated && dl->dl_type == DLT_EMULATED)
+            break;
+        void *a = lookup_symbol(dl, symbol);
+        if (a) {
+            DLINFO_UNLOCK(ulinker);
+            return a;
+        }
+        dl = dl->dl_next;
+    }
+    DLINFO_UNLOCK(ulinker);
+
+    ERROR("symbol \"%s\" not found", symbol);
+    return NULL;
+}
+
 static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size, unsigned char *ident)
 {
     struct dlinfo *ret = NULL;
@@ -1241,7 +1288,8 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
 
         if (sym) {
             sym_name = string_elf64(dl, dl->dle64_symtab[sym].st_name);
-            sym_addr = (Elf64_Addr)ulinker_dlsym(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name);
+            // lookup symbol with emulated libraries as this is for internal use
+            sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1);
             if (!sym_addr) {
                 if (ELF64_ST_BIND(dl->dle64_symtab[sym].st_info) != STB_WEAK) {
                     ERROR("failed to relocate ELF \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, sym_name);
@@ -1417,38 +1465,6 @@ out:
     return ret;
 }
 
-static void *entrypoint_elf64_library(struct dlinfo_elf64 *dl) {
-    if (!dl->dle64_ehdr.e_entry)
-        return NULL;
-    
-    return (void *)(dl->dle64_ehdr.e_entry + dl->dle64_load_bias);
-}
-
-static void *entrypoint_library(struct dlinfo *dl) {
-    if (dl->dl_type == DLT_ELF64)
-        return entrypoint_elf64_library((struct dlinfo_elf64 *)dl);
-    
-    return NULL;
-}
-
-static size_t address_in_library(struct dlinfo *dl, void *addr) {
-    if ((uintptr_t)addr >= (uintptr_t)dl->dl_base &&
-        (uintptr_t)addr < (uintptr_t)dl->dl_base + dl->dl_size) {
-        return (uintptr_t)addr - (uintptr_t)dl->dl_base;
-    }
-
-    return SIZE_MAX;
-}
-
-static struct dlinfo *library_for_address(struct ulinker *ulinker, void *addr) {
-    struct dlinfo *dl = ulinker->ul_dlinfo;
-    while (dl) {
-        if (address_in_library(dl, addr) != SIZE_MAX)
-            return dl;
-    }
-    return NULL;
-}
-
 static struct dlinfo_emulated *add_emulated_dlinfo(struct ulinker_emulated_dlinfo_args *args)
 {
     struct dlinfo_emulated *last_dlemu = NULL;
@@ -1542,11 +1558,17 @@ out:
 void ulinker_destroy(struct ulinker *ulinker) {
     // free all libraries
     while (ulinker->ul_dlinfo) {
-        struct dlinfo *dl = ulinker->ul_dlinfo;
-        ulinker->ul_dlinfo = dl->dl_next;
-        PRINT("ulinker destroy %p", dl);
-        ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, dl);
-        free_library(dl);
+        struct dlinfo *curr_dl = ulinker->ul_dlinfo;
+
+        // end of linker-specific list
+        if (curr_dl->dl_type == DLT_EMULATED) {
+            ulinker->ul_dlinfo = NULL;
+            break;
+        }
+
+        ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, curr_dl);
+        ulinker->ul_dlinfo = curr_dl->dl_next;
+        free_library(curr_dl);
     }
 
     pthread_mutex_destroy(&ulinker->ul_dlinfo_mtx);
@@ -1602,29 +1624,9 @@ int ulinker_dlclose(void *handle)
 }
 
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol) {
-    DLINFO_LOCK(ulinker);
-    struct dlinfo *dl = (struct dlinfo *)handle;
-    if (RTLD_DEFAULT == handle) {
-        dl = ulinker->ul_dlinfo;
-    }
-    else if (RTLD_NEXT == handle) {
-        void *lr = __builtin_return_address(0);
-        dl = library_for_address(ulinker, lr);
-        if (dl)
-            dl = dl->dl_next;
-    }
-
-    while (dl) {
-        void *a = lookup_symbol(dl, symbol);
-        if (a) {
-            DLINFO_UNLOCK(ulinker);
-            return a;
-        }
-        dl = dl->dl_next;
-    }
-    DLINFO_UNLOCK(ulinker);
-
-    return NULL;
+    void *lr = __builtin_return_address(0);
+    // do NOT search in emulated for API calls
+    return dlsym_internal(ulinker, handle, symbol, lr, 0);
 }
 
 char *ulinker_dlerror(void) {
@@ -1645,9 +1647,9 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
         return NULL;
     }
 
-    void *entry = entrypoint_library(dl);
+    void *entry = lookup_symbol(dl, "main");
     if (!entry) {
-        ERROR("failed to load executable library \"%s\": no entrypoint found", filename);
+        ERROR("failed to load executable library \"%s\": symbol \"main\" not found", filename);
         ulinker_destroy(tmp_linker);
         return NULL;
     }
@@ -1659,6 +1661,14 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
     // destroy all loaded libraries
     while (ulinker->ul_dlinfo) {
         struct dlinfo *curr_dl = ulinker->ul_dlinfo;
+
+        // end of linker-specific list
+        if (curr_dl->dl_type == DLT_EMULATED) {
+            ulinker->ul_dlinfo = NULL;
+            break;
+        }
+
+        ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, curr_dl);
         ulinker->ul_dlinfo = curr_dl->dl_next;
         free_library(curr_dl);
     }
@@ -1666,6 +1676,9 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
     // move loaded libraries from tmp_linker to ulinker (fix linker back pointer too!)
     ulinker->ul_dlinfo = tmp_linker->ul_dlinfo;
     for (struct dlinfo *curr_dl = ulinker->ul_dlinfo; curr_dl; curr_dl = curr_dl->dl_next) {
+        // end of linker-specific list
+        if (curr_dl->dl_type == DLT_EMULATED) 
+            break;
         curr_dl->dl_linker = ulinker;
     }
 
