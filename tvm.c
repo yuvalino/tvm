@@ -4278,14 +4278,14 @@ static void *ulinker_malloc(void *arg, size_t size)             { return rmem_ar
 static void  ulinker_free(void *arg, void *ptr)                 { rmem_arena_free(ULINKER_ARENA(arg), ptr); }
 static void *ulinker_realloc(void *arg, void *ptr, size_t size) { return rmem_arena_realloc(ULINKER_ARENA(arg), ptr, size); }
 
-static int     ulinker_open(void *, const char *name)                { return open(name, O_RDONLY); }
-static int     ulinker_close(void *, int fd)                         { return close(fd); }
-static ssize_t ulinker_read(void *, int fd, void *buf, size_t count) { return read(fd, buf, count); }
-static int     ulinker_fstat(void *, int fd, struct stat *statbuf)   { return fstat(fd, statbuf); }
+static int     ulinker_open(void *arg, const char *name)                { return open(name, O_RDONLY); }
+static int     ulinker_close(void *arg, int fd)                         { return close(fd); }
+static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { return read(fd, buf, count); }
+static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { return fstat(fd, statbuf); }
 
-static void *ulinker_mmap(void *, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return mmap(hint, length, prot, flags, fd, offset); }
-static int   ulinker_munmap(void *, void *addr, size_t size)                                            { return munmap(addr, size); }
-static int   ulinker_mprotect(void *, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
+static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return mmap(hint, length, prot, flags, fd, offset); }
+static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            { return munmap(addr, size); }
+static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
 
 static struct ulinker_ops ulinker_ops = {
     .uo_malloc = ulinker_malloc,

@@ -643,20 +643,1131 @@ typedef struct
 #define R_X86_64_IRELATIVE	37	/* Adjust indirectly by program base */
 #define R_AARCH64_IRELATIVE	1032	/* STT_GNU_IFUNC relocation.  */
 
+/* -------------------- Mach-O -------------------- */
+
+/*
+ * The 64-bit mach header appears at the very beginning of object files for
+ * 64-bit architectures.
+ */
+struct mach_header_64 {
+	uint32_t	magic;		/* mach magic number identifier */
+	int32_t		cputype;	/* cpu specifier */
+	int32_t		cpusubtype;	/* machine specifier */
+	uint32_t	filetype;	/* type of file */
+	uint32_t	ncmds;		/* number of load commands */
+	uint32_t	sizeofcmds;	/* the size of all the load commands */
+	uint32_t	flags;		/* flags */
+	uint32_t	reserved;	/* reserved */
+};
+
+/* Constant for the magic field of the mach_header_64 (64-bit architectures) */
+#define MH_MAGIC_64 0xfeedfacf /* the 64-bit mach magic number */
+
+/*
+ * The layout of the file depends on the filetype.  For all but the MH_OBJECT
+ * file type the segments are padded out and aligned on a segment alignment
+ * boundary for efficient demand pageing.  The MH_EXECUTE, MH_FVMLIB, MH_DYLIB,
+ * MH_DYLINKER and MH_BUNDLE file types also have the headers included as part
+ * of their first segment.
+ * 
+ * The file type MH_OBJECT is a compact format intended as output of the
+ * assembler and input (and possibly output) of the link editor (the .o
+ * format).  All sections are in one unnamed segment with no segment padding. 
+ * This format is used as an executable format when the file is so small the
+ * segment padding greatly increases its size.
+ *
+ * The file type MH_PRELOAD is an executable format intended for things that
+ * are not executed under the kernel (proms, stand alones, kernels, etc).  The
+ * format can be executed under the kernel but may demand paged it and not
+ * preload it before execution.
+ *
+ * A core file is in MH_CORE format and can be any in an arbritray legal
+ * Mach-O file.
+ *
+ * Constants for the filetype field of the mach_header
+ */
+#define	MH_OBJECT	0x1		/* relocatable object file */
+#define	MH_EXECUTE	0x2		/* demand paged executable file */
+#define	MH_FVMLIB	0x3		/* fixed VM shared library file */
+#define	MH_CORE		0x4		/* core file */
+#define	MH_PRELOAD	0x5		/* preloaded executable file */
+#define	MH_DYLIB	0x6		/* dynamically bound shared library */
+#define	MH_DYLINKER	0x7		/* dynamic link editor */
+#define	MH_BUNDLE	0x8		/* dynamically bound bundle file */
+#define	MH_DYLIB_STUB	0x9		/* shared library stub for static
+					   linking only, no section contents */
+#define	MH_DSYM		0xa		/* companion file with only debug
+					   sections */
+#define	MH_KEXT_BUNDLE	0xb		/* x86_64 kexts */
+#define MH_FILESET	0xc		/* a file composed of other Mach-Os to
+					   be run in the same userspace sharing
+					   a single linkedit. */
+#define	MH_GPU_EXECUTE	0xd		/* gpu program */
+#define	MH_GPU_DYLIB	0xe		/* gpu support functions */
+
+
+/* Constants for the flags field of the mach_header */
+#define	MH_NOUNDEFS	0x1		/* the object file has no undefined
+					   references */
+#define	MH_INCRLINK	0x2		/* the object file is the output of an
+					   incremental link against a base file
+					   and can't be link edited again */
+#define MH_DYLDLINK	0x4		/* the object file is input for the
+					   dynamic linker and can't be staticly
+					   link edited again */
+#define MH_BINDATLOAD	0x8		/* the object file's undefined
+					   references are bound by the dynamic
+					   linker when loaded. */
+#define MH_PREBOUND	0x10		/* the file has its dynamic undefined
+					   references prebound. */
+#define MH_SPLIT_SEGS	0x20		/* the file has its read-only and
+					   read-write segments split */
+#define MH_LAZY_INIT	0x40		/* the shared library init routine is
+					   to be run lazily via catching memory
+					   faults to its writeable segments
+					   (obsolete) */
+#define MH_TWOLEVEL	0x80		/* the image is using two-level name
+					   space bindings */
+#define MH_FORCE_FLAT	0x100		/* the executable is forcing all images
+					   to use flat name space bindings */
+#define MH_NOMULTIDEFS	0x200		/* this umbrella guarantees no multiple
+					   defintions of symbols in its
+					   sub-images so the two-level namespace
+					   hints can always be used. */
+#define MH_NOFIXPREBINDING 0x400	/* do not have dyld notify the
+					   prebinding agent about this
+					   executable */
+#define MH_PREBINDABLE  0x800           /* the binary is not prebound but can
+					   have its prebinding redone. only used
+                                           when MH_PREBOUND is not set. */
+#define MH_ALLMODSBOUND 0x1000		/* indicates that this binary binds to
+                                           all two-level namespace modules of
+					   its dependent libraries. only used
+					   when MH_PREBINDABLE and MH_TWOLEVEL
+					   are both set. */ 
+#define MH_SUBSECTIONS_VIA_SYMBOLS 0x2000/* safe to divide up the sections into
+					    sub-sections via symbols for dead
+					    code stripping */
+#define MH_CANONICAL    0x4000		/* the binary has been canonicalized
+					   via the unprebind operation */
+#define MH_WEAK_DEFINES	0x8000		/* the final linked image contains
+					   external weak symbols */
+#define MH_BINDS_TO_WEAK 0x10000	/* the final linked image uses
+					   weak symbols */
+
+#define MH_ALLOW_STACK_EXECUTION 0x20000/* When this bit is set, all stacks 
+					   in the task will be given stack
+					   execution privilege.  Only used in
+					   MH_EXECUTE filetypes. */
+#define MH_ROOT_SAFE 0x40000           /* When this bit is set, the binary 
+					  declares it is safe for use in
+					  processes with uid zero */
+                                         
+#define MH_SETUID_SAFE 0x80000         /* When this bit is set, the binary 
+					  declares it is safe for use in
+					  processes when issetugid() is true */
+
+#define MH_NO_REEXPORTED_DYLIBS 0x100000 /* When this bit is set on a dylib, 
+					  the static linker does not need to
+					  examine dependent dylibs to see
+					  if any are re-exported */
+#define	MH_PIE 0x200000			/* When this bit is set, the OS will
+					   load the main executable at a
+					   random address.  Only used in
+					   MH_EXECUTE filetypes. */
+#define	MH_DEAD_STRIPPABLE_DYLIB 0x400000 /* Only for use on dylibs.  When
+					     linking against a dylib that
+					     has this bit set, the static linker
+					     will automatically not create a
+					     LC_LOAD_DYLIB load command to the
+					     dylib if no symbols are being
+					     referenced from the dylib. */
+#define MH_HAS_TLV_DESCRIPTORS 0x800000 /* Contains a section of type 
+					    S_THREAD_LOCAL_VARIABLES */
+
+#define MH_NO_HEAP_EXECUTION 0x1000000	/* When this bit is set, the OS will
+					   run the main executable with
+					   a non-executable heap even on
+					   platforms (e.g. i386) that don't
+					   require it. Only used in MH_EXECUTE
+					   filetypes. */
+
+#define MH_APP_EXTENSION_SAFE 0x02000000 /* The code was linked for use in an
+					    application extension. */
+
+#define	MH_NLIST_OUTOFSYNC_WITH_DYLDINFO 0x04000000 /* The external symbols
+					   listed in the nlist symbol table do
+					   not include all the symbols listed in
+					   the dyld info. */
+
+#define	MH_SIM_SUPPORT 0x08000000	/* Allow LC_MIN_VERSION_MACOS and
+					   LC_BUILD_VERSION load commands with
+					   the platforms macOS, macCatalyst,
+					   iOSSimulator, tvOSSimulator and
+					   watchOSSimulator. */
+
+#define	MH_IMPLICIT_PAGEZERO 0x10000000	/* main executable has no __PAGEZERO
+					   segment.  Instead, loader (xnu)
+					   will load program high and block
+					   out all memory below it. */
+
+#define MH_DYLIB_IN_CACHE 0x80000000	/* Only for use on dylibs. When this bit
+					   is set, the dylib is part of the dyld
+					   shared cache, rather than loose in
+					   the filesystem. */
+
+/*
+ * The load commands directly follow the mach_header.  The total size of all
+ * of the commands is given by the sizeofcmds field in the mach_header.  All
+ * load commands must have as their first two fields cmd and cmdsize.  The cmd
+ * field is filled in with a constant for that command type.  Each command type
+ * has a structure specifically for it.  The cmdsize field is the size in bytes
+ * of the particular load command structure plus anything that follows it that
+ * is a part of the load command (i.e. section structures, strings, etc.).  To
+ * advance to the next load command the cmdsize can be added to the offset or
+ * pointer of the current load command.  The cmdsize for 32-bit architectures
+ * MUST be a multiple of 4 bytes and for 64-bit architectures MUST be a multiple
+ * of 8 bytes (these are forever the maximum alignment of any load commands).
+ * The padded bytes must be zero.  All tables in the object file must also
+ * follow these rules so the file can be memory mapped.  Otherwise the pointers
+ * to these tables will not work well or at all on some machines.  With all
+ * padding zeroed like objects will compare byte for byte.
+ */
+struct load_command {
+	uint32_t cmd;		/* type of load command */
+	uint32_t cmdsize;	/* total size of command in bytes */
+};
+
+/*
+ * After MacOS X 10.1 when a new load command is added that is required to be
+ * understood by the dynamic linker for the image to execute properly the
+ * LC_REQ_DYLD bit will be or'ed into the load command constant.  If the dynamic
+ * linker sees such a load command it it does not understand will issue a
+ * "unknown load command required for execution" error and refuse to use the
+ * image.  Other load commands without this bit that are not understood will
+ * simply be ignored.
+ */
+#define LC_REQ_DYLD 0x80000000
+
+/* Constants for the cmd field of all load commands, the type */
+#define	LC_SEGMENT	0x1	/* segment of this file to be mapped */
+#define	LC_SYMTAB	0x2	/* link-edit stab symbol table info */
+#define	LC_SYMSEG	0x3	/* link-edit gdb symbol table info (obsolete) */
+#define	LC_THREAD	0x4	/* thread */
+#define	LC_UNIXTHREAD	0x5	/* unix thread (includes a stack) */
+#define	LC_LOADFVMLIB	0x6	/* load a specified fixed VM shared library */
+#define	LC_IDFVMLIB	0x7	/* fixed VM shared library identification */
+#define	LC_IDENT	0x8	/* object identification info (obsolete) */
+#define LC_FVMFILE	0x9	/* fixed VM file inclusion (internal use) */
+#define LC_PREPAGE      0xa     /* prepage command (internal use) */
+#define	LC_DYSYMTAB	0xb	/* dynamic link-edit symbol table info */
+#define	LC_LOAD_DYLIB	0xc	/* load a dynamically linked shared library */
+#define	LC_ID_DYLIB	0xd	/* dynamically linked shared lib ident */
+#define LC_LOAD_DYLINKER 0xe	/* load a dynamic linker */
+#define LC_ID_DYLINKER	0xf	/* dynamic linker identification */
+#define	LC_PREBOUND_DYLIB 0x10	/* modules prebound for a dynamically */
+				/*  linked shared library */
+#define	LC_ROUTINES	0x11	/* image routines */
+#define	LC_SUB_FRAMEWORK 0x12	/* sub framework */
+#define	LC_SUB_UMBRELLA 0x13	/* sub umbrella */
+#define	LC_SUB_CLIENT	0x14	/* sub client */
+#define	LC_SUB_LIBRARY  0x15	/* sub library */
+#define	LC_TWOLEVEL_HINTS 0x16	/* two-level namespace lookup hints */
+#define	LC_PREBIND_CKSUM  0x17	/* prebind checksum */
+
+/*
+ * load a dynamically linked shared library that is allowed to be missing
+ * (all symbols are weak imported).
+ */
+#define	LC_LOAD_WEAK_DYLIB (0x18 | LC_REQ_DYLD)
+
+#define	LC_SEGMENT_64	0x19	/* 64-bit segment of this file to be
+				   mapped */
+#define	LC_ROUTINES_64	0x1a	/* 64-bit image routines */
+#define LC_UUID		0x1b	/* the uuid */
+#define LC_RPATH       (0x1c | LC_REQ_DYLD)    /* runpath additions */
+#define LC_CODE_SIGNATURE 0x1d	/* local of code signature */
+#define LC_SEGMENT_SPLIT_INFO 0x1e /* local of info to split segments */
+#define LC_REEXPORT_DYLIB (0x1f | LC_REQ_DYLD) /* load and re-export dylib */
+#define	LC_LAZY_LOAD_DYLIB 0x20	/* delay load of dylib until first use */
+#define	LC_ENCRYPTION_INFO 0x21	/* encrypted segment information */
+#define	LC_DYLD_INFO 	0x22	/* compressed dyld information */
+#define	LC_DYLD_INFO_ONLY (0x22|LC_REQ_DYLD)	/* compressed dyld information only */
+#define	LC_LOAD_UPWARD_DYLIB (0x23 | LC_REQ_DYLD) /* load upward dylib */
+#define LC_VERSION_MIN_MACOSX 0x24   /* build for MacOSX min OS version */
+#define LC_VERSION_MIN_IPHONEOS 0x25 /* build for iPhoneOS min OS version */
+#define LC_FUNCTION_STARTS 0x26 /* compressed table of function start addresses */
+#define LC_DYLD_ENVIRONMENT 0x27 /* string for dyld to treat
+				    like environment variable */
+#define LC_MAIN (0x28|LC_REQ_DYLD) /* replacement for LC_UNIXTHREAD */
+#define LC_DATA_IN_CODE 0x29 /* table of non-instructions in __text */
+#define LC_SOURCE_VERSION 0x2A /* source version used to build binary */
+#define LC_DYLIB_CODE_SIGN_DRS 0x2B /* Code signing DRs copied from linked dylibs */
+#define	LC_ENCRYPTION_INFO_64 0x2C /* 64-bit encrypted segment information */
+#define LC_LINKER_OPTION 0x2D /* linker options in MH_OBJECT files */
+#define LC_LINKER_OPTIMIZATION_HINT 0x2E /* optimization hints in MH_OBJECT files */
+#define LC_VERSION_MIN_TVOS 0x2F /* build for AppleTV min OS version */
+#define LC_VERSION_MIN_WATCHOS 0x30 /* build for Watch min OS version */
+#define LC_NOTE 0x31 /* arbitrary data included within a Mach-O file */
+#define LC_BUILD_VERSION 0x32 /* build for platform min OS version */
+#define LC_DYLD_EXPORTS_TRIE (0x33 | LC_REQ_DYLD) /* used with linkedit_data_command, payload is trie */
+#define LC_DYLD_CHAINED_FIXUPS (0x34 | LC_REQ_DYLD) /* used with linkedit_data_command */
+#define LC_FILESET_ENTRY (0x35 | LC_REQ_DYLD) /* used with fileset_entry_command */
+#define LC_ATOM_INFO 0x36 /* used with linkedit_data_command */
+
+/*
+ * A variable length string in a load command is represented by an lc_str
+ * union.  The strings are stored just after the load command structure and
+ * the offset is from the start of the load command structure.  The size
+ * of the string is reflected in the cmdsize field of the load command.
+ * Once again any padded bytes to bring the cmdsize field to a multiple
+ * of 4 bytes must be zero.
+ */
+union lc_str {
+	uint32_t	offset;	/* offset to the string */
+#ifndef __LP64__
+	char		*ptr;	/* pointer to the string */
+#endif 
+};
+
+/*
+ * The segment load command indicates that a part of this file is to be
+ * mapped into the task's address space.  The size of this segment in memory,
+ * vmsize, maybe equal to or larger than the amount to map from this file,
+ * filesize.  The file is mapped starting at fileoff to the beginning of
+ * the segment in memory, vmaddr.  The rest of the memory of the segment,
+ * if any, is allocated zero fill on demand.  The segment's maximum virtual
+ * memory protection and initial virtual memory protection are specified
+ * by the maxprot and initprot fields.  If the segment has sections then the
+ * section structures directly follow the segment command and their size is
+ * reflected in cmdsize.
+ */
+struct segment_command { /* for 32-bit architectures */
+	uint32_t	cmd;		/* LC_SEGMENT */
+	uint32_t	cmdsize;	/* includes sizeof section structs */
+	char		segname[16];	/* segment name */
+	uint32_t	vmaddr;		/* memory address of this segment */
+	uint32_t	vmsize;		/* memory size of this segment */
+	uint32_t	fileoff;	/* file offset of this segment */
+	uint32_t	filesize;	/* amount to map from the file */
+	int32_t		maxprot;	/* maximum VM protection */
+	int32_t		initprot;	/* initial VM protection */
+	uint32_t	nsects;		/* number of sections in segment */
+	uint32_t	flags;		/* flags */
+};
+
+/*
+ * The 64-bit segment load command indicates that a part of this file is to be
+ * mapped into a 64-bit task's address space.  If the 64-bit segment has
+ * sections then section_64 structures directly follow the 64-bit segment
+ * command and their size is reflected in cmdsize.
+ */
+struct segment_command_64 { /* for 64-bit architectures */
+	uint32_t	cmd;		/* LC_SEGMENT_64 */
+	uint32_t	cmdsize;	/* includes sizeof section_64 structs */
+	char		segname[16];	/* segment name */
+	uint64_t	vmaddr;		/* memory address of this segment */
+	uint64_t	vmsize;		/* memory size of this segment */
+	uint64_t	fileoff;	/* file offset of this segment */
+	uint64_t	filesize;	/* amount to map from the file */
+	int32_t		maxprot;	/* maximum VM protection */
+	int32_t		initprot;	/* initial VM protection */
+	uint32_t	nsects;		/* number of sections in segment */
+	uint32_t	flags;		/* flags */
+};
+
+/* Constants for the flags field of the segment_command */
+#define	SG_HIGHVM	0x1	/* the file contents for this segment is for
+				   the high part of the VM space, the low part
+				   is zero filled (for stacks in core files) */
+#define	SG_FVMLIB	0x2	/* this segment is the VM that is allocated by
+				   a fixed VM library, for overlap checking in
+				   the link editor */
+#define	SG_NORELOC	0x4	/* this segment has nothing that was relocated
+				   in it and nothing relocated to it, that is
+				   it maybe safely replaced without relocation*/
+#define SG_PROTECTED_VERSION_1	0x8 /* This segment is protected.  If the
+				       segment starts at file offset 0, the
+				       first page of the segment is not
+				       protected.  All other pages of the
+				       segment are protected. */
+#define SG_READ_ONLY    0x10 /* This segment is made read-only after fixups */
+
+
+
+/*
+ * A segment is made up of zero or more sections.  Non-MH_OBJECT files have
+ * all of their segments with the proper sections in each, and padded to the
+ * specified segment alignment when produced by the link editor.  The first
+ * segment of a MH_EXECUTE and MH_FVMLIB format file contains the mach_header
+ * and load commands of the object file before its first section.  The zero
+ * fill sections are always last in their segment (in all formats).  This
+ * allows the zeroed segment padding to be mapped into memory where zero fill
+ * sections might be. The gigabyte zero fill sections, those with the section
+ * type S_GB_ZEROFILL, can only be in a segment with sections of this type.
+ * These segments are then placed after all other segments.
+ *
+ * The MH_OBJECT format has all of its sections in one segment for
+ * compactness.  There is no padding to a specified segment boundary and the
+ * mach_header and load commands are not part of the segment.
+ *
+ * Sections with the same section name, sectname, going into the same segment,
+ * segname, are combined by the link editor.  The resulting section is aligned
+ * to the maximum alignment of the combined sections and is the new section's
+ * alignment.  The combined sections are aligned to their original alignment in
+ * the combined section.  Any padded bytes to get the specified alignment are
+ * zeroed.
+ *
+ * The format of the relocation entries referenced by the reloff and nreloc
+ * fields of the section structure for mach object files is described in the
+ * header file <reloc.h>.
+ */
+struct section { /* for 32-bit architectures */
+	char		sectname[16];	/* name of this section */
+	char		segname[16];	/* segment this section goes in */
+	uint32_t	addr;		/* memory address of this section */
+	uint32_t	size;		/* size in bytes of this section */
+	uint32_t	offset;		/* file offset of this section */
+	uint32_t	align;		/* section alignment (power of 2) */
+	uint32_t	reloff;		/* file offset of relocation entries */
+	uint32_t	nreloc;		/* number of relocation entries */
+	uint32_t	flags;		/* flags (section type and attributes)*/
+	uint32_t	reserved1;	/* reserved (for offset or index) */
+	uint32_t	reserved2;	/* reserved (for count or sizeof) */
+};
+
+struct section_64 { /* for 64-bit architectures */
+	char		sectname[16];	/* name of this section */
+	char		segname[16];	/* segment this section goes in */
+	uint64_t	addr;		/* memory address of this section */
+	uint64_t	size;		/* size in bytes of this section */
+	uint32_t	offset;		/* file offset of this section */
+	uint32_t	align;		/* section alignment (power of 2) */
+	uint32_t	reloff;		/* file offset of relocation entries */
+	uint32_t	nreloc;		/* number of relocation entries */
+	uint32_t	flags;		/* flags (section type and attributes)*/
+	uint32_t	reserved1;	/* reserved (for offset or index) */
+	uint32_t	reserved2;	/* reserved (for count or sizeof) */
+	uint32_t	reserved3;	/* reserved */
+};
+
+/*
+ * The flags field of a section structure is separated into two parts a section
+ * type and section attributes.  The section types are mutually exclusive (it
+ * can only have one type) but the section attributes are not (it may have more
+ * than one attribute).
+ */
+#define SECTION_TYPE		 0x000000ff	/* 256 section types */
+#define SECTION_ATTRIBUTES	 0xffffff00	/*  24 section attributes */
+
+/* Constants for the type of a section */
+#define	S_REGULAR		0x0	/* regular section */
+#define	S_ZEROFILL		0x1	/* zero fill on demand section */
+#define	S_CSTRING_LITERALS	0x2	/* section with only literal C strings*/
+#define	S_4BYTE_LITERALS	0x3	/* section with only 4 byte literals */
+#define	S_8BYTE_LITERALS	0x4	/* section with only 8 byte literals */
+#define	S_LITERAL_POINTERS	0x5	/* section with only pointers to */
+					/*  literals */
+/*
+ * For the two types of symbol pointers sections and the symbol stubs section
+ * they have indirect symbol table entries.  For each of the entries in the
+ * section the indirect symbol table entries, in corresponding order in the
+ * indirect symbol table, start at the index stored in the reserved1 field
+ * of the section structure.  Since the indirect symbol table entries
+ * correspond to the entries in the section the number of indirect symbol table
+ * entries is inferred from the size of the section divided by the size of the
+ * entries in the section.  For symbol pointers sections the size of the entries
+ * in the section is 4 bytes and for symbol stubs sections the byte size of the
+ * stubs is stored in the reserved2 field of the section structure.
+ */
+#define	S_NON_LAZY_SYMBOL_POINTERS	0x6	/* section with only non-lazy
+						   symbol pointers */
+#define	S_LAZY_SYMBOL_POINTERS		0x7	/* section with only lazy symbol
+						   pointers */
+#define	S_SYMBOL_STUBS			0x8	/* section with only symbol
+						   stubs, byte size of stub in
+						   the reserved2 field */
+#define	S_MOD_INIT_FUNC_POINTERS	0x9	/* section with only function
+						   pointers for initialization*/
+#define	S_MOD_TERM_FUNC_POINTERS	0xa	/* section with only function
+						   pointers for termination */
+#define	S_COALESCED			0xb	/* section contains symbols that
+						   are to be coalesced */
+#define	S_GB_ZEROFILL			0xc	/* zero fill on demand section
+						   (that can be larger than 4
+						   gigabytes) */
+#define	S_INTERPOSING			0xd	/* section with only pairs of
+						   function pointers for
+						   interposing */
+#define	S_16BYTE_LITERALS		0xe	/* section with only 16 byte
+						   literals */
+#define	S_DTRACE_DOF			0xf	/* section contains 
+						   DTrace Object Format */
+#define	S_LAZY_DYLIB_SYMBOL_POINTERS	0x10	/* section with only lazy
+						   symbol pointers to lazy
+						   loaded dylibs */
+/*
+ * Section types to support thread local variables
+ */
+#define S_THREAD_LOCAL_REGULAR                   0x11  /* template of initial 
+							  values for TLVs */
+#define S_THREAD_LOCAL_ZEROFILL                  0x12  /* template of initial 
+							  values for TLVs */
+#define S_THREAD_LOCAL_VARIABLES                 0x13  /* TLV descriptors */
+#define S_THREAD_LOCAL_VARIABLE_POINTERS         0x14  /* pointers to TLV 
+                                                          descriptors */
+#define S_THREAD_LOCAL_INIT_FUNCTION_POINTERS    0x15  /* functions to call
+							  to initialize TLV
+							  values */
+#define S_INIT_FUNC_OFFSETS                      0x16  /* 32-bit offsets to
+							  initializers */
+
+/*
+ * Constants for the section attributes part of the flags field of a section
+ * structure.
+ */
+#define SECTION_ATTRIBUTES_USR	 0xff000000	/* User setable attributes */
+#define S_ATTR_PURE_INSTRUCTIONS 0x80000000	/* section contains only true
+						   machine instructions */
+#define S_ATTR_NO_TOC 		 0x40000000	/* section contains coalesced
+						   symbols that are not to be
+						   in a ranlib table of
+						   contents */
+#define S_ATTR_STRIP_STATIC_SYMS 0x20000000	/* ok to strip static symbols
+						   in this section in files
+						   with the MH_DYLDLINK flag */
+#define S_ATTR_NO_DEAD_STRIP	 0x10000000	/* no dead stripping */
+#define S_ATTR_LIVE_SUPPORT	 0x08000000	/* blocks are live if they
+						   reference live blocks */
+#define S_ATTR_SELF_MODIFYING_CODE 0x04000000	/* Used with i386 code stubs
+						   written on by dyld */
+/*
+ * If a segment contains any sections marked with S_ATTR_DEBUG then all
+ * sections in that segment must have this attribute.  No section other than
+ * a section marked with this attribute may reference the contents of this
+ * section.  A section with this attribute may contain no symbols and must have
+ * a section type S_REGULAR.  The static linker will not copy section contents
+ * from sections with this attribute into its output file.  These sections
+ * generally contain DWARF debugging info.
+ */ 
+#define	S_ATTR_DEBUG		 0x02000000	/* a debug section */
+#define SECTION_ATTRIBUTES_SYS	 0x00ffff00	/* system setable attributes */
+#define S_ATTR_SOME_INSTRUCTIONS 0x00000400	/* section contains some
+						   machine instructions */
+#define S_ATTR_EXT_RELOC	 0x00000200	/* section has external
+						   relocation entries */
+#define S_ATTR_LOC_RELOC	 0x00000100	/* section has local
+						   relocation entries */
+
+
+/*
+ * The names of segments and sections in them are mostly meaningless to the
+ * link-editor.  But there are few things to support traditional UNIX
+ * executables that require the link-editor and assembler to use some names
+ * agreed upon by convention.
+ *
+ * The initial protection of the "__TEXT" segment has write protection turned
+ * off (not writeable).
+ *
+ * The link-editor will allocate common symbols at the end of the "__common"
+ * section in the "__DATA" segment.  It will create the section and segment
+ * if needed.
+ */
+
+/* The currently known segment names and the section names in those segments */
+
+#define	SEG_PAGEZERO	"__PAGEZERO"	/* the pagezero segment which has no */
+					/* protections and catches NULL */
+					/* references for MH_EXECUTE files */
+
+
+#define	SEG_TEXT	"__TEXT"	/* the tradition UNIX text segment */
+#define	SECT_TEXT	"__text"	/* the real text part of the text */
+					/* section no headers, and no padding */
+#define SECT_FVMLIB_INIT0 "__fvmlib_init0"	/* the fvmlib initialization */
+						/*  section */
+#define SECT_FVMLIB_INIT1 "__fvmlib_init1"	/* the section following the */
+					        /*  fvmlib initialization */
+						/*  section */
+
+#define	SEG_DATA	"__DATA"	/* the tradition UNIX data segment */
+#define	SECT_DATA	"__data"	/* the real initialized data section */
+					/* no padding, no bss overlap */
+#define	SECT_BSS	"__bss"		/* the real uninitialized data section*/
+					/* no padding */
+#define SECT_COMMON	"__common"	/* the section common symbols are */
+					/* allocated in by the link editor */
+
+#define	SEG_OBJC	"__OBJC"	/* objective-C runtime segment */
+#define SECT_OBJC_SYMBOLS "__symbol_table"	/* symbol table */
+#define SECT_OBJC_MODULES "__module_info"	/* module information */
+#define SECT_OBJC_STRINGS "__selector_strs"	/* string table */
+#define SECT_OBJC_REFS "__selector_refs"	/* string table */
+
+#define	SEG_ICON	 "__ICON"	/* the icon segment */
+#define	SECT_ICON_HEADER "__header"	/* the icon headers */
+#define	SECT_ICON_TIFF   "__tiff"	/* the icons in tiff format */
+
+#define	SEG_LINKEDIT	"__LINKEDIT"	/* the segment containing all structs */
+					/* created and maintained by the link */
+					/* editor.  Created with -seglinkedit */
+					/* option to ld(1) for MH_EXECUTE and */
+					/* FVMLIB file types only */
+
+#define SEG_UNIXSTACK	"__UNIXSTACK"	/* the unix stack segment */
+
+#define SEG_IMPORT	"__IMPORT"	/* the segment for the self (dyld) */
+					/* modifing code stubs that has read, */
+					/* write and execute permissions */
+
+typedef int             vm_prot_t;
+
+/*
+ *	Protection values, defined as bits within the vm_prot_t type
+ */
+
+#define VM_PROT_NONE    ((vm_prot_t) 0x00)
+
+#define VM_PROT_READ    ((vm_prot_t) 0x01)      /* read permission */
+#define VM_PROT_WRITE   ((vm_prot_t) 0x02)      /* write permission */
+#define VM_PROT_EXECUTE ((vm_prot_t) 0x04)      /* execute permission */
+
+#define VMPROT_TO_PROT(x)            (MAYBE_MAP_FLAG((x), VM_PROT_EXECUTE, PROT_EXEC) | \
+                                      MAYBE_MAP_FLAG((x), VM_PROT_READ, PROT_READ) | \
+                                      MAYBE_MAP_FLAG((x), VM_PROT_WRITE, PROT_WRITE))
+
+/*
+ * Dynamically linked shared libraries are identified by two things.  The
+ * pathname (the name of the library as found for execution), and the
+ * compatibility version number.  The pathname must match and the compatibility
+ * number in the user of the library must be greater than or equal to the
+ * library being used.  The time stamp is used to record the time a library was
+ * built and copied into user so it can be use to determined if the library used
+ * at runtime is exactly the same as used to built the program.
+ */
+struct dylib {
+    union lc_str  name;			/* library's path name */
+    uint32_t timestamp;			/* library's build time stamp */
+    uint32_t current_version;		/* library's current version number */
+    uint32_t compatibility_version;	/* library's compatibility vers number*/
+};
+
+/*
+ * A dynamically linked shared library (filetype == MH_DYLIB in the mach header)
+ * contains a dylib_command (cmd == LC_ID_DYLIB) to identify the library.
+ * An object that uses a dynamically linked shared library also contains a
+ * dylib_command (cmd == LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, or
+ * LC_REEXPORT_DYLIB) for each library it uses.
+ */
+struct dylib_command {
+	uint32_t	cmd;		/* LC_ID_DYLIB, LC_LOAD_{,WEAK_}DYLIB,
+					   LC_REEXPORT_DYLIB */
+	uint32_t	cmdsize;	/* includes pathname string */
+	struct dylib	dylib;		/* the library identification */
+};
+
+/*
+ * The symtab_command contains the offsets and sizes of the link-edit 4.3BSD
+ * "stab" style symbol table information as described in the header files
+ * <nlist.h> and <stab.h>.
+ */
+struct symtab_command {
+	uint32_t	cmd;		/* LC_SYMTAB */
+	uint32_t	cmdsize;	/* sizeof(struct symtab_command) */
+	uint32_t	symoff;		/* symbol table offset */
+	uint32_t	nsyms;		/* number of symbol table entries */
+	uint32_t	stroff;		/* string table offset */
+	uint32_t	strsize;	/* string table size in bytes */
+};
+
+/*
+ * Format of a symbol table entry of a Mach-O file for 32-bit architectures.
+ * Modified from the BSD format.  The modifications from the original format
+ * were changing n_other (an unused field) to n_sect and the addition of the
+ * N_SECT type.  These modifications are required to support symbols in a larger
+ * number of sections not just the three sections (text, data and bss) in a BSD
+ * file.
+ */
+struct nlist {
+	union {
+#ifndef __LP64__
+		char *n_name;	/* for use when in-core */
+#endif
+		uint32_t n_strx;	/* index into the string table */
+	} n_un;
+	uint8_t n_type;		/* type flag, see below */
+	uint8_t n_sect;		/* section number or NO_SECT */
+	int16_t n_desc;		/* see <mach-o/stab.h> */
+	uint32_t n_value;	/* value of this symbol (or stab offset) */
+};
+
+/*
+ * This is the symbol table entry structure for 64-bit architectures.
+ */
+struct nlist_64 {
+    union {
+        uint32_t  n_strx; /* index into the string table */
+    } n_un;
+    uint8_t n_type;        /* type flag, see below */
+    uint8_t n_sect;        /* section number or NO_SECT */
+    uint16_t n_desc;       /* see <mach-o/stab.h> */
+    uint64_t n_value;      /* value of this symbol (or stab offset) */
+};
+
+/*
+ * This is the second set of the symbolic information which is used to support
+ * the data structures for the dynamically link editor.
+ *
+ * The original set of symbolic information in the symtab_command which contains
+ * the symbol and string tables must also be present when this load command is
+ * present.  When this load command is present the symbol table is organized
+ * into three groups of symbols:
+ *	local symbols (static and debugging symbols) - grouped by module
+ *	defined external symbols - grouped by module (sorted by name if not lib)
+ *	undefined external symbols (sorted by name if MH_BINDATLOAD is not set,
+ *	     			    and in order the were seen by the static
+ *				    linker if MH_BINDATLOAD is set)
+ * In this load command there are offsets and counts to each of the three groups
+ * of symbols.
+ *
+ * This load command contains a the offsets and sizes of the following new
+ * symbolic information tables:
+ *	table of contents
+ *	module table
+ *	reference symbol table
+ *	indirect symbol table
+ * The first three tables above (the table of contents, module table and
+ * reference symbol table) are only present if the file is a dynamically linked
+ * shared library.  For executable and object modules, which are files
+ * containing only one module, the information that would be in these three
+ * tables is determined as follows:
+ * 	table of contents - the defined external symbols are sorted by name
+ *	module table - the file contains only one module so everything in the
+ *		       file is part of the module.
+ *	reference symbol table - is the defined and undefined external symbols
+ *
+ * For dynamically linked shared library files this load command also contains
+ * offsets and sizes to the pool of relocation entries for all sections
+ * separated into two groups:
+ *	external relocation entries
+ *	local relocation entries
+ * For executable and object modules the relocation entries continue to hang
+ * off the section structures.
+ */
+struct dysymtab_command {
+    uint32_t cmd;	/* LC_DYSYMTAB */
+    uint32_t cmdsize;	/* sizeof(struct dysymtab_command) */
+
+    /*
+     * The symbols indicated by symoff and nsyms of the LC_SYMTAB load command
+     * are grouped into the following three groups:
+     *    local symbols (further grouped by the module they are from)
+     *    defined external symbols (further grouped by the module they are from)
+     *    undefined symbols
+     *
+     * The local symbols are used only for debugging.  The dynamic binding
+     * process may have to use them to indicate to the debugger the local
+     * symbols for a module that is being bound.
+     *
+     * The last two groups are used by the dynamic binding process to do the
+     * binding (indirectly through the module table and the reference symbol
+     * table when this is a dynamically linked shared library file).
+     */
+    uint32_t ilocalsym;	/* index to local symbols */
+    uint32_t nlocalsym;	/* number of local symbols */
+
+    uint32_t iextdefsym;/* index to externally defined symbols */
+    uint32_t nextdefsym;/* number of externally defined symbols */
+
+    uint32_t iundefsym;	/* index to undefined symbols */
+    uint32_t nundefsym;	/* number of undefined symbols */
+
+    /*
+     * For the for the dynamic binding process to find which module a symbol
+     * is defined in the table of contents is used (analogous to the ranlib
+     * structure in an archive) which maps defined external symbols to modules
+     * they are defined in.  This exists only in a dynamically linked shared
+     * library file.  For executable and object modules the defined external
+     * symbols are sorted by name and is use as the table of contents.
+     */
+    uint32_t tocoff;	/* file offset to table of contents */
+    uint32_t ntoc;	/* number of entries in table of contents */
+
+    /*
+     * To support dynamic binding of "modules" (whole object files) the symbol
+     * table must reflect the modules that the file was created from.  This is
+     * done by having a module table that has indexes and counts into the merged
+     * tables for each module.  The module structure that these two entries
+     * refer to is described below.  This exists only in a dynamically linked
+     * shared library file.  For executable and object modules the file only
+     * contains one module so everything in the file belongs to the module.
+     */
+    uint32_t modtaboff;	/* file offset to module table */
+    uint32_t nmodtab;	/* number of module table entries */
+
+    /*
+     * To support dynamic module binding the module structure for each module
+     * indicates the external references (defined and undefined) each module
+     * makes.  For each module there is an offset and a count into the
+     * reference symbol table for the symbols that the module references.
+     * This exists only in a dynamically linked shared library file.  For
+     * executable and object modules the defined external symbols and the
+     * undefined external symbols indicates the external references.
+     */
+    uint32_t extrefsymoff;	/* offset to referenced symbol table */
+    uint32_t nextrefsyms;	/* number of referenced symbol table entries */
+
+    /*
+     * The sections that contain "symbol pointers" and "routine stubs" have
+     * indexes and (implied counts based on the size of the section and fixed
+     * size of the entry) into the "indirect symbol" table for each pointer
+     * and stub.  For every section of these two types the index into the
+     * indirect symbol table is stored in the section header in the field
+     * reserved1.  An indirect symbol table entry is simply a 32bit index into
+     * the symbol table to the symbol that the pointer or stub is referring to.
+     * The indirect symbol table is ordered to match the entries in the section.
+     */
+    uint32_t indirectsymoff; /* file offset to the indirect symbol table */
+    uint32_t nindirectsyms;  /* number of indirect symbol table entries */
+
+    /*
+     * To support relocating an individual module in a library file quickly the
+     * external relocation entries for each module in the library need to be
+     * accessed efficiently.  Since the relocation entries can't be accessed
+     * through the section headers for a library file they are separated into
+     * groups of local and external entries further grouped by module.  In this
+     * case the presents of this load command who's extreloff, nextrel,
+     * locreloff and nlocrel fields are non-zero indicates that the relocation
+     * entries of non-merged sections are not referenced through the section
+     * structures (and the reloff and nreloc fields in the section headers are
+     * set to zero).
+     *
+     * Since the relocation entries are not accessed through the section headers
+     * this requires the r_address field to be something other than a section
+     * offset to identify the item to be relocated.  In this case r_address is
+     * set to the offset from the vmaddr of the first LC_SEGMENT command.
+     * For MH_SPLIT_SEGS images r_address is set to the the offset from the
+     * vmaddr of the first read-write LC_SEGMENT command.
+     *
+     * The relocation entries are grouped by module and the module table
+     * entries have indexes and counts into them for the group of external
+     * relocation entries for that the module.
+     *
+     * For sections that are merged across modules there must not be any
+     * remaining external relocation entries for them (for merged sections
+     * remaining relocation entries must be local).
+     */
+    uint32_t extreloff;	/* offset to external relocation entries */
+    uint32_t nextrel;	/* number of external relocation entries */
+
+    /*
+     * All the local relocation entries are grouped together (they are not
+     * grouped by their module since they are only used if the object is moved
+     * from it staticly link edited address).
+     */
+    uint32_t locreloff;	/* offset to local relocation entries */
+    uint32_t nlocrel;	/* number of local relocation entries */
+
+};
+
+/*
+ * The linkedit_data_command contains the offsets and sizes of a blob
+ * of data in the __LINKEDIT segment.  
+ */
+struct linkedit_data_command {
+    uint32_t	cmd;		/* LC_CODE_SIGNATURE, LC_SEGMENT_SPLIT_INFO,
+				   LC_FUNCTION_STARTS, LC_DATA_IN_CODE,
+				   LC_DYLIB_CODE_SIGN_DRS, LC_ATOM_INFO,
+				   LC_LINKER_OPTIMIZATION_HINT,
+				   LC_DYLD_EXPORTS_TRIE, or
+				   LC_DYLD_CHAINED_FIXUPS. */
+    uint32_t	cmdsize;	/* sizeof(struct linkedit_data_command) */
+    uint32_t	dataoff;	/* file offset of data in __LINKEDIT segment */
+    uint32_t	datasize;	/* file size of data in __LINKEDIT segment  */
+};
+
+// header of the LC_DYLD_CHAINED_FIXUPS payload
+struct dyld_chained_fixups_header
+{
+    uint32_t    fixups_version;    // 0
+    uint32_t    starts_offset;     // offset of dyld_chained_starts_in_image in chain_data
+    uint32_t    imports_offset;    // offset of imports table in chain_data
+    uint32_t    symbols_offset;    // offset of symbol strings in chain_data
+    uint32_t    imports_count;     // number of imported symbol names
+    uint32_t    imports_format;    // DYLD_CHAINED_IMPORT*
+    uint32_t    symbols_format;    // 0 => uncompressed, 1 => zlib compressed
+};
+
+// This struct is embedded in LC_DYLD_CHAINED_FIXUPS payload
+struct dyld_chained_starts_in_image
+{
+    uint32_t    seg_count;
+    uint32_t    seg_info_offset[1];  // each entry is offset into this struct for that segment
+    // followed by pool of dyld_chain_starts_in_segment data
+};
+
+// This struct is embedded in dyld_chain_starts_in_image
+// and passed down to the kernel for page-in linking
+struct dyld_chained_starts_in_segment
+{
+    uint32_t    size;               // size of this (amount kernel needs to copy)
+    uint16_t    page_size;          // 0x1000 or 0x4000
+    uint16_t    pointer_format;     // DYLD_CHAINED_PTR_*
+    uint64_t    segment_offset;     // offset in memory to start of segment
+    uint32_t    max_valid_pointer;  // for 32-bit OS, any value beyond this is not a pointer
+    uint16_t    page_count;         // how many pages are in array
+    uint16_t    page_start[1];      // each entry is offset in each page of first element in chain
+                                    // or DYLD_CHAINED_PTR_START_NONE if no fixups on page
+ // uint16_t    chain_starts[1];    // some 32-bit formats may require multiple starts per page.
+                                    // for those, if high bit is set in page_starts[], then it
+                                    // is index into chain_starts[] which is a list of starts
+                                    // the last of which has the high bit set
+};
+
+enum {
+    DYLD_CHAINED_PTR_START_NONE   = 0xFFFF, // used in page_start[] to denote a page with no fixups
+    DYLD_CHAINED_PTR_START_MULTI  = 0x8000, // used in page_start[] to denote a page which has multiple starts
+    DYLD_CHAINED_PTR_START_LAST   = 0x8000, // used in chain_starts[] to denote last start in list for page
+};
+
+// This struct is embedded in __TEXT,__chain_starts section in firmware
+struct dyld_chained_starts_offsets
+{
+    uint32_t    pointer_format;     // DYLD_CHAINED_PTR_32_FIRMWARE
+    uint32_t    starts_count;       // number of starts in array
+    uint32_t    chain_starts[1];    // array chain start offsets
+};
+
+
+// values for dyld_chained_starts_in_segment.pointer_format
+enum {
+    DYLD_CHAINED_PTR_ARM64E                 =  1,    // stride 8, unauth target is vmaddr
+    DYLD_CHAINED_PTR_64                     =  2,    // target is vmaddr
+    DYLD_CHAINED_PTR_32                     =  3,
+    DYLD_CHAINED_PTR_32_CACHE               =  4,
+    DYLD_CHAINED_PTR_32_FIRMWARE            =  5,
+    DYLD_CHAINED_PTR_64_OFFSET              =  6,    // target is vm offset
+    DYLD_CHAINED_PTR_ARM64E_OFFSET          =  7,    // old name
+    DYLD_CHAINED_PTR_ARM64E_KERNEL          =  7,    // stride 4, unauth target is vm offset
+    DYLD_CHAINED_PTR_64_KERNEL_CACHE        =  8,
+    DYLD_CHAINED_PTR_ARM64E_USERLAND        =  9,    // stride 8, unauth target is vm offset
+    DYLD_CHAINED_PTR_ARM64E_FIRMWARE        = 10,    // stride 4, unauth target is vmaddr
+    DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE    = 11,    // stride 1, x86_64 kernel caches
+    DYLD_CHAINED_PTR_ARM64E_USERLAND24      = 12,    // stride 8, unauth target is vm offset, 24-bit bind
+    DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE    = 13,    // stride 8, regular/auth targets both vm offsets.  Only A keys supported
+};
+
+// DYLD_CHAINED_PTR_ARM64E
+struct dyld_chained_ptr_arm64e_rebase
+{
+    uint64_t    target   : 43,
+                high8    :  8,
+                next     : 11,    // 4 or 8-byte stide
+                bind     :  1,    // == 0
+                auth     :  1;    // == 0
+};
+
+// DYLD_CHAINED_PTR_ARM64E
+struct dyld_chained_ptr_arm64e_bind
+{
+    uint64_t    ordinal   : 16,
+                zero      : 16,
+                addend    : 19,    // +/-256K
+                next      : 11,    // 4 or 8-byte stide
+                bind      :  1,    // == 1
+                auth      :  1;    // == 0
+};
+
+// DYLD_CHAINED_PTR_ARM64E
+struct dyld_chained_ptr_arm64e_auth_rebase
+{
+    uint64_t    target    : 32,   // runtimeOffset
+                diversity : 16,
+                addrDiv   :  1,
+                key       :  2,
+                next      : 11,    // 4 or 8-byte stide
+                bind      :  1,    // == 0
+                auth      :  1;    // == 1
+};
+
+// DYLD_CHAINED_PTR_ARM64E
+struct dyld_chained_ptr_arm64e_auth_bind
+{
+    uint64_t    ordinal   : 16,
+                zero      : 16,
+                diversity : 16,
+                addrDiv   :  1,
+                key       :  2,
+                next      : 11,    // 4 or 8-byte stide
+                bind      :  1,    // == 1
+                auth      :  1;    // == 1
+};
+
+// DYLD_CHAINED_PTR_64/DYLD_CHAINED_PTR_64_OFFSET
+struct dyld_chained_ptr_64_rebase
+{
+    uint64_t    target    : 36,    // 64GB max image size (DYLD_CHAINED_PTR_64 => vmAddr, DYLD_CHAINED_PTR_64_OFFSET => runtimeOffset)
+                high8     :  8,    // top 8 bits set to this (DYLD_CHAINED_PTR_64 => after slide added, DYLD_CHAINED_PTR_64_OFFSET => before slide added)
+                reserved  :  7,    // all zeros
+                next      : 12,    // 4-byte stride
+                bind      :  1;    // == 0
+};
+
+
+// DYLD_CHAINED_PTR_ARM64E_USERLAND24
+struct dyld_chained_ptr_arm64e_bind24
+{
+    uint64_t    ordinal   : 24,
+                zero      :  8,
+                addend    : 19,    // +/-256K
+                next      : 11,    // 8-byte stide
+                bind      :  1,    // == 1
+                auth      :  1;    // == 0
+};
+
+// DYLD_CHAINED_PTR_ARM64E_USERLAND24
+struct dyld_chained_ptr_arm64e_auth_bind24
+{
+    uint64_t    ordinal   : 24,
+                zero      :  8,
+                diversity : 16,
+                addrDiv   :  1,
+                key       :  2,
+                next      : 11,    // 8-byte stide
+                bind      :  1,    // == 1
+                auth      :  1;    // == 1
+};
+
+
+// DYLD_CHAINED_PTR_64
+struct dyld_chained_ptr_64_bind
+{
+    uint64_t    ordinal   : 24,
+                addend    :  8,   // 0 thru 255
+                reserved  : 19,   // all zeros
+                next      : 12,   // 4-byte stride
+                bind      :  1;   // == 1
+};
+
+// DYLD_CHAINED_PTR_64_KERNEL_CACHE, DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE
+struct dyld_chained_ptr_64_kernel_cache_rebase
+{
+    uint64_t    target     : 30,   // basePointers[cacheLevel] + target
+                cacheLevel :  2,   // what level of cache to bind to (indexes a mach_header array)
+                diversity  : 16,
+                addrDiv    :  1,
+                key        :  2,
+                next       : 12,    // 1 or 4-byte stide
+                isAuth     :  1;    // 0 -> not authenticated.  1 -> authenticated
+};
+
+// DYLD_CHAINED_PTR_32
+// Note: for DYLD_CHAINED_PTR_32 some non-pointer values are co-opted into the chain
+// as out of range rebases.  If an entry in the chain is > max_valid_pointer, then it
+// is not a pointer.  To restore the value, subtract off the bias, which is
+// (64MB+max_valid_pointer)/2.
+struct dyld_chained_ptr_32_rebase
+{
+    uint32_t    target    : 26,   // vmaddr, 64MB max image size
+                next      :  5,   // 4-byte stride
+                bind      :  1;   // == 0
+};
+
+// DYLD_CHAINED_PTR_32
+struct dyld_chained_ptr_32_bind
+{
+    uint32_t    ordinal   : 20,
+                addend    :  6,   // 0 thru 63
+                next      :  5,   // 4-byte stride
+                bind      :  1;   // == 1
+};
+
+// DYLD_CHAINED_PTR_32_CACHE
+struct dyld_chained_ptr_32_cache_rebase
+{
+    uint32_t    target    : 30,   // 1GB max dyld cache TEXT and DATA
+                next      :  2;   // 4-byte stride
+};
+
+
+// DYLD_CHAINED_PTR_32_FIRMWARE
+struct dyld_chained_ptr_32_firmware_rebase
+{
+    uint32_t    target   : 26,   // 64MB max firmware TEXT and DATA
+                next     :  6;   // 4-byte stride
+};
+
+// DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE
+struct dyld_chained_ptr_arm64e_shared_cache_rebase
+{
+    uint64_t    runtimeOffset   : 34,   // offset from the start of the shared cache
+                high8           :  8,
+                unused          : 10,
+                next            : 11,   // 8-byte stide
+                auth            :  1;   // == 0
+};
+
+// DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE
+struct dyld_chained_ptr_arm64e_shared_cache_auth_rebase
+{
+    uint64_t    runtimeOffset   : 34,   // offset from the start of the shared cache
+                diversity       : 16,
+                addrDiv         :  1,
+                keyIsData       :  1,   // implicitly always the 'A' key.  0 -> IA.  1 -> DA
+                next            : 11,   // 8-byte stide
+                auth            :  1;   // == 1
+};
+
+
+
+// values for dyld_chained_fixups_header.imports_format
+enum {
+    DYLD_CHAINED_IMPORT          = 1,
+    DYLD_CHAINED_IMPORT_ADDEND   = 2,
+    DYLD_CHAINED_IMPORT_ADDEND64 = 3,
+};
+
+// DYLD_CHAINED_IMPORT
+struct dyld_chained_import
+{
+    uint32_t    lib_ordinal :  8,   // -15 .. 240 (0xF1 .. 0xF0)
+                weak_import :  1,
+                name_offset : 23;
+};
+
+// DYLD_CHAINED_IMPORT_ADDEND
+struct dyld_chained_import_addend
+{
+    uint32_t    lib_ordinal :  8,   // -15 .. 240 (0xF1 .. 0xF0)
+                weak_import :  1,
+                name_offset : 23;
+    int32_t     addend;
+};
+
+// DYLD_CHAINED_IMPORT_ADDEND64
+struct dyld_chained_import_addend64
+{
+    uint64_t    lib_ordinal : 16,   // -15 .. 65520 (0xFFF1 .. 0xFFF0)
+                weak_import :  1,
+                reserved    : 15,
+                name_offset : 32;
+    uint64_t    addend;
+};
+
 /* -------------------- Options -------------------- */
 
-static void *malloc_wrapper(void *, size_t size)             { return malloc(size); }
-static void  free_wrapper(void *, void *ptr)                 { return free(ptr); }
-static void *realloc_wrapper(void *, void *ptr, size_t size) { return realloc(ptr, size); }
+static void *malloc_wrapper(void *arg, size_t size)             { return malloc(size); }
+static void  free_wrapper(void *arg, void *ptr)                 { return free(ptr); }
+static void *realloc_wrapper(void *arg, void *ptr, size_t size) { return realloc(ptr, size); }
 
-static int     open_wrapper(void *, const char *name)                { return open(name, O_RDONLY); }
-static int     close_wrapper(void *, int fd)                         { return close(fd); }
-static ssize_t read_wrapper(void *, int fd, void *buf, size_t count) { return read(fd, buf, count); }
-static int     fstat_wrapper(void *, int fd, struct stat *statbuf)   { return fstat(fd, statbuf); }
+static int     open_wrapper(void *arg, const char *name)                { return open(name, O_RDONLY); }
+static int     close_wrapper(void *arg, int fd)                         { return close(fd); }
+static ssize_t read_wrapper(void *arg, int fd, void *buf, size_t count) { return read(fd, buf, count); }
+static int     fstat_wrapper(void *arg, int fd, struct stat *statbuf)   { return fstat(fd, statbuf); }
 
-static void *mmap_wrapper(void *, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return mmap(hint, length, prot, flags, fd, offset); }
-static int   munmap_wrapper(void *, void *addr, size_t size)                                            { return munmap(addr, size); }
-static int   mprotect_wrapper(void *, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
+static void *mmap_wrapper(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return mmap(hint, length, prot, flags, fd, offset); }
+static int   munmap_wrapper(void *arg, void *addr, size_t size)                                            { return munmap(addr, size); }
+static int   mprotect_wrapper(void *arg, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
 
 static struct ulinker_ops uo = {
     .uo_malloc = malloc_wrapper,
@@ -688,7 +1799,8 @@ struct ulinker {
 
 enum {
     DLT_EMULATED,
-    DLT_ELF64
+    DLT_ELF64,
+    DLT_MACHO64
 };
 
 #define DLINFO_NAME_LEN 128
@@ -738,6 +1850,30 @@ struct dlinfo_elf64 {
     Elf64_Rela *dle64_rela;
     size_t      dle64_rela_size;
     size_t      dle64_rela_ent;
+};
+
+struct dlinfo_macho64 {
+    struct dlinfo dlm64_base;
+
+    struct mach_header_64 dlm64_hdr;
+    size_t dlm64_sizeoflc;
+    uintptr_t dlm64_load_bias;
+    const struct load_command *dlm64_lc;
+
+    struct nlist_64 *dlm64_symtab;
+    size_t           dlm64_symtabsize;
+    const char      *dlm64_strtab;
+    size_t           dlm64_strtabsize;
+
+    size_t dlm64_dysymtab_iextdefsym;
+    size_t dlm64_dysymtab_nextdefsym;
+
+    const struct dyld_chained_starts_in_image *dlm64_chainedfixups_starts;
+
+    const char *dlm64_chainedfixups_strtab;
+    int         dlm64_chainedfixups_imports_format;
+    size_t      dlm64_chainedfixups_imports_count;
+    void       *dlm64_chainedfixups_imports;
 };
 
 struct dlinfo_emulated {
@@ -846,12 +1982,33 @@ static void *lookup_symbol_elf64(struct dlinfo_elf64 *dl, const char *s)
     return NULL;
 }
 
+static void *lookup_symbol_macho64(struct dlinfo_macho64 *dl, const char *s)
+{
+    if (!dl->dlm64_symtab)
+        return NULL;
+
+    for (size_t i = dl->dlm64_dysymtab_iextdefsym; i < (dl->dlm64_dysymtab_iextdefsym + dl->dlm64_dysymtab_nextdefsym) && i < dl->dlm64_symtabsize; i++) {
+        struct nlist_64 *n = &dl->dlm64_symtab[i];
+        if (!n->n_un.n_strx)
+            continue;
+        const char *sym_name = &dl->dlm64_strtab[n->n_un.n_strx];
+        // skip the leading underscore
+        if (0 == strcmp(s, sym_name+1))
+            return (void *)(dl->dlm64_load_bias + n->n_value);
+    }
+
+    return NULL;
+}
+
 static void *lookup_symbol(struct dlinfo *dl, const char *s)
 {
     if (dl->dl_type == DLT_EMULATED) 
         return lookup_symbol_emulated((struct dlinfo_emulated *)dl, s);
     if (dl->dl_type == DLT_ELF64)
         return lookup_symbol_elf64((struct dlinfo_elf64 *)dl, s);
+    if (dl->dl_type == DLT_MACHO64)
+        return lookup_symbol_macho64((struct dlinfo_macho64 *)dl, s);
+    ERROR("symbol \"%s\" not found: unknown dl_type %d", s, dl->dl_type);
     return NULL;
 }
 
@@ -1024,7 +2181,7 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
             goto out;
         }
 
-        if (file_end >= (size_t)file_size) {
+        if (file_end > (size_t)file_size) {
             ERROR("failed to load ELF \"%s\": load segment[%zd]:"
                 " p_offset (%p) + p_filesz (%p) ( = %p) past end of file (0x%zx)",
                 filename, i, (void *)curr_phdr->p_offset,
@@ -1243,6 +2400,297 @@ out:
     return ret;
 }
 
+static void free_macho64_library(struct dlinfo_macho64 *dl)
+{
+    if (DLBASE(dl)->dl_base) {
+        uo.uo_munmap(DLPRIVATE(dl), DLBASE(dl)->dl_base, DLBASE(dl)->dl_size);
+        DLBASE(dl)->dl_base = NULL;
+        DLBASE(dl)->dl_size = 0;
+    }
+    uo.uo_free(DLPRIVATE(dl), dl);
+}
+
+static uintptr_t vaddr_macho64(struct dlinfo_macho64 *dl, uint32_t fileoff)
+{
+    const struct load_command *curr_lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd != LC_SEGMENT_64)
+            continue;
+        
+        const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+        if (fileoff < curr_sc->fileoff || fileoff >= (curr_sc->fileoff + curr_sc->filesize))
+            continue;
+
+        return dl->dlm64_load_bias + curr_sc->vmaddr + fileoff - curr_sc->fileoff;
+    }
+
+    return 0;
+}
+
+static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size)
+{
+    struct dlinfo *ret = NULL;
+    struct dlinfo_macho64 *dl = NULL;
+    void* hdr_mmap = MAP_FAILED;
+    size_t hdr_size = 0;
+
+    if (!(dl = uo.uo_malloc(ulinker->ul_private, sizeof(struct dlinfo_macho64)))) {
+        ERROR("failed to open \"%s\": -%d (%s)", filename, ENOMEM, strerror(ENOMEM));
+        goto out;
+    }
+
+    memset(dl, 0, sizeof(*dl));
+    DLBASE(dl)->dl_type = DLT_MACHO64;
+    DLPRIVATE(dl) = ulinker->ul_private;
+
+    dl->dlm64_hdr.magic = MH_MAGIC_64;
+
+    if ((sizeof(struct mach_header_64) - 4) != uo.uo_read(ulinker->ul_private, fd, ((uint8_t *)&dl->dlm64_hdr) + 4, sizeof(struct mach_header_64) - 4)) {
+        ERROR("failed to read Mach-O header \"%s\": -%d (%s)", filename, errno, strerror(errno));
+        goto out;
+    }
+
+    if (dl->dlm64_hdr.filetype != MH_DYLIB) {
+        ERROR("failed to load Mach-O \"%s\": unexpected filetype: %d", filename, dl->dlm64_hdr.filetype);
+        goto out;
+    }
+
+    // map the header and load commands
+
+    dl->dlm64_sizeoflc = dl->dlm64_hdr.sizeofcmds;
+    hdr_size = page_end(sizeof(struct mach_header_64) + dl->dlm64_sizeoflc);
+
+    if (MAP_FAILED == (hdr_mmap = uo.uo_mmap(ulinker->ul_private, NULL, hdr_size, PROT_READ, MAP_PRIVATE, fd, 0))) {
+        ERROR("failed to map ELF phdr \"%s\" (size 0x%zx): -%d (%s)", filename, hdr_size, errno, strerror(errno));
+        goto out;
+    }
+
+    struct load_command *lc = (struct load_command *)((uintptr_t)hdr_mmap + sizeof(struct mach_header_64));
+    const struct load_command *curr_lc = NULL;
+    // reserve virtual range for library
+
+    Elf64_Addr min_vaddr = UINTPTR_MAX;
+    Elf64_Addr max_vaddr = 0;
+
+    int found_lc_segment = 0;
+    curr_lc = lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd != LC_SEGMENT_64) {
+            continue;
+        }
+        found_lc_segment = 1;
+
+        const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+        if (curr_sc->vmaddr < min_vaddr) {
+            min_vaddr = curr_sc->vmaddr;
+        }
+
+        if (curr_sc->vmaddr + curr_sc->vmsize > max_vaddr) {
+            max_vaddr = curr_sc->vmaddr + curr_sc->vmsize;
+        }
+    }
+    if (!found_lc_segment) {
+        min_vaddr = 0;
+    }
+
+    min_vaddr = page_start(min_vaddr);
+    max_vaddr = page_end(max_vaddr);
+
+    size_t load_size = max_vaddr - min_vaddr;
+
+    void *base = uo.uo_mmap(ulinker->ul_private, NULL, load_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (MAP_FAILED == base) {
+        ERROR("failed to map Mach-O \"%s\" (size 0x%zx): -%d (%s)", filename, load_size, errno, strerror(errno));
+        goto out;
+    }
+
+    DLBASE(dl)->dl_base = base;
+    DLBASE(dl)->dl_size = load_size;
+
+    dl->dlm64_load_bias = (uintptr_t)base - min_vaddr;
+
+    // load segments
+
+    curr_lc = lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd != LC_SEGMENT_64) {
+            continue;
+        }
+
+        const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+
+        // Segment addresses in memory.
+        uintptr_t seg_start = curr_sc->vmaddr + dl->dlm64_load_bias;
+        uintptr_t seg_end   = seg_start + curr_sc->vmsize;
+
+        uintptr_t seg_page_start = page_start(seg_start);
+        uintptr_t seg_page_end   = page_end(seg_end);
+
+        uintptr_t seg_file_end   = seg_start + curr_sc->filesize;
+
+        // File offsets.
+        uintptr_t file_start = curr_sc->fileoff;
+        uintptr_t file_end   = file_start + curr_sc->filesize;
+
+        uintptr_t file_page_start = page_start(file_start);
+        uintptr_t file_length = file_end - file_page_start;
+
+        if (file_size <= 0) {
+            ERROR("failed to load Mach-O \"%s\": invalid size 0x%zx", filename, file_size);
+            goto out;
+        }
+
+        if (file_end > (size_t)file_size) {
+            ERROR("failed to load Mach-O \"%s\": segment_command[%zd]:"
+                " fileoff (%p) + filesize (%p) ( = %p) past end of file (0x%zx)",
+                filename, i, (void *)curr_sc->fileoff,
+                (void *)curr_sc->filesize,
+                (void *)file_end, file_size);
+            goto out;
+        }
+
+        if (file_length != 0) {
+            void* seg_addr = uo.uo_mmap(ulinker->ul_private, (void *)seg_page_start,
+                                file_length,
+                                VMPROT_TO_PROT(curr_sc->initprot),
+                                MAP_FIXED|MAP_PRIVATE,
+                                fd,
+                                file_page_start);
+            if (seg_addr == MAP_FAILED) {
+                ERROR("failed to map Mach-O \"%s\" segment_command[%zd]: -%d (%s)", filename, i, errno, strerror(errno));
+                goto out;
+            }
+        }
+
+        // if the segment is writable, and does not end on a page boundary,
+        // zero-fill it until the page limit.
+        if ((curr_sc->initprot & VM_PROT_WRITE) != 0 && page_offset(seg_file_end) > 0) {
+            memset((void *)seg_file_end, 0, page_size() - page_offset(seg_file_end));
+        }
+
+        seg_file_end = page_end(seg_file_end);
+
+        // seg_file_end is now the first page address after the file
+        // content. If seg_end is larger, we need to zero anything
+        // between them. This is done by using a private anonymous
+        // map for all extra pages.
+        if (seg_page_end > seg_file_end) {
+            void* zeromap = uo.uo_mmap(ulinker->ul_private, (void *)seg_file_end,
+                                seg_page_end - seg_file_end,
+                                VMPROT_TO_PROT(curr_sc->initprot),
+                                MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE,
+                                -1,
+                                0);
+            if (zeromap == MAP_FAILED) {
+                ERROR("failed to zero fill Mach-O \"%s\" segment_command[%zd] gap: -%d (%s)", filename, i, errno, strerror(errno));
+                goto out;
+            }
+        }
+    }
+
+    // find phdr as it appears in the loaded segments
+
+    const struct load_command *loaded_lc = NULL;
+
+    // Otherwise, check the first loadable segment. If its file offset
+    // is 0, it starts with the ELF header, and we can trivially find the
+    // loaded program header from it.
+    curr_lc = lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd != LC_SEGMENT_64) {
+            continue;
+        }
+
+        const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+        if (curr_sc->fileoff == 0) {
+            uintptr_t loaded_hdr = (uintptr_t)dl->dlm64_load_bias + curr_sc->vmaddr;
+            loaded_lc = (const struct load_command *)(loaded_hdr + sizeof(struct mach_header_64));
+        }
+        break;
+    }
+
+    if (!loaded_lc) {
+        ERROR("failed to find loaded lc for Mach-O \"%s\"", filename);
+        goto out;
+    }
+
+    // Ensures that our loaded commands are actually within a loadable
+    // segment. This should help catch badly-formed Mach-O files that
+    // would cause the linker to crash later when trying to access it.
+    uintptr_t loaded_end = (uintptr_t)loaded_lc + dl->dlm64_sizeoflc;
+    curr_lc = lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd != LC_SEGMENT_64) {
+            continue;
+        }
+
+        const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+
+        Elf64_Addr seg_start = curr_sc->vmaddr + dl->dlm64_load_bias;
+        Elf64_Addr seg_end = curr_sc->filesize + seg_start;
+        if (seg_start <= (Elf64_Addr)loaded_end && (Elf64_Addr)loaded_end <= seg_end) {
+            dl->dlm64_lc = loaded_lc;
+            break;
+        }
+    }
+
+    if (!dl->dlm64_lc) {
+        ERROR("failed to load ELF\"%s\": loaded phdr %p not in loadable segment", filename, loaded_lc);
+        goto out;
+    }
+
+    ret = (struct dlinfo *)dl;
+
+    // parse additional information from load commands
+
+    curr_lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd == LC_ID_DYLIB) {
+            const struct dylib_command *dc = (const struct dylib_command *)curr_lc;
+            const char *dylib_name = (const char *)dc + dc->dylib.name.offset;
+            strncpy(DLBASE(dl)->dl_name, dylib_name, DLINFO_NAME_LEN - 1);
+        }
+
+        if (curr_lc->cmd == LC_SYMTAB) {
+            const struct symtab_command *symc = (const struct symtab_command *)curr_lc;
+            dl->dlm64_symtab = (struct nlist_64 *)vaddr_macho64(dl, symc->symoff);
+            dl->dlm64_symtabsize = symc->nsyms;
+            dl->dlm64_strtab = (const char *)vaddr_macho64(dl, symc->stroff);
+            dl->dlm64_strtabsize = symc->strsize;
+        }
+
+        if (curr_lc->cmd == LC_DYSYMTAB) {
+            const struct dysymtab_command *dysymc = (const struct dysymtab_command *)curr_lc;
+            dl->dlm64_dysymtab_iextdefsym = dysymc->iextdefsym;
+            dl->dlm64_dysymtab_nextdefsym = dysymc->nextdefsym;
+        }
+
+        if (curr_lc->cmd == LC_DYLD_CHAINED_FIXUPS) {
+            const struct linkedit_data_command *dcfc = (const struct linkedit_data_command *)curr_lc;
+            const struct dyld_chained_fixups_header *dcfhdr = (const struct dyld_chained_fixups_header *)vaddr_macho64(dl, dcfc->dataoff);
+            dl->dlm64_chainedfixups_starts = (const struct dyld_chained_starts_in_image *)(((uintptr_t)dcfhdr) + dcfhdr->starts_offset);
+            dl->dlm64_chainedfixups_strtab = (const char *)(((uintptr_t)dcfhdr) + dcfhdr->symbols_offset);
+            dl->dlm64_chainedfixups_imports = (void *)(((uintptr_t)dcfhdr) + dcfhdr->imports_offset);
+            dl->dlm64_chainedfixups_imports_count = dcfhdr->imports_count;
+            dl->dlm64_chainedfixups_imports_format = dcfhdr->imports_format;
+        }
+    }
+
+out:
+    if (hdr_mmap != MAP_FAILED) {
+        uo.uo_munmap(ulinker->ul_private, hdr_mmap, hdr_size);
+        hdr_mmap = MAP_FAILED;
+        hdr_size = 0;
+    }
+    if (!ret) {
+        if (dl) {
+            free_macho64_library(dl);
+            dl = NULL;
+        }
+    }
+    return ret;
+}
+
 static void free_library(struct dlinfo *dl)
 {
     if (dl->dl_type == DLT_EMULATED) {
@@ -1251,6 +2699,9 @@ static void free_library(struct dlinfo *dl)
     }
     if (dl->dl_type == DLT_ELF64) {
         free_elf64_library((struct dlinfo_elf64 *)dl);
+    }
+    if (dl->dl_type == DLT_MACHO64) {
+        free_macho64_library((struct dlinfo_macho64 *)dl);
     }
     else {
         // TODO abort
@@ -1273,7 +2724,6 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
         return 1;
     }
 
-    PRINT("link_library_elf64: %p %lu %lu", rel_opaque, size, rel_type);
     for (Elf64_Rela *rel = (Elf64_Rela *)rel_opaque; (uintptr_t)(rel + 1) <= (uintptr_t)rel_opaque + size; rel++)
     {
         Elf64_Word type = ELF64_R_TYPE(rel->r_info);
@@ -1351,6 +2801,86 @@ static int link_library_elf64(struct dlinfo_elf64 *dl)
     return 0;
 }
 
+static int link_library_macho64(struct dlinfo_macho64 *dl)
+{
+    if (!dl->dlm64_chainedfixups_imports)
+        return 0;
+
+    if (dl->dlm64_chainedfixups_imports_format != DYLD_CHAINED_IMPORT) {
+        ERROR("failed to link Mach-O \"%s\": unknown chained fixups imports format %d", DLBASE(dl)->dl_name, dl->dlm64_chainedfixups_imports_format);
+        return 1;
+    }
+
+    struct dyld_chained_import *imports = dl->dlm64_chainedfixups_imports;
+
+    uintptr_t starts_base = (uintptr_t)dl->dlm64_chainedfixups_starts;
+    for (uint32_t sg = 0; sg < dl->dlm64_chainedfixups_starts->seg_count; sg++) {
+        uint32_t seg_offset = dl->dlm64_chainedfixups_starts->seg_info_offset[sg];
+        if (seg_offset == 0) {// the mighty undocumented skip {
+            continue;
+        }
+
+        const struct dyld_chained_starts_in_segment *seg_starts = (const struct dyld_chained_starts_in_segment *)(starts_base + seg_offset);
+        uintptr_t segment_address = dl->dlm64_load_bias + seg_starts->segment_offset;
+
+        switch (seg_starts->pointer_format) {
+            case DYLD_CHAINED_PTR_64:
+            case DYLD_CHAINED_PTR_64_OFFSET:
+                break;
+            default:
+                ERROR("failed to link Mach-O \"%s\": unknown pointer format %d for segment %p", DLBASE(dl)->dl_name, seg_starts->pointer_format, (void *)seg_starts->segment_offset);
+                return 1;
+        }
+
+        for (uint32_t pg = 0; pg < seg_starts->page_count; pg++) {
+            if (seg_starts->page_start[pg] == DYLD_CHAINED_PTR_START_NONE)
+                continue;
+
+            union {
+                uintptr_t *ptr8;
+                uint8_t   *ptr1;
+
+                struct dyld_chained_ptr_64_rebase *ptr_64_rebase;
+                struct dyld_chained_ptr_64_bind   *ptr_64_bind;
+            } p;
+            p.ptr8 = (uintptr_t *)(segment_address + seg_starts->page_start[pg]);
+            
+            uintptr_t *prev_ptr8 = 0;
+            while (p.ptr8 != prev_ptr8) {
+                prev_ptr8 = p.ptr8;
+                unsigned next = 0;
+                switch (seg_starts->pointer_format) {
+                    case DYLD_CHAINED_PTR_64:
+                    case DYLD_CHAINED_PTR_64_OFFSET:
+                        if (p.ptr_64_rebase->bind) {
+                            next = p.ptr_64_bind->next * 4;
+                            struct dyld_chained_import *import = &imports[p.ptr_64_bind->ordinal];
+                            // skip the leading underscore
+                            const char *s = dl->dlm64_chainedfixups_strtab + import->name_offset + 1;
+                            uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1);
+                            if (!sym_addr && import->weak_import) {
+                                ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
+                                return 1;
+                            }
+                            PRINT("DYLD_CHAINED_PTR_64_BIND %p %p %s", p.ptr8, (void *)sym_addr, s - 1);
+                            *p.ptr8 = sym_addr;
+                        }
+                        else {
+                            next = p.ptr_64_rebase->next * 4;
+                            PRINT("DYLD_CHAINED_PTR_64_REBASE %p %p", p.ptr8, (void *)(dl->dlm64_load_bias + p.ptr_64_rebase->target));
+                            *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target;
+                        }
+                        break;
+                }
+                p.ptr1 += next;
+            }
+        }
+    }
+
+    DLBASE(dl)->dl_linked = 1;
+    return 0;
+}
+
 static int link_library(struct dlinfo *dl)
 {
     // already linked
@@ -1359,6 +2889,9 @@ static int link_library(struct dlinfo *dl)
 
     if (dl->dl_type == DLT_ELF64)
         return link_library_elf64((struct dlinfo_elf64 *)dl);
+
+    if (dl->dl_type == DLT_MACHO64)
+        return link_library_macho64((struct dlinfo_macho64 *)dl);
 
     ERROR("failed to link ELF \"%s\": unknown type %d", dl->dl_name, dl->dl_type);
     return 1;
@@ -1395,6 +2928,9 @@ static struct dlinfo *load_library_internal(struct ulinker *ulinker, const char 
 
     if (magic == *(uint32_t *)elf_magic) {  // \x7fELF
         dl = load_elf_library(ulinker, filename, fd, file_size);
+    }
+    else if (magic == MH_MAGIC_64) { // 0xfeedfacf
+        dl = load_macho64_library(ulinker, filename, fd, file_size);
     }
     else {
         ERROR("failed to load \"%s\": unknown magic %hhx,%hhx,%hhx,%hhx", filename, (magic) & 0xff, (magic >> 8) & 0xff, (magic >> 16) & 0xff, (magic >> 24) & 0xff);
