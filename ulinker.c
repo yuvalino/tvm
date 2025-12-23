@@ -2039,7 +2039,7 @@ static void *lookup_symbol(struct dlinfo *dl, const char *s)
     return NULL;
 }
 
-static size_t address_in_library(struct dlinfo *dl, void *addr) {
+static size_t address_in_library(struct dlinfo *dl, const void *addr) {
     if ((uintptr_t)addr >= (uintptr_t)dl->dl_base &&
         (uintptr_t)addr < (uintptr_t)dl->dl_base + dl->dl_size) {
         return (uintptr_t)addr - (uintptr_t)dl->dl_base;
@@ -2048,11 +2048,12 @@ static size_t address_in_library(struct dlinfo *dl, void *addr) {
     return SIZE_MAX;
 }
 
-static struct dlinfo *library_for_address(struct ulinker *ulinker, void *addr) {
+static struct dlinfo *library_for_address_locked(struct ulinker *ulinker, const void *addr) {
     struct dlinfo *dl = ulinker->ul_dlinfo;
-    while (dl) {
+    while (dl && dl->dl_type != DLT_EXTERNAL) {
         if (address_in_library(dl, addr) != SIZE_MAX)
             return dl;
+        dl = dl->dl_next;
     }
     return NULL;
 }
@@ -2065,7 +2066,7 @@ static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *s
         dl = ulinker->ul_dlinfo;
     }
     else if (RTLD_NEXT == handle) {
-        dl = library_for_address(ulinker, lr);
+        dl = library_for_address_locked(ulinker, lr);
         if (dl)
             dl = dl->dl_next;
     }
@@ -3264,4 +3265,18 @@ int ulinker_dlarch(void *handle)
 {
     struct dlinfo *dl = (struct dlinfo *)handle;
     return dl->dl_arch;
+}
+
+int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
+    DLINFO_LOCK(ulinker);
+    struct dlinfo *dl = library_for_address_locked(ulinker, addr);
+    DLINFO_UNLOCK(ulinker);
+
+    if (!dl)
+        return 0;
+
+    info->udli_fname = dl->dl_name;
+    info->udli_fbase = dl->dl_base;
+    info->udli_farch = dl->dl_arch;
+    return 1;
 }
