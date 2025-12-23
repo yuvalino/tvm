@@ -7,3 +7,6 @@
 [submodule "toybox"]
 	path = toybox
 	url = git@github.com:yuvalino/toybox-forkless.git
+[submodule "unicorn"]
+	path = unicorn
+	url = git@github.com:yuvalino/unicorn-forkless.git
