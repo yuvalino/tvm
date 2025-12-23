@@ -61,6 +61,7 @@ int   ulinker_dlclose(void *handle);
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol);
 char *ulinker_dlerror(void);
 
+
 /**
  * opens an executable file, closing all previous open libraries.
  */
@@ -68,7 +69,14 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename);
 
 enum {
     ULARCH_NONE = 0,
-    ULARCH_X86_64 = UC_ARCH_X86,
-    ULARCH_ARM64  = UC_ARCH_ARM64,
+    ULARCH_X86_64,
+    ULARCH_ARM64,
 };
 int ulinker_dlarch(void *handle);
+
+struct ulinker_dladdr_info {
+    const char *udli_fname; 
+    void       *udli_fbase;
+    int         udli_farch;
+};
+int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
