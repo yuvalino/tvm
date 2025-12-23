@@ -1798,7 +1798,7 @@ struct ulinker {
 /* -------------------- Dynamic Library Info -------------------- */
 
 enum {
-    DLT_EMULATED,
+    DLT_EXTERNAL,
     DLT_ELF64,
     DLT_MACHO64
 };
@@ -1876,13 +1876,13 @@ struct dlinfo_macho64 {
     void       *dlm64_chainedfixups_imports;
 };
 
-struct dlinfo_emulated {
-    struct dlinfo dlemu_base;
-    void *(*dlemu_dlsym)(void *, const char *s);
+struct dlinfo_external {
+    struct dlinfo dlext_base;
+    void *(*dlext_dlsym)(void *, const char *s);
 };
 
-static pthread_mutex_t g_emulated_dlinfos_mtx = PTHREAD_MUTEX_INITIALIZER;
-static struct dlinfo_emulated *g_emulated_dlinfos = NULL;
+static pthread_mutex_t g_external_dlinfos_mtx = PTHREAD_MUTEX_INITIALIZER;
+static struct dlinfo_external *g_external_dlinfos = NULL;
 
 /* -------------------- Private functions -------------------- */
 
@@ -1929,9 +1929,9 @@ static char *string_elf64(struct dlinfo_elf64 *dl, Elf64_Word idx)
     return dl->dle64_strtab + idx;
 }
 
-static void *lookup_symbol_emulated(struct dlinfo_emulated *dl, const char *s)
+static void *lookup_symbol_external(struct dlinfo_external *dl, const char *s)
 {
-    return dl->dlemu_dlsym(DLPRIVATE(dl), s);
+    return dl->dlext_dlsym(DLPRIVATE(dl), s);
 }
 
 static void *lookup_symbol_elf64(struct dlinfo_elf64 *dl, const char *s)
@@ -2002,8 +2002,8 @@ static void *lookup_symbol_macho64(struct dlinfo_macho64 *dl, const char *s)
 
 static void *lookup_symbol(struct dlinfo *dl, const char *s)
 {
-    if (dl->dl_type == DLT_EMULATED) 
-        return lookup_symbol_emulated((struct dlinfo_emulated *)dl, s);
+    if (dl->dl_type == DLT_EXTERNAL) 
+        return lookup_symbol_external((struct dlinfo_external *)dl, s);
     if (dl->dl_type == DLT_ELF64)
         return lookup_symbol_elf64((struct dlinfo_elf64 *)dl, s);
     if (dl->dl_type == DLT_MACHO64)
@@ -2030,7 +2030,7 @@ static struct dlinfo *library_for_address(struct ulinker *ulinker, void *addr) {
     return NULL;
 }
 
-static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *symbol, void *lr, int emulated)
+static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *symbol, void *lr, int external)
 {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = (struct dlinfo *)handle;
@@ -2044,7 +2044,7 @@ static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *s
     }
 
     while (dl) {
-        if (!emulated && dl->dl_type == DLT_EMULATED)
+        if (!external && dl->dl_type == DLT_EXTERNAL)
             break;
         void *a = lookup_symbol(dl, symbol);
         if (a) {
@@ -2693,8 +2693,8 @@ out:
 
 static void free_library(struct dlinfo *dl)
 {
-    if (dl->dl_type == DLT_EMULATED) {
-        // emulated shouldn't ever be free'd (linked by multiple linkers)
+    if (dl->dl_type == DLT_EXTERNAL) {
+        // external shouldn't ever be free'd (linked by multiple linkers)
         return;
     }
     if (dl->dl_type == DLT_ELF64) {
@@ -2738,7 +2738,7 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
 
         if (sym) {
             sym_name = string_elf64(dl, dl->dle64_symtab[sym].st_name);
-            // lookup symbol with emulated libraries as this is for internal use
+            // lookup symbol with external libraries as this is for internal use
             sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1);
             if (!sym_addr) {
                 if (ELF64_ST_BIND(dl->dle64_symtab[sym].st_info) != STB_WEAK) {
@@ -3001,42 +3001,42 @@ out:
     return ret;
 }
 
-static struct dlinfo_emulated *add_emulated_dlinfo(struct ulinker_emulated_dlinfo_args *args)
+static struct dlinfo_external *add_external_dlinfo(struct ulinker_external_dlinfo_args *args)
 {
-    struct dlinfo_emulated *last_dlemu = NULL;
+    struct dlinfo_external *last_dlext = NULL;
     
-    pthread_mutex_lock(&g_emulated_dlinfos_mtx);
+    pthread_mutex_lock(&g_external_dlinfos_mtx);
 
-    for (struct dlinfo_emulated *dlemu = g_emulated_dlinfos; dlemu; dlemu = (struct dlinfo_emulated *)dlemu->dlemu_base.dl_next) {
-        if (0 == strncmp(dlemu->dlemu_base.dl_name, args->ue_name, DLINFO_NAME_LEN)) {
-            pthread_mutex_unlock(&g_emulated_dlinfos_mtx);
-            return dlemu;
+    for (struct dlinfo_external *dlext = g_external_dlinfos; dlext; dlext = (struct dlinfo_external *)dlext->dlext_base.dl_next) {
+        if (0 == strncmp(dlext->dlext_base.dl_name, args->ue_name, DLINFO_NAME_LEN)) {
+            pthread_mutex_unlock(&g_external_dlinfos_mtx);
+            return dlext;
         }
-        last_dlemu = dlemu;
+        last_dlext = dlext;
     }
 
-    struct dlinfo_emulated *dlemu = uo.uo_malloc(args->ue_private, sizeof(struct dlinfo_emulated));
-    if (!dlemu) {
-        pthread_mutex_unlock(&g_emulated_dlinfos_mtx);
+    struct dlinfo_external *dlext = uo.uo_malloc(args->ue_private, sizeof(struct dlinfo_external));
+    if (!dlext) {
+        pthread_mutex_unlock(&g_external_dlinfos_mtx);
         return NULL;
     }
 
-    memset(dlemu, 0, sizeof(*dlemu));
-    DLPRIVATE(dlemu) = args->ue_private;
-    strncpy(DLBASE(dlemu)->dl_name, args->ue_name, DLINFO_NAME_LEN - 1);
-    DLBASE(dlemu)->dl_refcnt++;
-    DLBASE(dlemu)->dl_type = DLT_EMULATED;
-    DLBASE(dlemu)->dl_linked = 1;
-    dlemu->dlemu_dlsym = args->ue_dlsym;
+    memset(dlext, 0, sizeof(*dlext));
+    DLPRIVATE(dlext) = args->ue_private;
+    strncpy(DLBASE(dlext)->dl_name, args->ue_name, DLINFO_NAME_LEN - 1);
+    DLBASE(dlext)->dl_refcnt++;
+    DLBASE(dlext)->dl_type = DLT_EXTERNAL;
+    DLBASE(dlext)->dl_linked = 1;
+    dlext->dlext_dlsym = args->ue_dlsym;
 
-    if (last_dlemu)
-        DLBASE(last_dlemu)->dl_next = (struct dlinfo *)dlemu;
+    if (last_dlext)
+        DLBASE(last_dlext)->dl_next = (struct dlinfo *)dlext;
     else
-        g_emulated_dlinfos = dlemu;
+        g_external_dlinfos = dlext;
 
-    pthread_mutex_unlock(&g_emulated_dlinfos_mtx);
+    pthread_mutex_unlock(&g_external_dlinfos_mtx);
 
-    return dlemu;
+    return dlext;
 }
 
 /* -------------------- API -------------------- */
@@ -3051,8 +3051,8 @@ int ulinker_setopt(int opt, void *val)
         print_cb = (void (*)(char *, int))val;
         return 0;
     }
-    if (opt == ULINKER_ADD_EMULATED_DLINFO) {
-        return (add_emulated_dlinfo((struct ulinker_emulated_dlinfo_args *)val) ? 0 : 1);
+    if (opt == ULINKER_ADD_EXTERNAL_DLINFO) {
+        return (add_external_dlinfo((struct ulinker_external_dlinfo_args *)val) ? 0 : 1);
     }
     if (opt == ULINKER_EVENT_CB) {
         event_cb = (void (*)(int, void *))val;
@@ -3076,8 +3076,8 @@ struct ulinker *ulinker_create(void *private) {
     pthread_mutex_init(&ulinker->ul_dlinfo_mtx, NULL);
     ulinker->ul_private = private;
 
-    // put the emulated dlinfos in the end of the list
-    ulinker->ul_dlinfo = (struct dlinfo *)g_emulated_dlinfos;
+    // put the external dlinfos in the end of the list
+    ulinker->ul_dlinfo = (struct dlinfo *)g_external_dlinfos;
 
     ret = ulinker;
 out:
@@ -3097,7 +3097,7 @@ void ulinker_destroy(struct ulinker *ulinker) {
         struct dlinfo *curr_dl = ulinker->ul_dlinfo;
 
         // end of linker-specific list
-        if (curr_dl->dl_type == DLT_EMULATED) {
+        if (curr_dl->dl_type == DLT_EXTERNAL) {
             ulinker->ul_dlinfo = NULL;
             break;
         }
@@ -3161,7 +3161,7 @@ int ulinker_dlclose(void *handle)
 
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol) {
     void *lr = __builtin_return_address(0);
-    // do NOT search in emulated for API calls
+    // do NOT search in external for API calls
     return dlsym_internal(ulinker, handle, symbol, lr, 0);
 }
 
@@ -3199,7 +3199,7 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
         struct dlinfo *curr_dl = ulinker->ul_dlinfo;
 
         // end of linker-specific list
-        if (curr_dl->dl_type == DLT_EMULATED) {
+        if (curr_dl->dl_type == DLT_EXTERNAL) {
             ulinker->ul_dlinfo = NULL;
             break;
         }
@@ -3213,7 +3213,7 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
     ulinker->ul_dlinfo = tmp_linker->ul_dlinfo;
     for (struct dlinfo *curr_dl = ulinker->ul_dlinfo; curr_dl; curr_dl = curr_dl->dl_next) {
         // end of linker-specific list
-        if (curr_dl->dl_type == DLT_EMULATED) 
+        if (curr_dl->dl_type == DLT_EXTERNAL) 
             break;
         curr_dl->dl_linker = ulinker;
     }

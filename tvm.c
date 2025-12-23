@@ -967,6 +967,9 @@ static pthread_t main_pthread;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct task *current;
+static __thread int thread_tvm_disallow = 0;
+#define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
+#define TVM_OFF do { thread_tvm_disallow = 1; } while (0)
 
 static void task_lock(struct task *t)
 {
@@ -3661,6 +3664,9 @@ int can_enter_tvm(void *lr) {
     if (!main_task)
         return 0;
 
+    if (thread_tvm_disallow)
+        return 0;
+
     if (!lr) {
         if (!call)
             return 0;
@@ -4302,15 +4308,15 @@ static struct ulinker_ops ulinker_ops = {
     .uo_mprotect = ulinker_mprotect
 };
 
-static void *ulinker_emulated_dlsym(void *arg, const char *s)
+static void *ulinker_external_dlsym(void *arg, const char *s)
 {
     return dlsym(RTLD_DEFAULT, s);
 }
 
-static struct ulinker_emulated_dlinfo_args ulinker_tvm_emulated_args = {
+static struct ulinker_external_dlinfo_args ulinker_tvm_external_args = {
     .ue_private = NULL,
     .ue_name = "libtvm",
-    .ue_dlsym = ulinker_emulated_dlsym,
+    .ue_dlsym = ulinker_external_dlsym,
 };
 
 static void ulinker_event_cb(int event, void *arg)
@@ -4336,7 +4342,7 @@ void tvm_init(const char *init_comm)
 
     ulinker_setopt(ULINKER_PRINT_CB, (void *)ulinker_print_cb);
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
-    ulinker_setopt(ULINKER_ADD_EMULATED_DLINFO, &ulinker_tvm_emulated_args);
+    ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
 
     main_pthread = pthread_self();

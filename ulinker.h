@@ -5,7 +5,7 @@
 
 enum {
     ULINKER_OPS, // struct ulinker_ops *
-    ULINKER_ADD_EMULATED_DLINFO,
+    ULINKER_ADD_EXTERNAL_DLINFO,
     ULINKER_PRINT_CB,
     ULINKER_EVENT_CB,
 };
@@ -43,7 +43,7 @@ struct ulinker_ops {
     int   (*uo_mprotect)(void *, void *, size_t, int);
 };
 
-struct ulinker_emulated_dlinfo_args {
+struct ulinker_external_dlinfo_args {
     void *ue_private;
     const char *ue_name;
     void *(*ue_dlsym)(void *, const char *);
