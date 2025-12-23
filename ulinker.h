@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#include <unicorn/unicorn.h>
+
 enum {
     ULINKER_OPS, // struct ulinker_ops *
     ULINKER_ADD_EXTERNAL_DLINFO,
@@ -63,3 +65,10 @@ char *ulinker_dlerror(void);
  * opens an executable file, closing all previous open libraries.
  */
 void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename);
+
+enum {
+    ULARCH_NONE = 0,
+    ULARCH_X86_64 = UC_ARCH_X86,
+    ULARCH_ARM64  = UC_ARCH_ARM64,
+};
+int ulinker_dlarch(void *handle);

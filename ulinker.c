@@ -205,6 +205,12 @@ static const uint8_t elf_magic[4] = {ELFMAG0, ELFMAG1, ELFMAG2, ELFMAG3};
 #define ET_LOPROC	0xff00		/* Processor-specific range start */
 #define ET_HIPROC	0xffff		/* Processor-specific range end */
 
+/* Legal values for e_machine (architecture).  */
+
+#define EM_NONE		 0	/* No machine */
+#define EM_X86_64	62	/* AMD x86-64 architecture */
+#define EM_AARCH64	183	/* ARM AARCH64 */
+
 /* Program segment header.  */
 
 typedef struct
@@ -815,6 +821,26 @@ struct mach_header_64 {
 					   is set, the dylib is part of the dyld
 					   shared cache, rather than loose in
 					   the filesystem. */
+
+/*
+ * Capability bits used in the definition of cpu_type.
+ */
+#define CPU_ARCH_MASK           0xff000000      /* mask for architecture bits */
+#define CPU_ARCH_ABI64          0x01000000      /* 64 bit ABI */
+#define CPU_ARCH_ABI64_32       0x02000000      /* ABI for 64-bit hardware with 32-bit types; LP32 */
+
+/*
+ *	Machine types known by all.
+ */
+
+typedef int                     cpu_type_t;
+
+#define CPU_TYPE_X86            ((cpu_type_t) 7)
+#define CPU_TYPE_I386           CPU_TYPE_X86            /* compatibility */
+#define CPU_TYPE_X86_64         (CPU_TYPE_X86 | CPU_ARCH_ABI64)
+
+#define CPU_TYPE_ARM            ((cpu_type_t) 12)
+#define CPU_TYPE_ARM64          (CPU_TYPE_ARM | CPU_ARCH_ABI64)
 
 /*
  * The load commands directly follow the mach_header.  The total size of all
@@ -1811,6 +1837,7 @@ struct dlinfo {
     char dl_name[DLINFO_NAME_LEN];
     uint64_t dl_refcnt;
     int dl_type; // DLT_*
+    int dl_arch;
     void *dl_base;
     size_t dl_size;
     int dl_linked;
@@ -2093,6 +2120,11 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
     }
 
     dl->dle64_phdr_count = dl->dle64_ehdr.e_phnum;
+
+    if (dl->dle64_ehdr.e_machine == EM_X86_64)
+        DLBASE(dl)->dl_arch = ULARCH_X86_64;
+    else if (dl->dle64_ehdr.e_machine == EM_AARCH64)
+        DLBASE(dl)->dl_arch = ULARCH_ARM64;
 
     // map the program header
 
@@ -2454,6 +2486,11 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         ERROR("failed to load Mach-O \"%s\": unexpected filetype: %d", filename, dl->dlm64_hdr.filetype);
         goto out;
     }
+
+    if (dl->dlm64_hdr.cputype == CPU_TYPE_X86_64)
+        DLBASE(dl)->dl_arch = ULARCH_X86_64;
+    else if (dl->dlm64_hdr.cputype == CPU_TYPE_ARM64)
+        DLBASE(dl)->dl_arch = ULARCH_ARM64;
 
     // map the header and load commands
 
@@ -3221,4 +3258,10 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
     DLINFO_UNLOCK(ulinker);
 
     return entry;
+}
+
+int ulinker_dlarch(void *handle)
+{
+    struct dlinfo *dl = (struct dlinfo *)handle;
+    return dl->dl_arch;
 }
