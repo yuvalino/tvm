@@ -1,4 +1,4 @@
-.PHONY: first all clean mksh forkless dropbear dummy toybox libtvm
+.PHONY: first all clean mksh forkless dropbear dummy toybox libtvm unicorn
 
 first: all
 
@@ -6,7 +6,7 @@ all: forkless
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S), Linux)
-	LDFLAGS += -lm -pie
+	LDFLAGS += -pie
 endif
 ifeq ($(UNAME_S), Darwin)
 	LDFLAGS +=
@@ -22,6 +22,7 @@ clean:
 	@make -C toybox/ clean || true
 	@rm dropbear/Makefile || true
 	@rm mksh/Rebuild.sh || true
+	@rm unicorn/build || true
 	@rm *.a *.o || true
 	@rm test_tvm || true
 	@rm test_rmem || true
@@ -31,8 +32,8 @@ libtvm: dropbear mksh toybox
 	$(CC) $(CFLAGS) -g -I. -c rmem.c ulinker.c tvm.c main.c
 	ar rcs libtvm.a rmem.o ulinker.o tvm.o main.o
 
-forkless: dropbear mksh toybox
-	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c ulinker.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+forkless: dropbear mksh toybox unicorn
+	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil -lunicorn -lm $(LDFLAGS)
 
 test_tvm:
 	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c ulinker.c tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
@@ -52,6 +53,12 @@ dropbear: dummy
 toybox:
 	CFLAGS="$(CFLAGS) -g -I$(realpath .) -DTOYBOX_FORKLESS=1" V=1 make -C toybox
 	find toybox/ -type f -name '*.o' | xargs ar rcs libtoybox.a
+
+unicorn:
+	mkdir -p unicorn/build
+	if [ ! -f unicorn/build/Makefile ] ; then cd unicorn/build && cmake .. -DCMAKE_BUILD_TYPE=Release -DUNICORN_INTERPRETER=ON -DUNICORN_ARCH="x86;aarch64" -DUNICORN_BUILD_TESTS=OFF; fi
+	cd unicorn/build && make
+	cp unicorn/build/libunicorn.a .
 
 dummy:
 	@$(CC) $(CFLAGS) dummy/dummy.c -c -o /tmp/dummy.o
