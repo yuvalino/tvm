@@ -45,6 +45,9 @@
 #include "tvm.h"
 #include "rmem.h"
 #include "ulinker.h"
+#include "unicorn/unicorn.h"
+#include "unicorn/x86.h"
+#include "unicorn/arm64.h"
 
 /**
  * Instructions unclear, ended up implementing a kernel.
@@ -969,7 +972,8 @@ static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct task *current;
 static __thread int thread_tvm_disallow = 0;
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
-#define TVM_OFF do { thread_tvm_disallow = 1; } while (0)
+#define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
+#define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
 
 static void task_lock(struct task *t)
 {
@@ -1101,7 +1105,7 @@ static struct task *taskalloc()
             
             int newfd = CALL_FUNC(dup, t_fd(i));
             if (newfd == -1)
-                panic("taskalloc::dup");
+                panic("taskalloc::dup %d %d", i, t_fd(i));
             t->tsk_fd[i] = newfd;
             
             struct fops *fops = fops_for_fd_locked(current, i);
@@ -3546,6 +3550,886 @@ pid_t fork(void)
 }
 
 /////////////
+// Emulator
+/////////////
+
+struct emulator_map_entry {
+    struct emulator_map_entry *eme_next;
+    uint64_t eme_start;
+    size_t   eme_size;
+};
+
+void emulator_map_entry_destroy(struct emulator_map_entry *eme) {
+    kfree(eme);
+}
+
+struct emulator_map_entry *emulator_map_entry_create(uint64_t eme_start, size_t eme_size) {
+    struct emulator_map_entry *eme = NULL;
+
+    if (!(eme = kalloc(sizeof(*eme))))
+        return NULL;
+
+    eme->eme_start = eme_start;
+    eme->eme_size = eme_size;
+    return eme;
+}
+
+struct emulator_engine {
+    struct emulator_engine *ee_next;
+    struct emulator_context *ee_ec;
+    uc_engine *ee_uc;
+    int ee_arch;
+    struct emulator_map_entry *ee_eme;
+};
+
+void emulator_engine_destroy(struct emulator_engine *ee) {
+    while (ee->ee_eme) {
+        struct emulator_map_entry *eme = ee->ee_eme;
+        ee->ee_eme = eme->eme_next;
+
+        emulator_map_entry_destroy(eme);
+    }
+
+    if (ee->ee_uc) {
+        uc_close(ee->ee_uc);
+        ee->ee_uc = NULL;
+    }
+
+    kfree(ee);
+}
+
+uc_engine *uc_open_arch(int arch)
+{
+    uc_err err = UC_ERR_ARCH;
+    uc_engine *engine = NULL;
+
+    if (arch == ULARCH_ARM64)
+        err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &engine);
+    else if (arch == ULARCH_X86_64)
+        err = uc_open(UC_ARCH_X86, UC_MODE_64, &engine);
+
+    if (err) {
+        INFO("uc_open(ess_arch=%d) failed: %s", arch, uc_strerror(err));
+        return NULL;    
+    }
+    uc_ctl_exits_enable(engine);
+
+    return engine;
+}
+
+struct emulator_context;
+bool emulator_hook_cb(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, struct emulator_context *ec);
+
+static void emulator_debug_hook_cb(uc_engine *uc,
+                         uint64_t address,
+                         uint32_t size,
+                         void *user_data)
+{
+    INFO("emulator_debug: PC = 0x%lx, size = %u", address, size);
+}
+
+int emulator_engine_reset(struct emulator_engine *ee) {
+    int ret = 1;
+    uc_err err;
+    uc_engine *engine = NULL;
+
+    if (!(engine = uc_open_arch(ee->ee_arch)))
+        goto out;
+
+    uc_ctl(engine, UC_CTL_TLB_TYPE, UC_TLB_CPU);
+
+    uc_hook hh;
+    err = uc_hook_add(engine, &hh, UC_HOOK_MEM_INVALID, emulator_hook_cb, ee->ee_ec, 1, 0);
+    if (err) {
+        INFO("uc_hook_add(UC_HOOK_MEM_INVALID) failed: %s", uc_strerror(err));
+        goto out;
+    }
+
+    uc_hook_add(engine, &hh,
+            UC_HOOK_CODE,
+            emulator_debug_hook_cb,
+            NULL,
+            1, 0);
+
+    for (struct emulator_map_entry *eme = ee->ee_eme; eme; eme = eme->eme_next) {
+        err = uc_mem_map_ptr(engine, eme->eme_start, eme->eme_size, UC_PROT_ALL, (void *)eme->eme_start);
+        if (err) {
+            INFO("uc_mem_map_ptr(addr=%p, size=%p) failed: %s", (void *)eme->eme_start, (void *)eme->eme_size, uc_strerror(err));
+            goto out;
+        }
+    }
+
+    if (ee->ee_uc) {
+        uc_close(ee->ee_uc);
+        ee->ee_uc = NULL;
+    }
+
+    ee->ee_uc = engine;
+    ret = 0;
+    
+out:
+
+    if (ret && engine) {
+        uc_close(engine);
+        engine = NULL;
+    }
+    return ret;
+}
+
+struct emulator_engine *emulator_engine_create(struct emulator_context *ec, int arch)
+{
+    struct emulator_engine *ee = NULL;
+    struct emulator_engine *ret = NULL;
+
+    if (!(ee = kalloc(sizeof(struct emulator_engine))))
+        goto out;
+
+    ee->ee_ec = ec;
+    ee->ee_arch = arch;
+    ee->ee_next = NULL;
+    ee->ee_eme = NULL;
+    ee->ee_uc = NULL;
+
+    if (0 != emulator_engine_reset(ee))
+        goto out;
+
+    ret = ee;
+
+out:
+    if (!ret && ee) {
+        emulator_engine_destroy(ee);
+        ee = NULL;
+    }
+    return ret;
+}
+
+int emulator_engine_add_map_entry(struct emulator_engine *ee, uint64_t start, size_t size) {
+    struct emulator_map_entry *eme = emulator_map_entry_create(start, size);
+    if (!eme)
+        return 1;
+    eme->eme_next = ee->ee_eme;
+    ee->ee_eme = eme;
+    return 0;
+}
+
+#define EMULATOR_STACK_SIZE (0x1000 * 2000) // 8Mb
+
+enum {
+    ESS_INTR_UNSPEC = 0,
+    ESS_INTR_MEM = 1,
+};
+
+struct emulator_saved_state {
+    struct emulator_saved_state *ess_next;
+    int ess_arch;
+    int ess_abi;
+    uc_context *ess_context;
+    void   *ess_stack;
+    size_t  ess_stack_size;
+
+    int     ess_intr;
+
+    uc_mem_type ess_intr_memtype;
+    uint64_t    ess_intr_addr;
+};
+
+enum {
+    ESS_REG_PC,
+    ESS_REG_SP,
+    ESS_REG_RET,
+};
+
+void emulator_saved_state_destroy(struct emulator_saved_state *ss) {
+    if (ss->ess_stack) {
+        munmap(ss->ess_stack, ss->ess_stack_size);
+        ss->ess_stack = NULL;
+        ss->ess_stack_size = 0;
+    }
+
+    if (ss->ess_context) {
+        uc_context_free(ss->ess_context);
+        ss->ess_context = NULL;
+    }
+
+    kfree(ss);
+}
+
+int emulator_saved_state_read_reg(struct emulator_saved_state *ss, int reg, uint64_t *out) {
+    uc_err err = UC_ERR_ARCH;
+    if (ss->ess_arch == ULARCH_ARM64) {
+        if (reg == ESS_REG_PC)
+            err = uc_context_reg_read(ss->ess_context, UC_ARM64_REG_PC, out);
+        else if (reg == ESS_REG_SP)
+            err = uc_context_reg_read(ss->ess_context, UC_ARM64_REG_SP, out);
+        else if (reg == ESS_REG_RET)
+            err = uc_context_reg_read(ss->ess_context, UC_ARM64_REG_X0, out);
+    }
+    else if (ss->ess_arch == ULARCH_X86_64) {
+        if (reg == ESS_REG_PC)
+            err = uc_context_reg_read(ss->ess_context, UC_X86_REG_RIP, out);
+        else if (reg == ESS_REG_SP)
+            err = uc_context_reg_read(ss->ess_context, UC_X86_REG_RSP, out);
+        else if (reg == ESS_REG_RET)
+            err = uc_context_reg_read(ss->ess_context, UC_X86_REG_RAX, out);
+    }
+
+    if (err)
+        INFO("emulator_saved_state_read_reg(arch=%d, reg=%d) failed %s", ss->ess_arch, reg, uc_strerror(err));
+    return (int)err;
+}
+
+int emulator_saved_state_write_reg(struct emulator_saved_state *ss, int reg, const uint64_t *in) {
+    uc_err err = UC_ERR_ARCH;
+    if (ss->ess_arch == ULARCH_ARM64) {
+        if (reg == ESS_REG_PC)
+            err = uc_context_reg_write(ss->ess_context, UC_ARM64_REG_PC, in);
+        else if (reg == ESS_REG_SP)
+            err = uc_context_reg_write(ss->ess_context, UC_ARM64_REG_SP, in);
+        else if (reg == ESS_REG_RET)
+            err = uc_context_reg_write(ss->ess_context, UC_ARM64_REG_X0, in);
+    }
+    else if (ss->ess_arch == ULARCH_X86_64) {
+        if (reg == ESS_REG_PC)
+            err = uc_context_reg_write(ss->ess_context, UC_X86_REG_RIP, in);
+        else if (reg == ESS_REG_SP)
+            err = uc_context_reg_write(ss->ess_context, UC_X86_REG_RSP, in);
+        else if (reg == ESS_REG_RET)
+            err = uc_context_reg_write(ss->ess_context, UC_X86_REG_RAX, in);
+    }
+
+    if (err)
+        INFO("emulator_saved_state_write_reg(arch=%d, reg=%d) failed %s", ss->ess_arch, reg, uc_strerror(err));
+    return (int)err;
+}
+
+uc_context *uc_context_alloc_arch(uc_engine *engine, int arch)
+{
+    // TODO cache this
+
+    uc_context *context = NULL;
+    uc_context *ret = NULL;
+
+    uc_err err = uc_context_alloc(engine, &context);
+    if (err) {
+        INFO("uc_context_alloc(arch=%d) failed: %s", arch, uc_strerror(err));
+        goto out;
+    }
+
+    err = uc_context_save(engine, context);
+    if (err) {
+        INFO("uc_context_save(arch=%d) failed: %s", arch, uc_strerror(err));
+        goto out;
+    }
+
+    ret = context;
+
+out:
+    if (!ret && context) {
+        uc_context_free(context);
+        context = NULL;
+    }
+
+    return ret;
+}
+
+struct emulator_saved_state *emulator_saved_state_create(uc_engine *engine, int arch, int abi)
+{
+    struct emulator_saved_state *ess = NULL;
+    struct emulator_saved_state *ret = NULL;
+
+    if (!(ess = kalloc(sizeof(struct emulator_saved_state))))
+        goto out;
+
+    ess->ess_arch = arch;
+    ess->ess_abi  = abi;
+    ess->ess_intr = ESS_INTR_UNSPEC;
+    ess->ess_next = NULL;
+
+    if (!(ess->ess_context = uc_context_alloc_arch(engine, arch)))
+        goto out;
+
+    void *stack = mmap(NULL, EMULATOR_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (stack == MAP_FAILED)
+        goto out;
+    ess->ess_stack = stack;
+    ess->ess_stack_size = EMULATOR_STACK_SIZE;
+
+    // point rsp to stack top
+    uint64_t stack_top = (uint64_t)ess->ess_stack + ess->ess_stack_size;
+    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &stack_top))
+        goto out;
+
+    ret = ess;
+out:
+    if (!ret && ess)
+        emulator_saved_state_destroy(ess);
+
+    return ret;
+}
+
+struct emulator_context {
+    struct ulinker *ec_ulinker;
+    struct emulator_saved_state *ec_ss;
+    struct emulator_engine *ec_all_engines;
+    struct emulator_engine *ec_curr_engine;
+};
+
+void emulator_context_init(struct emulator_context *ec, struct ulinker *ulinker)
+{
+    memset(ec, 0, sizeof(*ec));
+    ec->ec_ulinker = ulinker;
+}
+
+void emulator_context_fini(struct emulator_context *ec)
+{
+    int prevtvm = TVM_OFF;
+
+    while (ec->ec_all_engines) {
+        struct emulator_engine *engine = ec->ec_all_engines;
+        ec->ec_all_engines = ec->ec_all_engines->ee_next;
+        emulator_engine_destroy(engine);
+    }
+    ec->ec_curr_engine = NULL;
+
+    while (ec->ec_ss) {
+        struct emulator_saved_state *ess = ec->ec_ss;
+        ec->ec_ss = ec->ec_ss->ess_next;
+
+        emulator_saved_state_destroy(ess);
+    }
+
+    TVM_RESTORE(prevtvm);
+}
+
+struct emulator_engine *emulator_context_get_or_create_engine(struct emulator_context *ec, int arch)
+{
+    struct emulator_engine *ee = NULL;
+    for (ee = ec->ec_all_engines; ee; ee = ee->ee_next) {
+        if (ee->ee_arch == arch)
+            return ee;
+    }
+
+    if (!(ee = emulator_engine_create(ec, arch)))
+        return NULL;
+
+    ee->ee_next = ec->ec_all_engines;
+    ec->ec_all_engines = ee;
+
+    return ee;
+}
+
+#if defined(__linux__)
+#define SELF_ABI ULABI_LINUX
+#elif defined(__APPLE__)
+#define SELF_ABI ULABI_DARWIN
+#else
+#define SELF_ABI ULABI_NONE
+#endif
+
+#if defined(__x86_64__)
+#define SELF_ARCH ULARCH_X86_64
+#elif defined(__aarch64__)
+#define SELF_ARCH ULARCH_ARM64
+#else
+#define SELF_ARCH ULARCH_NONE
+#endif
+
+
+int emulator_find_dl(struct emulator_context *ec, uint64_t pc, struct ulinker_dladdr_info *out_info)
+{
+    memset(out_info, 0, sizeof(*out_info));
+
+    if (ulinker_dladdr(ec->ec_ulinker, (void *)pc, out_info)) {
+        return 0;
+    }
+
+    Dl_info info;
+    if (dladdr((void *)pc, &info) && info.dli_fbase) {
+        out_info->udli_farch = ULARCH_NONE;
+        return 0;
+    }
+
+    return 1;
+}
+
+bool emulator_hook_cb(uc_engine *uc, uc_mem_type type,
+                                 uint64_t address, int size, int64_t value,
+                                 struct emulator_context *ec)
+{
+    ec->ec_ss->ess_intr = ESS_INTR_MEM;
+    ec->ec_ss->ess_intr_addr = address;
+    ec->ec_ss->ess_intr_memtype = type;
+    uc_emu_stop(uc);
+    INFO("emulator_hook_cb: intr ESS_INTR_MEM addr %p memtype %d", (void *)address, type);
+    return false;
+}
+
+int emulator_step(struct emulator_context *ec)
+{
+    int ret = 1;
+    uc_err err = UC_ERR_ARCH;
+    
+    uint64_t pc;
+    if (0 != emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC, &pc))
+        goto out;
+ 
+    if (0 != emulator_engine_reset(ec->ec_curr_engine))
+        goto out;
+
+    err = uc_context_restore(ec->ec_curr_engine->ee_uc, ec->ec_ss->ess_context);
+    if (err) {
+        INFO("uc_context_restore(ess_arch=%d) failed: %s", ec->ec_ss->ess_arch, uc_strerror(err));
+        goto out;
+    }
+
+    ec->ec_ss->ess_intr = ESS_INTR_UNSPEC;
+    err = uc_emu_start(ec->ec_curr_engine->ee_uc, pc, 0, 0, 0);
+
+    uc_err err2 = uc_context_save(ec->ec_curr_engine->ee_uc, ec->ec_ss->ess_context);
+    if (err2) {
+        INFO("uc_context_save(ess_arch=%d) failed: %s", ec->ec_ss->ess_arch, uc_strerror(err2));
+        goto out;
+    }
+
+    if (0 != emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC, &pc))
+        goto out;
+    INFO("STEP! pc=%p ret=%d (%s)", (void *)pc, ret, uc_strerror(err));
+
+    if (ec->ec_ss->ess_intr == ESS_INTR_UNSPEC) {
+        INFO("emulator_step: invalid stop pc=%p err=%d (%s)", (void *)pc, err, uc_strerror(err));
+        goto out;
+    }
+
+    ret = 0;
+
+out:
+
+    return ret;
+}
+
+#define EMULATOR_PARAMS_COUNT 20
+
+struct emulator_call_params {
+    uint64_t pc;
+    uint64_t arg[EMULATOR_PARAMS_COUNT];
+};
+
+int emulator_call_params_from_saved_state(struct emulator_call_params *params, struct emulator_saved_state *ess)
+{
+    int ret = 1;
+    uc_err err = UC_ERR_OK;
+
+    int nonstack_param_count = EMULATOR_PARAMS_COUNT;
+
+    if (0 != emulator_saved_state_read_reg(ess, ESS_REG_PC, &params->pc))
+        goto out;
+
+    if (ess->ess_arch == ULARCH_ARM64) {
+        nonstack_param_count = 8;
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X0, &params->arg[0]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X0) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X1, &params->arg[1]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X2, &params->arg[2]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X3, &params->arg[3]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X4, &params->arg[4]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X5, &params->arg[5]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X6, &params->arg[6]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X7, &params->arg[7]))) {
+            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+    }
+    else if (ess->ess_arch == ULARCH_X86_64) {
+        nonstack_param_count = 6;
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RDI, &params->arg[0]))) {
+            INFO("uc_context_reg_read(UC_X86_REG_RDI) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RSI, &params->arg[1]))) {
+            INFO("uc_context_reg_read(UC_X86_REG_RSI) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RDX, &params->arg[2]))) {
+            INFO("uc_context_reg_read(UC_X86_REG_RDX) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RCX, &params->arg[3]))) {
+            INFO("uc_context_reg_read(UC_X86_REG_RCX) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R8, &params->arg[4]))) {
+            INFO("uc_context_reg_read(UC_X86_REG_R8) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R9, &params->arg[5]))) {
+            INFO("uc_context_reg_read(UC_X86_REG_R9) failed %s", uc_strerror(err));
+            goto out;
+        }
+    }
+
+    // rest of arguments passed on stack
+    uint64_t sp;
+    if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
+        goto out;
+    memcpy(&params->arg[nonstack_param_count], (void *)sp, (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8);
+
+    ret = 0;
+
+out:
+
+    return ret;
+}
+
+int emulator_saved_state_from_call_params(struct emulator_saved_state *ess, struct emulator_call_params *params)
+{
+    int ret = 1;
+    uc_err err = UC_ERR_OK;
+
+    int nonstack_param_count = EMULATOR_PARAMS_COUNT;
+    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &params->pc))
+        goto out;
+
+    if (ess->ess_arch == ULARCH_ARM64) {
+        nonstack_param_count = 8;
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X0, &params->arg[0]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X0) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X1, &params->arg[1]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X2, &params->arg[2]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X3, &params->arg[3]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X4, &params->arg[4]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X5, &params->arg[5]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X6, &params->arg[6]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X7, &params->arg[7]))) {
+            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
+            goto out;
+        }
+    }
+    else if (ess->ess_arch == ULARCH_X86_64) {
+        nonstack_param_count = 6;
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RDI, &params->arg[0]))) {
+            INFO("uc_context_reg_write(UC_X86_REG_RDI) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RSI, &params->arg[1]))) {
+            INFO("uc_context_reg_write(UC_X86_REG_RSI) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RDX, &params->arg[2]))) {
+            INFO("uc_context_reg_write(UC_X86_REG_RDX) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RCX, &params->arg[3]))) {
+            INFO("uc_context_reg_write(UC_X86_REG_RCX) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R8, &params->arg[4]))) {
+            INFO("uc_context_reg_write(UC_X86_REG_R8) failed %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R9, &params->arg[5]))) {
+            INFO("uc_context_reg_write(UC_X86_REG_R9) failed %s", uc_strerror(err));
+            goto out;
+        }
+    }
+
+    // rest of arguments passed on stack
+    uint64_t sp;
+    if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
+        goto out;
+    sp -= (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8;
+    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &sp))
+        goto out;
+    memcpy((void *)sp, &params->arg[nonstack_param_count], (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8);
+
+    ret = 0;
+
+out:
+
+    return ret;
+}
+
+int emulator_saved_state_enter_call(struct emulator_saved_state *ess, uint64_t lr)
+{
+    int ret = 1;
+    uc_err err;
+
+    if (ess->ess_arch == ULARCH_ARM64) {
+        err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_LR, &lr);
+        if (err) {
+            INFO("emulator_saved_state_enter_call(arch=%d) failed %s", ess->ess_arch, uc_strerror(err));
+            goto out;
+        }
+    }
+    else if (ess->ess_arch == ULARCH_X86_64) {
+        uint64_t sp;
+        if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
+            goto out;
+        sp -= 8;
+        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &sp))
+            goto out;
+        memcpy((void *)sp, &lr, 8);
+    }
+
+    ret = 0;
+out:
+
+    return ret;
+}
+
+int emulator_saved_state_exit_call(struct emulator_saved_state *ess, uint64_t *out_lr)
+{
+    int ret = 1;
+    uc_err err;
+
+    if (ess->ess_arch == ULARCH_ARM64) {
+        err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_LR, out_lr);
+        if (err) {
+            INFO("emulator_saved_state_enter_call(arch=%d) failed %s", ess->ess_arch, uc_strerror(err));
+            goto out;
+        }
+    }
+    else if (ess->ess_arch == ULARCH_X86_64) {
+        uint64_t sp;
+        if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
+            goto out;
+        memcpy(out_lr, (void *)sp, 8);
+        sp += 8;
+        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &sp))
+            goto out;
+        
+    }
+
+    ret = 0;
+
+out:
+
+    return ret;
+}
+
+static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
+
+int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pcinfo, struct emulator_call_params *params, uint64_t *out_ret)
+{
+    int prevtvm;
+    int r = 1;
+    struct emulator_saved_state *ess = NULL;
+    uc_err err;
+
+    prevtvm = TVM_OFF;
+
+    INFO("CALL! pc=%p", (void *)params->pc);
+
+    struct ulinker_dladdr_info local_pcinfo;
+    if (!pcinfo) {
+        if (0 != emulator_find_dl(ec, params->pc, &local_pcinfo)) {
+            INFO("emulator_find_dl(pc=%p) failed", (void *)params->pc);
+            goto out;
+        }
+        pcinfo = &local_pcinfo;
+    }
+
+    // fast path: upcall to host
+    if (pcinfo->udli_farch == ULARCH_NONE) {
+        TVM_ON;
+        *out_ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))params->pc)(
+            params->arg[ 0], params->arg[ 1], params->arg[ 2], params->arg[ 3], params->arg[ 4],
+            params->arg[ 5], params->arg[ 6], params->arg[ 7], params->arg[ 8], params->arg[ 9],
+            params->arg[10], params->arg[11], params->arg[12], params->arg[13], params->arg[14],
+            params->arg[15], params->arg[16], params->arg[17], params->arg[18], params->arg[19]
+        );
+        TVM_OFF;
+        r = 0;
+        goto out;
+    }
+
+    // check abi compatibility
+
+    if (pcinfo->udli_farch == ULARCH_NONE || pcinfo->udli_fabi == ULABI_NONE) {
+        INFO("emulator_call_ex() failed: unknown guest abi (arch=%d, abi=%d)", pcinfo->udli_farch, pcinfo->udli_fabi);
+        goto out;
+    }
+
+    if (SELF_ARCH == ULARCH_NONE || SELF_ABI == ULABI_NONE) {
+        INFO("emulator_call_ex() failed: unknown host abi");
+        goto out;
+    }
+
+    int guest_darwin_arm64 = (pcinfo->udli_farch == ULARCH_ARM64) && (pcinfo->udli_fabi == ULABI_DARWIN);
+    int host_darwin_arm64  = (SELF_ARCH == ULARCH_ARM64)          && (SELF_ABI == ULABI_DARWIN);
+
+    // the arm64 api for apple is incompatible with arm64 linux, intel linux/apple when it comes to var args.
+    // thanks apple.
+    if (guest_darwin_arm64 != host_darwin_arm64) {
+        INFO("emulator_call_ex() failed: host / guest api incompatibility due to darwin arm64 (guest=%d, host=%d)", guest_darwin_arm64, host_darwin_arm64);
+        goto out;
+    }
+
+    // this should run in an emulator
+
+    struct emulator_engine *ee = emulator_context_get_or_create_engine(ec, pcinfo->udli_farch);
+    if (!ee)
+        goto out;
+    ec->ec_curr_engine = ee;
+
+    if (!(ess = emulator_saved_state_create(ee->ee_uc, pcinfo->udli_farch, pcinfo->udli_fabi)))
+        goto out;
+
+    ess->ess_next = ec->ec_ss;
+    ec->ec_ss = ess;
+
+    // initialize initial context
+
+    if (0 != emulator_saved_state_from_call_params(ess, params))
+        goto out;
+
+    
+    // writes to SP in x86_64
+    if (0 != emulator_saved_state_enter_call(ess, EMULATOR_CALL_END_LR))
+        goto out;
+
+    while (1) {
+        if (0 != emulator_step(ec))
+            goto out;
+        
+        if (ess->ess_intr == ESS_INTR_MEM) {
+            if (ess->ess_intr_addr == EMULATOR_CALL_END_LR && ess->ess_intr_memtype == UC_MEM_FETCH_UNMAPPED) {
+                // returned
+                if (0 == emulator_saved_state_read_reg(ess, ESS_REG_RET, out_ret))
+                    r = 0;
+                goto out;
+            }
+
+            // perhaps we need to page in memory
+            uint64_t fault_range_start = 0;
+            uint64_t fault_range_size  = 0;
+            if (ess->ess_intr_addr >= (uint64_t)ess->ess_stack && ess->ess_intr_addr < (uint64_t)ess->ess_stack + ess->ess_stack_size) {
+                fault_range_start = (uint64_t)ess->ess_stack;
+                fault_range_size = ess->ess_stack_size;
+            }
+            else {
+                struct ulinker_dladdr_info fault_info;
+                if (0 == emulator_find_dl(ec, ess->ess_intr_addr, &fault_info)) {
+                    if (UC_MEM_FETCH_UNMAPPED && fault_info.udli_farch != ess->ess_arch) {
+                        
+                        // read lr before call so stack is adjusted for emulator_call_params_from_saved_state()
+                        uint64_t fault_lr;
+                        if (0 != emulator_saved_state_exit_call(ess, &fault_lr))
+                            goto out;
+
+                        struct emulator_call_params fault_params;
+                        if (0 != emulator_call_params_from_saved_state(&fault_params, ess))
+                            goto out;
+
+                        INFO("SUBCALL! arch=%d pc=%p lr=%p", fault_info.udli_farch, (void *)fault_params.pc, (void *)fault_lr);
+                        // call with parameters and save ret
+                        uint64_t fault_ret;
+                        if (0 != emulator_call_ex(ec, &fault_info, &fault_params, &fault_ret))
+                            goto out;
+                        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_RET, &fault_ret))
+                            goto out;
+                        INFO("SUBCALL RET! res=%p lr=%p", (void *)fault_ret, (void *)fault_lr);
+                        
+                        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &fault_lr))
+                            goto out;
+                        continue;
+                    }
+
+                    fault_range_start = (uint64_t)fault_info.udli_fbase;
+                    fault_range_size  = fault_info.udli_fsize;
+                }
+            }
+
+            if (!fault_range_start || !fault_range_size) {
+                INFO("EMULATOR SEGFAULT AT %p", (void *)ess->ess_intr_addr);
+
+                uint64_t segfault_sp;
+                if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &segfault_sp))
+                    goto out;
+
+                INFO("emulator_call_ex segfault sp=%p", (void *)segfault_sp);
+
+                uint64_t ulr = 5;
+                uc_mem_read(ec->ec_curr_engine->ee_uc, segfault_sp, &ulr, 8);
+                INFO("lr = %p, ulr = %p", *(void **)segfault_sp, (void *)ulr);
+                goto out;
+            }
+
+            INFO("uc_mem_map_ptr(addr=%p, size=%p)", (void *)fault_range_start, (void *)fault_range_size);
+            
+            if (0 != emulator_engine_add_map_entry(ec->ec_curr_engine, fault_range_start, fault_range_size))
+                goto out;
+        }
+        else {
+            INFO("emulator_call_ex: invalid unexpected intr %d", ess->ess_intr);
+        }
+    }
+    
+out:
+
+    if (ess) {
+        ec->ec_ss = ess->ess_next;
+        emulator_saved_state_destroy(ess);
+        ess = NULL;
+    }
+
+    TVM_RESTORE(prevtvm);
+
+    return r;
+}
+
+int emulator_call(struct emulator_context *ec, uint64_t *out_ret, uint64_t pc, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+    struct emulator_call_params params = {
+        .pc = pc,
+        .arg = {arg0, arg1, arg2, arg3, arg4, arg5, 0}
+    };
+
+    return emulator_call_ex(ec, NULL, &params, out_ret);
+}
+
+/////////////
 // Hooks API
 /////////////
 
@@ -4207,8 +5091,6 @@ err:
 
 static int tvm_sorunner(int argc, char **argv)
 {
-    int ret = 1;
-    
     if (argc < 2) {
         fprintf(stderr, "USAGE: tvm sorunner LIBRARY\n");
         return 1;
@@ -4227,7 +5109,24 @@ static int tvm_sorunner(int argc, char **argv)
     }
 
     printf("sorunner %s %s %p\n", argv[1], "main", sym);
-    return ((main_func_t)sym)(argc - 1, argv + 1, tvm_environ);
+
+    struct emulator_context ec;
+    emulator_context_init(&ec, current->tsk_linker);
+
+    uint64_t ret;
+    int callerr = emulator_call(&ec, &ret, (uint64_t)sym,
+                  (uint64_t)(argc - 1),
+                  (uint64_t)(argv + 1),
+                  (uint64_t)tvm_environ,
+                0, 0, 0);
+    if (callerr)
+        printf("sorunner emulator_call failed!\n");
+    else
+        printf("sorunner ret %lu\n", ret);
+
+    emulator_context_fini(&ec);
+
+    return (callerr ? callerr : (int)ret);
 }
 
 static int tvm_main(int argc, char **argv)
