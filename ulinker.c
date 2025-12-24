@@ -1838,6 +1838,7 @@ struct dlinfo {
     uint64_t dl_refcnt;
     int dl_type; // DLT_*
     int dl_arch;
+    int dl_abi;
     void *dl_base;
     size_t dl_size;
     int dl_linked;
@@ -2126,6 +2127,7 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
         DLBASE(dl)->dl_arch = ULARCH_X86_64;
     else if (dl->dle64_ehdr.e_machine == EM_AARCH64)
         DLBASE(dl)->dl_arch = ULARCH_ARM64;
+    DLBASE(dl)->dl_abi = ULABI_LINUX;
 
     // map the program header
 
@@ -2492,6 +2494,7 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         DLBASE(dl)->dl_arch = ULARCH_X86_64;
     else if (dl->dlm64_hdr.cputype == CPU_TYPE_ARM64)
         DLBASE(dl)->dl_arch = ULARCH_ARM64;
+    DLBASE(dl)->dl_abi = ULABI_DARWIN;
 
     // map the header and load commands
 
@@ -2735,12 +2738,11 @@ static void free_library(struct dlinfo *dl)
         // external shouldn't ever be free'd (linked by multiple linkers)
         return;
     }
-    if (dl->dl_type == DLT_ELF64) {
+
+    if (dl->dl_type == DLT_ELF64)
         free_elf64_library((struct dlinfo_elf64 *)dl);
-    }
-    if (dl->dl_type == DLT_MACHO64) {
+    else if (dl->dl_type == DLT_MACHO64)
         free_macho64_library((struct dlinfo_macho64 *)dl);
-    }
     else {
         // TODO abort
         abort();
@@ -3261,12 +3263,6 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
     return entry;
 }
 
-int ulinker_dlarch(void *handle)
-{
-    struct dlinfo *dl = (struct dlinfo *)handle;
-    return dl->dl_arch;
-}
-
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = library_for_address_locked(ulinker, addr);
@@ -3277,6 +3273,8 @@ int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dla
 
     info->udli_fname = dl->dl_name;
     info->udli_fbase = dl->dl_base;
+    info->udli_fsize = dl->dl_size;
     info->udli_farch = dl->dl_arch;
+    info->udli_fabi  = dl->dl_abi;
     return 1;
 }

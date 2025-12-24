@@ -72,11 +72,18 @@ enum {
     ULARCH_X86_64,
     ULARCH_ARM64,
 };
-int ulinker_dlarch(void *handle);
+
+enum {
+    ULABI_NONE = 0,
+    ULABI_LINUX,
+    ULABI_DARWIN
+};
 
 struct ulinker_dladdr_info {
     const char *udli_fname; 
     void       *udli_fbase;
+    size_t      udli_fsize;
     int         udli_farch;
+    int         udli_fabi;
 };
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);

@@ -58,7 +58,7 @@ unicorn:
 	mkdir -p unicorn/build
 	if [ ! -f unicorn/build/Makefile ] ; then cd unicorn/build && cmake .. -DCMAKE_BUILD_TYPE=Release -DUNICORN_INTERPRETER=ON -DUNICORN_ARCH="x86;aarch64" -DUNICORN_BUILD_TESTS=OFF; fi
 	cd unicorn/build && make
-	cp unicorn/build/libunicorn.a .
+	cp unicorn/build/libunicorn.a ./libunicorn.a
 
 dummy:
 	@$(CC) $(CFLAGS) dummy/dummy.c -c -o /tmp/dummy.o
