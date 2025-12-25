@@ -276,9 +276,9 @@ typedef struct
 #define PF_MASKPROC	0xf0000000	/* Processor-specific */
 
 #define MAYBE_MAP_FLAG(x, from, to)  (((x) & (from)) ? (to) : 0)
-#define PFLAGS_TO_PROT(x)            (MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC) | \
-                                      MAYBE_MAP_FLAG((x), PF_R, PROT_READ) | \
+#define PFLAGS_TO_PROT(x)            (MAYBE_MAP_FLAG((x), PF_R, PROT_READ) | \
                                       MAYBE_MAP_FLAG((x), PF_W, PROT_WRITE))
+                                    //MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC) |   <- no need, emulated
 
 /* Dynamic section entry.  */
 
@@ -1258,9 +1258,9 @@ typedef int             vm_prot_t;
 #define VM_PROT_WRITE   ((vm_prot_t) 0x02)      /* write permission */
 #define VM_PROT_EXECUTE ((vm_prot_t) 0x04)      /* execute permission */
 
-#define VMPROT_TO_PROT(x)            (MAYBE_MAP_FLAG((x), VM_PROT_EXECUTE, PROT_EXEC) | \
-                                      MAYBE_MAP_FLAG((x), VM_PROT_READ, PROT_READ) | \
+#define VMPROT_TO_PROT(x)            (MAYBE_MAP_FLAG((x), VM_PROT_READ, PROT_READ) | \
                                       MAYBE_MAP_FLAG((x), VM_PROT_WRITE, PROT_WRITE))
+                                    //MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC) |   <- no need, emulated
 
 /*
  * Dynamically linked shared libraries are identified by two things.  The
