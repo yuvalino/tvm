@@ -410,6 +410,9 @@ DECL_FUNC(getopt_long_only);
 // DECL_FUNC(dlerror);
 // DECL_FUNC(dladdr);
 
+DECL_FUNC(getcwd);
+DECL_FUNC(getwd);
+
 #if defined(__linux__)
 DECL_FUNC(mknodat);
 DECL_FUNC(clearenv);
@@ -425,6 +428,7 @@ DECL_FUNC(openat64);
 DECL_FUNC(fstatat64);
 DECL_FUNC(lseek64);
 DECL_FUNC(ftruncate64);
+DECL_FUNC(get_current_dir_name);
 #endif
 
 __attribute__((constructor))
@@ -7195,6 +7199,31 @@ FUNCTION_DEFINE5(int, getopt_long_only, int, argc, char * const *, argv, const c
     return r;
 }
 
+FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
+    if (buf != NULL)
+        return CALL_FUNC(getcwd, buf, size);
+    
+    char *tmp = CALL_FUNC(getcwd, buf, size);
+    if (!tmp)
+        return NULL;
+    
+    size_t len = strlen(tmp);
+    char *ret = malloc(len + 1);
+    if (ret) {
+        memcpy(ret, tmp, len);
+        ret[len] = 0;
+    }
+
+    CALL_FUNC(free, tmp);
+    return ret;
+}
+
+FUNCTION_DEFINE1(char *, getwd, char *, buf) {
+    return getcwd(buf, PATH_MAX);
+}
+
+
+
 #if defined(__linux__)
 
 /////////////
@@ -7358,6 +7387,22 @@ FUNCTION_DEFINE3(off_t, lseek64, int, fd, off64_t, offset, int, whence) {
 
 FUNCTION_DEFINE2(int, ftruncate64, int, fd, off64_t, length) {
     return CALL_FUNC(ftruncate64, t_fd(fd), length);
+}
+
+FUNCTION_DEFINE0(char *, get_current_dir_name) {
+    char *tmp = CALL_FUNC(get_current_dir_name);
+    if (!tmp)
+        return NULL;
+    
+    size_t len = strlen(tmp);
+    char *ret = malloc(len + 1);
+    if (ret) {
+        memcpy(ret, tmp, len);
+        ret[len] = 0;
+    }
+
+    CALL_FUNC(free, tmp);
+    return ret;
 }
 
 #endif
