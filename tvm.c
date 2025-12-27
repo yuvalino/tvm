@@ -5093,6 +5093,16 @@ err:
     return ret;
 }
 
+
+static int tvm_pwd(int argc, char **argv)
+{
+    char pwd[PATH_MAX];
+    getcwd(pwd, sizeof(pwd));
+
+    printf("%s\n", pwd);
+    return 0;
+}
+
 static int tvm_sorunner(int argc, char **argv)
 {
     if (argc < 2) {
@@ -5146,6 +5156,7 @@ static int tvm_main(int argc, char **argv)
         printf("COMMANDs:\n");
         printf("  ps             tasks list\n");
         printf("  lsof           fd list\n");
+        printf("  pwd            print working directory\n");
         printf("  sorunner       run shared object\n");
         printf("\n");
         return 0;
@@ -5153,6 +5164,7 @@ static int tvm_main(int argc, char **argv)
 
     if (0 == strcmp(argv[1], "ps")) return tvm_ps(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "lsof")) return tvm_lsof(argc - 1, argv + 1);
+    if (0 == strcmp(argv[1], "pwd")) return tvm_pwd(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "sorunner")) return tvm_sorunner(argc - 1, argv + 1);
     
     fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
