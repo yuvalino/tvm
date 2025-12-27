@@ -113,6 +113,7 @@ int main(int argc, char **argv)
         char *nargv[] = {
             argv[0],
             //"-vvvvvv",
+            "-e",
             "-F",
             "-E",
             "-p",
