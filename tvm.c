@@ -5103,6 +5103,16 @@ static int tvm_pwd(int argc, char **argv)
     return 0;
 }
 
+static int tvm_env(int argc, char **argv)
+{
+    char **p = tvm_environ;
+    if (argc > 1)
+        p = environ;
+    for (; p && *p; p++)
+        printf("%s\n", *p);
+    return 0;
+}
+
 static int tvm_sorunner(int argc, char **argv)
 {
     if (argc < 2) {
@@ -5157,6 +5167,7 @@ static int tvm_main(int argc, char **argv)
         printf("  ps             tasks list\n");
         printf("  lsof           fd list\n");
         printf("  pwd            print working directory\n");
+        printf("  env            print environment variables\n");
         printf("  sorunner       run shared object\n");
         printf("\n");
         return 0;
@@ -5165,6 +5176,7 @@ static int tvm_main(int argc, char **argv)
     if (0 == strcmp(argv[1], "ps")) return tvm_ps(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "lsof")) return tvm_lsof(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "pwd")) return tvm_pwd(argc - 1, argv + 1);
+    if (0 == strcmp(argv[1], "env")) return tvm_env(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "sorunner")) return tvm_sorunner(argc - 1, argv + 1);
     
     fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
