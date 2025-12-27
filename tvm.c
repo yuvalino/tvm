@@ -5146,6 +5146,7 @@ static int tvm_main(int argc, char **argv)
         printf("COMMANDs:\n");
         printf("  ps             tasks list\n");
         printf("  lsof           fd list\n");
+        printf("  sorunner       run shared object\n");
         printf("\n");
         return 0;
     }
