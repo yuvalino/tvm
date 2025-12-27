@@ -234,7 +234,10 @@ struct original_func_t {
 
 static LIST_HEAD(original_functions);
 
+DECL_FUNC(fopen);
+DECL_FUNC(freopen);
 DECL_FUNC(fdopen);
+DECL_FUNC(opendir)
 DECL_FUNC(fdopendir);
 DECL_FUNC(fwrite);
 DECL_FUNC(fread);
@@ -291,24 +294,37 @@ DECL_FUNC(poll);
 DECL_FUNC(fcntl);
 DECL_FUNC(ftruncate);
 DECL_FUNC(stat);
+DECL_FUNC(lstat);
 DECL_FUNC(fstat);
 DECL_FUNC(fstatat);
 DECL_FUNC(access);
 DECL_FUNC(faccessat);
 DECL_FUNC(chmod);
+DECL_FUNC(lchmod);
 DECL_FUNC(fchmod);
 DECL_FUNC(fchmodat);
 DECL_FUNC(chown);
+DECL_FUNC(lchown);
 DECL_FUNC(fchown);
 DECL_FUNC(fchownat);
 DECL_FUNC(flock);
 DECL_FUNC(lockf);
+DECL_FUNC(readlink);
 DECL_FUNC(readlinkat);
+DECL_FUNC(symlink);
 DECL_FUNC(symlinkat);
+DECL_FUNC(link);
 DECL_FUNC(linkat);
+DECL_FUNC(rename);
 DECL_FUNC(renameat);
+DECL_FUNC(unlink);
 DECL_FUNC(unlinkat);
+DECL_FUNC(mkdir);
 DECL_FUNC(mkdirat);
+DECL_FUNC(rmdir);
+DECL_FUNC(mkfifo);
+DECL_FUNC(mkfifoat);
+DECL_FUNC(mkstemp);
 
 DECL_FUNC(socket);
 DECL_FUNC(accept);
@@ -410,10 +426,14 @@ DECL_FUNC(getopt_long_only);
 // DECL_FUNC(dlerror);
 // DECL_FUNC(dladdr);
 
+DECL_FUNC(realpath);
+DECL_FUNC(chdir);
+DECL_FUNC(fchdir);
 DECL_FUNC(getcwd);
 DECL_FUNC(getwd);
 
 #if defined(__linux__)
+DECL_FUNC(mknod);
 DECL_FUNC(mknodat);
 DECL_FUNC(clearenv);
 DECL_FUNC(execvpe);
@@ -614,6 +634,49 @@ err:
     return ret;
 }
 #endif
+
+ssize_t fd_getpath(int fd, char *out, size_t outsize)
+{
+#if defined(__APPLE__)
+    char filepath[PATH_MAX];
+    filepath[0] = 0;
+
+    if (-1 == CALL_FUNC(fcntl, F_GETPATH, (uint64_t)&filepath))
+        return -1;
+
+    size_t len = strlen(filepath);
+    if (len + 1 > outsize) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(out, filepath, len + 1);
+    return len;
+#elif defined(__linux__)
+        if (!out || outsize == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+
+    ssize_t n = CALL_FUNC(readlink, link, out, outsize - 1);
+    if (n < 0)
+        return -1;
+
+    if ((size_t)n >= outsize) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    out[n] = '\0';
+    return n;
+#endif
+
+    errno = ENOSYS;
+    return -1;
+}
 
 /////////////
 // Jmpbuf manipulation
@@ -966,6 +1029,7 @@ struct task {
     char tsk_comm[16];
     struct rmem_arena *tsk_ar;
     struct ulinker *tsk_linker;
+    char tsk_cwd[PATH_MAX];
 };
 
 static Dl_info main_dlinfo = {0};
@@ -1088,6 +1152,10 @@ static struct task *taskalloc()
             panic("taskalloc make_pthread_entry");
         list_add_tail(&pent->ptl_entry, &t->tsk_pthreads);
         ++t->tsk_pthreads_count;
+
+        t->tsk_cwd[0] = 0;
+        if (!CALL_FUNC(getcwd, t->tsk_cwd, sizeof(t->tsk_cwd)))
+            panic("taskalloc getcwd");
     } else {
         task_lock(current);
         t->tsk_parent = current;
@@ -1126,6 +1194,9 @@ static struct task *taskalloc()
         }
 
         memcpy(t->tsk_sighandlers, t->tsk_parent->tsk_sighandlers, sizeof(t->tsk_sighandlers));
+
+        t->tsk_cwd[0] = 0;
+        strncpy(t->tsk_cwd, current->tsk_cwd, sizeof(t->tsk_cwd));
 
         task_unlock(current);
 
@@ -1492,6 +1563,88 @@ static FILE *t_f(FILE *f)
         return current->tsk_f[2];
     return f;
 }
+
+char *current_normalize_path(const char *file_name, char *out_path)
+{
+    char tmp[PATH_MAX];
+    int c = 0;
+
+    task_lock(current);
+    if (file_name[0] == '/')
+        c = snprintf(tmp, PATH_MAX, "%s", file_name);
+    else if (file_name[0] == 0)
+        c = snprintf(tmp, PATH_MAX, "%s", current->tsk_cwd);
+    else
+        c = snprintf(tmp, PATH_MAX, "%s/%s", current->tsk_cwd, file_name);
+    task_unlock(current);
+
+    if (c < 0 || c >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+
+    /* Normalize path: handle ., .., and // */
+    char *stack[PATH_MAX / 2];
+    int top = 0;
+
+    char *p = tmp;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p)
+            break;
+
+        char *start = p;
+        while (*p && *p != '/') p++;
+        if (*p)
+            *p++ = '\0';
+
+        if (strcmp(start, ".") == 0) {
+            continue;
+        } else if (strcmp(start, "..") == 0) {
+            if (top > 0)
+                top--;
+        } else {
+            stack[top++] = start;
+        }
+    }
+
+    /* Rebuild normalized path */
+    char *out = out_path;
+    size_t left = PATH_MAX;
+
+    if (left < 2) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+
+    *out++ = '/';
+    left--;
+
+    for (int i = 0; i < top; i++) {
+        size_t len = strlen(stack[i]);
+        if (len + 1 > left) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        memcpy(out, stack[i], len);
+        out += len;
+        left -= len;
+
+        if (i != top - 1) {
+            *out++ = '/';
+            left--;
+        }
+    }
+
+    if (out == out_path + 1)  /* root */
+        *out = '\0';
+    else
+        *out = '\0';
+
+    INFO("realpath: \"%s\" = \"%s\"", file_name, out_path);
+    return out_path;
+}
+
 
 /////////////
 // Allocator
@@ -5376,8 +5529,39 @@ static void __panic(const char *msg, const char *file, int line)
  * - _FORTIFY_SOURCE - `__printf_chk()`, `__dup_chk()` etc (for now just don't compile with -Os)
  */
 
+FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
+{
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return NULL;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(fopen, pathname, mode);
+}
+
+FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FILE *, stream)
+{
+    char pathname_abs[PATH_MAX];
+    if (pathname) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return NULL;
+        pathname = pathname_abs;
+    }
+    
+    return CALL_FUNC(freopen, pathname, mode, t_f(stream));
+}
+
 FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     return CALL_FUNC(fdopen, t_fd(fd), mode);
+}
+
+FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return NULL;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(opendir, pathname);
 }
 
 FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
@@ -5631,6 +5815,11 @@ FUNCTION_DEFINE_VA2(int, open, const char *, pathname, int, flags) {
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(open, pathname, flags, mode);
 
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+    INFO("open: \"%s\"", pathname);
     int f = task_reserve_fd(current, 0);
     if (f == -1) {
         errno = EMFILE;
@@ -5655,6 +5844,11 @@ FUNCTION_DEFINE_VA2(int, open, const char *, pathname, int, flags) {
 }
 
 FUNCTION_DEFINE2(int, creat, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
     int r = CALL_FUNC(creat, pathname, mode);
     if (r == -1) {
         return r;
@@ -5672,6 +5866,13 @@ FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags)
     mode_t mode = va_arg(__ap, int);
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(openat, dirfd, pathname, flags, mode);
+    
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
 
     int f = task_reserve_fd(current, 0);
     if (f == -1) {
@@ -6010,6 +6211,11 @@ FUNCTION_DEFINE2(int, ftruncate, int, fd, off_t, length) {
 }
 
 FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
     struct fops *fops;
     if ((fops = fops_for_pathname(pathname))) {
         FOPS_PATH(fops, f_stat, pathname, statbuf);
@@ -6021,6 +6227,20 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
     }
 
     return CALL_FUNC(stat, pathname, statbuf);
+}
+
+FUNCTION_DEFINE2(int, lstat, const char *, pathname, struct stat *, statbuf) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    if (find_program(pathname)) {
+        statbuf->st_mode = S_IFREG | S_IXUSR | S_IXGRP | S_IXOTH;
+        return 0;
+    }
+
+    return CALL_FUNC(lstat, pathname, statbuf);
 }
 
 FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
@@ -6037,10 +6257,22 @@ FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
 }
 
 FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *, statbuf, int, flags) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(fstatat, t_fd(dirfd), pathname, statbuf, flags);
 }
 
 FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
     // make sure the shell finds our programs
     if (find_program(pathname))
         return 0;
@@ -6049,15 +6281,36 @@ FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
 }
 
 FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, int, flags) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(faccessat, t_fd(dirfd), pathname, mode, flags);
 }
 
 FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
     struct fops *fops;
     if (!(fops = fops_for_pathname(pathname)))
         return CALL_FUNC(chmod, pathname, mode);
 
     FOPS_PATH(fops, f_chmod, pathname, mode);
+}
+
+FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(lchmod, pathname, mode);
 }
 
 FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
@@ -6075,15 +6328,36 @@ FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
 
 // TODO support dirfd properly
 FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode, int, flags) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(fchmodat, t_fd(dirfd), pathname, mode, flags);
 }
 
 FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname;
+
     struct fops *fops;
     if (!(fops = fops_for_pathname(pathname)))
         return CALL_FUNC(chown, pathname, owner, group);
 
     FOPS_PATH(fops, f_chown, pathname, owner, group);
+}
+
+FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname;
+
+    return CALL_FUNC(lchown, pathname, owner, group);
 }
 
 FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
@@ -6100,6 +6374,13 @@ FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
 }
 
 FUNCTION_DEFINE5(int, fchownat, int, dirfd, const char *, pathname, uid_t, owner, gid_t, group, int, flags) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(fchownat, t_fd(dirfd), pathname, owner, group, flags);
 }
 
@@ -6111,28 +6392,195 @@ FUNCTION_DEFINE3(int, lockf, int, fd, int, cmd, off_t, len) {
     return CALL_FUNC(lockf, t_fd(fd), cmd, len);
 }
 
+FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t, bufsiz) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(readlink, pathname, buf, bufsiz);
+}
+
 FUNCTION_DEFINE4(ssize_t, readlinkat, int, dirfd, const char *, pathname, char *, buf, size_t, bufsiz) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(readlinkat, t_fd(dirfd), pathname, buf, bufsiz);
 }
 
+FUNCTION_DEFINE2(int, symlink, const char *, target, const char *, linkpath) {
+    char linkpath_abs[PATH_MAX];
+    if (!current_normalize_path(linkpath, linkpath_abs))
+        return -1;
+    linkpath = linkpath_abs;
+
+    return CALL_FUNC(symlink, target, linkpath);
+}
+
 FUNCTION_DEFINE3(int, symlinkat, const char *, target, int, newdirfd, const char *, linkpath) {
+    char linkpath_abs[PATH_MAX];
+    if (newdirfd == AT_FDCWD) {
+        if (!current_normalize_path(linkpath, linkpath_abs))
+            return -1;
+        linkpath = linkpath_abs;
+    }
+
     return CALL_FUNC(symlinkat, target, t_fd(newdirfd), linkpath);
 }
 
+FUNCTION_DEFINE2(int, link, const char *, oldpath, const char *, newpath) {
+    char oldpath_abs[PATH_MAX];
+    if (!current_normalize_path(oldpath, oldpath_abs))
+        return -1;
+    oldpath = oldpath_abs;
+
+    char newpath_abs[PATH_MAX];
+    if (!current_normalize_path(newpath, newpath_abs))
+        return -1;
+    newpath = newpath_abs;
+
+    return CALL_FUNC(link, oldpath, newpath);
+}
+
 FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath, int, flags) {
+    char oldpath_abs[PATH_MAX];
+    if (olddirfd == AT_FDCWD) {
+        if (!current_normalize_path(oldpath, oldpath_abs))
+            return -1;
+        oldpath = oldpath_abs;
+    }
+
+    char newpath_abs[PATH_MAX];
+    if (newdirfd == AT_FDCWD) {
+        if (!current_normalize_path(newpath, newpath_abs))
+            return -1;
+        newpath = newpath_abs;
+    }
+
     return CALL_FUNC(linkat, t_fd(olddirfd), oldpath, t_fd(newdirfd), newpath, flags);
 }
 
+FUNCTION_DEFINE2(int, rename, const char *, oldpath, const char *, newpath) {
+    char oldpath_abs[PATH_MAX];
+    if (!current_normalize_path(oldpath, oldpath_abs))
+        return -1;
+    oldpath = oldpath_abs;
+
+    char newpath_abs[PATH_MAX];
+    if (!current_normalize_path(newpath, newpath_abs))
+        return -1;
+    newpath = newpath_abs;
+
+    return CALL_FUNC(rename, oldpath, newpath);
+}
+
 FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath) {
+    char oldpath_abs[PATH_MAX];
+    if (olddirfd == AT_FDCWD) {
+        if (!current_normalize_path(oldpath, oldpath_abs))
+            return -1;
+        oldpath = oldpath_abs;
+    }
+
+    char newpath_abs[PATH_MAX];
+    if (newdirfd == AT_FDCWD) {
+        if (!current_normalize_path(newpath, newpath_abs))
+            return -1;
+        newpath = newpath_abs;
+    }
+
     return CALL_FUNC(renameat, t_fd(olddirfd), oldpath, t_fd(newdirfd), newpath);
 }
 
+FUNCTION_DEFINE1(int, unlink, const char *, pathname) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(unlink, pathname);
+}
+
 FUNCTION_DEFINE3(int, unlinkat, int, dirfd, const char *, pathname, int, flags) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(unlinkat, t_fd(dirfd), pathname, flags);
 }
 
+FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(mkdir, pathname, mode);
+}
+
 FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(mkdirat, t_fd(dirfd), pathname, mode);
+}
+
+FUNCTION_DEFINE1(int, rmdir, const char *, pathname) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(rmdir, pathname);
+}
+
+FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(mkfifo, pathname, mode);
+}
+
+FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
+    return CALL_FUNC(mkfifoat, t_fd(dirfd), pathname, mode);
+}
+
+FUNCTION_DEFINE1(int, mkstemp, char *, template) {
+    int f = task_reserve_fd(current, 0);
+    if (f == -1) {
+        errno = EMFILE;
+        return -1;
+    }
+
+    int r = CALL_FUNC(mkstemp, template);
+    
+    if (r == -1) {
+        task_set_fd(current, f, -1);
+        return r;
+    }
+
+    task_set_fd(current, f, r);
+    return f;
 }
 
 FUNCTION_DEFINE3(int,  socket, int, domain, int, type, int, protocol) {
@@ -6667,6 +7115,11 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 }
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
     INFO("execve(\"%s\")", pathname);
 
     int argc = 0;
@@ -6829,6 +7282,13 @@ FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
 }
 
 FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
+    char file_abs[PATH_MAX];
+    if (!strchr(file, '/')) {
+        if (!current_normalize_path(file, file_abs))
+            return -1;
+        file = file_abs;
+    }
+
     const char *pathname = find_program_pathname(file);
     if (!pathname) {
         errno = ENOENT;
@@ -6861,7 +7321,7 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
         close(master);
         return -1;
     }
-
+    INFO("OPENPTY OPEN %s", sname);
     int slave = open(sname, O_RDWR | O_NOCTTY);
     if (-1 == slave) {
         close(master);
@@ -7224,22 +7684,81 @@ FUNCTION_DEFINE5(int, getopt_long_only, int, argc, char * const *, argv, const c
     return r;
 }
 
-FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
-    if (buf != NULL)
-        return CALL_FUNC(getcwd, buf, size);
-    
-    char *tmp = CALL_FUNC(getcwd, buf, size);
-    if (!tmp)
+FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_name)
+{
+    int c = 0;
+    char tmp[PATH_MAX];
+    tmp[0] = 0;
+
+    task_lock(current);
+    if (file_name[0] == '/')
+        c = snprintf(tmp, PATH_MAX, "%s", file_name);
+    else if (file_name[0] == 0)
+        c = snprintf(tmp, PATH_MAX, "%s", current->tsk_cwd);
+    else
+        c = snprintf(tmp, PATH_MAX, "%s/%s", current->tsk_cwd, file_name);
+    task_unlock(current);
+
+    if (c >= PATH_MAX) {
+        errno = ENAMETOOLONG;
         return NULL;
+    }
     
-    size_t len = strlen(tmp);
-    char *ret = malloc(len + 1);
-    if (ret) {
-        memcpy(ret, tmp, len);
-        ret[len] = 0;
+    char *tmp2 = CALL_FUNC(realpath, tmp, resolved_name);
+    if (!tmp2)
+        return NULL;
+
+    if (resolved_name)
+        return tmp2;
+
+    char *ret = malloc(strlen(tmp2));
+    if (ret)
+        strcpy(ret, tmp2);
+    CALL_FUNC(free, tmp2);
+    return ret;
+}
+
+FUNCTION_DEFINE1(int, chdir, const char *, path) {
+    char abs_path[PATH_MAX];
+    if (!current_normalize_path(path, abs_path))
+        return -1;
+    path = abs_path;
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
     }
 
-    CALL_FUNC(free, tmp);
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    task_lock(current);
+    strcpy(current->tsk_cwd, path);
+    task_unlock(current);
+
+    return 0;
+}
+
+FUNCTION_DEFINE1(int, fchdir, int, fildes) {
+    char tmp[PATH_MAX];
+    if (0 > fd_getpath(t_fd(fildes), tmp, sizeof(tmp)))
+        return -1;
+
+    return chdir(tmp);
+}
+
+FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
+    task_lock(current);
+    if (buf != NULL) {
+        strncpy(buf, current->tsk_cwd, size);
+        task_unlock(current);
+        return buf;
+    }
+    
+    char *ret = strdup(current->tsk_cwd);
+    task_unlock(current);
     return ret;
 }
 
@@ -7255,11 +7774,34 @@ FUNCTION_DEFINE1(char *, getwd, char *, buf) {
 // Linux-specific hooks
 /////////////
 
+FUNCTION_DEFINE3(int, mknod, const char *, pathname, mode_t, mode, dev_t, dev) {
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    return CALL_FUNC(mknod, pathname, mode, dev);
+}
+
 FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode, dev_t, dev) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(mknodat, t_fd(dirfd), pathname, mode, dev);
 }
 
 FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {
+    char file_abs[PATH_MAX];
+    if (!strchr(file, '/')) {
+        if (!current_normalize_path(file, file_abs))
+            return -1;
+        file = file_abs;
+    }
+
     const char *pathname = find_program_pathname(file);
     if (!pathname) {
         errno = ENOENT;
@@ -7357,6 +7899,11 @@ FUNCTION_DEFINE_VA2(int, open64, const char *, pathname, int, flags) {
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(open64, pathname, flags, mode);
 
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
     int f = task_reserve_fd(current, 0);
     if (f == -1) {
         errno = EMFILE;
@@ -7385,6 +7932,13 @@ FUNCTION_DEFINE_VA3(int, openat64, int, dirfd, const char *, pathname, int, flag
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(openat64, dirfd, pathname, flags, mode);
 
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     int f = task_reserve_fd(current, 0);
     if (f == -1) {
         errno = EMFILE;
@@ -7403,6 +7957,13 @@ FUNCTION_DEFINE_VA3(int, openat64, int, dirfd, const char *, pathname, int, flag
 }
 
 FUNCTION_DEFINE4(int, fstatat64, int, dirfd, const char *, pathname, struct stat64 *, statbuf, int, flags) {
+    char pathname_abs[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!current_normalize_path(pathname, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+    }
+
     return CALL_FUNC(fstatat64, t_fd(dirfd), pathname, statbuf, flags);
 }
 
@@ -7415,19 +7976,10 @@ FUNCTION_DEFINE2(int, ftruncate64, int, fd, off64_t, length) {
 }
 
 FUNCTION_DEFINE0(char *, get_current_dir_name) {
-    char *tmp = CALL_FUNC(get_current_dir_name);
-    if (!tmp)
-        return NULL;
-    
-    size_t len = strlen(tmp);
-    char *ret = malloc(len + 1);
-    if (ret) {
-        memcpy(ret, tmp, len);
-        ret[len] = 0;
-    }
-
-    CALL_FUNC(free, tmp);
-    return ret;
+    char *pwd = getenv("PWD");
+    if (pwd)
+        return strdup(pwd);
+    return getcwd(NULL, 0);
 }
 
 #endif
