@@ -110,11 +110,13 @@ static void format_time(char *buf, size_t buflen)
     );
 }
 
+static int g_outfd = STDOUT_FILENO;
+
 #define INFO(Msg, ...) do { \
     char __ts[32]; \
     format_time(__ts, sizeof(__ts)); \
     int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
-    CALL_FUNC(write, 1, msgbuf, __num); \
+    CALL_FUNC(write, g_outfd, msgbuf, __num); \
 } while (0)
 
 #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
@@ -1137,11 +1139,22 @@ static struct task *taskalloc()
         main_task = t;
         t->tsk_pid = __gettid();
         t->tsk_sid = t->tsk_pgid = t->tsk_pid;
-        for (int i = 0; i < 3; i++)
-            t->tsk_fd[i] = i;
-        t->tsk_f[0] = stdin;
-        t->tsk_f[1] = stdout;
-        t->tsk_f[2] = stderr;
+
+        // simple dups for main task
+        for (int i = 0; i < 3; i++) {
+            int rfd = CALL_FUNC(dup, i);
+            if (-1 == rfd)
+                panic("taskalloc::dup %d", i);
+            t->tsk_fd[i] = rfd;
+        }
+
+        for (int i = 0; i < 3; i++) {
+            t->tsk_f[i] = CALL_FUNC(fdopen, t->tsk_fd[i], (i?"w":"r"));
+            if (!t->tsk_f[i])
+                panic("taskalloc::fdopen");
+            if (0 != CALL_FUNC(setvbuf, t->tsk_f[i], NULL, _IOLBF, 0))
+                panic("taskalloc: setvbuf");
+        }
 
         t->tsk_environ = copyenv(t->tsk_ar, environ);
         if (!t->tsk_environ)
@@ -1641,7 +1654,6 @@ char *current_normalize_path(const char *file_name, char *out_path)
     else
         *out = '\0';
 
-    INFO("realpath: \"%s\" = \"%s\"", file_name, out_path);
     return out_path;
 }
 
@@ -5328,8 +5340,6 @@ static int tvm_sorunner(int argc, char **argv)
                 0, 0, 0);
     if (callerr)
         printf("sorunner emulator_call failed!\n");
-    else
-        printf("sorunner ret %lu\n", ret);
 
     emulator_context_fini(&ec);
 
@@ -5379,14 +5389,14 @@ static void rmem_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
     int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
-    CALL_FUNC(write, 1, msgbuf, __num);
+    CALL_FUNC(write, g_outfd, msgbuf, __num);
 }
 
 static void ulinker_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
     int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
-    CALL_FUNC(write, 1, msgbuf, __num);
+    CALL_FUNC(write, g_outfd, msgbuf, __num);
 }
 
 #define ULINKER_ARENA(_arg) ((_arg) ? ((struct task *)arg)->tsk_ar : global_arena)
@@ -5486,6 +5496,29 @@ void tvm_init(const char *init_comm)
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
 }
 
+int tvm_setopt(int opt, void *val) {
+    if (opt == TVMOPT_OUTFD) {
+        g_outfd = (int)(long)val;
+        return 0;
+    }
+    if (opt == TVMOPT_SETFD) {
+        int inner_fd = ((int *)val)[0];
+        int outer_fd = ((int *)val)[1];
+
+        // simple dup2 to old fd
+        if (t_fd(inner_fd) != -1)
+            return (-1 == CALL_FUNC(dup2, outer_fd, t_fd(inner_fd)));
+
+        // dup new fd and set
+        int rfd = CALL_FUNC(dup, outer_fd);
+        if (rfd == -1)
+            return 1;
+        task_set_fd(current, inner_fd, rfd);
+        return 0;
+    }
+    return 1;
+}
+
 char ***_tvm_environ()
 {
     if (!main_task)
@@ -5505,7 +5538,7 @@ void tvm_log(const char *function, const char *msg, ...)
 
     n += snprintf(msgbuf + n, sizeof(msgbuf) - n, "\n");
 
-    CALL_FUNC(write, 1, msgbuf, n);
+    CALL_FUNC(write, g_outfd, msgbuf, n);
 }
 
 void tvm_dump(int mode)

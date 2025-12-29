@@ -20,6 +20,12 @@ void _tvm_register_cow(void *(*getptr_fn)(void), unsigned size, void (*init_fn)(
     
 void tvm_init(const char *init_comm);
 
+enum {
+    TVMOPT_OUTFD, // int fd
+    TVMOPT_SETFD, // int[2] = {inner_fd, outer_fd}
+};
+int tvm_setopt(int opt, void *val);
+
 #define tvm_environ (*(_tvm_environ()))
 char ***_tvm_environ(void);
 
