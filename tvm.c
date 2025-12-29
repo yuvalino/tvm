@@ -3785,6 +3785,9 @@ static void emulator_debug_hook_cb(uc_engine *uc,
     INFO("emulator_debug: PC = 0x%lx, size = %u", address, size);
 }
 
+#define EMULATOR_ADDRESS_MIN ((uint64_t)0x4000)
+#define EMULATOR_ADDRESS_MAX ((uint64_t)0xFFFFFFFFFFFFC000)
+
 int emulator_engine_reset(struct emulator_engine *ee) {
     int ret = 1;
     uc_err err;
@@ -3808,13 +3811,41 @@ int emulator_engine_reset(struct emulator_engine *ee) {
             NULL,
             1, 0);
 
+    // Map emulator map entries as RWX while the rest are mapped as RW
+    // NOTE: This is to allow passthrough memory to host but allow us to tightly control which code is executed on guest and which on host
+
+    uint64_t last_entry_end = EMULATOR_ADDRESS_MIN; // incase there are no entries, map everything
+
     for (struct emulator_map_entry *eme = ee->ee_eme; eme; eme = eme->eme_next) {
-        err = uc_mem_map_ptr(engine, eme->eme_start, eme->eme_size, UC_PROT_ALL, (void *)eme->eme_start);
+        if (eme->eme_start > last_entry_end) {
+            INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE)", (void *)last_entry_end, (void *)(eme->eme_start - last_entry_end));
+            err = uc_mem_map_ptr(engine, last_entry_end, eme->eme_start - last_entry_end, UC_PROT_READ | UC_PROT_WRITE, (void *)last_entry_end);
+            if (err) {
+                INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE) failed: %s", (void *)last_entry_end, (void *)(eme->eme_start - last_entry_end), uc_strerror(err));
+                goto out;
+            }
+        }
+
+        INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE|UC_PROT_EXEC)", (void *)eme->eme_start, (void *)eme->eme_size);
+        err = uc_mem_map_ptr(engine, eme->eme_start, eme->eme_size, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC, (void *)eme->eme_start);
         if (err) {
-            INFO("uc_mem_map_ptr(addr=%p, size=%p) failed: %s", (void *)eme->eme_start, (void *)eme->eme_size, uc_strerror(err));
+            INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE|UC_PROT_EXEC) failed: %s", (void *)eme->eme_start, (void *)eme->eme_size, uc_strerror(err));
+            goto out;
+        }
+
+        last_entry_end = eme->eme_start + eme->eme_size;
+    }
+
+    if (last_entry_end < EMULATOR_ADDRESS_MAX) {
+        INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE)", (void *)last_entry_end, (void *)(EMULATOR_ADDRESS_MAX - last_entry_end));
+        err = uc_mem_map_ptr(engine, last_entry_end, EMULATOR_ADDRESS_MAX - last_entry_end, UC_PROT_READ | UC_PROT_WRITE, (void *)last_entry_end);
+        if (err) {
+            INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE) failed: %s", (void *)last_entry_end, (void *)(EMULATOR_ADDRESS_MAX - last_entry_end), uc_strerror(err));
             goto out;
         }
     }
+
+    INFO("emulator_engine_reset: done");
 
     if (ee->ee_uc) {
         uc_close(ee->ee_uc);
@@ -4492,51 +4523,50 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
             goto out;
         
         if (ess->ess_intr == ESS_INTR_MEM) {
-            if (ess->ess_intr_addr == EMULATOR_CALL_END_LR && ess->ess_intr_memtype == UC_MEM_FETCH_UNMAPPED) {
+            if (ess->ess_intr_memtype != UC_MEM_FETCH_PROT) {
+                INFO("ess->ess_intr_memtype %d != UC_MEM_FETCH_PROT", ess->ess_intr_memtype);
+                raise(SIGSEGV);
+            }
+
+            if (ess->ess_intr_addr == EMULATOR_CALL_END_LR) {
                 // returned
                 if (0 == emulator_saved_state_read_reg(ess, ESS_REG_RET, out_ret))
                     r = 0;
                 goto out;
             }
 
-            // perhaps we need to page in memory
+            // perhaps we need to page in executable memory
             uint64_t fault_range_start = 0;
             uint64_t fault_range_size  = 0;
-            if (ess->ess_intr_addr >= (uint64_t)ess->ess_stack && ess->ess_intr_addr < (uint64_t)ess->ess_stack + ess->ess_stack_size) {
-                fault_range_start = (uint64_t)ess->ess_stack;
-                fault_range_size = ess->ess_stack_size;
-            }
-            else {
-                struct ulinker_dladdr_info fault_info;
-                if (0 == emulator_find_dl(ec, ess->ess_intr_addr, &fault_info)) {
-                    if (UC_MEM_FETCH_UNMAPPED && fault_info.udli_farch != ess->ess_arch) {
-                        
-                        // read lr before call so stack is adjusted for emulator_call_params_from_saved_state()
-                        uint64_t fault_lr;
-                        if (0 != emulator_saved_state_exit_call(ess, &fault_lr))
-                            goto out;
+            struct ulinker_dladdr_info fault_info;
+            if (0 == emulator_find_dl(ec, ess->ess_intr_addr, &fault_info)) {
+                if (fault_info.udli_farch != ess->ess_arch) {
+                    
+                    // read lr before call so stack is adjusted for emulator_call_params_from_saved_state()
+                    uint64_t fault_lr;
+                    if (0 != emulator_saved_state_exit_call(ess, &fault_lr))
+                        goto out;
 
-                        struct emulator_call_params fault_params;
-                        if (0 != emulator_call_params_from_saved_state(&fault_params, ess))
-                            goto out;
+                    struct emulator_call_params fault_params;
+                    if (0 != emulator_call_params_from_saved_state(&fault_params, ess))
+                        goto out;
 
-                        INFO("SUBCALL! arch=%d pc=%p lr=%p", fault_info.udli_farch, (void *)fault_params.pc, (void *)fault_lr);
-                        // call with parameters and save ret
-                        uint64_t fault_ret;
-                        if (0 != emulator_call_ex(ec, &fault_info, &fault_params, &fault_ret))
-                            goto out;
-                        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_RET, &fault_ret))
-                            goto out;
-                        INFO("SUBCALL RET! res=%p lr=%p", (void *)fault_ret, (void *)fault_lr);
-                        
-                        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &fault_lr))
-                            goto out;
-                        continue;
-                    }
-
-                    fault_range_start = (uint64_t)fault_info.udli_fbase;
-                    fault_range_size  = fault_info.udli_fsize;
+                    INFO("SUBCALL! arch=%d pc=%p lr=%p", fault_info.udli_farch, (void *)fault_params.pc, (void *)fault_lr);
+                    // call with parameters and save ret
+                    uint64_t fault_ret;
+                    if (0 != emulator_call_ex(ec, &fault_info, &fault_params, &fault_ret))
+                        goto out;
+                    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_RET, &fault_ret))
+                        goto out;
+                    INFO("SUBCALL RET! res=%p lr=%p", (void *)fault_ret, (void *)fault_lr);
+                    
+                    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &fault_lr))
+                        goto out;
+                    continue;
                 }
+
+                fault_range_start = (uint64_t)fault_info.udli_fbase;
+                fault_range_size  = fault_info.udli_fsize;
             }
 
             if (!fault_range_start || !fault_range_size) {
@@ -4554,7 +4584,7 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
                 goto out;
             }
 
-            INFO("uc_mem_map_ptr(addr=%p, size=%p)", (void *)fault_range_start, (void *)fault_range_size);
+            INFO("PAGE IN RWX (addr=%p, size=%p)", (void *)fault_range_start, (void *)fault_range_size);
             
             if (0 != emulator_engine_add_map_entry(ec->ec_curr_engine, fault_range_start, fault_range_size))
                 goto out;
