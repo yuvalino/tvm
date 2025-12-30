@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <limits.h>
 
 void xxd(void *addr, int len)
 {
@@ -69,6 +70,11 @@ int main(int argc, char **argv)
     tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
     tvm_register_program("/usr/bin/toybox", (main_func_t) _toybox_main);
     toybox_iter_toy_names(add_toy, NULL);
+
+    // set home to current directory
+    char cwd[PATH_MAX];
+    getcwd(cwd, sizeof(cwd));
+    setenv("HOME", cwd, 1);
 
     if (argc < 2) {
         fprintf(stderr, "forkless: no command\n");
