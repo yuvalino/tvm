@@ -32,8 +32,8 @@ libtvm: dropbear mksh toybox unicorn
 	$(CC) $(CFLAGS) -g -I.  -I./unicorn/include -c rmem.c ulinker.c tvm.c main.c
 	ar rcs libtvm.a rmem.o ulinker.o tvm.o main.o
 
-forkless: dropbear mksh toybox unicorn
-	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil -lunicorn -lm $(LDFLAGS)
+forkless: dropbear mksh toybox unicorn minivim
+	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil -lunicorn -lm -lminivim $(LDFLAGS)
 
 test_tvm: unicorn
 	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c test_tvm.c -o test_tvm -L . -lpthread -lunicorn -lm $(LDFLAGS)
@@ -59,6 +59,10 @@ unicorn:
 	if [ ! -f unicorn/build/Makefile ] ; then cd unicorn/build && cmake .. $(CMAKE_FLAGS) -DCMAKE_BUILD_TYPE=Release -DUNICORN_INTERPRETER=ON -DUNICORN_ARCH="x86;aarch64" -DUNICORN_BUILD_TESTS=OFF; fi
 	cd unicorn/build && make
 	cp unicorn/build/libunicorn.a ./libunicorn.a
+
+minivim:
+	CFLAGS="$(CFLAGS) -g -I$(realpath .) -DMINIVIM_FORKLESS=1" make -C mini-vim libminivim.a
+	cp mini-vim/libminivim.a .
 
 dummy:
 	@$(CC) $(CFLAGS) dummy/dummy.c -c -o /tmp/dummy.o

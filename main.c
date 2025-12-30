@@ -55,6 +55,7 @@ int dropbear_main(int argc, char **argv);
 int scp_main(int argc, char **argv);
 int _toybox_main(int argc, char **argv);
 void toybox_iter_toy_names(void (*fn)(const char *, void *), void * arg);
+int minivim_main(int argc, char **argv);
 
 static void add_toy(const char *toy_name, void *arg)
 {
@@ -70,6 +71,7 @@ int main(int argc, char **argv)
     tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
     tvm_register_program("/usr/bin/toybox", (main_func_t) _toybox_main);
     toybox_iter_toy_names(add_toy, NULL);
+    tvm_register_program("/usr/bin/vim", (main_func_t) minivim_main);
 
     // set home to current directory
     char cwd[PATH_MAX];

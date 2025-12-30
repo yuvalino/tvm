@@ -2477,6 +2477,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
 #if defined(__linux__)
         case TCSETS:
         case TCSETSW:
+        case TCSETSF:
 #elif defined(__APPLE__)
         case TIOCSETA:
         case TIOCSETAW:
