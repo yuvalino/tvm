@@ -1,4 +1,4 @@
 HISTFILE="$HOME/.forkless_history"
 HISTSIZE=5000
 
-alias ll="ls -la"
+alias ll="ls -la --color"

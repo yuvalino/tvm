@@ -69,9 +69,10 @@
 // LOCK ORDERING
 
 // tty
-// task
+// task | vfs_node
 // file
 // file_stream
+// vfs_file
 
 /////////////
 // Macros
@@ -508,6 +509,7 @@ void task_filestreamdealloc_list(struct task *t, struct list_head *head);
 void *kalloc(size_t size);
 void kfree(void *p);
 void *krealloc(void *ptr, size_t size);
+char *kstrdup(const char *s);
 
 int can_enter_tvm(void *lr);
 
@@ -715,6 +717,166 @@ ssize_t fd_getpath(int fd, char *out, size_t outsize)
 
     errno = ENOSYS;
     return -1;
+}
+
+static uint32_t hex32(const char *s) {
+    uint32_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        char c = s[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (c - 'A' + 10);
+        else return 0;
+    }
+    return v;
+}
+
+static size_t align4(size_t n) {
+    return (n + 3) & ~3;
+}
+
+static void *read_all(int fd, size_t *out_size) {
+#define READ_CHUNK 4096
+    if (!out_size)
+        return NULL;
+
+    *out_size = 0;
+
+    size_t cap = READ_CHUNK;
+    char *buf = malloc(cap);
+    if (!buf)
+        return NULL;
+
+    size_t total = 0;
+
+    while (1) {
+        if (total == cap) {
+            size_t new_cap = cap * 2;
+            char *new_buf = realloc(buf, new_cap);
+            if (!new_buf) {
+                free(buf);
+                return NULL;
+            }
+            buf = new_buf;
+            cap = new_cap;
+        }
+
+        ssize_t r = read(fd, buf + total, cap - total);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+
+            free(buf);
+            return NULL;
+        }
+
+        if (r == 0)
+            break;
+
+        total += (size_t)r;
+    }
+
+    *out_size = total;
+    return buf;
+#undef READ_CHUNK
+}
+
+
+/////////////
+// CPIO
+/////////////
+
+typedef struct {
+    /* Header fields (as in the cpio "newc" format) */
+    uint32_t c_magic;
+    uint32_t c_ino;
+    uint32_t c_mode;
+    uint32_t c_uid;
+    uint32_t c_gid;
+    uint32_t c_nlink;
+    uint32_t c_mtime;
+    uint64_t c_filesize;
+    uint32_t c_devmajor;
+    uint32_t c_devminor;
+    uint32_t c_rdevmajor;
+    uint32_t c_rdevminor;
+    uint32_t c_namesize;
+    uint32_t c_check;
+
+    /* Derived fields */
+    const char *name;     /* pointer inside the buffer */
+    const void *data;     /* pointer inside the buffer */
+} cpio_t;
+
+#define CPIO_NEWC_HEADERSIZE 110
+
+typedef int (*cpio_cb)(void *arg, const cpio_t *entry);
+
+static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
+    const unsigned char *p = buf;
+    const unsigned char *end = p + len;
+
+    while (1) {
+        if ((size_t)(end - p) < CPIO_NEWC_HEADERSIZE)
+            return -1;
+
+        if (memcmp(p, "070701", 6) != 0)
+            return -1;
+
+        cpio_t cpio;
+        cpio.c_magic = 0x070701;
+        p += 6;
+
+        cpio.c_ino = hex32((const char*)p); p += 8;
+        cpio.c_mode = hex32((const char*)p); p += 8;
+        cpio.c_uid = hex32((const char*)p); p += 8;
+        cpio.c_gid = hex32((const char*)p); p += 8;
+        cpio.c_nlink = hex32((const char*)p); p += 8;
+        cpio.c_mtime = hex32((const char*)p); p += 8;
+
+        cpio.c_filesize = hex32((const char*)p); p += 8;
+
+        cpio.c_devmajor = hex32((const char*)p); p += 8;
+        cpio.c_devminor = hex32((const char*)p); p += 8;
+        cpio.c_rdevmajor = hex32((const char*)p); p += 8;
+        cpio.c_rdevminor = hex32((const char*)p); p += 8;
+
+        cpio.c_namesize = hex32((const char*)p); p += 8;
+        cpio.c_check = hex32((const char*)p); p += 8;
+
+        if (cpio.c_namesize == 0 || cpio.c_namesize > 1 << 20)
+            return -1;
+
+        if (cpio.c_filesize > (uint64_t)1 << 40)
+            return -1;
+
+        if ((size_t)(end - p) < cpio.c_namesize)
+            return -1;
+
+        cpio.name = (const char*)p;
+        if (cpio.name[cpio.c_namesize - 1] != '\0')
+            return -1;
+
+        size_t name_pad = align4(CPIO_NEWC_HEADERSIZE + cpio.c_namesize) - (CPIO_NEWC_HEADERSIZE + cpio.c_namesize);
+        p += cpio.c_namesize + name_pad;
+
+        if ((uint64_t)(end - p) < cpio.c_filesize)
+            return -1;
+
+        cpio.data = p;
+
+        if (strcmp(cpio.name, "TRAILER!!!") == 0)
+            return 0;
+
+        if (cb) {
+            int r = cb(arg, &cpio);
+            if (r)
+                return r;
+        }
+
+        p += align4((size_t)cpio.c_filesize);
+    }
 }
 
 /////////////
@@ -1019,13 +1181,14 @@ static char **findenv(char **env, const char *name, size_t name_len)
 
 #define DEV_REG 0
 #define DEV_TTY 1
+#define DEV_VFS 2
 
 struct fops {
     /**
      * open and initialize `out` (modify f_data).
      * errno set to ENOTSUP if pathname not relevant to this device.
      */
-    int (*f_open)(const char *pathname, int flags, mode_t mode, struct file *out);
+    int (*f_open)(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out);
     /**
      * dup `oldf` to `newf` and initialize `newf` (modify f_data).
      * both locked
@@ -1049,6 +1212,7 @@ struct fops {
     int (*f_chmod)(const char *pathname, mode_t mode, int flag);
     int (*f_ioctl)(struct file *file, unsigned long request, void *arg);
     ssize_t (*f_read)(struct file *file, void *buf, size_t count, int offset);
+    int (*f_readdir)(struct file *file, struct dirent *out);
     ssize_t (*f_write)(struct file *file, const void *buf, size_t count, int offset);
     void (*f_close)(struct file *file);
 };
@@ -1061,7 +1225,7 @@ struct device {
 
 static LIST_HEAD(devices);
 #define REGISTER_DEV(Dev) __attribute__((constructor)) \
-    static void _tvm_dreg_ ## Fops () { list_add_tail(&((Dev).dev_list), &devices); }
+    static void _tvm_register_dev_ ## Dev () { list_add_tail(&((Dev).dev_list), &devices); }
 
 struct file {
     uint64_t f_gencnt;
@@ -1075,6 +1239,8 @@ struct file {
 
     int f_nfd;// not real, in task
     struct task *f_task; // back pointer to owning task
+
+    char *f_pathname; // optionally available pathname for open file
 };
 
 uint64_t next_gencnt = 0;
@@ -1095,6 +1261,11 @@ void filedealloc_locked(struct file *file) {
     if (file->f_ops && file->f_ops->f_close)
         file->f_ops->f_close(file);
 
+    if (file->f_pathname) {
+        kfree(file->f_pathname);
+        file->f_pathname = NULL;
+    }
+
     file->f_ops = NULL;
     file->f_data = NULL;
     file->f_type = DEV_REG;
@@ -1108,6 +1279,7 @@ void filedealloc_locked(struct file *file) {
     
     pthread_mutex_unlock(&file->f_lock);
     pthread_mutex_destroy(&file->f_lock);
+    kfree(file);
 }
 
 struct file *filealloc() {
@@ -1172,7 +1344,7 @@ void file_unlock(struct file *file, int refcount) {
 /**
  * returns locked with refcnt
  */
-struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode)
+struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid)
 {
     // TODO support opening devices when dirfd != AT_FDCWD
 
@@ -1183,10 +1355,18 @@ struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode)
     file->f_refcnt++;
     file_lock(file, 0);
 
+    if (pathname[0] == '/') {
+        file->f_pathname = kstrdup(pathname);
+        if (!file->f_pathname) {
+            filedealloc_locked(file);
+            return NULL;
+        }
+    }
+
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
-        if (0 == dev->dev_fops.f_open(pathname, flags, mode, file)) {
+        if (0 == dev->dev_fops.f_open(pathname, flags, mode, uid, gid, file)) {
             return file;
         }
 
@@ -1240,7 +1420,7 @@ struct file *file_dup_locked(struct file *oldfile) {
     return newfile;
 }
 
-int file_stat(int dirfd, const char *pathname, struct stat *statbuf, int flag)
+int file_stat(const char *pathname, struct stat *statbuf, int flag)
 {
     // TODO support opening devices when dirfd != AT_FDCWD
 
@@ -1258,7 +1438,7 @@ int file_stat(int dirfd, const char *pathname, struct stat *statbuf, int flag)
         errno = last_errno;
     };
 
-    return CALL_FUNC(fstatat, dirfd, pathname, statbuf, flag);
+    return CALL_FUNC(fstatat, AT_FDCWD, pathname, statbuf, flag);
 }
 
 int file_chmod(int dirfd, const char *pathname, mode_t mode, int flag)
@@ -1333,8 +1513,6 @@ int file_chown(int dirfd, const char *pathname, uid_t owner, gid_t group, int fl
 
 #define TS_ZOMBIE  0x1
 #define TS_CTTY    0x2
-
-#define TFD_MASK 0x0F000000
 
 typedef void (*exit_t)(void);
 
@@ -1981,19 +2159,24 @@ static void terminate_current_locked(int result)
     __builtin_unreachable();
 }
 
-char *current_normalize_path(const char *file_name, char *out_path)
+/**
+ * normalize `file_name` path, with an optional dirname for relative values.
+ */
+char *normalize_path(const char *dirname, const char *file_name, char *out_path)
 {
     char tmp[PATH_MAX];
     int c = 0;
 
-    task_lock(current);
+    if (!dirname)
+        task_lock(current);
     if (file_name[0] == '/')
         c = snprintf(tmp, PATH_MAX, "%s", file_name);
     else if (file_name[0] == 0)
-        c = snprintf(tmp, PATH_MAX, "%s", current->tsk_cwd);
+        c = snprintf(tmp, PATH_MAX, "%s", (dirname ?: current->tsk_cwd));
     else
-        c = snprintf(tmp, PATH_MAX, "%s/%s", current->tsk_cwd, file_name);
-    task_unlock(current);
+        c = snprintf(tmp, PATH_MAX, "%s/%s", (dirname ?: current->tsk_cwd), file_name);
+    if (!dirname)
+        task_unlock(current);
 
     if (c < 0 || c >= PATH_MAX) {
         errno = ENAMETOOLONG;
@@ -2059,6 +2242,35 @@ char *current_normalize_path(const char *file_name, char *out_path)
         *out = '\0';
 
     return out_path;
+}
+
+char *dirfd_normalize_path(int dirnfd, const char *file_name, char *out_path)
+{
+    struct file *dir = NULL;
+    const char *dirname = NULL;
+    if (dirnfd != AT_FDCWD) {
+        struct file *dir = file_for_task(current, dirnfd);
+        if (!dir)
+            return NULL;
+
+        if (!dir->f_pathname) {
+            strncpy(out_path, file_name, PATH_MAX-1);
+            file_unlock(dir, 1);
+            return out_path;
+        }
+
+        dirname = dir->f_pathname;
+        file_unlock(dir, 0);
+    }
+
+    char *ret = normalize_path(dirname, file_name, out_path);
+
+    if (dir) {
+        file_lock(dir, 0);
+        file_unlock(dir, 1);
+    }
+
+    return ret;
 }
 
 int copy_pthread_attr(const pthread_attr_t *src, pthread_attr_t *dest)
@@ -2293,6 +2505,9 @@ struct file_stream {
     };
 
     char fs_mode[5]; // for files only
+
+    struct dirent fs_dirent; // for dirs only
+    char fs_dirent_name[NAME_MAX+1]; // incase dirent->d_name is defined as zero-length array
 };
 
 struct file_stream_list_entry {
@@ -3033,7 +3248,7 @@ static struct tty *tty_for_rfd(int rfd, int *out_ttymode) {
 
 static struct fops *ttyops();
 
-static int ttyop_open(const char *pathname, int flags, mode_t mode, struct file *out)
+static int ttyop_open(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out)
 {
     // tty_for_path locks stuff
     file_unlock(out, 0);
@@ -4010,6 +4225,687 @@ static int tty_slavename_locked(struct tty *tt, char *buf, size_t buflen)
 
     snprintf(buf, buflen, TTY_DIR "/%d", tt->t_mfd);
     return 0;
+}
+
+/////////////
+// VFS
+/////////////
+
+#define VFS_NAME_MAX 256
+
+struct vfs_node {
+    struct list_head vn_list;
+    char vn_name[VFS_NAME_MAX];
+
+    struct stat vn_st;          /* S_ISDIR / S_ISREG determine type */
+
+    char *vn_data;
+    size_t vn_size;
+
+    struct vfs_node *vn_parent;
+    struct list_head vn_children;
+
+    size_t vn_refcnt;
+    pthread_mutex_t vn_lock;
+};
+
+static LIST_HEAD(vfs_list);
+static pthread_mutex_t vfs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define VFS_LOCK()   pthread_mutex_lock(&vfs_lock);
+#define VFS_UNLOCK() pthread_mutex_unlock(&vfs_lock);
+
+static ino_t vfs_next_inode_value = 4141000000;
+static pthread_mutex_t vfs_next_inode_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static ino_t vfs_next_inode() {
+    pthread_mutex_lock(&vfs_next_inode_lock);
+    ino_t ret = vfs_next_inode_value++;
+    pthread_mutex_unlock(&vfs_next_inode_lock);
+    return ret;
+}
+
+static struct vfs_node * vnalloc(const char *name, mode_t mode, uid_t uid, gid_t gid)
+{
+    int namelen = strlen(name);
+    if (namelen > VFS_NAME_MAX-1) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+
+    struct vfs_node *vn = kalloc(sizeof(*vn));
+    if (!vn)
+        return NULL;
+
+    memcpy(vn->vn_name, name, namelen);
+    vn->vn_name[namelen] = 0;
+
+    INIT_LIST_HEAD(&vn->vn_children);
+    INIT_LIST_HEAD(&vn->vn_list);
+
+    vn->vn_st.st_mode = mode;
+    vn->vn_st.st_uid  = uid;
+    vn->vn_st.st_gid  = gid;
+    vn->vn_st.st_nlink = 1;
+    vn->vn_st.st_ino = vfs_next_inode();
+
+    vn->vn_refcnt = 1;
+    pthread_mutex_init(&vn->vn_lock, NULL);
+    pthread_mutex_lock(&vn->vn_lock);
+
+    return vn;
+}
+
+static void vndealloc_locked(struct vfs_node *vn)
+{
+    if (vn->vn_refcnt != 0) {
+        panic("refcount != 0 (%zu)", vn->vn_refcnt);
+    }
+
+    /* Free file data if present */
+    if (vn->vn_data) {
+        kfree(vn->vn_data);
+        vn->vn_data = NULL;
+    }
+    vn->vn_size = 0;
+
+    pthread_mutex_unlock(&vn->vn_lock);
+    pthread_mutex_destroy(&vn->vn_lock);
+    kfree(vn);
+}
+
+void vn_lock(struct vfs_node *vn, int refcount) {
+    pthread_mutex_lock(&vn->vn_lock);
+    vn->vn_refcnt += refcount;
+}
+
+void vn_unlock(struct vfs_node *vn, int refcount) {
+    // very important that refcount == 0 wouldn't trigger free
+    if (refcount && 0 == (vn->vn_refcnt -= refcount)) {
+        vndealloc_locked(vn);
+        return;
+    }
+    pthread_mutex_unlock(&vn->vn_lock);
+}
+
+static void
+vfs_add_child_locked(struct vfs_node *parent, struct vfs_node *child)
+{
+    if (!S_ISDIR(parent->vn_st.st_mode))
+        panic("parent is not a directory");
+
+    child->vn_parent = parent;
+    child->vn_refcnt++;
+    parent->vn_refcnt++;
+    list_add_tail(&child->vn_list, &parent->vn_children);
+}
+
+static struct vfs_node *vfs_find_child_locked(struct vfs_node *dir, const char *name)
+{
+    struct vfs_node *vn;
+
+    list_for_each_entry(vn, &dir->vn_children, vn_list) {
+        if (0 == strcmp(vn->vn_name, name)) {
+            vn_lock(vn, 1);
+            return vn;
+        }
+    }
+
+    return NULL;
+}
+
+static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *relpath, int create, mode_t mode, uid_t uid, gid_t gid)
+{
+    char tmp[PATH_MAX];
+    struct vfs_node *cur = root;
+
+    strlcpy(tmp, relpath, sizeof(tmp));
+
+    char *saveptr;
+    char *tok = strtok_r(tmp, "/", &saveptr);
+    char *next_tok;
+
+    while (tok) {
+        next_tok = strtok_r(NULL, "/", &saveptr);
+        struct vfs_node *child = vfs_find_child_locked(cur, tok);
+        
+        if (!child) {
+            if (create && next_tok == NULL) {
+                /* Only create the leaf */
+                child = vnalloc(tok, mode, uid, gid);
+                if (!child) {
+                    if (cur != root)
+                        vn_unlock(cur, 1);
+                    return NULL;
+                }
+                vfs_add_child_locked(cur, child);
+                if (cur != root)
+                    vn_unlock(cur, 1);
+                return child;
+            } else {
+                if (cur != root)
+                    vn_unlock(cur, 1);
+                return NULL;
+            }
+        } else {
+            /* If intermediate exists but is not a directory, fail */
+            if (next_tok && !S_ISDIR(child->vn_st.st_mode)) {
+                vn_unlock(child, 1);
+                if (cur != root)
+                    vn_unlock(cur, 1);
+                return NULL;
+            }
+        }
+
+        if (cur != root)
+            vn_unlock(cur, 1);
+        cur = child;
+        tok = next_tok;
+    }
+
+    return cur;
+}
+
+static struct vfs_node *vfs_lookup(const char *abspath, int create, mode_t mode, uid_t uid, gid_t gid)
+{
+    int pathlen = strlen(abspath);
+
+    VFS_LOCK();
+    struct vfs_node *root;
+    list_for_each_entry(root, &vfs_list, vn_list) {
+        int vnlen = strlen(root->vn_name);
+        if (pathlen < vnlen)
+            continue;
+
+        if (0 == strncmp(root->vn_name, abspath, vnlen) &&
+            (abspath[vnlen] == 0 || abspath[vnlen] == '/')) {
+            vn_lock(root, 1);
+            VFS_UNLOCK();
+
+            if (abspath[vnlen] == 0)
+                return root;
+
+            struct vfs_node *vn = vfs_lookup_locked(root, abspath + vnlen + 1, create, mode, uid, gid);
+            vn_unlock(root, 1);
+            return vn;
+        }
+    }
+    VFS_UNLOCK();
+
+    // not root was found, not even in vfs
+    errno = ENOTSUP;
+    return NULL;
+}
+
+static void vfs_add_root(struct vfs_node *root) {
+    VFS_LOCK();
+    vn_lock(root, 1);
+    VERIFY(!root->vn_parent);
+    root->vn_refcnt++;
+    list_add(&root->vn_list, &vfs_list);
+    vn_unlock(root, 1);
+    VFS_UNLOCK();
+}
+
+struct vfs_file {
+    int vf_oflags;
+    int vf_cursor;
+    struct vfs_node *vf_vn;
+
+    size_t vf_refcnt;
+    pthread_mutex_t vf_lock;
+};
+
+static struct vfs_file * vfalloc()
+{
+    struct vfs_file *vf = kalloc(sizeof(*vf));
+    if (!vf)
+        return NULL;
+    memset(vf, 0, sizeof(*vf));
+
+    vf->vf_refcnt = 1;
+    pthread_mutex_init(&vf->vf_lock, NULL);
+    pthread_mutex_lock(&vf->vf_lock);
+
+    return vf;
+}
+
+static void vfdealloc_locked(struct vfs_file *vf)
+{
+    VERIFY(!vf->vf_refcnt);
+    VERIFY(!vf->vf_vn);
+
+    pthread_mutex_unlock(&vf->vf_lock);
+    pthread_mutex_destroy(&vf->vf_lock);
+    kfree(vf);
+}
+
+void vf_lock(struct vfs_file *vf, int refcount) {
+    pthread_mutex_lock(&vf->vf_lock);
+    vf->vf_refcnt += refcount;
+}
+
+void vf_unlock(struct vfs_file *vf, int refcount) {
+    // very important that refcount == 0 wouldn't trigger free
+    if (refcount && 0 == (vf->vf_refcnt -= refcount)) {
+        vfdealloc_locked(vf);
+        return;
+    }
+    pthread_mutex_unlock(&vf->vf_lock);
+}
+
+static struct vfs_file *vf_for_file_locked(struct file *file) {
+    VERIFY(file->f_type == DEV_VFS);
+    VERIFY(file->f_data);
+
+    struct vfs_file *vf = (struct vfs_file *)file->f_data;
+    vf_lock(vf, 1);
+    return vf;
+}
+
+static struct vfs_node *vn_for_vf_locked(struct vfs_file *vf) {
+    struct vfs_node *vn = vf->vf_vn;
+    vf_unlock(vf, 0);
+    vn_lock(vn, 1);
+    vf_lock(vf, 0);
+    return vn;
+}
+
+static struct vfs_node *vn_for_file_locked(struct file *file) {
+    struct vfs_file *vf = vf_for_file_locked(file);
+    if (!vf)
+        return NULL;
+
+    file_unlock(file, 0);
+    struct vfs_node *vn = vn_for_vf_locked(vf);
+    file_lock(file, 0);
+    vf_unlock(vf, 1);
+    return vn;
+}
+
+static struct vfs_node *vn_for_pathname(const char *pathname) {
+    return vfs_lookup(pathname, 0, 0, 0, 0);
+}
+
+static struct fops *vfsops();
+
+static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out) {
+    file_unlock(out, 0);
+
+    struct vfs_node *vn = vfs_lookup(pathname, flags & O_CREAT, mode, uid, gid);
+    if (!vn) {
+        file_lock(out, 0);
+        return -1;
+    }
+
+    struct vfs_file *vf = vfalloc();
+    if (!vf) {
+        vn_unlock(vn, 1);
+        file_lock(out, 0);
+        return -1;
+    }
+
+    int rfd;
+    if (S_ISDIR(vn->vn_st.st_mode))
+        rfd = CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
+    else
+        rfd = CALL_FUNC(open, "/dev/null", (flags & O_ACCMODE));
+
+    if (-1 == rfd) {
+        vf_unlock(vf, 1);
+        vn_unlock(vn, 1);
+        file_lock(out, 0);
+        return -1;
+    }
+
+    vf->vf_oflags = flags;
+    vf->vf_vn = vn;
+    vf->vf_refcnt++;
+    vn->vn_refcnt++;
+
+    vf_unlock(vf, 1);
+    vn_unlock(vn, 1);
+
+    file_lock(out, 0);
+    out->f_rfd = rfd;
+    out->f_type = DEV_VFS;
+    out->f_data = (void *)vf;
+    out->f_ops = vfsops();
+
+    return 0;
+}
+
+static int vfsop_dup(struct file *oldfile, struct file *newfile) {
+
+    struct vfs_file *vf = vf_for_file_locked(oldfile);
+    if (!vf)
+        return -1;
+
+    vf->vf_refcnt++;
+    newfile->f_data = (void *)vf;
+    vf_unlock(vf, 1);
+    return 0;
+}
+
+static void vfsop_close(struct file *file) {
+    struct vfs_file *vf = vf_for_file_locked(file);
+    if (!vf)
+        return;
+
+    file_unlock(file, 0);
+    struct vfs_node *vn = vn_for_vf_locked(vf);
+    file_lock(file, 0);
+    if (!vn) {
+        vf_unlock(vf, 1);
+        return;
+    }
+
+    // we took ref in vf_for_file_locked()
+    vf->vf_refcnt--;
+    if (vf->vf_refcnt > 1) {
+        vf_unlock(vf, 1);
+        vn_unlock(vn, 1);
+        return;
+    }
+
+    VERIFY(vf->vf_refcnt == 1);
+
+    vn->vn_refcnt--;
+    vf->vf_vn = NULL;
+    vn_unlock(vn, 1);
+
+    file->f_data = NULL;
+    vf_unlock(vf, 1); // will dealloc
+}
+
+static int vn_stat_locked(struct vfs_node *vn, struct stat *st) {
+    if (!st) {
+        return 0;
+    }
+
+    memcpy(st, &vn->vn_st, sizeof(*st));
+    st->st_size = vn->vn_size;
+
+    return 0;
+}
+
+static int vfsop_fstat(struct file *file, struct stat *st)
+{
+    struct vfs_node *vn = vn_for_file_locked(file);
+    if (!vn)
+        return -1;
+
+    int ret = vn_stat_locked(vn, st);
+    vn_unlock(vn, 1);
+    return ret;
+}
+
+static int vfsop_stat(const char *pathname, struct stat *st, int flag)
+{
+    struct vfs_node *vn = vn_for_pathname(pathname);
+    if (!vn)
+        return -1;
+
+    int ret = vn_stat_locked(vn, st);
+    vn_unlock(vn, 1);
+    return ret;
+}
+
+static int vn_chmod_locked(struct vfs_node *vn, mode_t mode)
+{
+    vn->vn_st.st_mode = (vn->vn_st.st_mode & ~07777) | (mode & 07777);
+    return 0;
+}
+
+static int vfsop_fchmod(struct file *file, mode_t mode)
+{
+    struct vfs_node *vn = vn_for_file_locked(file);
+    if (!vn)
+        return -1;
+
+    int ret = vn_chmod_locked(vn, mode);
+    vn_unlock(vn, 1);
+    return ret;
+}
+
+static int vfsop_chmod(const char *pathname, mode_t mode, int flag)
+{
+    struct vfs_node *vn = vn_for_pathname(pathname);
+    if (!vn)
+        return -1;
+
+    int ret = vn_chmod_locked(vn, mode);
+    vn_unlock(vn, 1);
+    return ret;
+}
+
+static int vn_chown_locked(struct vfs_node *vn, uid_t owner, gid_t group)
+{
+    vn->vn_st.st_uid = owner;
+    vn->vn_st.st_gid = group;
+    return 0;
+}
+
+static int vfsop_fchown(struct file *file, uid_t owner, gid_t group)
+{
+    struct vfs_node *vn = vn_for_file_locked(file);
+    if (!vn)
+        return -1;
+
+    int ret = vn_chown_locked(vn, owner, group);
+    vn_unlock(vn, 1);
+    return ret;
+}
+
+static int vfsop_chown(const char *pathname, uid_t owner, gid_t group, int flag)
+{
+    struct vfs_node *vn = vn_for_pathname(pathname);
+    if (!vn)
+        return -1;
+
+    int ret = vn_chown_locked(vn, owner, group);
+    vn_unlock(vn, 1);
+    return ret;
+}
+
+static int vfsop_ioctl(struct file *file, unsigned long request, void *arg)
+{
+    errno = ENOTSUP;
+    return -1;
+}
+
+static ssize_t vfsop_read(struct file *file, void *buf, size_t count, int offset)
+{
+    struct vfs_file *vf = vf_for_file_locked(file);
+    if (!vf)
+        return -1;
+
+    file_unlock(file, 0);
+    struct vfs_node *vn = vn_for_vf_locked(vf);
+    file_lock(file, 0);
+    if (!vn) {
+        vf_unlock(vf, 1);
+        return -1;
+    }
+
+    if (S_ISDIR(vn->vn_st.st_mode) || (vf->vf_oflags & O_DIRECTORY)) {
+        vf_unlock(vf, 1);
+        vn_unlock(vn, 1);
+        errno = EISDIR;
+        return -1;
+    }
+
+    if (O_RDONLY != (vf->vf_oflags & (O_ACCMODE)) &&
+        O_RDWR   != (vf->vf_oflags & (O_ACCMODE))) {
+        vf_unlock(vf, 1);
+        vn_unlock(vn, 1);
+        errno = EBADF;
+        return -1;
+    }
+
+    size_t op_offset = offset;
+    if (offset < 0)
+        op_offset = vf->vf_cursor;
+
+    // read after size return no data
+    if (op_offset > vn->vn_size) {
+        vf_unlock(vf, 1);
+        vn_unlock(vn, 1);
+        return 0;
+    }
+
+    size_t op_left = vn->vn_size - op_offset;
+
+    size_t op_size = count;
+    if (op_size > op_left)
+        op_size = op_left;
+
+    memcpy(buf, vn->vn_data + op_offset, op_size);
+
+    if (offset == -1)
+        vf->vf_cursor += op_size;
+
+    vf_unlock(vf, 1);
+    vn_unlock(vn, 1);
+
+    return op_size;
+}
+
+static ssize_t vfsop_write(struct file *file, const void *buf, size_t count, int offset)
+{
+    // not implemented
+    errno = ENOTSUP;
+    return -1;
+}
+
+static int vfsop_readdir(struct file *file, struct dirent *out)
+{
+    struct vfs_file *vf = vf_for_file_locked(file);
+    if (!vf)
+        return -1;
+
+    file_unlock(file, 0);
+    struct vfs_node *vn = vn_for_vf_locked(vf);
+    file_lock(file, 0);
+    if (!vn) {
+        vf_unlock(vf, 1);
+        return -1;
+    }
+
+    if (!S_ISDIR(vn->vn_st.st_mode)) {
+        vf_unlock(vf, 1);
+        vn_unlock(vn, 1);
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    int cursor = vf->vf_cursor;
+    file_unlock(file, 0);
+    vf_unlock(vf, 0);
+
+    int i = 0;
+    struct vfs_node *child;
+    list_for_each_entry(child, &vn->vn_children, vn_list) {
+        if (i == cursor)
+            break;
+        i++;
+    }
+
+    // end of children
+    if (list_is_head(&child->vn_list, &vn->vn_children)) {
+        vn_unlock(vn, 1);
+        file_lock(file, 0);
+        vf_lock(vf, 0);
+        vf_unlock(vf, 1);
+        return -1;
+    }
+
+    // inc cursor and release vf
+    vf_lock(vf, 0);
+    vf->vf_cursor++;
+    vf_unlock(vf, 1);
+
+    vn_lock(child, 1);
+    vn_unlock(vn, 1);
+
+    int namelen = strlen(child->vn_name);
+    if (namelen > NAME_MAX)
+        namelen = NAME_MAX;
+
+    // all other fields are not specified in POSIX readdir
+    out->d_ino = child->vn_st.st_ino;
+    memcpy(out->d_name, child->vn_name, namelen);
+    out->d_name[namelen] = 0;
+
+    vn_unlock(child, 1);
+    file_lock(file, 0);
+
+    return 0;
+}
+
+static struct device devvfs = {
+    .dev_type = DEV_VFS,
+    .dev_fops = {
+        .f_open = vfsop_open,
+        .f_dup = vfsop_dup,
+
+        .f_fstat = vfsop_fstat,
+        .f_fchown = vfsop_fchown,
+        .f_fchmod = vfsop_fchmod,
+
+        .f_stat = vfsop_stat,
+        .f_chmod = vfsop_chmod,
+        .f_chown = vfsop_chown,
+
+        .f_ioctl = vfsop_ioctl,
+        .f_read = vfsop_read,
+        .f_write = vfsop_write,
+        .f_close = vfsop_close,
+
+        .f_readdir = vfsop_readdir,
+    }
+};
+
+REGISTER_DEV(devvfs);
+
+static struct fops *vfsops() {
+    return &devvfs.dev_fops;
+}
+
+static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
+    if (S_ISDIR(cpio->c_mode) || 
+        S_ISREG(cpio->c_mode)) {
+        struct vfs_node *child = vfs_lookup_locked(vn, cpio->name, 1, cpio->c_mode, cpio->c_uid, cpio->c_gid);
+        if (!child) {
+            // TODO clear all children
+            return -1;
+        }
+
+        if (!S_ISDIR(cpio->c_mode)) {
+            if (cpio->c_filesize) {
+                void *buf = kalloc(cpio->c_filesize);
+                if (!buf) {
+                    // TODO clear all children
+                    vn_unlock(child, 1);
+                    return -1;
+                }
+                memcpy(buf, cpio->data, cpio->c_filesize);
+
+                child->vn_data = buf;
+                child->vn_size = cpio->c_filesize;
+            }
+        }
+
+        vn_unlock(child, 1);
+    }
+
+    // skip unsupported modes
+
+    return 0;
+}
+
+static int vfs_load_cpio(struct vfs_node *vn, const void *buf, size_t len) {
+    return cpio_parse(buf, len, (cpio_cb)vfs_load_cpio_cb, vn);
 }
 
 /////////////
@@ -6300,8 +7196,8 @@ static int tvm_sorunner(int argc, char **argv)
     }
 
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(argv[1], pathname_abs)) {
-        fprintf(stderr, "failed to exec \"%s\": -%d (%s)\n", pathname_abs, errno, strerror(errno));
+    if (!normalize_path(NULL, argv[1], pathname_abs)) {
+        fprintf(stderr, "failed to exec \"%s\": -%d (%s)\n", argv[1], errno, strerror(errno));
         return 1;
     }
 
@@ -6334,6 +7230,104 @@ static int tvm_sorunner(int argc, char **argv)
     return (callerr ? callerr : (int)ret);
 }
 
+static void tvm_cpio_print_mode(uint32_t mode) {
+    char buf[11] = "----------";
+
+    /* file type */
+    switch (mode & 0170000) {
+        case 0100000: buf[0] = '-'; break; /* regular */
+        case 0040000: buf[0] = 'd'; break; /* dir */
+        case 0120000: buf[0] = 'l'; break; /* symlink */
+        default:      buf[0] = '?'; break;
+    }
+
+    /* owner */
+    buf[1] = (mode & 0400) ? 'r' : '-';
+    buf[2] = (mode & 0200) ? 'w' : '-';
+    buf[3] = (mode & 0100) ? 'x' : '-';
+
+    /* group */
+    buf[4] = (mode & 0040) ? 'r' : '-';
+    buf[5] = (mode & 0020) ? 'w' : '-';
+    buf[6] = (mode & 0010) ? 'x' : '-';
+
+    /* others */
+    buf[7] = (mode & 0004) ? 'r' : '-';
+    buf[8] = (mode & 0002) ? 'w' : '-';
+    buf[9] = (mode & 0001) ? 'x' : '-';
+
+    printf("%s ", buf);
+}
+
+static int tvm_cpio_cb(void *arg, const cpio_t *cpio) {
+    (void)arg;
+
+    tvm_cpio_print_mode(cpio->c_mode);
+
+    /* uid/gid */
+    printf("%u %u ", cpio->c_uid, cpio->c_gid);
+
+    /* name */
+    printf("%s\n", cpio->name);
+
+    return 0;
+}
+
+static int tvm_cpio(int argc, char **argv)
+{
+    if (isatty(STDIN_FILENO))
+        err(1, "isatty(0)");
+
+    size_t size;
+    void *buf = read_all(STDIN_FILENO, &size);
+    if (!buf)
+        err(1, "read(0)");
+
+    if (0 != cpio_parse(buf, size, (cpio_cb)tvm_cpio_cb, NULL))
+        errx(1, "cpio_parse");
+
+    return 0;
+}
+
+static int tvm_mount(int argc, char **argv)
+{
+    if (argc < 3)
+        errx(1, "USAGE: tvm mount [CPIO] [TARGET]");
+
+    int fd = open(argv[1], O_RDONLY);
+    if (fd == -1)
+        err(1, "%s", argv[1]);
+
+    size_t size;
+    void *buf = read_all(fd, &size);
+    if (!buf)
+        err(1, "read");
+
+    close(fd);
+
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, argv[2], pathname_abs)) {
+        err(1, "normalize_path(NULL, \"%s\")", argv[2]);
+        return 1;
+    }
+
+    struct vfs_node *root = vnalloc(pathname_abs, S_IFDIR | 0766, getuid(), getgid());
+    if (!root)
+        err(1, "vnalloc");
+    
+    if (0 != vfs_load_cpio(root, buf, size )) {
+        vn_unlock(root, 1);
+        err(1, "vfs_load_cpio");
+    }
+
+    vn_unlock(root, 0);
+    vfs_add_root(root);
+    vn_lock(root, 0);
+    vn_unlock(root, 1);
+
+    return 0;
+}
+
 static int tvm_main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -6350,6 +7344,8 @@ static int tvm_main(int argc, char **argv)
         printf("  pwd            print working directory\n");
         printf("  env            print environment variables\n");
         printf("  sorunner       run shared object\n");
+        printf("  cpio           CPIO archive reader\n");
+        printf("  mount          VFS mount\n");
         printf("\n");
         return 0;
     }
@@ -6359,6 +7355,8 @@ static int tvm_main(int argc, char **argv)
     if (0 == strcmp(argv[1], "pwd")) return tvm_pwd(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "env")) return tvm_env(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "sorunner")) return tvm_sorunner(argc - 1, argv + 1);
+    if (0 == strcmp(argv[1], "cpio")) return tvm_cpio(argc - 1, argv + 1);
+    if (0 == strcmp(argv[1], "mount")) return tvm_mount(argc - 1, argv + 1);
     
     fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
     fprintf(stderr, "Try 'tvm -h' for more information.\n");
@@ -6685,7 +7683,7 @@ static void __panic(const char *msg, const char *file, int line)
 
 FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return NULL;
     pathname = pathname_abs;
 
@@ -6737,7 +7735,11 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
 }
 
 FUNCTION_DEFINE1(int, closedir, DIR *, dir) {
+    if (!dir)
+        return EBADF;
+
     struct file_stream *fs = (struct file_stream *)dir;
+
 
     int nfd = fs->fs_nfd;
 
@@ -6745,7 +7747,9 @@ FUNCTION_DEFINE1(int, closedir, DIR *, dir) {
     task_filestreamdealloc_locked(current, fs);
     task_unlock(current);
     
-    return close(nfd);
+    if (-1 == close(nfd))
+        return errno;
+    return 0;
 }
 
 FUNCTION_DEFINE1(struct dirent *, readdir, DIR *, dir) {
@@ -6753,11 +7757,24 @@ FUNCTION_DEFINE1(struct dirent *, readdir, DIR *, dir) {
     if (!file)
         return NULL;
 
-    file_unlock(file, 0);
-    struct dirent *dent = CALL_FUNC(readdir, real_dp(dir));
-    file_lock(file, 0);
+    struct file_stream *fs = (struct file_stream *)dir;
+
+    if (!file->f_ops || !file->f_ops->f_readdir) {
+        file_unlock(file, 0);
+        struct dirent *dent = CALL_FUNC(readdir, real_dp(dir));
+        file_lock(file, 0);
+        file_unlock(file, 1);
+        return dent;
+    }
+
+    struct dirent *de = &fs->fs_dirent;
+    if (0 != file->f_ops->f_readdir(file, de)) {
+        file_unlock(file, 1);
+        return NULL;
+    }
+
     file_unlock(file, 1);
-    return dent;
+    return de;
 }
 
 FUNCTION_DEFINE1(int, dirfd, DIR *, dir) {
@@ -6790,7 +7807,7 @@ static int fmode_to_flags(const char *mode)
 FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
 {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return NULL;
     pathname = pathname_abs;
 
@@ -6849,6 +7866,9 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
 }
 
 FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
+    if (!stream)
+        return EOF;
+
     struct file_stream *fs = (struct file_stream *)stream;
 
     int nfd = fs->fs_nfd;
@@ -7374,12 +8394,12 @@ FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags)
     
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
 
-    struct file *file = (void *)CURRENT_RFD(dirfd, (long)file_open(__rfd, pathname, flags, mode));
+    struct file *file = (void *)CURRENT_RFD(dirfd, (long)file_open(__rfd, pathname, flags, mode, getuid(), getgid()));
     if (!file)
         return -1;
 
@@ -7771,7 +8791,7 @@ FUNCTION_DEFINE2(int, ftruncate, int, fd, off_t, length) {
 
 FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -7780,12 +8800,12 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
         return 0;
     }
     
-    return file_stat(AT_FDCWD, pathname, statbuf, 0);
+    return file_stat(pathname, statbuf, 0);
 }
 
 FUNCTION_DEFINE2(int, lstat, const char *, pathname, struct stat *, statbuf) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -7794,7 +8814,7 @@ FUNCTION_DEFINE2(int, lstat, const char *, pathname, struct stat *, statbuf) {
         return 0;
     }
     
-    return file_stat(AT_FDCWD, pathname, statbuf, AT_SYMLINK_NOFOLLOW);
+    return file_stat(pathname, statbuf, AT_SYMLINK_NOFOLLOW);
 }
 
 FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
@@ -7820,18 +8840,16 @@ FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
 
 FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *, statbuf, int, flag) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
-
-    return CURRENT_RFD(dirfd, file_stat(__rfd, pathname, statbuf, flag));
+    if(!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+    
+    return file_stat(pathname, statbuf, flag);
 }
 
 FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -7851,7 +8869,7 @@ FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
 FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, int, flags) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -7861,7 +8879,7 @@ FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, 
 
 FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -7870,7 +8888,7 @@ FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
 
 FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -7901,7 +8919,7 @@ FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
 FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode, int, flag) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -7911,7 +8929,7 @@ FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode
 
 FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname;
 
@@ -7920,7 +8938,7 @@ FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group)
 
 FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname;
 
@@ -7951,7 +8969,7 @@ FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
 FUNCTION_DEFINE5(int, fchownat, int, dirfd, const char *, pathname, uid_t, owner, gid_t, group, int, flag) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -7969,7 +8987,7 @@ FUNCTION_DEFINE3(int, lockf, int, fd, int, cmd, off_t, len) {
 
 FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t, bufsiz) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -7979,7 +8997,7 @@ FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t,
 FUNCTION_DEFINE4(ssize_t, readlinkat, int, dirfd, const char *, pathname, char *, buf, size_t, bufsiz) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -7989,7 +9007,7 @@ FUNCTION_DEFINE4(ssize_t, readlinkat, int, dirfd, const char *, pathname, char *
 
 FUNCTION_DEFINE2(int, symlink, const char *, target, const char *, linkpath) {
     char linkpath_abs[PATH_MAX];
-    if (!current_normalize_path(linkpath, linkpath_abs))
+    if (!normalize_path(NULL, linkpath, linkpath_abs))
         return -1;
     linkpath = linkpath_abs;
 
@@ -7999,7 +9017,7 @@ FUNCTION_DEFINE2(int, symlink, const char *, target, const char *, linkpath) {
 FUNCTION_DEFINE3(int, symlinkat, const char *, target, int, newdirfd, const char *, linkpath) {
     char linkpath_abs[PATH_MAX];
     if (newdirfd == AT_FDCWD) {
-        if (!current_normalize_path(linkpath, linkpath_abs))
+        if (!normalize_path(NULL, linkpath, linkpath_abs))
             return -1;
         linkpath = linkpath_abs;
     }
@@ -8009,12 +9027,12 @@ FUNCTION_DEFINE3(int, symlinkat, const char *, target, int, newdirfd, const char
 
 FUNCTION_DEFINE2(int, link, const char *, oldpath, const char *, newpath) {
     char oldpath_abs[PATH_MAX];
-    if (!current_normalize_path(oldpath, oldpath_abs))
+    if (!normalize_path(NULL, oldpath, oldpath_abs))
         return -1;
     oldpath = oldpath_abs;
 
     char newpath_abs[PATH_MAX];
-    if (!current_normalize_path(newpath, newpath_abs))
+    if (!normalize_path(NULL, newpath, newpath_abs))
         return -1;
     newpath = newpath_abs;
 
@@ -8024,14 +9042,14 @@ FUNCTION_DEFINE2(int, link, const char *, oldpath, const char *, newpath) {
 FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath, int, flags) {
     char oldpath_abs[PATH_MAX];
     if (olddirfd == AT_FDCWD) {
-        if (!current_normalize_path(oldpath, oldpath_abs))
+        if (!normalize_path(NULL, oldpath, oldpath_abs))
             return -1;
         oldpath = oldpath_abs;
     }
 
     char newpath_abs[PATH_MAX];
     if (newdirfd == AT_FDCWD) {
-        if (!current_normalize_path(newpath, newpath_abs))
+        if (!normalize_path(NULL, newpath, newpath_abs))
             return -1;
         newpath = newpath_abs;
     }
@@ -8067,12 +9085,12 @@ FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirf
 
 FUNCTION_DEFINE2(int, rename, const char *, oldpath, const char *, newpath) {
     char oldpath_abs[PATH_MAX];
-    if (!current_normalize_path(oldpath, oldpath_abs))
+    if (!normalize_path(NULL, oldpath, oldpath_abs))
         return -1;
     oldpath = oldpath_abs;
 
     char newpath_abs[PATH_MAX];
-    if (!current_normalize_path(newpath, newpath_abs))
+    if (!normalize_path(NULL, newpath, newpath_abs))
         return -1;
     newpath = newpath_abs;
 
@@ -8082,14 +9100,14 @@ FUNCTION_DEFINE2(int, rename, const char *, oldpath, const char *, newpath) {
 FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath) {
     char oldpath_abs[PATH_MAX];
     if (olddirfd == AT_FDCWD) {
-        if (!current_normalize_path(oldpath, oldpath_abs))
+        if (!normalize_path(NULL, oldpath, oldpath_abs))
             return -1;
         oldpath = oldpath_abs;
     }
 
     char newpath_abs[PATH_MAX];
     if (newdirfd == AT_FDCWD) {
-        if (!current_normalize_path(newpath, newpath_abs))
+        if (!normalize_path(NULL, newpath, newpath_abs))
             return -1;
         newpath = newpath_abs;
     }
@@ -8125,7 +9143,7 @@ FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdi
 
 FUNCTION_DEFINE1(int, unlink, const char *, pathname) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -8135,7 +9153,7 @@ FUNCTION_DEFINE1(int, unlink, const char *, pathname) {
 FUNCTION_DEFINE3(int, unlinkat, int, dirfd, const char *, pathname, int, flags) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -8145,7 +9163,7 @@ FUNCTION_DEFINE3(int, unlinkat, int, dirfd, const char *, pathname, int, flags) 
 
 FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -8155,7 +9173,7 @@ FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
 FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -8165,7 +9183,7 @@ FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode)
 
 FUNCTION_DEFINE1(int, rmdir, const char *, pathname) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -8174,7 +9192,7 @@ FUNCTION_DEFINE1(int, rmdir, const char *, pathname) {
 
 FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -8184,7 +9202,7 @@ FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
 FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -9380,7 +10398,7 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -9595,7 +10613,7 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
     INFO("execvp: %s", file);
     char file_abs[PATH_MAX];
     if (strchr(file, '/')) {
-        if (!current_normalize_path(file, file_abs))
+        if (!normalize_path(NULL, file, file_abs))
             return -1;
         file = file_abs;
     }
@@ -10094,7 +11112,7 @@ FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_nam
 
 FUNCTION_DEFINE1(int, chdir, const char *, path) {
     char abs_path[PATH_MAX];
-    if (!current_normalize_path(path, abs_path))
+    if (!normalize_path(NULL, path, abs_path))
         return -1;
     path = abs_path;
 
@@ -10150,7 +11168,7 @@ FUNCTION_DEFINE1(char *, getwd, char *, buf) {
 
 FUNCTION_DEFINE3(int, mknod, const char *, pathname, mode_t, mode, dev_t, dev) {
     char pathname_abs[PATH_MAX];
-    if (!current_normalize_path(pathname, pathname_abs))
+    if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
 
@@ -10160,7 +11178,7 @@ FUNCTION_DEFINE3(int, mknod, const char *, pathname, mode_t, mode, dev_t, dev) {
 FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode, dev_t, dev) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
@@ -10171,7 +11189,7 @@ FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode,
 FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {
     char file_abs[PATH_MAX];
     if (strchr(file, '/')) {
-        if (!current_normalize_path(file, file_abs))
+        if (!normalize_path(NULL, file, file_abs))
             return -1;
         file = file_abs;
     }
@@ -10285,7 +11303,7 @@ FUNCTION_DEFINE_VA3(int, openat64, int, dirfd, const char *, pathname, int, flag
 FUNCTION_DEFINE4(int, fstatat64, int, dirfd, const char *, pathname, struct stat64 *, statbuf, int, flags) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        if (!current_normalize_path(pathname, pathname_abs))
+        if (!normalize_path(NULL, pathname, pathname_abs))
             return -1;
         pathname = pathname_abs;
     }
