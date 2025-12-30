@@ -10,3 +10,6 @@
 [submodule "unicorn"]
 	path = unicorn
 	url = git@github.com:yuvalino/unicorn-forkless.git
+[submodule "mini-vim"]
+	path = mini-vim
+	url = git@github.com:yuvalino/mini-vim-forkless.git
