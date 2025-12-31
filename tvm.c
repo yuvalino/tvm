@@ -236,6 +236,11 @@ struct original_func_t {
 
 static LIST_HEAD(original_functions);
 
+DECL_FUNC(malloc);
+DECL_FUNC(calloc);
+DECL_FUNC(realloc);
+DECL_FUNC(free);
+
 DECL_FUNC(fopen);
 DECL_FUNC(freopen);
 DECL_FUNC(fdopen);
@@ -402,11 +407,6 @@ DECL_FUNC(tcsendbreak);
 DECL_FUNC(tcdrain);
 DECL_FUNC(tcflush);
 DECL_FUNC(tcflow);
-
-DECL_FUNC(malloc);
-DECL_FUNC(calloc);
-DECL_FUNC(realloc);
-DECL_FUNC(free);
 
 DECL_FUNC(strdup);
 DECL_FUNC(strndup);
@@ -1011,6 +1011,8 @@ struct pthread_entry *make_pthread_entry(pthread_t t)
     return pentry;
 }
 
+typedef void (*exit_t)(void);
+
 struct task {
     struct list_head tsk_list;
     struct task *tsk_parent;
@@ -1032,6 +1034,7 @@ struct task {
     struct rmem_arena *tsk_ar;
     struct ulinker *tsk_linker;
     char tsk_cwd[PATH_MAX];
+    exit_t tsk_exits[32];
 };
 
 static Dl_info main_dlinfo = {0};
@@ -1140,6 +1143,8 @@ static struct task *taskalloc()
         t->tsk_pid = __gettid();
         t->tsk_sid = t->tsk_pgid = t->tsk_pid;
 
+        memset(&t->tsk_exits, 0, sizeof(t->tsk_exits));
+
         // simple dups for main task
         for (int i = 0; i < 3; i++) {
             int rfd = CALL_FUNC(dup, i);
@@ -1177,7 +1182,7 @@ static struct task *taskalloc()
         t->tsk_pgid = current->tsk_pgid;
         t->tsk_state = current->tsk_state & TS_CTTY;
         memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
-
+        memcpy(&t->tsk_exits, &current->tsk_exits, sizeof(t->tsk_exits));
         // TODO 
         // t->tsk_environ = copyenv(t->tsk_ar, current->tsk_environ);
         // if (!t->tsk_environ)
@@ -2266,14 +2271,13 @@ static int islocaltty(int fd)
         return 0;
     }
 
+    task_unlock(current);
     struct tty *tt = tty_for_fd(t_fd(fd), TTM_ALL);
     if (!tt) {
-        task_unlock(current);
         return 0;
     }
 
     tty_unlock(tt);
-    task_unlock(current);
     return 1;
 }
 
@@ -6786,6 +6790,17 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
 }
 
 FUNCTION_DEFINE_NORET1(exit, int, status) {
+    task_lock(current);
+    exit_t exits[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
+    memcpy(&exits, current->tsk_exits, sizeof(exits));
+    memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
+    task_unlock(current);
+
+    for (int i = 0; i < sizeof(current->tsk_exits)/sizeof(*current->tsk_exits); i++) {
+        if (exits[i])
+            exits[i]();
+    }
+
     _exit(status);
 }
 
@@ -6806,6 +6821,34 @@ FUNCTION_DEFINE_NORET1(_Exit, int, status) {
 FUNCTION_DEFINE_NORET0(abort) {
     raise(SIGABRT);
     exit(1); // unreachable
+}
+
+// atexit is implemented in the executable rather than libc
+// so we cannot really call the original one
+
+//FUNCTION_DEFINE1(int, atexit, exit_t, function) {
+int atexit(exit_t function) {
+    
+    if (!can_enter_tvm(NULL))
+        return 0;
+
+    if (!function) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    task_lock(current);
+    for (int i = (sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)) - 1; i >= 0; i--) {
+        if (!current->tsk_exits[i]) {
+            current->tsk_exits[i] = function;
+            task_unlock(current);
+            return 0;
+        }
+    }
+    task_unlock(current);
+
+    errno = ENOMEM;
+    return -1;
 }
 
 FUNCTION_DEFINE0(pid_t, getpid) {
@@ -7218,6 +7261,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     task_lock(current);
     memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
     strncpy(current->tsk_comm, basename, sizeof(current->tsk_comm));
+    memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
     task_unlock(current);
 
     for (int i = 0; i < MAX_FILES; i++) {
