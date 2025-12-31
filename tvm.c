@@ -2485,6 +2485,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
 #elif defined(__APPLE__)
         case TIOCSETA:
         case TIOCSETAW:
+        case TIOCSETAF:
 #endif
             memcpy(&tt->t_termios, arg, sizeof(tt->t_termios));
             ret = 0;
@@ -7558,7 +7559,7 @@ FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct te
             break;
     }
 
-    return ttyop_ioctl(t_fd(fd), request, (void *)termios_p);
+    return ttyop_ioctl(t_fd(fd), (unsigned)request, (void *)termios_p);
 }
 
 FUNCTION_DEFINE2(int, tcsendbreak, int, fd, int, duration) {
