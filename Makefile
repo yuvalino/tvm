@@ -20,6 +20,7 @@ CONFFLAGS ?=
 clean:
 	@make -C dropbear/ clean || true
 	@make -C toybox/ clean || true
+	@make -C mini-vim/ clean || true
 	@rm dropbear/Makefile || true
 	@rm mksh/Rebuild.sh || true
 	@rm -rf unicorn/build || true
@@ -28,7 +29,7 @@ clean:
 	@rm test_rmem || true
 	@rm forkless || true
 
-libtvm: dropbear mksh toybox unicorn
+libtvm: dropbear mksh toybox unicorn minivim
 	$(CC) $(CFLAGS) -g -I.  -I./unicorn/include -c rmem.c ulinker.c tvm.c main.c
 	ar rcs libtvm.a rmem.o ulinker.o tvm.o main.o
 
