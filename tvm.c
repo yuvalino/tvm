@@ -40,6 +40,7 @@
 #include <sys/vfs.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#include <asm/prctl.h>
 #endif
 
 #include "tvm.h"
@@ -2139,9 +2140,28 @@ static COW_IMPL(char[PATH_MAX], tty_name);
 static COW_IMPL(char[PATH_MAX], pts_name);
 
 static cc_t ttydefchars[NCCS] = {
-	CEOF, CEOL, CEOL, CERASE, CWERASE, CKILL, CREPRINT,
-	_POSIX_VDISABLE, CINTR, CQUIT, CSUSP, CDSUSP, CSTART, CSTOP, CLNEXT,
-	CDISCARD, CMIN, CTIME, CSTATUS, _POSIX_VDISABLE
+	[VEOF]=CEOF,
+    [VEOL]=CEOL,
+    [VEOL2]=CEOL,
+    [VERASE]=CERASE,
+    [VWERASE]=CWERASE,
+    [VKILL]=CKILL,
+    [VREPRINT]=CREPRINT,
+	[VINTR]=CINTR,
+    [VQUIT]=CQUIT,
+    [VSUSP]=CSUSP,
+#ifdef VDSUSP
+    [VDSUSP]=CDSUSP,
+#endif
+    [VSTART]=CSTART,
+    [VSTOP]=CSTOP,
+    [VLNEXT]=CLNEXT,
+	[VDISCARD]=CDISCARD,
+    [VMIN]=CMIN,
+    [VTIME]=CTIME,
+#ifdef VSTATUS
+    [VSTATUS]=CSTATUS,
+#endif
 };
 
 static void tty_lock(struct tty *tt) { pthread_mutex_lock(&tt->t_lock); }
@@ -2658,8 +2678,88 @@ static ssize_t ttyop_read(int fd, void *buf, size_t count, int offset)
     //     CALL_FUNC(write, f, buf, count);
     // }
 
+    struct termios termios;
+    memcpy(&termios, &tt->t_termios, sizeof(termios));
+
     tty_unlock(tt);
-    return CALL_FUNC(read, fd, buf, count);
+
+    size_t total_read = 0;
+    uint8_t *out = buf;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+    int vmin = termios.c_cc[VMIN];
+    int vtime = termios.c_cc[VTIME]; // in tenths of a second
+
+    int timer_started = 0;
+    struct timespec start_time;
+    long remaining_ms = vtime * 100; // VTIME in 0.1s units → ms
+
+    while (1) {
+        // Check if we have enough bytes for VMIN
+        if (vmin > 0 && total_read >= (size_t)vmin)
+            break;
+
+        // If VMIN == 0 and some bytes already read, return immediately
+        if (vmin == 0 && total_read > 0)
+            break;
+
+        int poll_timeout;
+        if (vmin == 0 && vtime == 0) {
+            poll_timeout = 0;  // poll returns immediately
+        } else if (vmin == 0 && vtime > 0) {
+            poll_timeout = remaining_ms; // timer starts immediately
+        } else if (vmin > 0 && vtime > 0 && timer_started) {
+            poll_timeout = remaining_ms; // inter-byte timeout
+        } else {
+            poll_timeout = -1; // infinite wait for VMIN>0, VTIME=0
+        }
+        //INFO("ttyop_read VMIN %d VTIME %d poll_timeout %d", vmin, vtime, poll_timeout);
+        if (vtime == 21)
+            *(int *)0xDEAD = 0;
+        int ret = CALL_FUNC(poll, &pfd, 1, poll_timeout);
+        if (ret == 0) {
+            // Timeout
+            break;
+        } else if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        // Data is available: read one byte at a time
+        unsigned char c;
+        ssize_t n = CALL_FUNC(read, fd, &c, 1);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            break; // EOF
+
+        // Store the byte
+        if (total_read < count)
+            out[total_read++] = c;
+
+        // Start timer after first byte if VMIN>0 and VTIME>0
+        if (vmin > 0 && vtime > 0 && !timer_started) {
+            clock_gettime(CLOCK_MONOTONIC, &start_time);
+            timer_started = 1;
+        }
+
+        // Update remaining time if timer is running
+        if (timer_started && vtime > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - start_time.tv_sec) * 1000 +
+                              (now.tv_nsec - start_time.tv_nsec) / 1000000;
+            remaining_ms = vtime * 100 - elapsed_ms;
+            if (remaining_ms < 0)
+                remaining_ms = 0;
+        }
+    }
+
+    return total_read;
 }
 
 #define TTY_CHARMASK    0x000000ff      /* Character mask */
@@ -3755,6 +3855,7 @@ struct emulator_engine {
     uc_engine *ee_uc;
     int ee_arch;
     struct emulator_map_entry *ee_eme;
+    int ee_refresh;
 };
 
 void emulator_engine_destroy(struct emulator_engine *ee) {
@@ -3780,8 +3881,24 @@ uc_engine *uc_open_arch(int arch)
 
     if (arch == ULARCH_ARM64)
         err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &engine);
-    else if (arch == ULARCH_X86_64)
+    else if (arch == ULARCH_X86_64) {
         err = uc_open(UC_ARCH_X86, UC_MODE_64, &engine);
+#if defined(__linux__) && defined(__x86_64__)
+        uint64_t fs_base;
+        if (0 != syscall(SYS_arch_prctl, ARCH_GET_FS, &fs_base)) {
+            INFO("arch_prctl(ARCH_GET_FS) failed: %d (%s)", errno, strerror(errno));
+            uc_close(engine);
+            return NULL;
+        }
+
+        err = uc_reg_write(engine, UC_X86_REG_FS_BASE, &fs_base);
+        if (err) {
+            INFO("uc_reg_write(UC_X86_REG_FS_BASE) failed: %s", uc_strerror(err));
+            uc_close(engine);
+            return NULL;
+        }
+#endif
+    }
 
     if (err) {
         INFO("uc_open(ess_arch=%d) failed: %s", arch, uc_strerror(err));
@@ -3823,11 +3940,11 @@ int emulator_engine_reset(struct emulator_engine *ee) {
         goto out;
     }
 
-    uc_hook_add(engine, &hh,
-            UC_HOOK_CODE,
-            emulator_debug_hook_cb,
-            NULL,
-            1, 0);
+    // uc_hook_add(engine, &hh,
+    //         UC_HOOK_CODE,
+    //         emulator_debug_hook_cb,
+    //         NULL,
+    //         1, 0);
 
     // Map emulator map entries as RWX while the rest are mapped as RW
     // NOTE: This is to allow passthrough memory to host but allow us to tightly control which code is executed on guest and which on host
@@ -3836,7 +3953,6 @@ int emulator_engine_reset(struct emulator_engine *ee) {
 
     for (struct emulator_map_entry *eme = ee->ee_eme; eme; eme = eme->eme_next) {
         if (eme->eme_start > last_entry_end) {
-            INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE)", (void *)last_entry_end, (void *)(eme->eme_start - last_entry_end));
             err = uc_mem_map_ptr(engine, last_entry_end, eme->eme_start - last_entry_end, UC_PROT_READ | UC_PROT_WRITE, (void *)last_entry_end);
             if (err) {
                 INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE) failed: %s", (void *)last_entry_end, (void *)(eme->eme_start - last_entry_end), uc_strerror(err));
@@ -3844,7 +3960,6 @@ int emulator_engine_reset(struct emulator_engine *ee) {
             }
         }
 
-        INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE|UC_PROT_EXEC)", (void *)eme->eme_start, (void *)eme->eme_size);
         err = uc_mem_map_ptr(engine, eme->eme_start, eme->eme_size, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC, (void *)eme->eme_start);
         if (err) {
             INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE|UC_PROT_EXEC) failed: %s", (void *)eme->eme_start, (void *)eme->eme_size, uc_strerror(err));
@@ -3855,15 +3970,12 @@ int emulator_engine_reset(struct emulator_engine *ee) {
     }
 
     if (last_entry_end < EMULATOR_ADDRESS_MAX) {
-        INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE)", (void *)last_entry_end, (void *)(EMULATOR_ADDRESS_MAX - last_entry_end));
         err = uc_mem_map_ptr(engine, last_entry_end, EMULATOR_ADDRESS_MAX - last_entry_end, UC_PROT_READ | UC_PROT_WRITE, (void *)last_entry_end);
         if (err) {
             INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE) failed: %s", (void *)last_entry_end, (void *)(EMULATOR_ADDRESS_MAX - last_entry_end), uc_strerror(err));
             goto out;
         }
     }
-
-    INFO("emulator_engine_reset: done");
 
     if (ee->ee_uc) {
         uc_close(ee->ee_uc);
@@ -3895,6 +4007,7 @@ struct emulator_engine *emulator_engine_create(struct emulator_context *ec, int 
     ee->ee_next = NULL;
     ee->ee_eme = NULL;
     ee->ee_uc = NULL;
+    ee->ee_refresh = 0;
 
     if (0 != emulator_engine_reset(ee))
         goto out;
@@ -3915,6 +4028,7 @@ int emulator_engine_add_map_entry(struct emulator_engine *ee, uint64_t start, si
         return 1;
     eme->eme_next = ee->ee_eme;
     ee->ee_eme = eme;
+    ee->ee_refresh = 1;
     return 0;
 }
 
@@ -4165,8 +4279,8 @@ bool emulator_hook_cb(uc_engine *uc, uc_mem_type type,
     ec->ec_ss->ess_intr = ESS_INTR_MEM;
     ec->ec_ss->ess_intr_addr = address;
     ec->ec_ss->ess_intr_memtype = type;
-    uc_emu_stop(uc);
-    INFO("emulator_hook_cb: intr ESS_INTR_MEM addr %p memtype %d", (void *)address, type);
+    //uc_emu_stop(uc);
+    //INFO("emulator_hook_cb: intr ESS_INTR_MEM addr %p memtype %d", (void *)address, type);
     return false;
 }
 
@@ -4179,8 +4293,11 @@ int emulator_step(struct emulator_context *ec)
     if (0 != emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC, &pc))
         goto out;
  
-    if (0 != emulator_engine_reset(ec->ec_curr_engine))
-        goto out;
+    if (ec->ec_curr_engine->ee_refresh) {
+        if (0 != emulator_engine_reset(ec->ec_curr_engine))
+            goto out;
+        ec->ec_curr_engine->ee_refresh = 0;
+    }
 
     err = uc_context_restore(ec->ec_curr_engine->ee_uc, ec->ec_ss->ess_context);
     if (err) {
@@ -4199,7 +4316,6 @@ int emulator_step(struct emulator_context *ec)
 
     if (0 != emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC, &pc))
         goto out;
-    INFO("STEP! pc=%p ret=%d (%s)", (void *)pc, ret, uc_strerror(err));
 
     if (ec->ec_ss->ess_intr == ESS_INTR_UNSPEC) {
         INFO("emulator_step: invalid stop pc=%p err=%d (%s)", (void *)pc, err, uc_strerror(err));
@@ -4463,8 +4579,6 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
 
     prevtvm = TVM_OFF;
 
-    INFO("CALL! pc=%p", (void *)params->pc);
-
     struct ulinker_dladdr_info local_pcinfo;
     if (!pcinfo) {
         if (0 != emulator_find_dl(ec, params->pc, &local_pcinfo)) {
@@ -4569,14 +4683,12 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
                     if (0 != emulator_call_params_from_saved_state(&fault_params, ess))
                         goto out;
 
-                    INFO("SUBCALL! arch=%d pc=%p lr=%p", fault_info.udli_farch, (void *)fault_params.pc, (void *)fault_lr);
                     // call with parameters and save ret
                     uint64_t fault_ret;
                     if (0 != emulator_call_ex(ec, &fault_info, &fault_params, &fault_ret))
                         goto out;
                     if (0 != emulator_saved_state_write_reg(ess, ESS_REG_RET, &fault_ret))
                         goto out;
-                    INFO("SUBCALL RET! res=%p lr=%p", (void *)fault_ret, (void *)fault_lr);
                     
                     if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &fault_lr))
                         goto out;
@@ -4602,7 +4714,7 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
                 goto out;
             }
 
-            INFO("PAGE IN RWX (addr=%p, size=%p)", (void *)fault_range_start, (void *)fault_range_size);
+            INFO("PAGE IN %p-%p)", (void *)fault_range_start, (void *)(fault_range_start + fault_range_size));
             
             if (0 != emulator_engine_add_map_entry(ec->ec_curr_engine, fault_range_start, fault_range_size))
                 goto out;
@@ -5333,8 +5445,14 @@ static int tvm_sorunner(int argc, char **argv)
         return 1;
     }
 
-    printf("sorunner %s %s %p\n", argv[1], "main", sym);
+    struct ulinker_dladdr_info info;
+    ulinker_dladdr(current->tsk_linker, sym, &info);
 
+    printf("sorunner %s %s %p base %p\n", argv[1], "main", sym, info.udli_fbase);
+
+#ifdef ENABLE_RWX
+    return ((main_func_t)sym)(argc - 1, argv + 1, tvm_environ);
+#else
     struct emulator_context ec;
     emulator_context_init(&ec, current->tsk_linker);
 
@@ -5350,6 +5468,7 @@ static int tvm_sorunner(int argc, char **argv)
     emulator_context_fini(&ec);
 
     return (callerr ? callerr : (int)ret);
+#endif
 }
 
 static int tvm_main(int argc, char **argv)
