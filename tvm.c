@@ -6946,6 +6946,12 @@ FUNCTION_DEFINE_NORET0(abort) {
 // atexit is implemented in the executable rather than libc
 // so we cannot really call the original one
 
+#if defined(__linux__)
+int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle) {
+    return atexit((exit_t)func);
+}
+#endif
+
 //FUNCTION_DEFINE1(int, atexit, exit_t, function) {
 int atexit(exit_t function) {
     
