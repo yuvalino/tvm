@@ -45,6 +45,10 @@ static void (*print_cb)(char *, int) = NULL;
     (uint64_t)__tv.tv_sec * 1000 + (uint64_t)__tv.tv_usec / 1000; \
 })
 
+struct rmem_ops rops = {
+    .ro_mmap = mmap,
+    .ro_munmap = munmap,
+};
 
 static inline size_t round_up(size_t x, size_t y) { return ((x+y-1)/y)*y; }
 
@@ -374,7 +378,7 @@ static struct rmem_slab *rmem_slab_create(size_t slabsize, size_t objsize) {
     if (!nobj)
         return NULL;
 
-    void *mem = mmap(NULL, slabsize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    void *mem = rops.ro_mmap(NULL, slabsize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED)
         return NULL;
 
@@ -395,7 +399,7 @@ static struct rmem_slab *rmem_slab_create(size_t slabsize, size_t objsize) {
 }
 
 static void rmem_slab_destroy(struct rmem_slab *sl) {
-    munmap(sl, sl->sl_size);
+    rops.ro_munmap(sl, sl->sl_size);
 }
 
 static void rmem_slab_free(struct rmem_slab *sl, void *p)
@@ -468,6 +472,11 @@ int rmem_setopt(int opt, void *val)
         return 0;
     }
 
+    if (opt == RMEM_OPS) {
+        memcpy(&rops, val, sizeof(rops));
+        return 0;
+    }
+
     // unknown opt?
     return 1;
 }
@@ -482,7 +491,7 @@ struct rmem_arena {
 };
 
 struct rmem_arena *rmem_arena_create(void *private) {
-    void *mem = mmap(NULL, sizeof(struct rmem_arena), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    void *mem = rops.ro_mmap(NULL, sizeof(struct rmem_arena), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED)
         return NULL;
 
@@ -501,7 +510,7 @@ void rmem_arena_destroy(struct rmem_arena *ar) {
         rmem_slab_destroy(sl);
     }
     pthread_mutex_destroy(&ar->ar_lock);
-    munmap(ar, sizeof(struct rmem_arena));
+    rops.ro_munmap(ar, sizeof(struct rmem_arena));
 }
 
 static void *rmem_arena_alloc_locked(struct rmem_arena *ar, size_t size) {

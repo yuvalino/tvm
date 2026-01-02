@@ -417,6 +417,8 @@ DECL_FUNC(getline);
 DECL_FUNC(getdelim);
 
 DECL_FUNC(mmap);
+DECL_FUNC(munmap);
+DECL_FUNC(mprotect);
 
 DECL_FUNC(getopt);
 DECL_FUNC(getopt_long);
@@ -3775,7 +3777,7 @@ pid_t fork(void)
     }
 
     if (0 != cow_fixup_load_data_variables(&arg->fixup, 0)) {
-        munmap(arg->tmp_stack, TEMP_STACK_SIZE);
+        CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
         kfree(arg);
         errno = ENOMEM;
         return -1;
@@ -3830,7 +3832,7 @@ pid_t fork(void)
 
     pthread_mutex_destroy(&arg->mtx);
     pthread_cond_destroy(&arg->cond);
-    munmap(arg->tmp_stack, TEMP_STACK_SIZE);
+    CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
     kfree(arg);
     return ret;
 }
@@ -4072,7 +4074,7 @@ enum {
 
 void emulator_saved_state_destroy(struct emulator_saved_state *ss) {
     if (ss->ess_stack) {
-        munmap(ss->ess_stack, ss->ess_stack_size);
+        CALL_FUNC(munmap, ss->ess_stack, ss->ess_stack_size);
         ss->ess_stack = NULL;
         ss->ess_stack_size = 0;
     }
@@ -4179,7 +4181,7 @@ struct emulator_saved_state *emulator_saved_state_create(uc_engine *engine, int 
     if (!(ess->ess_context = uc_context_alloc_arch(engine, arch)))
         goto out;
 
-    void *stack = mmap(NULL, EMULATOR_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    void *stack = CALL_FUNC(mmap, NULL, EMULATOR_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (stack == MAP_FAILED)
         goto out;
     ess->ess_stack = stack;
@@ -5541,20 +5543,33 @@ static void ulinker_print_cb(char *msg) {
     CALL_FUNC(write, g_outfd, msgbuf, __num);
 }
 
+void *rmem_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
+    return CALL_FUNC(mmap, hint, size, prot, flags, fd, offset);
+}
+
+int rmem_munmap(void *addr, size_t size) {
+    return CALL_FUNC(munmap, addr, size);
+}
+
+struct rmem_ops rmem_ops = {
+    .ro_mmap = rmem_mmap,
+    .ro_munmap = rmem_munmap,
+};
+
 #define ULINKER_ARENA(_arg) ((_arg) ? ((struct task *)arg)->tsk_ar : global_arena)
 
 static void *ulinker_malloc(void *arg, size_t size)             { return rmem_arena_alloc(ULINKER_ARENA(arg), size); }
 static void  ulinker_free(void *arg, void *ptr)                 { rmem_arena_free(ULINKER_ARENA(arg), ptr); }
 static void *ulinker_realloc(void *arg, void *ptr, size_t size) { return rmem_arena_realloc(ULINKER_ARENA(arg), ptr, size); }
 
-static int     ulinker_open(void *arg, const char *name)                { return open(name, O_RDONLY); }
-static int     ulinker_close(void *arg, int fd)                         { return close(fd); }
-static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { return read(fd, buf, count); }
-static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { return fstat(fd, statbuf); }
+static int     ulinker_open(void *arg, const char *name)                { return CALL_FUNC(open, name, O_RDONLY); }
+static int     ulinker_close(void *arg, int fd)                         { return CALL_FUNC(close, fd); }
+static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { return CALL_FUNC(read, fd, buf, count); }
+static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { return CALL_FUNC(fstat, fd, statbuf); }
 
-static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return mmap(hint, length, prot, flags, fd, offset); }
-static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            { return munmap(addr, size); }
-static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
+static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return CALL_FUNC(mmap, hint, length, prot, flags, fd, offset); }
+static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            { return CALL_FUNC(munmap, addr, size); }
+static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return CALL_FUNC(mprotect, addr, size, flags); }
 
 static struct ulinker_ops ulinker_ops = {
     .uo_malloc = ulinker_malloc,
@@ -5595,6 +5610,7 @@ static void ulinker_event_cb(int event, void *arg)
 void tvm_init(const char *init_comm)
 {
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
+    rmem_setopt(RMEM_OPS, (void *)&rmem_ops);
 
     if (0 == dladdr(tvm_init, &main_dlinfo))
         panic("dladdr(tvm_init) failed");

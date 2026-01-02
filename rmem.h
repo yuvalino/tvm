@@ -3,7 +3,14 @@
 
 enum {
     RMEM_PRINT_CB,
+    RMEM_OPS, // struct rmem_ops *
 };
+
+struct rmem_ops {
+    void *(*ro_mmap)(void *, size_t, int, int, int, off_t);
+    int   (*ro_munmap)(void *, size_t);
+};
+
 int rmem_setopt(int opt, void *val);
 
 struct rmem_arena;
