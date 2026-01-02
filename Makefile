@@ -67,3 +67,6 @@ minivim:
 
 dummy:
 	@$(CC) $(CFLAGS) dummy/dummy.c -c -o /tmp/dummy.o
+
+snake: examples/snake.c
+	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@ -shared -fPIC

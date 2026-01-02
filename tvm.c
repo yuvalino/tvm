@@ -486,6 +486,11 @@ void *krealloc(void *ptr, size_t size);
 
 int can_enter_tvm(void *lr);
 
+struct emulator_context;
+struct emulator_context *emulator_context_create(struct ulinker *ulinker);
+void                     emulator_context_destroy(struct emulator_context *ec);
+
+
 /////////////
 // Helpers
 /////////////
@@ -1036,6 +1041,7 @@ struct task {
     struct ulinker *tsk_linker;
     char tsk_cwd[PATH_MAX];
     exit_t tsk_exits[32];
+    struct emulator_context *tsk_emulator;
 };
 
 static Dl_info main_dlinfo = {0};
@@ -1138,6 +1144,9 @@ static struct task *taskalloc()
     for (int i = 0; i < 3; i++)
         t->tsk_f[i] = NULL;
 
+    t->tsk_emulator = emulator_context_create(t->tsk_linker);
+    if (!t->tsk_emulator)
+        panic("taskalloc::emulator_context_create");
     
     if (main_pthread == pthread_self() && !current) {
         main_task = t;
@@ -1234,6 +1243,8 @@ static void taskdealloc(struct task *t)
     --t->tsk_pthreads_count;
     if (list_empty(&t->tsk_pthreads))
         panic("taskalloc tsk_pthreads empty");
+    
+    emulator_context_destroy(t->tsk_emulator);
     
     struct pthread_entry *pentry = list_entry(t->tsk_pthreads.next, struct pthread_entry, ptl_entry);
     list_del(&pentry->ptl_entry);
@@ -4194,13 +4205,18 @@ struct emulator_context {
     struct emulator_engine *ec_curr_engine;
 };
 
-void emulator_context_init(struct emulator_context *ec, struct ulinker *ulinker)
+struct emulator_context *emulator_context_create(struct ulinker *ulinker)
 {
+    struct emulator_context *ec = kalloc(sizeof(*ec));
+    if (!ec)
+        return NULL;
+
     memset(ec, 0, sizeof(*ec));
     ec->ec_ulinker = ulinker;
+    return ec;
 }
 
-void emulator_context_fini(struct emulator_context *ec)
+void emulator_context_destroy(struct emulator_context *ec)
 {
     int prevtvm = TVM_OFF;
 
@@ -4219,6 +4235,7 @@ void emulator_context_fini(struct emulator_context *ec)
     }
 
     TVM_RESTORE(prevtvm);
+    kfree(ec);
 }
 
 struct emulator_engine *emulator_context_get_or_create_engine(struct emulator_context *ec, int arch)
@@ -4589,9 +4606,13 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
     }
 
     // fast path: upcall to host
+#ifdef ENABLE_RWX
+    if (1) {
+#else
     if (pcinfo->udli_farch == ULARCH_NONE) {
+#endif
         TVM_ON;
-        *out_ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        uint64_t ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))params->pc)(
@@ -4600,6 +4621,8 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
             params->arg[10], params->arg[11], params->arg[12], params->arg[13], params->arg[14],
             params->arg[15], params->arg[16], params->arg[17], params->arg[18], params->arg[19]
         );
+        if (out_ret)
+            *out_ret = ret;
         TVM_OFF;
         r = 0;
         goto out;
@@ -4662,8 +4685,11 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
 
             if (ess->ess_intr_addr == EMULATOR_CALL_END_LR) {
                 // returned
-                if (0 == emulator_saved_state_read_reg(ess, ESS_REG_RET, out_ret))
+                uint64_t ret;
+                if (0 == emulator_saved_state_read_reg(ess, ESS_REG_RET, &ret))
                     r = 0;
+                if (out_ret)
+                    *out_ret = ret;
                 goto out;
             }
 
@@ -5450,14 +5476,8 @@ static int tvm_sorunner(int argc, char **argv)
 
     printf("sorunner %s %s %p base %p\n", argv[1], "main", sym, info.udli_fbase);
 
-#ifdef ENABLE_RWX
-    return ((main_func_t)sym)(argc - 1, argv + 1, tvm_environ);
-#else
-    struct emulator_context ec;
-    emulator_context_init(&ec, current->tsk_linker);
-
     uint64_t ret;
-    int callerr = emulator_call(&ec, &ret, (uint64_t)sym,
+    int callerr = emulator_call(current->tsk_emulator, &ret, (uint64_t)sym,
                   (uint64_t)(argc - 1),
                   (uint64_t)(argv + 1),
                   (uint64_t)tvm_environ,
@@ -5465,10 +5485,7 @@ static int tvm_sorunner(int argc, char **argv)
     if (callerr)
         printf("sorunner emulator_call failed!\n");
 
-    emulator_context_fini(&ec);
-
     return (callerr ? callerr : (int)ret);
-#endif
 }
 
 static int tvm_main(int argc, char **argv)
@@ -6917,8 +6934,10 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
     task_unlock(current);
 
     for (int i = 0; i < sizeof(current->tsk_exits)/sizeof(*current->tsk_exits); i++) {
-        if (exits[i])
-            exits[i]();
+        if (exits[i]) {
+            if (0 != emulator_call(current->tsk_emulator, NULL, (uint64_t)exits[i], 0, 0, 0, 0, 0, 0))
+                abort();
+        }
     }
 
     _exit(status);
@@ -6940,7 +6959,7 @@ FUNCTION_DEFINE_NORET1(_Exit, int, status) {
 
 FUNCTION_DEFINE_NORET0(abort) {
     raise(SIGABRT);
-    exit(1); // unreachable
+    _exit(1); // unreachable
 }
 
 // atexit is implemented in the executable rather than libc
