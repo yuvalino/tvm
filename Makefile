@@ -70,3 +70,6 @@ dummy:
 
 snake: examples/snake.c
 	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@ -shared -fPIC
+
+stopit: examples/stopit.c
+	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@ -shared -fPIC

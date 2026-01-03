@@ -492,6 +492,7 @@ struct emulator_context;
 struct emulator_context *emulator_context_create(struct ulinker *ulinker);
 void                     emulator_context_destroy(struct emulator_context *ec);
 
+void emulator_call_sighandler(struct emulator_context *ec, uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
 
 /////////////
 // Helpers
@@ -1923,14 +1924,14 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     }
     
     if ((act->sa_flags & SA_SIGINFO) == 0) {
-        void (*hand)(int) = act->sa_handler;
         task_unlock(current);
-        return hand(signum);
+        emulator_call_sighandler(current->tsk_emulator, (uint64_t)act->sa_handler, signum, 0, 0);
+        return;
     }
     
-    void (*hand)(int, siginfo_t *, void *) = act->sa_sigaction;
     task_unlock(current);
-    return hand(signum, siginfo, ucontext);
+    emulator_call_sighandler(current->tsk_emulator, (uint64_t)act->sa_sigaction, signum, siginfo, ucontext);
+    return;
 }
 
 /////////////
@@ -4587,6 +4588,58 @@ out:
     return ret;
 }
 
+#define EMUFUNC_FLAG 0x0000800000000000ULL
+#define EMUFUNC_MARK(_PTR)   ((typeof(_PTR))((uint64_t)_PTR | EMUFUNC_FLAG))
+#define EMUFUNC_MARKED(_PTR) ((uint64_t)_PTR & EMUFUNC_FLAG)
+#define EMUFUNC_UNMARK(_PTR) ((typeof(_PTR))((uint64_t)_PTR & ~EMUFUNC_FLAG))
+
+int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+    // mark new handler
+    struct sigaction act2;
+    if (act) {
+        memcpy(&act2, act, sizeof(*act));
+        act = &act2;
+        
+        void **handler_func = &act->sa_handler;
+        if (act->sa_flags & SA_SIGINFO)
+            handler_func = &act->sa_sigaction;
+
+        if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
+            *handler_func = EMUFUNC_MARK(*handler_func);
+    }
+    
+    int ret = sigaction(signum, act, oldact);
+
+    // unmark old handler
+    if (oldact) {
+        void **handler_func = &act->sa_handler;
+        if (act->sa_flags & SA_SIGINFO)
+            handler_func = &act->sa_sigaction;
+
+        if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
+            *handler_func = EMUFUNC_UNMARK(*handler_func);
+    }
+}
+
+#if defined(__linux__)
+sighandler_t emulator_signal(int signum, sighandler_t handler) {
+#elif defined(__APPLE__)
+sig_t emulator_signal(int signum, sig_t handler) {
+#endif
+    // mark new handler
+    if (handler && handler != SIG_DFL && handler != SIG_IGN)
+        handler = EMUFUNC_MARK(handler);
+    
+    handler = signal(signum, handler);
+
+    // unmark old handler
+    if (handler && handler != SIG_DFL && handler != SIG_IGN && handler != SIG_ERR)
+        handler = EMUFUNC_UNMARK(handler);
+    
+    return handler;
+}
+
 static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
 
 int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pcinfo, struct emulator_call_params *params, uint64_t *out_ret)
@@ -4772,6 +4825,23 @@ int emulator_call(struct emulator_context *ec, uint64_t *out_ret, uint64_t pc, u
     };
 
     return emulator_call_ex(ec, NULL, &params, out_ret);
+}
+
+void emulator_call_sighandler(struct emulator_context *ec, uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+
+    // handler is not in emulator
+#ifdef ENABLE_RWX
+    if (1) {
+#else
+    if (!EMUFUNC_MARKED(handler_pc)) {
+#endif
+        ((void (*)(uint64_t, uint64_t, uint64_t))handler_pc)(arg0, arg1, arg2);
+        return;
+    }
+
+    // handler is in emulator, call emulator from signal handler so help me god
+    handler_pc = EMUFUNC_UNMARK(handler_pc);
+    emulator_call(current->tsk_emulator, NULL, handler_pc, arg0, arg1, arg2, 0, 0, 0);
 }
 
 /////////////
@@ -5588,6 +5658,8 @@ static struct ulinker_ops ulinker_ops = {
 
 static void *ulinker_external_dlsym(void *arg, const char *s)
 {
+    if (0 == strcmp(s, "sigaction")) return &emulator_sigaction;
+    if (0 == strcmp(s, "signal"))    return &emulator_signal;
     return dlsym(RTLD_DEFAULT, s);
 }
 
