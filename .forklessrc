@@ -1,1 +1,4 @@
+HISTFILE="$HOME/.forkless_history"
+HISTSIZE=5000
+
 alias ll="ls -la"

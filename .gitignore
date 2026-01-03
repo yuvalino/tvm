@@ -10,3 +10,4 @@ __pycache__
 __.SYM*
 snake
 stopit
+.forkless_history
