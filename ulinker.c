@@ -468,6 +468,88 @@ typedef struct
 #define DF_P1_GROUPPERM	0x00000002	/* Symbols from next object are not
 					   generally available.  */
 
+typedef struct
+{
+  Elf32_Word	sh_name;		/* Section name (string tbl index) */
+  Elf32_Word	sh_type;		/* Section type */
+  Elf32_Word	sh_flags;		/* Section flags */
+  Elf32_Addr	sh_addr;		/* Section virtual addr at execution */
+  Elf32_Off	sh_offset;		/* Section file offset */
+  Elf32_Word	sh_size;		/* Section size in bytes */
+  Elf32_Word	sh_link;		/* Link to another section */
+  Elf32_Word	sh_info;		/* Additional section information */
+  Elf32_Word	sh_addralign;		/* Section alignment */
+  Elf32_Word	sh_entsize;		/* Entry size if section holds table */
+} Elf32_Shdr;
+
+typedef struct
+{
+  Elf64_Word	sh_name;		/* Section name (string tbl index) */
+  Elf64_Word	sh_type;		/* Section type */
+  Elf64_Xword	sh_flags;		/* Section flags */
+  Elf64_Addr	sh_addr;		/* Section virtual addr at execution */
+  Elf64_Off	sh_offset;		/* Section file offset */
+  Elf64_Xword	sh_size;		/* Section size in bytes */
+  Elf64_Word	sh_link;		/* Link to another section */
+  Elf64_Word	sh_info;		/* Additional section information */
+  Elf64_Xword	sh_addralign;		/* Section alignment */
+  Elf64_Xword	sh_entsize;		/* Entry size if section holds table */
+} Elf64_Shdr;
+
+#define SHN_UNDEF	0		/* Undefined section */
+#define SHN_LORESERVE	0xff00		/* Start of reserved indices */
+#define SHN_LOPROC	0xff00		/* Start of processor-specific */
+#define SHN_BEFORE	0xff00		/* Order section before all others
+					   (Solaris).  */
+#define SHN_AFTER	0xff01		/* Order section after all others
+					   (Solaris).  */
+#define SHN_HIPROC	0xff1f		/* End of processor-specific */
+#define SHN_LOOS	0xff20		/* Start of OS-specific */
+#define SHN_HIOS	0xff3f		/* End of OS-specific */
+#define SHN_ABS		0xfff1		/* Associated symbol is absolute */
+#define SHN_COMMON	0xfff2		/* Associated symbol is common */
+#define SHN_XINDEX	0xffff		/* Index is in extra table.  */
+#define SHN_HIRESERVE	0xffff		/* End of reserved indices */
+
+/* Legal values for sh_type (section type).  */
+
+#define SHT_NULL	  0		/* Section header table entry unused */
+#define SHT_PROGBITS	  1		/* Program data */
+#define SHT_SYMTAB	  2		/* Symbol table */
+#define SHT_STRTAB	  3		/* String table */
+#define SHT_RELA	  4		/* Relocation entries with addends */
+#define SHT_HASH	  5		/* Symbol hash table */
+#define SHT_DYNAMIC	  6		/* Dynamic linking information */
+#define SHT_NOTE	  7		/* Notes */
+#define SHT_NOBITS	  8		/* Program space with no data (bss) */
+#define SHT_REL		  9		/* Relocation entries, no addends */
+#define SHT_SHLIB	  10		/* Reserved */
+#define SHT_DYNSYM	  11		/* Dynamic linker symbol table */
+#define SHT_INIT_ARRAY	  14		/* Array of constructors */
+#define SHT_FINI_ARRAY	  15		/* Array of destructors */
+#define SHT_PREINIT_ARRAY 16		/* Array of pre-constructors */
+#define SHT_GROUP	  17		/* Section group */
+#define SHT_SYMTAB_SHNDX  18		/* Extended section indices */
+#define	SHT_NUM		  19		/* Number of defined types.  */
+#define SHT_LOOS	  0x60000000	/* Start OS-specific.  */
+#define SHT_GNU_ATTRIBUTES 0x6ffffff5	/* Object attributes.  */
+#define SHT_GNU_HASH	  0x6ffffff6	/* GNU-style hash table.  */
+#define SHT_GNU_LIBLIST	  0x6ffffff7	/* Prelink library list */
+#define SHT_CHECKSUM	  0x6ffffff8	/* Checksum for DSO content.  */
+#define SHT_LOSUNW	  0x6ffffffa	/* Sun-specific low bound.  */
+#define SHT_SUNW_move	  0x6ffffffa
+#define SHT_SUNW_COMDAT   0x6ffffffb
+#define SHT_SUNW_syminfo  0x6ffffffc
+#define SHT_GNU_verdef	  0x6ffffffd	/* Version definition section.  */
+#define SHT_GNU_verneed	  0x6ffffffe	/* Version needs section.  */
+#define SHT_GNU_versym	  0x6fffffff	/* Version symbol table.  */
+#define SHT_HISUNW	  0x6fffffff	/* Sun-specific high bound.  */
+#define SHT_HIOS	  0x6fffffff	/* End OS-specific type */
+#define SHT_LOPROC	  0x70000000	/* Start of processor-specific */
+#define SHT_HIPROC	  0x7fffffff	/* End of processor-specific */
+#define SHT_LOUSER	  0x80000000	/* Start of application-specific */
+#define SHT_HIUSER	  0x8fffffff	/* End of application-specific */
+
 /* Symbol table entry.  */
 
 typedef struct
@@ -627,21 +709,6 @@ typedef struct
 #define ELF64_R_SYM(i)			((i) >> 32)
 #define ELF64_R_TYPE(i)			((i) & 0xffffffff)
 #define ELF64_R_INFO(sym,type)		((((Elf64_Xword) (sym)) << 32) + (type))
-
-#define SHN_UNDEF	0		/* Undefined section */
-#define SHN_LORESERVE	0xff00		/* Start of reserved indices */
-#define SHN_LOPROC	0xff00		/* Start of processor-specific */
-#define SHN_BEFORE	0xff00		/* Order section before all others
-					   (Solaris).  */
-#define SHN_AFTER	0xff01		/* Order section after all others
-					   (Solaris).  */
-#define SHN_HIPROC	0xff1f		/* End of processor-specific */
-#define SHN_LOOS	0xff20		/* Start of OS-specific */
-#define SHN_HIOS	0xff3f		/* End of OS-specific */
-#define SHN_ABS		0xfff1		/* Associated symbol is absolute */
-#define SHN_COMMON	0xfff2		/* Associated symbol is common */
-#define SHN_XINDEX	0xffff		/* Index is in extra table.  */
-#define SHN_HIRESERVE	0xffff		/* End of reserved indices */
 
 #define R_X86_64_JUMP_SLOT	7	/* Create PLT entry */
 #define R_AARCH64_JUMP_SLOT    1026	/* Create PLT entry.  */
@@ -1890,6 +1957,16 @@ struct dlinfo_elf64 {
     Elf64_Rela *dle64_rela;
     size_t      dle64_rela_size;
     size_t      dle64_rela_ent;
+
+    void       *dle64_shsymtab_map;
+    size_t      dle64_shsymtab_map_size;
+    Elf64_Sym  *dle64_shsymtab;
+    size_t      dle64_shsymtab_size;
+
+    void       *dle64_shstrtab_map;
+    size_t      dle64_shstrtab_map_size;
+    const char *dle64_shstrtab;
+    size_t      dle64_shstrtab_size;
 };
 
 struct dlinfo_macho64 {
@@ -1954,6 +2031,18 @@ static const Elf64_Phdr *elf64_find_phdr(struct dlinfo_elf64 *dl, long ptype) {
 
 static void free_elf64_library(struct dlinfo_elf64 *dl)
 {
+    if (dl->dle64_shstrtab_map && dl->dle64_shstrtab_map_size) {
+        uo.uo_munmap(DLPRIVATE(dl), dl->dle64_shstrtab_map, dl->dle64_shstrtab_map_size);
+        dl->dle64_shstrtab_map = dl->dle64_shstrtab = NULL;
+        dl->dle64_shstrtab_map_size = dl->dle64_shstrtab_size = 0;
+    }
+
+    if (dl->dle64_shsymtab_map && dl->dle64_shsymtab_map_size) {
+        uo.uo_munmap(DLPRIVATE(dl), dl->dle64_shsymtab_map, dl->dle64_shsymtab_map_size);
+        dl->dle64_shsymtab_map = dl->dle64_shsymtab = NULL;
+        dl->dle64_shsymtab_map_size = dl->dle64_shsymtab_size = 0;
+    }
+
     if (DLBASE(dl)->dl_base) {
         uo.uo_munmap(DLPRIVATE(dl), DLBASE(dl)->dl_base, DLBASE(dl)->dl_size);
         DLBASE(dl)->dl_base = NULL;
@@ -1974,7 +2063,7 @@ static void *lookup_symbol_external(struct dlinfo_external *dl, const char *s)
     return dl->dlext_dlsym(DLPRIVATE(dl), s);
 }
 
-static void *lookup_symbol_elf64(struct dlinfo_elf64 *dl, const char *s)
+static void *lookup_symbol_elf64_dyn(struct dlinfo_elf64 *dl, const char *s)
 {
     uint32_t hash = 5381;
     const uint8_t* name = (const uint8_t *)(s);
@@ -2022,6 +2111,33 @@ static void *lookup_symbol_elf64(struct dlinfo_elf64 *dl, const char *s)
     return NULL;
 }
 
+static void *lookup_symbol_elf64_all(struct dlinfo_elf64 *dl, const char *s)
+{
+    if (!dl->dle64_shsymtab || !dl->dle64_shstrtab)
+        goto dyn;
+    
+    for (int i = 0; i < dl->dle64_shsymtab_size; i++) {
+        // out-of-bounds in string table?
+        if (dl->dle64_shsymtab[i].st_name >= dl->dle64_shstrtab_size)
+            continue;
+        
+        const char *name = dl->dle64_shstrtab + dl->dle64_shsymtab[i].st_name;
+        if (strcmp(name, s) == 0) {
+            return (void *)(dl->dle64_load_bias + dl->dle64_shsymtab[i].st_value);
+        }
+    }
+
+dyn:
+    return lookup_symbol_elf64_dyn(dl, s);
+}
+
+static void *lookup_symbol_elf64(struct dlinfo_elf64 *dl, const char *s, int all)
+{
+    if (!all)
+        return lookup_symbol_elf64_dyn(dl, s);
+    return lookup_symbol_elf64_all(dl, s);
+}
+
 static void *lookup_symbol_macho64(struct dlinfo_macho64 *dl, const char *s)
 {
     if (!dl->dlm64_symtab)
@@ -2040,12 +2156,12 @@ static void *lookup_symbol_macho64(struct dlinfo_macho64 *dl, const char *s)
     return NULL;
 }
 
-static void *lookup_symbol(struct dlinfo *dl, const char *s)
+static void *lookup_symbol(struct dlinfo *dl, const char *s, int all)
 {
     if (dl->dl_type == DLT_EXTERNAL) 
         return lookup_symbol_external((struct dlinfo_external *)dl, s);
     if (dl->dl_type == DLT_ELF64)
-        return lookup_symbol_elf64((struct dlinfo_elf64 *)dl, s);
+        return lookup_symbol_elf64((struct dlinfo_elf64 *)dl, s, all);
     if (dl->dl_type == DLT_MACHO64)
         return lookup_symbol_macho64((struct dlinfo_macho64 *)dl, s);
     ERROR("symbol \"%s\" not found: unknown dl_type %d", s, dl->dl_type);
@@ -2071,7 +2187,7 @@ static struct dlinfo *library_for_address_locked(struct ulinker *ulinker, const 
     return NULL;
 }
 
-static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *symbol, void *lr, int external)
+static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *symbol, void *lr, int external, int all)
 {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = (struct dlinfo *)handle;
@@ -2087,7 +2203,7 @@ static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *s
     while (dl) {
         if (!external && dl->dl_type == DLT_EXTERNAL)
             break;
-        void *a = lookup_symbol(dl, symbol);
+        void *a = lookup_symbol(dl, symbol, all);
         if (a) {
             DLINFO_UNLOCK(ulinker);
             return a;
@@ -2104,8 +2220,10 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
 {
     struct dlinfo *ret = NULL;
     struct dlinfo_elf64 *dl = NULL;
-    void* phdr_mmap = MAP_FAILED;
+    void  *phdr_mmap = MAP_FAILED;
     size_t phdr_size = 0;
+    void  *shdr_mmap = MAP_FAILED;
+    size_t shdr_size = 0;
 
     if (!(dl = uo.uo_malloc(ulinker->ul_private, sizeof(struct dlinfo_elf64)))) {
         ERROR("failed to open \"%s\": -%d (%s)", filename, ENOMEM, strerror(ENOMEM));
@@ -2410,7 +2528,69 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
         }
     }
 
+    // parse symbol section (optional)
+
+    if (dl->dle64_ehdr.e_shnum && dl->dle64_ehdr.e_shoff) {
+        off_t shdr_off  = page_start(dl->dle64_ehdr.e_shoff);
+        shdr_size = page_end(dl->dle64_ehdr.e_shoff + dl->dle64_ehdr.e_shnum * sizeof(Elf64_Shdr)) - shdr_off;
+        shdr_mmap  = uo.uo_mmap(ulinker->ul_private, NULL, shdr_size, PROT_READ, MAP_PRIVATE, fd, shdr_off);
+        if (shdr_mmap == MAP_FAILED) {
+            ERROR("failed to allocate ELF \"%s\" section headers: -%d (%s)", filename, errno, strerror(errno));
+            goto out;
+        }
+
+        Elf64_Shdr *shdr0 = (Elf64_Shdr *)((uint64_t)shdr_mmap + (dl->dle64_ehdr.e_shoff & (page_size() - 1)));
+
+        int i = 0;
+        for (Elf64_Shdr *shdr = shdr0; shdr < (shdr0 + dl->dle64_ehdr.e_shnum); shdr++, i++) {
+            if (shdr->sh_type != SHT_SYMTAB)
+                continue;
+
+            // no symbols or no linked string table
+            if (!shdr->sh_size || !shdr->sh_link)
+                continue;
+
+            // string table empty?
+            Elf64_Shdr *link_shdr = &shdr0[shdr->sh_link];
+            if (!link_shdr->sh_size)
+                continue;
+
+            off_t  shsymtab_off  = page_start(shdr->sh_offset);
+            size_t shsymtab_size = page_end(shdr->sh_offset + shdr->sh_size) - shsymtab_off;
+            void  *shsymtab_mmap = uo.uo_mmap(ulinker->ul_private, NULL, shsymtab_size, PROT_READ, MAP_PRIVATE, fd, shsymtab_off);
+            if (shsymtab_mmap == MAP_FAILED) {
+                ERROR("failed to allocate ELF \"%s\" .symtab section: -%d (%s)", filename, errno, strerror(errno));
+                goto out;
+            }
+
+            dl->dle64_shsymtab_map = shsymtab_mmap;
+            dl->dle64_shsymtab_map_size = shsymtab_size;
+            dl->dle64_shsymtab = (Elf64_Sym *)((uint64_t)shsymtab_mmap + (shdr->sh_offset & (page_size() - 1)));
+            dl->dle64_shsymtab_size = shdr->sh_size / sizeof(Elf64_Sym);
+
+            off_t  shstrtab_off  = page_start(link_shdr->sh_offset);
+            size_t shstrtab_size = page_end(link_shdr->sh_offset + link_shdr->sh_size) - shstrtab_off;
+            void  *shstrtab_mmap = uo.uo_mmap(ulinker->ul_private, NULL, shstrtab_size, PROT_READ, MAP_PRIVATE, fd, shstrtab_off);
+            if (shstrtab_mmap == MAP_FAILED) {
+                ERROR("failed to allocate ELF \"%s\" .strtab section: -%d (%s)", filename, errno, strerror(errno));
+                goto out;
+            }
+
+            dl->dle64_shstrtab_map = shstrtab_mmap;
+            dl->dle64_shstrtab_map_size = shstrtab_size;
+            dl->dle64_shstrtab = (const char *)((uint64_t)shstrtab_mmap + (link_shdr->sh_offset & (page_size() - 1)));
+            dl->dle64_shstrtab_size = link_shdr->sh_size;
+
+            break;
+        }
+    }
+
 out:
+    if (shdr_mmap != MAP_FAILED) {
+        uo.uo_munmap(ulinker->ul_private, shdr_mmap, shdr_size);
+        shdr_mmap = MAP_FAILED;
+        shdr_size = 0;
+    }
     if (phdr_mmap != MAP_FAILED) {
         uo.uo_munmap(ulinker->ul_private, phdr_mmap, phdr_size);
         phdr_mmap = MAP_FAILED;
@@ -2791,7 +2971,7 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
         if (sym) {
             sym_name = string_elf64(dl, dl->dle64_symtab[sym].st_name);
             // lookup symbol with external libraries as this is for internal use
-            sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1);
+            sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1, 0);
             if (!sym_addr) {
                 if (ELF64_ST_BIND(dl->dle64_symtab[sym].st_info) != STB_WEAK) {
                     ERROR("failed to relocate ELF \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, sym_name);
@@ -2909,7 +3089,7 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                             struct dyld_chained_import *import = &imports[p.ptr_64_bind->ordinal];
                             // skip the leading underscore
                             const char *s = dl->dlm64_chainedfixups_strtab + import->name_offset + 1;
-                            uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1);
+                            uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1, 0);
                             if (!sym_addr && import->weak_import) {
                                 ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
                                 return 1;
@@ -3211,10 +3391,10 @@ int ulinker_dlclose(void *handle)
     return 0;
 }
 
-void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol) {
+void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all) {
     void *lr = __builtin_return_address(0);
     // do NOT search in external for API calls
-    return dlsym_internal(ulinker, handle, symbol, lr, 0);
+    return dlsym_internal(ulinker, handle, symbol, lr, 0, all);
 }
 
 char *ulinker_dlerror(void) {
@@ -3235,7 +3415,7 @@ void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
         return NULL;
     }
 
-    void *entry = lookup_symbol(dl, "main");
+    void *entry = lookup_symbol(dl, "main", 1);
     if (!entry) {
         ERROR("failed to load executable library \"%s\": symbol \"main\" not found", filename);
         ulinker_destroy(tmp_linker);

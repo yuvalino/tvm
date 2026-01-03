@@ -5612,7 +5612,7 @@ static int tvm_sorunner(int argc, char **argv)
         return 1;
     }
 
-    void *sym = ulinker_dlsym(current->tsk_linker, handle, "main");
+    void *sym = ulinker_dlsym(current->tsk_linker, handle, "main", 1);
     if (!sym) {
         fprintf(stderr, "failed to exec \"%s\": %s\n", argv[1], ulinker_dlerror());
         return 1;
@@ -7553,8 +7553,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
-        if (0 == strcmp(pathname, "/tmp/a.out"))
-            main_func = (main_func_t)ulinker_dlopen_executable(current->tsk_linker, pathname);
+        main_func = (main_func_t)ulinker_dlopen_executable(current->tsk_linker, pathname);
     }
 
     if (!main_func) {
@@ -7599,13 +7598,24 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     
     // TODO if 0, 1, 2 are closed we can be nice and open /dev/full, /dev/null and /dev/null for the program
 
+    // TODO purge rmem heap + mmaps
+
     cow_run_init_funcs(); // re-initialize copy-on-write vars with init statements
 
     // TODO hack, getopt should have a tvm thread-safe version
     extern int optind;
     optind = 1;
 
-    exit(main_func(argc, argv, envp));
+    uint64_t ret;
+    int callerr = emulator_call(current->tsk_emulator, &ret, (uint64_t)main_func,
+                  (uint64_t)argc,
+                  (uint64_t)argv,
+                  (uint64_t)envp,
+                0, 0, 0);
+    if (callerr)
+        printf("execve emulator_call failed!\n");
+
+    exit(callerr ? callerr : (int)ret);
 }
 
 FUNCTION_DEFINE_VA2(int, execl, const char *, pathname, const char *, arg/*, ... , (char *) NULL */) {

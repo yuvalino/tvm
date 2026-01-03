@@ -58,7 +58,7 @@ void ulinker_destroy(struct ulinker *ulinker);
 
 void *ulinker_dlopen(struct ulinker *ulinker, const char *filename, int flags);
 int   ulinker_dlclose(void *handle);
-void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol);
+void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all);
 char *ulinker_dlerror(void);
 
 
