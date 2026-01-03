@@ -4065,6 +4065,7 @@ struct emulator_saved_state {
 
     uc_mem_type ess_intr_memtype;
     uint64_t    ess_intr_addr;
+    uint64_t    ess_fault_lr;
 };
 
 enum {
@@ -4608,7 +4609,7 @@ int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction
         if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
             *handler_func = EMUFUNC_MARK(*handler_func);
     }
-    
+
     int ret = sigaction(signum, act, oldact);
 
     // unmark old handler
@@ -4639,6 +4640,88 @@ sig_t emulator_signal(int signum, sig_t handler) {
     
     return handler;
 }
+
+#ifdef ENABLE_RWX
+int emulator_setjmp(jmp_buf env)           { return setjmp(env); }
+int emulator_longjmp(jmp_buf env, int val) { return longjmp(env, val); }
+#else
+int emulator_setjmp(jmp_buf env) {
+    uc_err err;
+    struct emulator_saved_state *ess = current->tsk_emulator->ec_ss;
+
+    uint64_t *envarr = (uint64_t *)env;
+
+    if (ess->ess_arch == ULARCH_X86_64/* && ess->ess_abi == ULABI_LINUX*/) {
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RBX, &envarr[0]))) panic("uc_context_reg_read(UC_X86_REG_RBX)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RBP, &envarr[1]))) panic("uc_context_reg_read(UC_X86_REG_RBP)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R12, &envarr[2]))) panic("uc_context_reg_read(UC_X86_REG_R12)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R13, &envarr[3]))) panic("uc_context_reg_read(UC_X86_REG_R13)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R14, &envarr[4]))) panic("uc_context_reg_read(UC_X86_REG_R14)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R15, &envarr[5]))) panic("uc_context_reg_read(UC_X86_REG_R15)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RSP, &envarr[6]))) panic("uc_context_reg_read(UC_X86_REG_RSP)");
+        envarr[7] = ess->ess_fault_lr;
+    }
+    else if (ess->ess_arch == ULARCH_ARM64/* && ess->ess_abi == ULABI_DARWIN*/)
+    {
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X19, &envarr[0])))  panic("uc_context_reg_read(UC_ARM64_REG_X19)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X20, &envarr[1])))  panic("uc_context_reg_read(UC_ARM64_REG_X20)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X21, &envarr[2])))  panic("uc_context_reg_read(UC_ARM64_REG_X21)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X22, &envarr[3])))  panic("uc_context_reg_read(UC_ARM64_REG_X22)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X23, &envarr[4])))  panic("uc_context_reg_read(UC_ARM64_REG_X23)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X24, &envarr[5])))  panic("uc_context_reg_read(UC_ARM64_REG_X24)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X25, &envarr[6])))  panic("uc_context_reg_read(UC_ARM64_REG_X25)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X26, &envarr[7])))  panic("uc_context_reg_read(UC_ARM64_REG_X26)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X27, &envarr[8])))  panic("uc_context_reg_read(UC_ARM64_REG_X27)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X28, &envarr[9])))  panic("uc_context_reg_read(UC_ARM64_REG_X28)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X29, &envarr[10]))) panic("uc_context_reg_read(UC_ARM64_REG_X29)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X30, &envarr[11]))) panic("uc_context_reg_read(UC_ARM64_REG_X30)");
+        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_SP,  &envarr[12]))) panic("uc_context_reg_read(UC_ARM64_REG_SP)");
+        envarr[13] = ess->ess_fault_lr;
+    }
+
+    return 0;
+}
+
+int emulator_longjmp(jmp_buf env, int val) {
+    uc_err err;
+    struct emulator_saved_state *ess = current->tsk_emulator->ec_ss;
+    uint64_t *envarr = (uint64_t *)env;
+
+    if (!val) val = 1;
+
+    if (ess->ess_arch == ULARCH_X86_64/* && ess->ess_abi == ULABI_LINUX*/) {
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RBX, &envarr[0]))) panic("uc_context_reg_write(UC_X86_REG_RBX)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RBP, &envarr[1]))) panic("uc_context_reg_write(UC_X86_REG_RBP)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R12, &envarr[2]))) panic("uc_context_reg_write(UC_X86_REG_R12)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R13, &envarr[3]))) panic("uc_context_reg_write(UC_X86_REG_R13)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R14, &envarr[4]))) panic("uc_context_reg_write(UC_X86_REG_R14)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R15, &envarr[5]))) panic("uc_context_reg_write(UC_X86_REG_R15)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RSP, &envarr[6]))) panic("uc_context_reg_write(UC_X86_REG_RSP)");
+        ess->ess_fault_lr = envarr[7];
+    }
+    else if (ess->ess_arch == ULARCH_ARM64/* && ess->ess_abi == ULABI_DARWIN*/)
+    {
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X19, &envarr[0])))  panic("uc_context_reg_write(UC_ARM64_REG_X19)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X20, &envarr[1])))  panic("uc_context_reg_write(UC_ARM64_REG_X20)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X21, &envarr[2])))  panic("uc_context_reg_write(UC_ARM64_REG_X21)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X22, &envarr[3])))  panic("uc_context_reg_write(UC_ARM64_REG_X22)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X23, &envarr[4])))  panic("uc_context_reg_write(UC_ARM64_REG_X23)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X24, &envarr[5])))  panic("uc_context_reg_write(UC_ARM64_REG_X24)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X25, &envarr[6])))  panic("uc_context_reg_write(UC_ARM64_REG_X25)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X26, &envarr[7])))  panic("uc_context_reg_write(UC_ARM64_REG_X26)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X27, &envarr[8])))  panic("uc_context_reg_write(UC_ARM64_REG_X27)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X28, &envarr[9])))  panic("uc_context_reg_write(UC_ARM64_REG_X28)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X29, &envarr[10]))) panic("uc_context_reg_write(UC_ARM64_REG_X29)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X30, &envarr[11]))) panic("uc_context_reg_write(UC_ARM64_REG_X30)");
+        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_SP,  &envarr[12]))) panic("uc_context_reg_write(UC_ARM64_REG_SP)");
+        ess->ess_fault_lr = envarr[13];
+    }
+
+    return val;
+}
+
+#endif
+
 
 static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
 
@@ -4756,8 +4839,7 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
                 if (fault_info.udli_farch != ess->ess_arch) {
                     
                     // read lr before call so stack is adjusted for emulator_call_params_from_saved_state()
-                    uint64_t fault_lr;
-                    if (0 != emulator_saved_state_exit_call(ess, &fault_lr))
+                    if (0 != emulator_saved_state_exit_call(ess, &ess->ess_fault_lr))
                         goto out;
 
                     struct emulator_call_params fault_params;
@@ -4771,7 +4853,7 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
                     if (0 != emulator_saved_state_write_reg(ess, ESS_REG_RET, &fault_ret))
                         goto out;
                     
-                    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &fault_lr))
+                    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &ess->ess_fault_lr))
                         goto out;
                     continue;
                 }
@@ -5660,6 +5742,8 @@ static void *ulinker_external_dlsym(void *arg, const char *s)
 {
     if (0 == strcmp(s, "sigaction")) return &emulator_sigaction;
     if (0 == strcmp(s, "signal"))    return &emulator_signal;
+    if (0 == strcmp(s, "_setjmp"))   return &emulator_setjmp;
+    if (0 == strcmp(s, "longjmp"))   return &emulator_longjmp;
     return dlsym(RTLD_DEFAULT, s);
 }
 

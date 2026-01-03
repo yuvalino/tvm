@@ -73,3 +73,6 @@ snake: examples/snake.c
 
 stopit: examples/stopit.c
 	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@ -shared -fPIC
+
+hello_jmpbuf: examples/hello_jmpbuf.c
+	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@ -shared -fPIC
