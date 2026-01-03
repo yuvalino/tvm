@@ -4641,10 +4641,6 @@ sig_t emulator_signal(int signum, sig_t handler) {
     return handler;
 }
 
-#ifdef ENABLE_RWX
-int emulator_setjmp(jmp_buf env)           { return setjmp(env); }
-int emulator_longjmp(jmp_buf env, int val) { return longjmp(env, val); }
-#else
 int emulator_setjmp(jmp_buf env) {
     uc_err err;
     struct emulator_saved_state *ess = current->tsk_emulator->ec_ss;
@@ -4719,9 +4715,6 @@ int emulator_longjmp(jmp_buf env, int val) {
 
     return val;
 }
-
-#endif
-
 
 static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
 
@@ -5740,10 +5733,12 @@ static struct ulinker_ops ulinker_ops = {
 
 static void *ulinker_external_dlsym(void *arg, const char *s)
 {
+    #ifndef ENABLE_RWX
     if (0 == strcmp(s, "sigaction")) return &emulator_sigaction;
     if (0 == strcmp(s, "signal"))    return &emulator_signal;
     if (0 == strcmp(s, "_setjmp"))   return &emulator_setjmp;
     if (0 == strcmp(s, "longjmp"))   return &emulator_longjmp;
+    #endif
     return dlsym(RTLD_DEFAULT, s);
 }
 
