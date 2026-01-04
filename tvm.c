@@ -4812,7 +4812,7 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
         
         if (ess->ess_intr == ESS_INTR_MEM) {
             if (ess->ess_intr_memtype != UC_MEM_FETCH_PROT) {
-                INFO("ess->ess_intr_memtype %d != UC_MEM_FETCH_PROT", ess->ess_intr_memtype);
+                INFO("ess->ess_intr_memtype %d != UC_MEM_FETCH_PROT at %p", ess->ess_intr_memtype, (void *)ess->ess_intr_addr);
                 raise(SIGSEGV);
             }
 
@@ -5738,7 +5738,8 @@ static void *ulinker_external_dlsym(void *arg, const char *s)
     #ifndef ENABLE_RWX
     if (0 == strcmp(s, "sigaction")) return &emulator_sigaction;
     if (0 == strcmp(s, "signal"))    return &emulator_signal;
-    if (0 == strcmp(s, "_setjmp"))   return &emulator_setjmp;
+    if (0 == strcmp(s, "_setjmp"))   return &emulator_setjmp;  // linux
+    if (0 == strcmp(s, "setjmp"))    return &emulator_setjmp;  // darwin
     if (0 == strcmp(s, "longjmp"))   return &emulator_longjmp;
     #endif
     return dlsym(RTLD_DEFAULT, s);
