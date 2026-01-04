@@ -1975,6 +1975,7 @@ struct dlinfo_macho64 {
     struct mach_header_64 dlm64_hdr;
     size_t dlm64_sizeoflc;
     uintptr_t dlm64_load_bias;
+    uintptr_t dlm64_pagezero;
     const struct load_command *dlm64_lc;
 
     struct nlist_64 *dlm64_symtab;
@@ -2645,6 +2646,13 @@ static uintptr_t vaddr_macho64(struct dlinfo_macho64 *dl, uint32_t fileoff)
             continue;
         
         const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+
+        // skip page zero
+        if (curr_sc->initprot == 0 && curr_sc->maxprot == 0 && curr_sc->vmaddr == 0) {
+            // PAGEZERO
+            continue;
+        }
+
         if (fileoff < curr_sc->fileoff || fileoff >= (curr_sc->fileoff + curr_sc->filesize))
             continue;
 
@@ -2677,8 +2685,13 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         goto out;
     }
 
-    if (dl->dlm64_hdr.filetype != MH_DYLIB) {
+    if (dl->dlm64_hdr.filetype != MH_DYLIB && dl->dlm64_hdr.filetype != MH_EXECUTE) {
         ERROR("failed to load Mach-O \"%s\": unexpected filetype: %d", filename, dl->dlm64_hdr.filetype);
+        goto out;
+    }
+
+    if (dl->dlm64_hdr.filetype == MH_EXECUTE && !(dl->dlm64_hdr.flags & MH_PIE)) {
+        ERROR("failed to load Mach-O \"%s\": executable files are only supported as PIE!", filename);
         goto out;
     }
 
@@ -2711,9 +2724,17 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         if (curr_lc->cmd != LC_SEGMENT_64) {
             continue;
         }
-        found_lc_segment = 1;
 
         const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+
+        // skip page zero
+        if (curr_sc->initprot == 0 && curr_sc->maxprot == 0 && curr_sc->vmaddr == 0) {
+            dl->dlm64_pagezero += curr_sc->vmsize;
+            continue;
+        }
+
+        found_lc_segment = 1;
+
         if (curr_sc->vmaddr < min_vaddr) {
             min_vaddr = curr_sc->vmaddr;
         }
@@ -2751,6 +2772,12 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         }
 
         const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+
+        // skip page zero
+        if (curr_sc->initprot == 0 && curr_sc->maxprot == 0 && curr_sc->vmaddr == 0) {
+            // PAGEZERO
+            continue;
+        }
 
         // Segment addresses in memory.
         uintptr_t seg_start = curr_sc->vmaddr + dl->dlm64_load_bias;
@@ -2823,11 +2850,6 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
 
     // find phdr as it appears in the loaded segments
 
-    const struct load_command *loaded_lc = NULL;
-
-    // Otherwise, check the first loadable segment. If its file offset
-    // is 0, it starts with the ELF header, and we can trivially find the
-    // loaded program header from it.
     curr_lc = lc;
     for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
         if (curr_lc->cmd != LC_SEGMENT_64) {
@@ -2835,40 +2857,22 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         }
 
         const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
-        if (curr_sc->fileoff == 0) {
+
+        // skip page zero
+        if (curr_sc->initprot == 0 && curr_sc->maxprot == 0 && curr_sc->vmaddr == 0) {
+            // PAGEZERO
+            continue;
+        }
+
+        if (curr_sc->fileoff <= sizeof(struct mach_header_64) && (curr_sc->fileoff + curr_sc->filesize) >= (sizeof(struct mach_header_64) + dl->dlm64_hdr.sizeofcmds)) {
             uintptr_t loaded_hdr = (uintptr_t)dl->dlm64_load_bias + curr_sc->vmaddr;
-            loaded_lc = (const struct load_command *)(loaded_hdr + sizeof(struct mach_header_64));
-        }
-        break;
-    }
-
-    if (!loaded_lc) {
-        ERROR("failed to find loaded lc for Mach-O \"%s\"", filename);
-        goto out;
-    }
-
-    // Ensures that our loaded commands are actually within a loadable
-    // segment. This should help catch badly-formed Mach-O files that
-    // would cause the linker to crash later when trying to access it.
-    uintptr_t loaded_end = (uintptr_t)loaded_lc + dl->dlm64_sizeoflc;
-    curr_lc = lc;
-    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
-        if (curr_lc->cmd != LC_SEGMENT_64) {
-            continue;
-        }
-
-        const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
-
-        Elf64_Addr seg_start = curr_sc->vmaddr + dl->dlm64_load_bias;
-        Elf64_Addr seg_end = curr_sc->filesize + seg_start;
-        if (seg_start <= (Elf64_Addr)loaded_end && (Elf64_Addr)loaded_end <= seg_end) {
-            dl->dlm64_lc = loaded_lc;
+            dl->dlm64_lc = (const struct load_command *)(loaded_hdr + sizeof(struct mach_header_64));
             break;
         }
     }
 
     if (!dl->dlm64_lc) {
-        ERROR("failed to load ELF\"%s\": loaded phdr %p not in loadable segment", filename, loaded_lc);
+        ERROR("failed to find loaded lc for Mach-O \"%s\"", filename);
         goto out;
     }
 
@@ -3053,7 +3057,7 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
         }
 
         const struct dyld_chained_starts_in_segment *seg_starts = (const struct dyld_chained_starts_in_segment *)(starts_base + seg_offset);
-        uintptr_t segment_address = dl->dlm64_load_bias + seg_starts->segment_offset;
+        uintptr_t segment_address = dl->dlm64_load_bias + seg_starts->segment_offset + dl->dlm64_pagezero;
 
         switch (seg_starts->pointer_format) {
             case DYLD_CHAINED_PTR_64:
@@ -3099,8 +3103,8 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                         }
                         else {
                             next = p.ptr_64_rebase->next * 4;
-                            PRINT("DYLD_CHAINED_PTR_64_REBASE %p %p", p.ptr8, (void *)(dl->dlm64_load_bias + p.ptr_64_rebase->target));
-                            *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target;
+                            PRINT("DYLD_CHAINED_PTR_64_REBASE %p %p", p.ptr8, (void *)(dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero));
+                            *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero;
                         }
                         break;
                 }
