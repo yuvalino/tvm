@@ -5608,15 +5608,21 @@ static int tvm_sorunner(int argc, char **argv)
         return 1;
     }
 
-    void *handle = ulinker_dlopen(current->tsk_linker, argv[1], 0);
+    char pathname_abs[PATH_MAX];
+    if (!current_normalize_path(argv[1], pathname_abs)) {
+        fprintf(stderr, "failed to exec \"%s\": -%d (%s)\n", pathname_abs, errno, strerror(errno));
+        return 1;
+    }
+
+    void *handle = ulinker_dlopen(current->tsk_linker, pathname_abs, 0);
     if (!handle) {
-        fprintf(stderr, "failed to exec \"%s\": %s\n", argv[1], ulinker_dlerror());
+        fprintf(stderr, "failed to exec \"%s\": %s\n", pathname_abs, ulinker_dlerror());
         return 1;
     }
 
     void *sym = ulinker_dlsym(current->tsk_linker, handle, "main", 1);
     if (!sym) {
-        fprintf(stderr, "failed to exec \"%s\": %s\n", argv[1], ulinker_dlerror());
+        fprintf(stderr, "failed to exec \"%s\": %s\n", pathname_abs, ulinker_dlerror());
         return 1;
     }
 
@@ -6600,7 +6606,7 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
         statbuf->st_mode = S_IFREG | S_IXUSR | S_IXGRP | S_IXOTH;
         return 0;
     }
-
+    
     return CALL_FUNC(stat, pathname, statbuf);
 }
 
@@ -6651,6 +6657,12 @@ FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
     // make sure the shell finds our programs
     if (find_program(pathname))
         return 0;
+
+    if (mode & X_OK) {
+        mode &= ~X_OK;
+        if (!mode)
+            mode = F_OK;
+    }
 
     return CALL_FUNC(access, pathname, mode);
 }
