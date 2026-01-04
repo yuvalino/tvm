@@ -1930,7 +1930,7 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     }
     
     task_unlock(current);
-    emulator_call_sighandler(current->tsk_emulator, (uint64_t)act->sa_sigaction, signum, siginfo, ucontext);
+    emulator_call_sighandler(current->tsk_emulator, (uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
     return;
 }
 
@@ -3931,7 +3931,7 @@ static void emulator_debug_hook_cb(uc_engine *uc,
                          uint32_t size,
                          void *user_data)
 {
-    INFO("emulator_debug: PC = 0x%lx, size = %u", address, size);
+    INFO("emulator_debug: PC = %p, size = %u", (void *)address, size);
 }
 
 #define EMULATOR_ADDRESS_MIN ((uint64_t)0x4000)
@@ -4602,9 +4602,9 @@ int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction
         memcpy(&act2, act, sizeof(*act));
         act = &act2;
         
-        void **handler_func = &act->sa_handler;
+        void **handler_func = (void **)&act->sa_handler;
         if (act->sa_flags & SA_SIGINFO)
-            handler_func = &act->sa_sigaction;
+            handler_func = (void **)&act->sa_sigaction;
 
         if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
             *handler_func = EMUFUNC_MARK(*handler_func);
@@ -4614,13 +4614,15 @@ int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction
 
     // unmark old handler
     if (oldact) {
-        void **handler_func = &act->sa_handler;
+        void **handler_func = (void **)&act->sa_handler;
         if (act->sa_flags & SA_SIGINFO)
-            handler_func = &act->sa_sigaction;
+            handler_func = (void **)&act->sa_sigaction;
 
         if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
             *handler_func = EMUFUNC_UNMARK(*handler_func);
     }
+
+    return ret;
 }
 
 #if defined(__linux__)

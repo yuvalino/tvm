@@ -2034,13 +2034,15 @@ static void free_elf64_library(struct dlinfo_elf64 *dl)
 {
     if (dl->dle64_shstrtab_map && dl->dle64_shstrtab_map_size) {
         uo.uo_munmap(DLPRIVATE(dl), dl->dle64_shstrtab_map, dl->dle64_shstrtab_map_size);
-        dl->dle64_shstrtab_map = dl->dle64_shstrtab = NULL;
+        dl->dle64_shstrtab_map = NULL;
+        dl->dle64_shstrtab = NULL;
         dl->dle64_shstrtab_map_size = dl->dle64_shstrtab_size = 0;
     }
 
     if (dl->dle64_shsymtab_map && dl->dle64_shsymtab_map_size) {
         uo.uo_munmap(DLPRIVATE(dl), dl->dle64_shsymtab_map, dl->dle64_shsymtab_map_size);
-        dl->dle64_shsymtab_map = dl->dle64_shsymtab = NULL;
+        dl->dle64_shsymtab_map = NULL;
+        dl->dle64_shsymtab = NULL;
         dl->dle64_shsymtab_map_size = dl->dle64_shsymtab_size = 0;
     }
 
