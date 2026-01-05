@@ -76,3 +76,6 @@ stopit: examples/stopit.c
 
 hello_jmpbuf: examples/hello_jmpbuf.c
 	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@
+
+gdb_backtrace: examples/gdb_backtrace.c
+	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@

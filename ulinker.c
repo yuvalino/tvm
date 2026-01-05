@@ -550,6 +550,28 @@ typedef struct
 #define SHT_LOUSER	  0x80000000	/* Start of application-specific */
 #define SHT_HIUSER	  0x8fffffff	/* End of application-specific */
 
+/* Legal values for sh_flags (section flags).  */
+
+#define SHF_WRITE	     (1 << 0)	/* Writable */
+#define SHF_ALLOC	     (1 << 1)	/* Occupies memory during execution */
+#define SHF_EXECINSTR	     (1 << 2)	/* Executable */
+#define SHF_MERGE	     (1 << 4)	/* Might be merged */
+#define SHF_STRINGS	     (1 << 5)	/* Contains nul-terminated strings */
+#define SHF_INFO_LINK	     (1 << 6)	/* `sh_info' contains SHT index */
+#define SHF_LINK_ORDER	     (1 << 7)	/* Preserve order after combining */
+#define SHF_OS_NONCONFORMING (1 << 8)	/* Non-standard OS specific handling
+					   required */
+#define SHF_GROUP	     (1 << 9)	/* Section is member of a group.  */
+#define SHF_TLS		     (1 << 10)	/* Section hold thread-local data.  */
+#define SHF_COMPRESSED	     (1 << 11)	/* Section with compressed data. */
+#define SHF_MASKOS	     0x0ff00000	/* OS-specific.  */
+#define SHF_MASKPROC	     0xf0000000	/* Processor-specific */
+#define SHF_GNU_RETAIN	     (1 << 21)  /* Not to be GCed by linker.  */
+#define SHF_ORDERED	     (1 << 30)	/* Special ordering requirement
+					   (Solaris).  */
+#define SHF_EXCLUDE	     (1U << 31)	/* Section is excluded unless
+					   referenced or allocated (Solaris).*/
+
 /* Symbol table entry.  */
 
 typedef struct
@@ -709,6 +731,9 @@ typedef struct
 #define ELF64_R_SYM(i)			((i) >> 32)
 #define ELF64_R_TYPE(i)			((i) & 0xffffffff)
 #define ELF64_R_INFO(sym,type)		((((Elf64_Xword) (sym)) << 32) + (type))
+
+#define R_X86_64_COPY		5	/* Copy symbol at runtime */
+#define R_AARCH64_COPY         1024	/* Copy symbol at runtime.  */
 
 #define R_X86_64_JUMP_SLOT	7	/* Create PLT entry */
 #define R_AARCH64_JUMP_SLOT    1026	/* Create PLT entry.  */
@@ -1889,6 +1914,76 @@ static struct ulinker_ops uo = {
     .uo_mprotect = mprotect_wrapper
 };
 
+/* ------------------- GDB JIT Interface ------------------- */
+
+enum jit_actions {
+    JIT_NOACTION = 0,
+    JIT_REGISTER_FN = 1,
+    JIT_UNREGISTER_FN = 2
+};
+
+struct jit_code_entry {
+    struct jit_code_entry *next;
+    struct jit_code_entry *prev;
+    const char *symfile_addr;
+    uint64_t symfile_size;
+};
+
+struct jit_debug_descriptor {
+    uint32_t version;                 // must be 1
+    uint32_t action_flag;              // jit_actions
+    struct jit_code_entry *relevant_entry;
+    struct jit_code_entry *first_entry;
+};
+
+struct jit_debug_descriptor __jit_debug_descriptor = {
+    .version = 1,
+    .action_flag = JIT_NOACTION,
+    .relevant_entry = NULL,
+    .first_entry = NULL
+};
+
+__attribute__((noinline))
+void __jit_debug_register_code(void) {
+    // GDB sets a breakpoint here
+}
+
+pthread_mutex_t __jit_debug_descriptor_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+void gdb_jit_register(struct jit_code_entry *entry)
+{
+    pthread_mutex_lock(&__jit_debug_descriptor_mtx);
+
+    entry->prev = NULL;
+    entry->next = __jit_debug_descriptor.first_entry;
+    if (entry->next)
+        entry->next->prev = entry;
+    __jit_debug_descriptor.first_entry = entry;
+    __jit_debug_descriptor.relevant_entry = entry;
+    __jit_debug_descriptor.action_flag = JIT_REGISTER_FN;
+    __jit_debug_register_code();
+
+    pthread_mutex_unlock(&__jit_debug_descriptor_mtx);
+}
+
+void gdb_jit_unregister(struct jit_code_entry *entry)
+{
+    pthread_mutex_lock(&__jit_debug_descriptor_mtx);
+    
+    if (entry->prev)
+        entry->prev->next = entry->next;
+    else
+        __jit_debug_descriptor.first_entry = entry->next;
+
+    if (entry->next)
+        entry->next->prev = entry->prev;
+
+    __jit_debug_descriptor.relevant_entry = entry;
+    __jit_debug_descriptor.action_flag = JIT_UNREGISTER_FN;
+    __jit_debug_register_code();
+    pthread_mutex_unlock(&__jit_debug_descriptor_mtx);
+}
+
 /* -------------------- Linker Instance -------------------- */
 
 struct ulinker {
@@ -1967,6 +2062,8 @@ struct dlinfo_elf64 {
     size_t      dle64_shstrtab_map_size;
     const char *dle64_shstrtab;
     size_t      dle64_shstrtab_size;
+
+    struct jit_code_entry dle64_jit_entry;
 };
 
 struct dlinfo_macho64 {
@@ -2004,6 +2101,101 @@ static struct dlinfo_external *g_external_dlinfos = NULL;
 
 /* -------------------- Private functions -------------------- */
 
+int create_elf64_jit_entry(struct dlinfo_elf64 *dl, const char *filename)
+{
+    int ret = -1;
+    int fd = -1;
+    
+    fd = uo.uo_open(DLPRIVATE(dl), filename);
+    if (-1 == fd) {
+        ERROR("failed to open ELF \"%s\": -%d (%s)", filename, errno, strerror(errno));
+        goto out;
+    }
+    
+    struct stat statbuf;
+    if (-1 == uo.uo_fstat(DLPRIVATE(dl), fd, &statbuf)) {
+        ERROR("failed to stat ELF \"%s\": -%d (%s)", filename, errno, strerror(errno));
+        goto out;
+    }
+
+    char *data = uo.uo_malloc(DLPRIVATE(dl), statbuf.st_size);
+    if (!data) {
+        ERROR("failed to allocate debug data for ELF \"%s\": -%d (%s)", filename, ENOMEM, strerror(ENOMEM));
+        goto out;
+    }
+
+    size_t total_read = 0;
+    while (total_read < statbuf.st_size) {
+        ssize_t current_read = uo.uo_read(DLPRIVATE(dl), fd, data + total_read, statbuf.st_size - total_read);
+        if (current_read == -1 || current_read == 0) {
+            ERROR("failed to read ELF \"%s\": -%d (%s)", filename, errno, strerror(errno));
+            goto out;
+        }
+        total_read += current_read;
+    }
+
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)data;
+
+    // GDB expects an ET_REL
+    ehdr->e_type = ET_REL;
+
+
+    Elf64_Phdr *phdr0 = (Elf64_Phdr *)(data + ehdr->e_phoff);
+    for (Elf64_Phdr *phdr = phdr0; phdr < &phdr0[ehdr->e_phnum]; phdr++) {
+        if (phdr->p_memsz || phdr->p_vaddr) {
+            phdr->p_vaddr += dl->dle64_load_bias;
+            phdr->p_paddr += dl->dle64_load_bias;
+        }
+    }
+
+    Elf64_Shdr *symtab = NULL;
+    const char *strtab_str = NULL;
+
+    Elf64_Shdr *shdr0 = (Elf64_Shdr *)(data + ehdr->e_shoff);
+    const char *shnstrtab_str = (const char *)(data + shdr0[ehdr->e_shstrndx].sh_offset);
+
+    // find symbol and string table
+    for (Elf64_Shdr *shdr = shdr0; shdr < &shdr0[ehdr->e_shnum]; shdr++) {
+
+        if (0 == strcmp(&shnstrtab_str[shdr->sh_name], ".symtab"))
+            symtab = shdr;
+        else if (0 == strcmp(&shnstrtab_str[shdr->sh_name], ".strtab"))
+            strtab_str = (const char *)(data + shdr->sh_offset);
+    }
+
+    // fixup symbols to be calculated from section start
+    if (symtab) {
+        Elf64_Sym *sym0 = (Elf64_Sym *)(data + symtab->sh_offset);
+        for (Elf64_Sym *sym = sym0; sym < &sym0[symtab->sh_size / sizeof(Elf64_Sym)]; sym++) {
+            sym->st_value -= shdr0[sym->st_shndx].sh_addr;
+        }
+    }
+
+    // fixup section addresses to absolute values
+    for (Elf64_Shdr *shdr = shdr0; shdr < &shdr0[ehdr->e_shnum]; shdr++) {
+        if (shdr->sh_addr) {
+            shdr->sh_addr += dl->dle64_load_bias;
+        }
+    }
+
+    dl->dle64_jit_entry.symfile_addr = data;
+    dl->dle64_jit_entry.symfile_size = statbuf.st_size;
+    ret = 0;
+
+out:
+    if (ret) {
+        if (data) {
+            uo.uo_free(DLPRIVATE(dl), data);
+            data = NULL;
+        }      
+    }
+    if (fd != -1) {
+        uo.uo_close(DLPRIVATE(dl), fd);
+        fd = -1;
+    }
+    return ret;
+}
+
 static struct dlinfo *find_library(struct ulinker *ulinker, const char *name, int refcnt)
 {
     struct dlinfo *dl = NULL;
@@ -2032,6 +2224,13 @@ static const Elf64_Phdr *elf64_find_phdr(struct dlinfo_elf64 *dl, long ptype) {
 
 static void free_elf64_library(struct dlinfo_elf64 *dl)
 {
+    if (dl->dle64_jit_entry.symfile_addr) {
+        gdb_jit_unregister(&dl->dle64_jit_entry);
+        uo.uo_free(DLPRIVATE(dl), (void *)dl->dle64_jit_entry.symfile_addr);
+        dl->dle64_jit_entry.symfile_addr = NULL;
+        dl->dle64_jit_entry.symfile_size = 0;
+    }
+    
     if (dl->dle64_shstrtab_map && dl->dle64_shstrtab_map_size) {
         uo.uo_munmap(DLPRIVATE(dl), dl->dle64_shstrtab_map, dl->dle64_shstrtab_map_size);
         dl->dle64_shstrtab_map = NULL;
@@ -2317,6 +2516,8 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
     DLBASE(dl)->dl_base = base;
     DLBASE(dl)->dl_size = load_size;
 
+    PRINT("elf64 %s base at %p", filename, base);
+
     dl->dle64_load_bias = (uintptr_t)base - min_vaddr;
 
     // load segments
@@ -2587,6 +2788,9 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
             break;
         }
     }
+
+    if (0 == create_elf64_jit_entry(dl, filename))
+        gdb_jit_register(&dl->dle64_jit_entry);
 
 out:
     if (shdr_mmap != MAP_FAILED) {
@@ -2970,12 +3174,14 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
 
         Elf64_Word sym = ELF64_R_SYM(rel->r_info);
         const char *sym_name = NULL;
+        size_t     sym_size = 0;
         Elf64_Addr sym_addr = 0;
         Elf64_Addr reloc = dl->dle64_load_bias + rel->r_offset;
         Elf64_Addr addend = rel->r_addend;
 
         if (sym) {
             sym_name = string_elf64(dl, dl->dle64_symtab[sym].st_name);
+            sym_size = dl->dle64_symtab[sym].st_size;
             // lookup symbol with external libraries as this is for internal use
             sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1, 0);
             if (!sym_addr) {
@@ -2987,6 +3193,11 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
         }
 
         switch (type) {
+            case R_X86_64_COPY:
+            case R_AARCH64_COPY:
+                PRINT("RELO COPY %p %p %s %zu", (void *)reloc, (void *)(sym_addr + addend), sym_name, sym_size);
+                memcpy(( void *)reloc, (void *)(sym_addr + addend), sym_size);
+                break;
             case R_X86_64_JUMP_SLOT:
             case R_AARCH64_JUMP_SLOT:
                 PRINT("RELO JMP_SLOT %p %p %s", (void *)reloc, (void *)(sym_addr + addend), sym_name);
