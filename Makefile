@@ -79,3 +79,6 @@ hello_jmpbuf: examples/hello_jmpbuf.c
 
 gdb_backtrace: examples/gdb_backtrace.c
 	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@
+
+threads: examples/threads.c
+	@$(CC) $(CFLAGS) $(LDFLAGS) -g $^ -o $@

@@ -61,6 +61,11 @@
  * - SIGSTOP/SIGTTIN/SIGTTOU without deadlocking the entire TVM
  */
 
+// LOCK ORDERING
+
+// tty
+// task
+
 /////////////
 // Macros
 /////////////
@@ -1005,21 +1010,6 @@ static char **findenv(char **env, const char *name, size_t name_len)
 #define TFD_MASK 0x0F000000
 #define TFD_TTY  0x01000000
 
-struct pthread_entry {
-    struct list_head ptl_entry;
-    pthread_t ptl_value;
-};
-
-struct pthread_entry *make_pthread_entry(pthread_t t)
-{
-    struct pthread_entry *pentry = kalloc(sizeof(struct pthread_entry));
-    if (pentry) {
-        INIT_LIST_HEAD(&pentry->ptl_entry);
-        pentry->ptl_value = t;
-    }
-    return pentry;
-}
-
 typedef void (*exit_t)(void);
 
 struct task {
@@ -1034,8 +1024,8 @@ struct task {
     int tsk_state;
     pthread_cond_t tsk_wait_cond;
     struct sigaction tsk_sighandlers[MAX_SIGNALS];
-    unsigned tsk_pthreads_count;
-    struct list_head tsk_pthreads;  // pthread_entry
+    unsigned tsk_threads_cnt;
+    struct list_head tsk_threads;  // thread
     pid_t tsk_sid;
     pid_t tsk_pgid;
     char **tsk_environ;
@@ -1044,7 +1034,15 @@ struct task {
     struct ulinker *tsk_linker;
     char tsk_cwd[PATH_MAX];
     exit_t tsk_exits[32];
-    struct emulator_context *tsk_emulator;
+};
+
+struct thread {
+    struct list_head thr_list;
+    struct task *thr_task; // back pointer to owning task
+    pthread_t thr_pthread;
+    pthread_attr_t thr_pthread_attr;
+    uint64_t thr_refcount;
+    struct emulator_context *thr_emulator;
 };
 
 static Dl_info main_dlinfo = {0};
@@ -1053,6 +1051,7 @@ static pthread_t main_pthread;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct task *current;
+static __thread struct thread *current_thread;
 static __thread int thread_tvm_disallow = 0;
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
@@ -1110,150 +1109,54 @@ static int t_fdr(int fd, int lock)
     return -1;
 }
 
-/**
- * locks tasks_lock and current.
- */
-static struct task *taskalloc()
+static struct task *taskalloc_common()
 {
+    struct task *ret = NULL;
     struct task *t = kalloc(sizeof(struct task));
     if (!t)
-        panic("taskalloc");
+        goto out;
     
-    INIT_LIST_HEAD(&t->tsk_list);
-    INIT_LIST_HEAD(&t->tsk_pthreads);
+    memset(t, 0, sizeof(*t));
 
-    t->tsk_parent = NULL;
+    INIT_LIST_HEAD(&t->tsk_list);
+    INIT_LIST_HEAD(&t->tsk_threads);
+
     t->tsk_refcount = 1;
-    t->tsk_state = 0;
-    t->tsk_pthreads_count = 0;
 
     t->tsk_ar = rmem_arena_create(t);
     if (!t->tsk_ar)
-        panic("taskalloc::rmem_arena_create");
+        goto out;
 
     t->tsk_linker = ulinker_create((void *)t);
     if (!t->tsk_linker)
-        panic("taskalloc::ulinker_create");
+        goto out;
 
     if (pthread_mutex_init(&t->tsk_lock, NULL) != 0) {
-        panic("taskalloc::pthread_mutex_init(lock)");
+        goto out;
     }
     if (pthread_cond_init(&t->tsk_wait_cond, NULL) != 0) {
-        panic("taskalloc::pthread_cond_init(wait_cond)");
+        goto out;
     }
 
     for (int i = 0; i < MAX_FILES; i++)
         t->tsk_fd[i] = -1;
-    for (int i = 0; i < 3; i++)
-        t->tsk_f[i] = NULL;
 
-    t->tsk_emulator = emulator_context_create(t->tsk_linker);
-    if (!t->tsk_emulator)
-        panic("taskalloc::emulator_context_create");
-    
-    if (main_pthread == pthread_self() && !current) {
-        main_task = t;
-        t->tsk_pid = __gettid();
-        t->tsk_sid = t->tsk_pgid = t->tsk_pid;
+    ret = t;
 
-        memset(&t->tsk_exits, 0, sizeof(t->tsk_exits));
-
-        // simple dups for main task
-        for (int i = 0; i < 3; i++) {
-            int rfd = CALL_FUNC(dup, i);
-            if (-1 == rfd)
-                panic("taskalloc::dup %d", i);
-            t->tsk_fd[i] = rfd;
+out:
+    if (!ret) {
+        if (t) {
+            kfree(t);
+            t = NULL;
         }
-
-        for (int i = 0; i < 3; i++) {
-            t->tsk_f[i] = CALL_FUNC(fdopen, t->tsk_fd[i], (i?"w":"r"));
-            if (!t->tsk_f[i])
-                panic("taskalloc::fdopen");
-            if (0 != CALL_FUNC(setvbuf, t->tsk_f[i], NULL, _IOLBF, 0))
-                panic("taskalloc: setvbuf");
-        }
-
-        t->tsk_environ = copyenv(t->tsk_ar, environ);
-        if (!t->tsk_environ)
-            panic("copyenv");
-
-        struct pthread_entry *pent = make_pthread_entry(pthread_self());
-        if (!pent)
-            panic("taskalloc make_pthread_entry");
-        list_add_tail(&pent->ptl_entry, &t->tsk_pthreads);
-        ++t->tsk_pthreads_count;
-
-        t->tsk_cwd[0] = 0;
-        if (!CALL_FUNC(getcwd, t->tsk_cwd, sizeof(t->tsk_cwd)))
-            panic("taskalloc getcwd");
-    } else {
-        task_lock(current);
-        t->tsk_parent = current;
-        t->tsk_pid = -1;
-        t->tsk_sid = current->tsk_sid;
-        t->tsk_pgid = current->tsk_pgid;
-        t->tsk_state = current->tsk_state & TS_CTTY;
-        memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
-        memcpy(&t->tsk_exits, &current->tsk_exits, sizeof(t->tsk_exits));
-        // TODO 
-        // t->tsk_environ = copyenv(t->tsk_ar, current->tsk_environ);
-        // if (!t->tsk_environ)
-        //     panic("copyenv");
-        t->tsk_environ = NULL;
-
-        for (int i = 0; i < MAX_FILES; i++) {
-            if (t_fd(i) == -1)
-                continue;
-            
-            int newfd = CALL_FUNC(dup, t_fd(i));
-            if (newfd == -1)
-                panic("taskalloc::dup %d %d", i, t_fd(i));
-            t->tsk_fd[i] = newfd;
-            
-            struct fops *fops = fops_for_fd_locked(current, i);
-            t->tsk_fd[i] |= fops_fdflag(fops);
-            if (0 != fops_dup(fops, t_fd(i), newfd)) {
-                CALL_FUNC(close, newfd);
-                panic("taskalloc::f_dup");
-            }
-        }
-        for (int i = 0; i < 3; i++) {
-            t->tsk_f[i] = CALL_FUNC(fdopen, t->tsk_fd[i] & ~TFD_MASK, (i?"w":"r"));
-            if (!t->tsk_f[i])
-                panic("taskalloc::fdopen");
-        }
-
-        memcpy(t->tsk_sighandlers, t->tsk_parent->tsk_sighandlers, sizeof(t->tsk_sighandlers));
-
-        t->tsk_cwd[0] = 0;
-        strncpy(t->tsk_cwd, current->tsk_cwd, sizeof(t->tsk_cwd));
-
-        task_unlock(current);
-
-        pthread_mutex_lock(&tasks_lock);
-        list_add_tail(&t->tsk_list, &main_task->tsk_list);
-        pthread_mutex_unlock(&tasks_lock);
     }
-
-    return t;
+    return ret;
 }
 
 static void taskdealloc(struct task *t)
 {
-    if (t->tsk_pthreads_count != 1)
-        panic("taskdealloc tsk_pthreads_count");
-    --t->tsk_pthreads_count;
-    if (list_empty(&t->tsk_pthreads))
-        panic("taskalloc tsk_pthreads empty");
-    
-    emulator_context_destroy(t->tsk_emulator);
-    
-    struct pthread_entry *pentry = list_entry(t->tsk_pthreads.next, struct pthread_entry, ptl_entry);
-    list_del(&pentry->ptl_entry);
-    kfree(pentry);
-    if (!list_empty(&t->tsk_pthreads))
-        panic("taskalloc tsk_pthreads not one");
+    if (t->tsk_threads_cnt != 0)
+        panic("taskdealloc tsk_threads_cnt %u", t->tsk_threads_cnt);
 
     if (t->tsk_linker) {
         ulinker_destroy(t->tsk_linker);
@@ -1311,6 +1214,71 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
     
     if (dolocktasks)
         pthread_mutex_unlock(&tasks_lock);
+}
+
+/**
+ * locks tasks_lock and current.
+ */
+static struct task *taskalloc()
+{
+    struct task *ret = NULL;
+
+    struct task *t = taskalloc_common();
+    if (!t)
+        return NULL;
+    
+    task_lock(current);
+    t->tsk_parent = current;
+    t->tsk_pid = -1;
+    t->tsk_sid = current->tsk_sid;
+    t->tsk_pgid = current->tsk_pgid;
+    t->tsk_state = current->tsk_state & TS_CTTY;
+    memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
+    memcpy(&t->tsk_exits, &current->tsk_exits, sizeof(t->tsk_exits));
+
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (t_fd(i) == -1)
+            continue;
+        
+        int newfd = CALL_FUNC(dup, t_fd(i));
+        if (newfd == -1)
+            goto out;
+        t->tsk_fd[i] = newfd;
+        
+        struct fops *fops = fops_for_fd_locked(current, i);
+        t->tsk_fd[i] |= fops_fdflag(fops);
+        if (0 != fops_dup(fops, t_fd(i), newfd)) {
+            CALL_FUNC(close, newfd);
+            t->tsk_fd[i] &= ~fops_fdflag(fops);
+            goto out;
+        }
+    }
+
+    for (int i = 0; i < 3; i++) {
+        t->tsk_f[i] = CALL_FUNC(fdopen, t->tsk_fd[i] & ~TFD_MASK, (i?"w":"r"));
+        if (!t->tsk_f[i])
+            goto out;
+    }
+
+    memcpy(t->tsk_sighandlers, t->tsk_parent->tsk_sighandlers, sizeof(t->tsk_sighandlers));
+
+    t->tsk_cwd[0] = 0;
+    strncpy(t->tsk_cwd, current->tsk_cwd, sizeof(t->tsk_cwd));
+
+    task_unlock(current);
+
+    ret = t;
+
+out:
+
+    if (!ret) {
+        if (t) {
+            taskfreelastref(t, 1, 1);
+            t = NULL;
+        }
+    }
+
+    return ret;
 }
 
 static int task_get_fd_locked(struct task *t, int min_fd)
@@ -1464,11 +1432,11 @@ static int task_set_pgid(struct task *t, int pgid)
  * needs tasks_lock and t locked
  */
 static int task_kill_locked(struct task *t, int signum) {
-    if (list_empty(&t->tsk_pthreads))
+    if (list_empty(&t->tsk_threads))
         return ESRCH;
     
-    struct pthread_entry *pent = list_entry(t->tsk_pthreads.next, struct pthread_entry, ptl_entry);
-    return pthread_kill(pent->ptl_value, signum);
+    struct thread *thr = list_entry(t->tsk_threads.next, struct thread, thr_list);
+    return pthread_kill(thr->thr_pthread, signum);
 }
 
 /**
@@ -1518,6 +1486,7 @@ static void terminate_current_locked(int result)
     if (current->tsk_refcount != 1)
         panic("_exit refcount");
     --current->tsk_refcount;
+    --current->tsk_threads_cnt;
 
     // SIGCHLD special cases
     struct task *parent = current->tsk_parent;
@@ -1677,6 +1646,78 @@ char *current_normalize_path(const char *file_name, char *out_path)
     return out_path;
 }
 
+int copy_pthread_attr(const pthread_attr_t *src, pthread_attr_t *dest)
+{
+    int ret;
+    int detachstate, inheritsched, scope;
+    size_t stacksize;
+    struct sched_param schedparam;
+    int schedpolicy;
+
+    // Get attributes from the source
+    if ((ret = pthread_attr_getdetachstate(src, &detachstate))) goto out;
+    if ((ret = pthread_attr_getinheritsched(src, &inheritsched))) goto out;
+    if ((ret = pthread_attr_getscope(src, &scope))) goto out;
+    if ((ret = pthread_attr_getstacksize(src, &stacksize))) goto out;
+    if ((ret = pthread_attr_getschedparam(src, &schedparam))) goto out;
+    if ((ret = pthread_attr_getschedpolicy(src, &schedpolicy))) goto out;
+
+    // Set attributes in the destination
+    if ((ret = pthread_attr_setdetachstate(dest, detachstate))) goto out;
+    if ((ret = pthread_attr_setinheritsched(dest, inheritsched))) goto out;
+    if ((ret = pthread_attr_setscope(dest, scope))) goto out;
+    if ((ret = pthread_attr_setstacksize(dest, stacksize))) goto out;
+    if ((ret = pthread_attr_setschedparam(dest, &schedparam))) goto out;
+    if ((ret = pthread_attr_setschedpolicy(dest, schedpolicy))) goto out;
+
+out:
+
+    return ret;
+}
+
+void threaddealloc(struct thread *thr)
+{
+    if (thr->thr_emulator) {
+        emulator_context_destroy(thr->thr_emulator);
+        thr->thr_emulator = NULL;
+    }
+
+    pthread_attr_destroy(&thr->thr_pthread_attr);
+
+    kfree(thr);
+}
+
+struct thread *threadalloc(struct task *parent)
+{
+    struct thread *ret = NULL;
+    struct thread *thr = kalloc(sizeof(struct thread));
+    if (!thr)
+        return NULL;
+
+    memset(thr, 0, sizeof(*thr));
+
+    INIT_LIST_HEAD(&thr->thr_list);
+    thr->thr_refcount = 1;
+    thr->thr_task = parent;
+
+    pthread_attr_init(&thr->thr_pthread_attr);
+
+    thr->thr_emulator = emulator_context_create(parent->tsk_linker);
+    if (!thr->thr_emulator)
+        goto out;
+
+    ret = thr;
+
+out:
+    if (!ret) {
+        if (thr) {
+            threaddealloc(thr);
+            thr = NULL;
+        }
+    }
+
+    return ret;
+}
 
 /////////////
 // Allocator
@@ -1925,12 +1966,12 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     
     if ((act->sa_flags & SA_SIGINFO) == 0) {
         task_unlock(current);
-        emulator_call_sighandler(current->tsk_emulator, (uint64_t)act->sa_handler, signum, 0, 0);
+        emulator_call_sighandler(current_thread->thr_emulator, (uint64_t)act->sa_handler, signum, 0, 0);
         return;
     }
     
     task_unlock(current);
-    emulator_call_sighandler(current->tsk_emulator, (uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
+    emulator_call_sighandler(current_thread->thr_emulator, (uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
     return;
 }
 
@@ -2178,9 +2219,6 @@ static cc_t ttydefchars[NCCS] = {
 #endif
 };
 
-static void tty_lock(struct tty *tt) { pthread_mutex_lock(&tt->t_lock); }
-static void tty_unlock(struct tty *tt) { pthread_mutex_unlock(&tt->t_lock); }
-
 static struct tty *ttyalloc()
 {
     int ends[2] = {-1, -1};
@@ -2195,6 +2233,7 @@ static struct tty *ttyalloc()
         return NULL;
     }
 
+    tt->t_refcnt = 0;
     tt->t_mfd = ends[0];
     tt->t_sfd = ends[1];
 
@@ -2231,12 +2270,6 @@ static struct tty *ttyalloc()
         goto fail;
     }
 
-    tty_lock(tt);
-
-    pthread_mutex_lock(&ttys_lock);
-    list_add_tail(&tt->t_list, &ttys);
-    pthread_mutex_unlock(&ttys_lock);
-
     return tt;
 
 fail:
@@ -2250,19 +2283,38 @@ fail:
 
 static void ttydealloc(struct tty *tt)
 {
-    pthread_mutex_lock(&ttys_lock);
-    list_del(&tt->t_list);
-    pthread_mutex_unlock(&ttys_lock);
-
     if (tt->t_mfd != -1)
         CALL_FUNC(close, tt->t_mfd);
     if (tt->t_sfd != -1)
         CALL_FUNC(close, tt->t_sfd);
 
-    pthread_mutex_unlock(&tt->t_lock);
     pthread_mutex_destroy(&tt->t_lock);
 
     kfree(tt);
+}
+
+static void tty_lock(struct tty *tt, int refcount) {
+    pthread_mutex_lock(&tt->t_lock);
+    tt->t_refcnt += refcount;
+}
+
+static void tty_unlock(struct tty *tt, int refcount) {
+
+    // very important that refcount == 0 wouldn't trigger free
+    if (refcount && 0 == (tt->t_refcnt -= refcount)) {
+
+        pthread_mutex_unlock(&tt->t_lock);
+
+        // refcount is 0, no one will take references from tty list
+
+        pthread_mutex_lock(&ttys_lock);
+        list_del(&tt->t_list);
+        pthread_mutex_unlock(&ttys_lock);
+
+        ttydealloc(tt);
+        return;
+    }
+    pthread_mutex_unlock(&tt->t_lock);
 }
 
 /**
@@ -2279,7 +2331,15 @@ static struct tty *tty_for_fd(int fd, int mode)
     list_for_each_entry(tt, &ttys, t_list) {
         if (((mode & TTM_MASTER) && tt->t_mfd_ino == st.st_ino) || 
             ((mode & TTM_SLAVE)  && tt->t_sfd_ino == st.st_ino)) {
-            tty_lock(tt);
+            tty_lock(tt, 0);
+            
+            // tty is being destroyed, leave it be
+            if (!tt->t_refcnt) {
+                tty_unlock(tt, 0);
+                continue;
+            }
+
+            tt->t_refcnt++;
             pthread_mutex_unlock(&ttys_lock);
             return tt;
         }
@@ -2311,7 +2371,7 @@ static int islocaltty(int fd)
         return 0;
     }
 
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return 1;
 }
 
@@ -2320,7 +2380,7 @@ static int ttyop_openchk(const char *pathname) {
 }
 
 /**
- * Returns locked.
+ * Returns locked and ups ref
  */
 static struct tty *tty_for_path(const char *pathname) {
     if (!(ttyop_openchk(pathname)))
@@ -2337,13 +2397,21 @@ static struct tty *tty_for_path(const char *pathname) {
         pthread_mutex_lock(&ttys_lock);
         struct tty *tt;
         list_for_each_entry(tt, &ttys, t_list) {
-            tty_lock(tt);
+            tty_lock(tt, 0);
+
+            // tty is being destroyed, leave it be
+            if (!tt->t_refcnt) {
+                tty_unlock(tt, 0);
+                continue;
+            }
+
             if (tt->t_sid == current->tsk_sid) {
+                tt->t_refcnt++;
                 pthread_mutex_unlock(&ttys_lock);
                 task_unlock(current);
                 return tt;
             }
-            tty_unlock(tt);
+            tty_unlock(tt, 0);
         }
         pthread_mutex_unlock(&ttys_lock);
 
@@ -2359,12 +2427,20 @@ static struct tty *tty_for_path(const char *pathname) {
     pthread_mutex_lock(&ttys_lock);
     struct tty *tt;
     list_for_each_entry(tt, &ttys, t_list) {
-        tty_lock(tt);
+        tty_lock(tt, 0);
+
+        // tty is being destroyed, leave it be
+        if (!tt->t_refcnt) {
+            tty_unlock(tt, 0);
+            continue;
+        }
+        
         if (((int) n) == tt->t_mfd) {
+            tt->t_refcnt++;
             pthread_mutex_unlock(&ttys_lock);
             return tt;
         }
-        tty_unlock(tt);
+        tty_unlock(tt, 0);
     }
     pthread_mutex_unlock(&ttys_lock);
 
@@ -2379,7 +2455,7 @@ static int ttyop_open(const char *pathname, int flags, mode_t mode)
         return -1;
     }
     
-    // tt is locked
+    // tt is locked and ref'd
 
     if (0 == (flags & O_NOCTTY)) {
         task_lock(current);
@@ -2394,6 +2470,7 @@ static int ttyop_open(const char *pathname, int flags, mode_t mode)
             // no stealing!
             if (tt->t_sid != current->tsk_sid && tt->t_sid != -1) {
                 task_unlock(current);
+                tty_unlock(tt, 1);
                 errno = EIO;
                 return -1;
             }
@@ -2417,7 +2494,7 @@ static int ttyop_open(const char *pathname, int flags, mode_t mode)
         task_unlock(current);
     }
 
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return r_sfd;
 }
 
@@ -2427,7 +2504,7 @@ static int ttyop_dup(int oldfd, int newfd) {
         return 0;
     
     tt->t_refcnt++;
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return 0;
 }
 
@@ -2440,7 +2517,7 @@ static int ttyop_stat(int fd, struct stat *st)
     }
 
     if (!st) {
-        tty_unlock(tt);
+        tty_unlock(tt, 1);
         return 0;
     }
 
@@ -2451,7 +2528,7 @@ static int ttyop_stat(int fd, struct stat *st)
     st->st_gid = tt->t_gid;
     st->st_mode = tt->t_mode;
 
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return 0;
 }
 
@@ -2465,7 +2542,7 @@ static int ttyop_chmod(int fd, mode_t mode)
 
     tt->t_mode = mode;
 
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return 0;
 }
 
@@ -2480,7 +2557,7 @@ static int ttyop_chown(int fd, uid_t owner, gid_t group)
     tt->t_uid = owner;
     tt->t_gid = group;
 
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return 0;
 }
 
@@ -2539,9 +2616,9 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             }
             
             pgid = tt->t_pgid;
-            tty_unlock(tt);
+            tty_unlock(tt, 0);
             kill(-pgid, SIGWINCH);
-            tty_lock(tt);
+            tty_lock(tt, 0);
             ret = 0;
             break;
         
@@ -2578,7 +2655,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             }
             task_unlock(current);
 
-            tty_unlock(tt);
+            tty_unlock(tt, 0);
             pthread_mutex_lock(&tasks_lock);
             list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
                 task_lock(t);
@@ -2587,13 +2664,13 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
                 task_unlock(t);
             }
             pthread_mutex_unlock(&tasks_lock);
-            tty_lock(tt);
+            tty_lock(tt, 0);
             
             pgid = tt->t_pgid;
-            tty_unlock(tt);
+            tty_unlock(tt, 0);
             kill(-pgid, SIGHUP);
             kill(-pgid, SIGCONT);
-            tty_lock(tt);
+            tty_lock(tt, 0);
             ret = 0;
             break;
 
@@ -2621,7 +2698,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             }
             task_unlock(current);
 
-            tty_unlock(tt);
+            tty_unlock(tt, 0);
             pthread_mutex_lock(&tasks_lock);
             list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
                 if (t->tsk_pgid == *((pid_t *)arg)) {
@@ -2629,7 +2706,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
                 }
             }
             pthread_mutex_unlock(&tasks_lock);
-            tty_lock(tt);
+            tty_lock(tt, 0);
 
             // group non-existed / empty
             if (t == main_task && main_task->tsk_pgid != *((pid_t *) arg)) {
@@ -2661,7 +2738,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             errno = ENOTSUP;
     }
 
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return ret;
 }
 
@@ -2683,19 +2760,10 @@ static ssize_t ttyop_read(int fd, void *buf, size_t count, int offset)
         is_master = 0;
     }
 
-    // if (is_master) {
-    //     static int f = -1;
-    //     if (f == -1) {
-    //         unlink("/tmp/tty.read");
-    //         f = CALL_FUNC(open, "/tmp/tty.read", O_CREAT | O_WRONLY | O_TRUNC, 0777);
-    //     }
-    //     CALL_FUNC(write, f, buf, count);
-    // }
-
     struct termios termios;
     memcpy(&termios, &tt->t_termios, sizeof(termios));
 
-    tty_unlock(tt);
+    tty_unlock(tt, 0);
 
     size_t total_read = 0;
     uint8_t *out = buf;
@@ -2737,6 +2805,8 @@ static ssize_t ttyop_read(int fd, void *buf, size_t count, int offset)
         } else if (ret < 0) {
             if (errno == EINTR)
                 continue;
+            tty_lock(tt, 0);
+            tty_unlock(tt, 1);
             return -1;
         }
 
@@ -2746,6 +2816,8 @@ static ssize_t ttyop_read(int fd, void *buf, size_t count, int offset)
         if (n < 0) {
             if (errno == EINTR)
                 continue;
+            tty_lock(tt, 0);
+            tty_unlock(tt, 1);
             return -1;
         }
         if (n == 0)
@@ -2773,6 +2845,8 @@ static ssize_t ttyop_read(int fd, void *buf, size_t count, int offset)
         }
     }
 
+    tty_lock(tt, 0);
+    tty_unlock(tt, 1);
     return total_read;
 }
 
@@ -2870,9 +2944,9 @@ static int tty_putc(struct tty *tt, int fd, int c)
     if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, 0))
         return -1;
     
-    tty_unlock(tt);
+    tty_unlock(tt, 0);
     ret = CALL_FUNC(write, fd, &c, 1);
-    tty_lock(tt);
+    tty_lock(tt, 0);
 
     if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, O_NONBLOCK))
         return -1;
@@ -2898,41 +2972,41 @@ static int tty_output(struct tty *tt, int fd, int c)
 
     // if ONLCR is set, translate newline into "\r\n"
     if (c == '\n' && ISSET(tt->t_oflag, ONLCR)) {
-		if (tty_putc(tt, fd, '\r'))
-			return -1;
-	}
+        if (tty_putc(tt, fd, '\r'))
+            return -1;
+    }
     // if OCRNL is set, translate "\r" into "\n"
-	else if (c == '\r' && ISSET(tt->t_oflag, OCRNL))
-		c = '\n';
+    else if (c == '\r' && ISSET(tt->t_oflag, OCRNL))
+        c = '\n';
     // if ONOCR is set, don't transmit CRs when on column 0
     else if (c == '\r' && ISSET(tt->t_oflag, ONOCR) && tt->t_col == 0)
-		return 0;
+        return 0;
 
     if (!ISSET(tt->t_lflag, FLUSHO) && tty_putc(tt, fd, c))
-		return -1;
+        return -1;
     
     col = tt->t_col;
-	switch (CCLASS(c)) {
-	case BACKSPACE:
-		if (col > 0) {
-			--col;
-		}
-		break;
-	case CONTROL:
-		break;
-	case NEWLINE:
-	case RETURN:
-		col = 0;
-		break;
-	case ORDINARY:
-		++col;
-		break;
-	case TAB:
-		col = (col + 8) & ~7;
-		break;
-	}
-	tt->t_col = col;
-	return 0;
+    switch (CCLASS(c)) {
+    case BACKSPACE:
+        if (col > 0) {
+            --col;
+        }
+        break;
+    case CONTROL:
+        break;
+    case NEWLINE:
+    case RETURN:
+        col = 0;
+        break;
+    case ORDINARY:
+        ++col;
+        break;
+    case TAB:
+        col = (col + 8) & ~7;
+        break;
+    }
+    tt->t_col = col;
+    return 0;
 }
 
 static ssize_t tty_output_buffer(struct tty *tt, int fd, const uint8_t *buf, size_t count)
@@ -3003,9 +3077,9 @@ static int tty_input(struct tty *tt, int fd, int c)
                 tty_echo(tt, c);
                 int pgid = tt->t_pgid;
                 int sig = CCEQ(tt->t_cc[VINTR], c) ? SIGINT : (CCEQ(tt->t_cc[VQUIT], c) ? SIGQUIT : SIGTSTP);
-                tty_unlock(tt);
+                tty_unlock(tt, 0);
                 kill(-pgid, sig); // TODO check TS_CTTY
-                tty_lock(tt);
+                tty_lock(tt, 0);
                 return 0;
             }
         }
@@ -3065,23 +3139,12 @@ static ssize_t ttyop_write(int fd, const void *buf, size_t count, int offset)
         is_master = 0;
     }
 
-    // if (is_master) {
-    //     static int f = -1;
-    //     if (f == -1) {
-    //         unlink("/tmp/tty.write");
-    //         f = CALL_FUNC(open, "/tmp/tty.write", O_CREAT | O_WRONLY | O_TRUNC, 0777);
-    //         if (f == -1)
-    //             CALL_FUNC(printf, "ERR %d\n", errno);
-    //     }
-    //     CALL_FUNC(write, f, buf, count);
-    // }
-
     ssize_t ret;
     if (is_master)
         ret = tty_input_buffer(tt, fd, buf, count);
     else
         ret = tty_output_buffer(tt, fd, buf, count);
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return ret;
 }
 
@@ -3092,8 +3155,8 @@ static int ttyop_close(int fd) {
         return 0;
 
     tt->t_refcnt--;
-    if (tt->t_refcnt) {
-        tty_unlock(tt);
+    if (tt->t_refcnt > 1) {
+        tty_unlock(tt, 1);
         return 0;
     }
 
@@ -3113,6 +3176,14 @@ static int ttyop_close(int fd) {
         }
         pthread_mutex_unlock(&tasks_lock);
     }
+
+    // leave refcnt at 0, no one will take ref in global list after unlocking
+    tt->t_refcnt--;
+    tty_unlock(tt, 0);
+
+    pthread_mutex_lock(&ttys_lock);
+    list_del(&tt->t_list);
+    pthread_mutex_unlock(&ttys_lock);
 
     ttydealloc(tt);
 
@@ -3150,8 +3221,6 @@ static int ptm_open()
         return -1;
     }
 
-    // tt is locked
-
     int mfd = CALL_FUNC(dup, tt->t_mfd);
     if (-1 == mfd) {
         ttydealloc(tt);
@@ -3159,7 +3228,10 @@ static int ptm_open()
     }
 
     tt->t_refcnt++;
-    tty_unlock(tt);
+
+    pthread_mutex_lock(&ttys_lock);
+    list_add_tail(&tt->t_list, &ttys);
+    pthread_mutex_unlock(&ttys_lock);
     return mfd;
 }
 
@@ -3170,12 +3242,12 @@ static int tty_slavename(int fd, char *buf, size_t buflen)
         return ENOTTY;
 
     if (tt->t_mfd == -1) {
-        tty_unlock(tt);
+        tty_unlock(tt, 1);
         return EINVAL;
     }
 
     snprintf(buf, buflen, TTY_DIR "/%d", tt->t_mfd);
-    tty_unlock(tt);
+    tty_unlock(tt, 1);
     return 0;
 }
 
@@ -3430,412 +3502,6 @@ static const char *find_program_pathname(const char *file)
     pthread_mutex_unlock(&programs_lock);
 
     return NULL;
-}
-
-/////////////
-// tvm_pthread_* API
-/////////////
-
-/**
- * This is the bread and butter of `fork()`.
- * 
- * This doesn't try to imitate the `fork()` API and all the parent stack frames fuckfest,
- * but a simple API to create either a thread or a process ontop of `pthread_create` with a start routine,
- * allocating/copying task struct and calling COW logic.
- */
-
-#define TVM_PTHREAD_FORK 1
-
-struct thread_create_arg
-{
-    int flags;
-};
-
-struct thread_arg
-{
-    struct thread_create_arg create_arg;
-    struct task *task;
-    struct pthread_entry *pentry;
-    void *(*start_routine) (void *);
-    void *arg;
-    pthread_mutex_t wake_mtx;
-    pthread_cond_t  wake_cond;
-    int wake;
-};
-
-static void *thread_entry(struct thread_arg *arg)
-{
-    current = arg->task;
-
-    task_lock(current);
-
-    if (current->tsk_pid == -1)
-        current->tsk_pid = __gettid();
-
-    ++current->tsk_pthreads_count;
-    arg->pentry->ptl_value = pthread_self();
-    list_add_tail(&arg->pentry->ptl_entry, &current->tsk_pthreads);
-
-    task_unlock(current);
-
-    void *(*start_routine)(void *) = arg->start_routine;
-    void *routine_arg = arg->arg;
-    
-    pthread_mutex_lock(&arg->wake_mtx);
-    arg->wake = 1;
-    pthread_cond_broadcast(&arg->wake_cond);
-    pthread_mutex_unlock(&arg->wake_mtx);
-
-    void *retval = start_routine(routine_arg);
-    pthread_exit(retval);
-}
-
-int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg, struct thread_create_arg *create_arg)
-{
-    int ret = ENOMEM;
-
-    struct thread_arg *targ = kalloc(sizeof(struct thread_arg));
-    if (!targ)
-        goto out;
-
-    if (0 != pthread_mutex_init(&targ->wake_mtx, NULL))
-        goto out;
-
-    if (0 != pthread_cond_init(&targ->wake_cond, NULL))
-        goto out;
-
-    targ->pentry = kalloc(sizeof(struct pthread_entry));
-    if (!targ->pentry)
-        goto out;
-
-    memcpy(&targ->create_arg, create_arg, sizeof(*create_arg));
-    if (create_arg->flags & TVM_PTHREAD_FORK)
-    {
-        targ->task = taskalloc();
-        if (!targ->task)
-            goto out;
-    }
-    else
-    {
-        task_lock(current);
-        ++current->tsk_refcount;
-        targ->task = current;
-        task_unlock(current);
-    }
-
-    targ->start_routine = start_routine;
-    targ->arg = arg;
-    targ->wake = 0;
-
-    ret = CALL_FUNC(pthread_create, thread, attr, (void *(*)(void *))thread_entry, (void *)targ);
-
-    if (0 == ret) {
-        pthread_mutex_lock(&targ->wake_mtx);
-        while (!targ->wake) {
-            pthread_cond_wait(&targ->wake_cond, &targ->wake_mtx);
-        }
-        pthread_mutex_unlock(&targ->wake_mtx);
-    }
-
-out:
-
-    if (targ)
-    {
-        if (ret != 0)
-        {
-            if (create_arg->flags & TVM_PTHREAD_FORK)
-            {
-                if (targ->task)
-                    taskfreelastref(targ->task, 1, 1);
-            }
-            else
-            {
-                if (targ->task) {
-                    task_lock(current);
-                    --current->tsk_refcount;
-                    task_unlock(current);
-                }
-            }
-
-            if (targ->pentry)
-            kfree(targ->pentry);
-        }
-
-        kfree(targ);
-    }
-
-    return ret;
-}
-
-__attribute__ ((noreturn))
-void tvm_pthread_exit(void *retval)
-{
-    if (pthread_self() == main_pthread)
-        CALL_FUNC(_exit, (int) ((long) retval));
-    
-    // TODO task_release(current, 1);
-    
-    CALL_FUNC(pthread_exit, retval);
-    __builtin_unreachable();
-}
-
-/////////////
-// Forkless API
-/////////////
-
-/**
- * Who knew imitating `fork()` API with threads is such a hassle. Well it is.
- * 
- * Idea is to `setjmp` on parent, on child stack copy some frames from the parent and `longjmp` to the new stack.
- * Main problem is fixing up all the stack pointers on the frames pointer to the old stack to be on the new stack,
- * read `Jmpbuf implementation` section for that.
- */
-
-#define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
-#define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
-
-#define TEMP_STACK_SIZE DEFAULT_STACK_SIZE
-
-struct forkless_arg {
-    int result;
-    pthread_mutex_t mtx;
-    pthread_cond_t cond;
-    char ***parent_environ;
-    jmp_buf jmpbuf_parent;
-    jmp_buf jmpbuf_tmp;
-    jmp_buf jmpbuf_fail;
-    void *tmp_stack;
-    void *caller_fp;
-    struct cow_fixup_context fixup;
-    struct rmem_arena *parent_ar;
-    size_t duplicate_errors;
-};
-
-static void forkless_dup_cb(struct forkless_arg *arg, void *old_slab, void *new_slab, size_t slabsize)
-{
-    if (0 != cow_fixup_ctx_add(&arg->fixup, new_slab, old_slab, slabsize))
-        arg->duplicate_errors++;
-}
-
-static void forkless_done_cb(struct forkless_arg *arg)
-{
-    if (arg->duplicate_errors == 0)
-        cow_fixup_process(&arg->fixup);
-}
-
-static void *forkless_entry(struct forkless_arg *arg)
-{
-    // TODO: do NOT copy the environ of parent task, or atleast free it after duplication
-
-    uintptr_t curr_fp = (uintptr_t)__builtin_frame_address(0);
-
-    // move to temporary stack
-    if (0 == setjmp(arg->jmpbuf_tmp))
-    {
-        /**
-         * this code moves to a temporary stack, since we're gonna modify our own stack.
-         *
-         *   ._______. 0x0000
-         *   |       |
-         *   |       |
-         *   |       |
-         *   |       |        <- sp
-         *   |       | 
-         *   '_______' 0xffff <- fp
-         * 
-         * NOTE: `fp` points to a 2-dword structure
-         *   struct prologue {
-         *     void *fp;
-         *     void *lr;
-         *   }
-         * 
-         * This means an additional 2-dword needs to be added to the frame on top of `fp - sp`.
-         * We don't copy it, but rather forge it to values we can detect if a return is attempted.
-         * 
-         *   ^         ^  ^- sp is up there
-         *   |         |
-         *   |         |_
-         *   | prev fp | '- fp points here 
-         *   | prev lr |
-         *   |         |
-         */
-        jmpbuf_demangle(&arg->jmpbuf_tmp);
-        uintptr_t curr_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_tmp);
-        // `fp` is just before the value of `fp` itself, so keep room for `fp` on the stack
-        uintptr_t next_fp = (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE - 2 * sizeof(uintptr_t);
-        uintptr_t next_sp = next_fp - (curr_fp - curr_sp);
-
-        memcpy((void *)next_sp, (void *)curr_sp, curr_fp - curr_sp);
-        // forge prologue so if a return occurs we can detect it
-        *(uintptr_t *)(next_fp) = 0xDEADBEEF46464646;
-        *(uintptr_t *)(next_fp + 8) = 0xDEADBEEF42424242;
-
-        // include prologue (fp + lr) when adjusting jmpbuf context regs
-        jmpbuf_setstack(&arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
-        jmpbuf_mangle(&arg->jmpbuf_tmp);
-
-        longjmp(arg->jmpbuf_tmp, 1);
-    }
-
-    // running on a temporary stack until the next longjmp
-
-    // load and copy all data vars
-    if (0 != cow_fixup_load_data_variables(&arg->fixup, 1)) {
-        // TODO: handle?
-        panic("TODO");
-        // pthread_mutex_lock(&arg->mtx);
-        // arg->done = errno;
-        // pthread_cond_broadcast(&arg->cond);
-        // pthread_mutex_unlock(&arg->mtx);
-        // pthread_exit(NULL);
-    }
-    for (int i = 0; i < arg->fixup.count; i++)
-        memcpy(arg->fixup.ptrs[i].new, arg->fixup.ptrs[i].old, arg->fixup.ptrs[i].size);
-
-    /**
-     * setup child stack as a copy of a few important frames from parent stack
-     *
-     *                       parent               child
-     *                     ._______.   0x0000   ._______.
-     *                     |       |            |       |
-     *        .--<  sp ->  |-------| -> -\      |       |
-     *  stack |            |       |      -> -> |-------|  <- sp  >--.
-     *  copy  |            |       |   memcpy   |       |            |  stack
-     *  size  '-->  fp ->  |-------| -> -\      |       |            |  copy
-     *                     '_______'      -> -> '_______'  <- fp  <--'  size
-     */
-
-    uintptr_t parent_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_parent);
-    uintptr_t parent_fp = (uintptr_t)arg->caller_fp;
-
-    // its important to "link" the new frames copied from parent to the current stack for `pthread_exit()` to work
-    // as `pthread_exit()` throws a C++ exception on some implmentations that is meant to be caught
-    // by pthread's `__thread_entry` func (which calls the start routine)
-    uintptr_t child_fp = curr_fp;
-    uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
-
-    memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
-
-    // include prologue (fp + lr) when adjusting jmpbuf context regs (important for fixing up pointers to rbp)
-    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)child_sp, (void *)parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t)))
-    {
-        // TODO: handle?
-        panic("TODO");
-    }
-
-    // fix the environ pointer (which is allocated on the task heap)
-    current->tsk_environ = *arg->parent_environ;
-    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&current->tsk_environ, (void *)arg->parent_environ, sizeof(current->tsk_environ)))
-    {
-        // TODO: handle?
-        panic("TODO");
-    }
-
-    int ret = rmem_arena_duplicate(
-        current->tsk_ar,
-        arg->parent_ar,
-        (void (*)(void *, void *, void *, size_t))forkless_dup_cb,
-        (void (*)(void *))forkless_done_cb,
-        (void *)arg
-    );
-
-    if (ret)
-    {
-        // TODO: handle?
-        panic("TODO");
-    }
-
-    if (arg->duplicate_errors)
-        panic("got %zu duplicate errors", arg->duplicate_errors);
-
-    // include prologue (fp + lr) when adjusting jmpbuf context regs
-    jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
-    jmpbuf_mangle(&arg->jmpbuf_parent);
-
-    longjmp(arg->jmpbuf_parent, 1);
-}
-
-pid_t fork(void)
-{
-    if (!main_task || !can_enter_tvm(__builtin_return_address(0)))
-        return CALL_FUNC(fork);
-    
-    struct rmem_arena *parent_ar = arena_for_task(current);
-    if (!parent_ar)
-        panic("parent task %p arena not found", current);
-
-    struct forkless_arg *arg = kalloc(sizeof(struct forkless_arg));
-    if (!arg) {
-        errno = ENOMEM;
-        return -1;
-    }
-
-    arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (arg->tmp_stack == MAP_FAILED) {
-        kfree(arg);
-        errno = ENOMEM;
-        return -1;
-    }
-
-    if (0 != cow_fixup_load_data_variables(&arg->fixup, 0)) {
-        CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
-        kfree(arg);
-        errno = ENOMEM;
-        return -1;
-    }
-
-    arg->result = 0;
-    pthread_mutex_init(&arg->mtx, NULL);
-    pthread_cond_init(&arg->cond, NULL);
-    arg->caller_fp = *(void **)__builtin_frame_address(0);
-    arg->parent_ar = parent_ar;
-    arg->parent_environ = &current->tsk_environ;
-
-    if (0 != setjmp(arg->jmpbuf_parent)) {
-        // child
-        pthread_mutex_lock(&arg->mtx);
-        arg->result = __gettid();
-        pthread_cond_broadcast(&arg->cond);
-        pthread_mutex_unlock(&arg->mtx);
-        return 0;
-    }
-
-    // parent
-
-    jmpbuf_demangle(&arg->jmpbuf_parent);
-
-    arg->parent_ar = arena_for_task(current);
-
-    pthread_t thr;
-    struct thread_create_arg create_arg = {
-        .flags = TVM_PTHREAD_FORK
-    };
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE);
-    int ret = tvm_pthread_create_ex(&thr, &attr, (void *(*)(void *)) forkless_entry, (void *)arg, &create_arg);
-    pthread_attr_destroy(&attr);
-
-    if (ret == 0) {
-        pthread_mutex_lock(&arg->mtx);
-        while (arg->result == 0) {
-            pthread_cond_wait(&arg->cond, &arg->mtx);
-        }
-        pthread_mutex_unlock(&arg->mtx);
-        if (arg->result > 0) {
-            ret = arg->result;
-        }
-        else {
-            ret = -1;
-            errno = -arg->result;
-        }
-    }
-
-    pthread_mutex_destroy(&arg->mtx);
-    pthread_cond_destroy(&arg->cond);
-    CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
-    kfree(arg);
-    return ret;
 }
 
 /////////////
@@ -4645,7 +4311,7 @@ sig_t emulator_signal(int signum, sig_t handler) {
 
 int emulator_setjmp(jmp_buf env) {
     uc_err err;
-    struct emulator_saved_state *ess = current->tsk_emulator->ec_ss;
+    struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
 
     uint64_t *envarr = (uint64_t *)env;
 
@@ -4682,7 +4348,7 @@ int emulator_setjmp(jmp_buf env) {
 
 int emulator_longjmp(jmp_buf env, int val) {
     uc_err err;
-    struct emulator_saved_state *ess = current->tsk_emulator->ec_ss;
+    struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
     uint64_t *envarr = (uint64_t *)env;
 
     if (!val) val = 1;
@@ -4918,7 +4584,41 @@ void emulator_call_sighandler(struct emulator_context *ec, uint64_t handler_pc, 
 
     // handler is in emulator, call emulator from signal handler so help me god
     handler_pc = EMUFUNC_UNMARK(handler_pc);
-    emulator_call(current->tsk_emulator, NULL, handler_pc, arg0, arg1, arg2, 0, 0, 0);
+    emulator_call(ec, NULL, handler_pc, arg0, arg1, arg2, 0, 0, 0);
+}
+
+struct emulator_pthread_create_arg {
+    void *(*start_fn)(void *);
+    void *arg;
+};
+
+void *tvm_emulator_thread_entry(struct emulator_pthread_create_arg *arg) {
+    uint64_t ret;
+    uintptr_t pc = (uintptr_t)arg->start_fn;
+    uintptr_t arg1 = (uintptr_t)arg->arg;
+
+    emulator_call(current_thread->thr_emulator, &ret, pc, arg1, 0, 0, 0, 0, 0);
+
+    return (void *)ret;
+}
+
+int emulator_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *_arg)
+{
+    struct emulator_pthread_create_arg *arg = kalloc(sizeof(*arg));
+    if (!arg) {
+        return ENOMEM;
+    }
+
+    arg->start_fn = start_routine;
+    arg->arg = _arg;
+
+    int ret = pthread_create(thread, attr, (void *(*)(void *))tvm_emulator_thread_entry, (void *)arg);
+
+    if (ret) {
+        kfree(arg);
+    }
+
+    return ret;
 }
 
 /////////////
@@ -5478,7 +5178,7 @@ static int tvm_lsof(int argc, char **argv)
             fdr[i].tty.mfd = tt->t_mfd;
             fdr[i].tty.sid = tt->t_sid;
             fdr[i].tty.end = "master";
-            tty_unlock(tt);
+            tty_unlock(tt, 1);
             continue;
         }
         if ((tt = tty_for_fd(fdr[i].rfd, TTM_SLAVE))) {
@@ -5486,7 +5186,7 @@ static int tvm_lsof(int argc, char **argv)
             fdr[i].tty.mfd = tt->t_mfd;
             fdr[i].tty.sid = tt->t_pgid;
             fdr[i].tty.end = "slave";
-            tty_unlock(tt);
+            tty_unlock(tt, 1);
             continue;
         }
     }
@@ -5632,7 +5332,7 @@ static int tvm_sorunner(int argc, char **argv)
     printf("sorunner %s %s %p base %p\n", argv[1], "main", sym, info.udli_fbase);
 
     uint64_t ret;
-    int callerr = emulator_call(current->tsk_emulator, &ret, (uint64_t)sym,
+    int callerr = emulator_call(current_thread->thr_emulator, &ret, (uint64_t)sym,
                   (uint64_t)(argc - 1),
                   (uint64_t)(argv + 1),
                   (uint64_t)tvm_environ,
@@ -5747,6 +5447,9 @@ static void *ulinker_external_dlsym(void *arg, const char *s)
     if (0 == strcmp(s, "_setjmp"))   return &emulator_setjmp;  // linux
     if (0 == strcmp(s, "setjmp"))    return &emulator_setjmp;  // darwin
     if (0 == strcmp(s, "longjmp"))   return &emulator_longjmp;
+
+    if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
+
     #endif
     return dlsym(RTLD_DEFAULT, s);
 }
@@ -5784,16 +5487,50 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
 
-    main_pthread = pthread_self();
-    current = taskalloc();  // special initialization for main thread
+    current = taskalloc_common();
+    if (!current)
+        panic("couldn't create main task");
 
-    if (!current->tsk_ar)
-        panic("couldn't create main task arena");
+    main_task = current;
+    current->tsk_pid = __gettid();
+    current->tsk_sid = current->tsk_pgid = current->tsk_pid;
+
+    for (int i = 0; i < 3; i++) {
+        int rfd = CALL_FUNC(dup, i);
+        if (-1 == rfd)
+            panic("tvm_init::dup %d", i);
+        current->tsk_fd[i] = rfd;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        current->tsk_f[i] = CALL_FUNC(fdopen, current->tsk_fd[i], (i?"w":"r"));
+        if (!current->tsk_f[i])
+            panic("tvm_init::fdopen");
+        if (0 != CALL_FUNC(setvbuf, current->tsk_f[i], NULL, _IOLBF, 0))
+            panic("tvm_init: setvbuf");
+    }
+
+    current->tsk_environ = copyenv(current->tsk_ar, environ);
+    if (!current->tsk_environ)
+        panic("tvm_init::copyenv");
+
+    current_thread = threadalloc(current);
+    if (!current_thread)
+        panic("tvm_init::threadalloc");
+
+    current_thread->thr_pthread = pthread_self();
+    current_thread->thr_task = current;
+
+    list_add_tail(&current_thread->thr_list, &current->tsk_threads);
+    current->tsk_threads_cnt++;
+
+    current->tsk_cwd[0] = 0;
+    if (!CALL_FUNC(getcwd, current->tsk_cwd, sizeof(current->tsk_cwd)))
+        panic("tvm_init::getcwd");
+
     strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
 
     cow_run_init_funcs(); // initialize copy-on-write vars with init statements
-
-    task_lock(current);
     
     struct sigaction act = {
         .sa_sigaction = signal_handler,
@@ -5808,8 +5545,6 @@ void tvm_init(const char *init_comm)
                 panic("sigaction(%d): %s", i, strerror(errno));
         }
     }
-
-    task_unlock(current);
 
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
 }
@@ -6200,7 +5935,7 @@ FUNCTION_DEFINE_VA2(int, open, const char *, pathname, int, flags) {
     if (!current_normalize_path(pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
-    INFO("open: \"%s\"", pathname);
+
     int f = task_reserve_fd(current, 0);
     if (f == -1) {
         errno = EMFILE;
@@ -7097,15 +6832,468 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     
 }
 
-typedef void *(*start_routine_fn)(void *);
+/**
+ * Who knew imitating `fork()` API with threads is such a hassle. Well it is.
+ * 
+ * Idea is to `setjmp` on parent, on child stack copy some frames from the parent and `longjmp` to the new stack.
+ * Main problem is fixing up all the stack pointers on the frames pointer to the old stack to be on the new stack,
+ * read `Jmpbuf implementation` section for that.
+ */
 
-FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t *, attr, start_routine_fn, start_routine, void *, arg) {
-    struct thread_create_arg create_arg = { .flags = 0 };
-    return tvm_pthread_create_ex(thread, attr, start_routine, arg, &create_arg);
+#define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
+#define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
+
+#define TEMP_STACK_SIZE DEFAULT_STACK_SIZE
+
+struct fork_arg {
+    struct task *parent;
+    struct task *tsk;
+    struct thread *thr;
+
+    struct cow_fixup_context fixup;
+    void *tmp_stack;
+
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+    char ***parent_environ;
+    jmp_buf jmpbuf_parent;
+    jmp_buf jmpbuf_tmp;
+    jmp_buf jmpbuf_fail;
+    
+    void *caller_fp;
+    
+    size_t duplicate_errors;
+    int first_duplicate_error;
+
+    pid_t pid;
+};
+
+static void forkless_dup_cb(struct fork_arg *arg, void *old_slab, void *new_slab, size_t slabsize)
+{
+    if (0 != cow_fixup_ctx_add(&arg->fixup, new_slab, old_slab, slabsize)) {
+        arg->duplicate_errors++;
+        if (!arg->first_duplicate_error)
+            arg->first_duplicate_error = errno;
+    }
+}
+
+static void forkless_done_cb(struct fork_arg *arg)
+{
+    if (arg->duplicate_errors == 0)
+        cow_fixup_process(&arg->fixup);
+}
+
+static void *tvm_proc_entry(struct fork_arg *arg)
+{
+    uintptr_t curr_fp = (uintptr_t)__builtin_frame_address(0);
+
+    // when this function fails, it is probably running on an adjusted stack
+    // so we need to restore to the original stack frame of this function to return
+    // the error number is set to thread's errno
+    if ((setjmp(arg->jmpbuf_fail)))
+        return (void *)(long)errno;
+
+    // move to temporary stack
+    if (0 == setjmp(arg->jmpbuf_tmp))
+    {
+        /**
+         * this code moves to a temporary stack, since we're gonna modify our own stack.
+         *
+         *   ._______. 0x0000
+         *   |       |
+         *   |       |
+         *   |       |
+         *   |       |        <- sp
+         *   |       | 
+         *   '_______' 0xffff <- fp
+         * 
+         * NOTE: `fp` points to a 2-dword structure
+         *   struct prologue {
+         *     void *fp;
+         *     void *lr;
+         *   }
+         * 
+         * This means an additional 2-dword needs to be added to the frame on top of `fp - sp`.
+         * We don't copy it, but rather forge it to values we can detect if a return is attempted.
+         * 
+         *   ^         ^  ^- sp is up there
+         *   |         |
+         *   |         |_
+         *   | prev fp | '- fp points here 
+         *   | prev lr |
+         *   |         |
+         */
+        jmpbuf_demangle(&arg->jmpbuf_tmp);
+        uintptr_t curr_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_tmp);
+        // `fp` is just before the value of `fp` itself, so keep room for `fp` on the stack
+        uintptr_t next_fp = (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE - 2 * sizeof(uintptr_t);
+        uintptr_t next_sp = next_fp - (curr_fp - curr_sp);
+
+        memcpy((void *)next_sp, (void *)curr_sp, curr_fp - curr_sp);
+        // forge prologue so if a return occurs we can detect it
+        *(uintptr_t *)(next_fp) = 0xDEADBEEF46464646;
+        *(uintptr_t *)(next_fp + 8) = 0xDEADBEEF42424242;
+
+        // include prologue (fp + lr) when adjusting jmpbuf context regs
+        jmpbuf_setstack(&arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
+        jmpbuf_mangle(&arg->jmpbuf_tmp);
+
+        longjmp(arg->jmpbuf_tmp, 1);
+    }
+
+    // running on a temporary stack until the next longjmp
+
+    // load and copy all data vars
+    if (0 != cow_fixup_load_data_variables(&arg->fixup, 1))
+        goto fail;
+
+    for (int i = 0; i < arg->fixup.count; i++)
+        memcpy(arg->fixup.ptrs[i].new, arg->fixup.ptrs[i].old, arg->fixup.ptrs[i].size);
+
+    /**
+     * setup child stack as a copy of a few important frames from parent stack
+     *
+     *                       parent               child
+     *                     ._______.   0x0000   ._______.
+     *                     |       |            |       |
+     *        .--<  sp ->  |-------| -> -\      |       |
+     *  stack |            |       |      -> -> |-------|  <- sp  >--.
+     *  copy  |            |       |   memcpy   |       |            |  stack
+     *  size  '-->  fp ->  |-------| -> -\      |       |            |  copy
+     *                     '_______'      -> -> '_______'  <- fp  <--'  size
+     */
+
+    uintptr_t parent_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_parent);
+    uintptr_t parent_fp = (uintptr_t)arg->caller_fp;
+
+    // its important to "link" the new frames copied from parent to the current stack for `pthread_exit()` to work
+    // as `pthread_exit()` throws a C++ exception on some implmentations that is meant to be caught
+    // by pthread's `__thread_entry` func (which calls the start routine)
+    uintptr_t child_fp = curr_fp;
+    uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
+
+    memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
+
+    // include prologue (fp + lr) when adjusting jmpbuf context regs (important for fixing up pointers to rbp)
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)child_sp, (void *)parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t)))
+        goto fail;
+
+    // fix the environ pointer (which is allocated on the task's arena)
+    arg->tsk->tsk_environ = arg->parent->tsk_environ;
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_environ, (void *)&arg->parent->tsk_environ, sizeof(arg->tsk->tsk_environ)))
+        goto fail;
+
+    arg->first_duplicate_error = 0;
+    if (0 != rmem_arena_duplicate(
+        arg->tsk->tsk_ar,
+        arg->parent->tsk_ar,
+        (void (*)(void *, void *, void *, size_t))forkless_dup_cb,
+        (void (*)(void *))forkless_done_cb,
+        (void *)arg))
+        goto fail;
+
+    if (arg->duplicate_errors) {
+        INFO("tvm_proc_entry - %zu duplicate errors - first error: %d", arg->duplicate_errors, arg->first_duplicate_error);
+        errno = arg->first_duplicate_error;
+        goto fail;
+    }
+
+    // include prologue (fp + lr) when adjusting jmpbuf context regs
+    jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
+    jmpbuf_mangle(&arg->jmpbuf_parent);
+
+    longjmp(arg->jmpbuf_parent, 1);
+
+fail:
+
+    // notify parent to pthread join us
+    pthread_mutex_lock(&arg->mtx);
+    arg->pid = -1;
+    pthread_cond_broadcast(&arg->cond);
+    pthread_mutex_unlock(&arg->mtx);
+
+    longjmp(arg->jmpbuf_fail, 1);
+}
+
+// for now we need strict control of how many frames we need to restore on new stack
+// so do not use wrapper
+//FUNCTION_DEFINE0(pid_t, fork) {
+pid_t fork(void) {
+    if (!can_enter_tvm(__builtin_return_address(0)))
+        return CALL_FUNC(fork);
+    
+    struct task *tsk = NULL;
+    struct thread *thr = NULL;
+    struct fork_arg *arg = NULL;
+    pthread_attr_t attr;
+    pid_t ret = -1;
+    int r;
+
+    if ((r = pthread_attr_init(&attr))) {
+        errno = r;
+        return -1;
+    }
+
+    if ((r = pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE))) {
+        errno = r;
+        goto out;
+    }
+
+    tsk = taskalloc(); // locks current and inherits whatever
+    if (!tsk) {
+        errno = ENOMEM;
+        goto out;
+    }
+
+    thr = threadalloc(tsk);
+    if (!thr) {
+        errno = ENOMEM;
+        goto out;
+    }
+
+    if ((r = copy_pthread_attr(&attr, &thr->thr_pthread_attr))) {
+        errno = r;
+        goto out;
+    }
+
+    arg = kalloc(sizeof(struct fork_arg));
+    if (!arg) {
+        errno = ENOMEM;
+        goto out;
+    }
+
+    arg->pid = 0;
+    arg->tsk = tsk;
+    arg->thr = thr;
+    arg->parent = current;
+    arg->caller_fp = *(void **)__builtin_frame_address(0);
+
+    arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (arg->tmp_stack == MAP_FAILED) {
+        arg->tmp_stack = NULL;
+        errno = ENOMEM;
+        goto out;
+    }
+
+    if ((r = pthread_mutex_init(&arg->mtx, NULL))) {
+        errno = r;
+        goto out;
+    }
+
+    if ((r = pthread_cond_init(&arg->cond, NULL))) {
+        errno = r;
+        goto out;
+    }
+
+    if (0 != cow_fixup_load_data_variables(&arg->fixup, 0)) {
+        // HANDLE??
+        goto out;
+    }
+
+    if (0 != setjmp(arg->jmpbuf_parent)) {
+        
+        // child
+
+        current = arg->tsk;
+        current_thread = arg->thr;
+
+        current->tsk_pid = __gettid();
+        current_thread->thr_pthread = pthread_self();
+
+        list_add_tail(&current_thread->thr_list, &current->tsk_threads);
+        current->tsk_threads_cnt++;
+
+        // finally, add child task to tasks list
+        pthread_mutex_lock(&tasks_lock);
+        list_add_tail(&current->tsk_list, &main_task->tsk_list);
+        pthread_mutex_unlock(&tasks_lock);
+
+        // let parent know our PID and exit on both child and parent
+        pthread_mutex_lock(&arg->mtx);
+        arg->pid = __gettid();
+        pthread_cond_broadcast(&arg->cond);
+        pthread_mutex_unlock(&arg->mtx);
+
+        return 0;
+    }
+
+    // parent
+
+    jmpbuf_demangle(&arg->jmpbuf_parent);
+
+    pthread_t pth;
+    if ((r = CALL_FUNC(pthread_create, &pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg))) {
+        errno = r;
+        goto out;
+    }
+
+    // failure no longer allowed on parent
+
+    pthread_mutex_lock(&arg->mtx);
+    while (arg->pid == 0) {
+        pthread_cond_wait(&arg->cond, &arg->mtx);
+    }
+    pthread_mutex_unlock(&arg->mtx);
+
+    ret = arg->pid;
+
+    // if child failed, it'll return -1 so join it
+    if (ret == -1) {
+        // we are not allowed to fail here
+        void *thread_r;
+        if ((r = pthread_join(pth, &thread_r)))
+            panic("fork::pthread_join failed (errno %d)", r);
+
+        errno = (int)(long)(thread_r);
+    }
+
+out:
+
+    if (arg) {
+
+        pthread_cond_destroy(&arg->cond);
+        pthread_mutex_destroy(&arg->mtx);        
+
+        if (arg->tmp_stack) {
+            CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
+            arg->tmp_stack = NULL;
+        }        
+
+        kfree(arg);
+        arg = NULL;
+    }
+
+    if (ret == -1) {
+
+        if (thr) {
+            threaddealloc(thr);
+            thr = NULL;
+        }
+        
+        if (tsk) {
+            taskfreelastref(tsk, 1, 1);
+            tsk = NULL;
+        }
+    }
+
+    pthread_attr_destroy(&attr);
+
+    return ret;
+}
+
+typedef void *(*start_routine_fn)(void *);
+struct pthread_create_arg
+{
+    start_routine_fn start_fn;
+    void *start_arg;
+    struct task *tsk;
+    struct thread *thr;
+};
+
+static void *tvm_thread_entry(struct pthread_create_arg *arg)
+{
+    current = arg->tsk;
+    current_thread = arg->thr;
+
+    current_thread->thr_pthread = pthread_self();
+
+    task_lock(current);
+    list_add_tail(&current_thread->thr_list, &current->tsk_threads);
+    current->tsk_threads_cnt++;
+    task_unlock(current);
+
+    start_routine_fn start_fn = arg->start_fn;
+    void *start_arg = arg->start_arg;
+    kfree(arg);
+
+    pthread_exit(start_fn(start_arg));
+}
+
+FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t *, attr, start_routine_fn, start_routine, void *, _arg) {
+    int ret = EINVAL;
+    struct pthread_create_arg *arg = NULL;
+    struct thread *thr = NULL;
+
+    task_lock(current);
+    current->tsk_refcount++;
+    task_unlock(current);
+
+    thr = threadalloc(current);
+    if (!thr) {
+        ret = ENOMEM;
+        goto out;
+    }
+
+    if (attr) {
+        if (0 != (ret = copy_pthread_attr(attr, &thr->thr_pthread_attr)))
+            goto out;
+        ret = EINVAL;
+    }
+
+    arg = kalloc(sizeof(struct pthread_create_arg));
+    if (!arg) {
+        ret = ENOMEM;
+        goto out;
+    }
+
+    arg->start_fn = start_routine;
+    arg->start_arg = _arg;
+    arg->thr = thr;
+
+    arg->tsk = current;
+
+    ret = CALL_FUNC(pthread_create, thread, attr, (start_routine_fn)tvm_thread_entry, (void *)arg);
+
+    if (!ret) {
+        arg = NULL;
+        thr = NULL;
+    }
+
+    // TODO condition variable wait for child to succeed
+
+out:
+    if (ret) {
+
+        if (arg) {
+            kfree(arg);
+            arg = NULL;
+        }
+
+        if (thr) {
+            threaddealloc(thr);
+            thr = NULL;
+        }
+
+        task_lock(current);
+        current->tsk_refcount--;
+        task_unlock(current);
+    }
+
+    return ret;
 }
 
 FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
-    tvm_pthread_exit(retval);
+
+    task_lock(current);
+    if (current->tsk_threads_cnt == 1) {
+        task_unlock(current);
+        exit((int) ((long) retval));
+    }
+    
+    list_del(&current_thread->thr_list);
+    current->tsk_threads_cnt--;
+    current->tsk_refcount--;
+
+    if (current_thread->thr_refcount == 1) {
+        threaddealloc(current_thread);
+    }
+
+    current_thread = NULL;
+
+    task_unlock(current);
+
+    CALL_FUNC(pthread_exit, retval);
+    __builtin_unreachable();
 }
 
 FUNCTION_DEFINE_NORET1(exit, int, status) {
@@ -7117,7 +7305,7 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
 
     for (int i = 0; i < sizeof(current->tsk_exits)/sizeof(*current->tsk_exits); i++) {
         if (exits[i]) {
-            if (0 != emulator_call(current->tsk_emulator, NULL, (uint64_t)exits[i], 0, 0, 0, 0, 0, 0))
+            if (0 != emulator_call(current_thread->thr_emulator, NULL, (uint64_t)exits[i], 0, 0, 0, 0, 0, 0))
                 abort();
         }
     }
@@ -7127,7 +7315,7 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
 
 FUNCTION_DEFINE_NORET1(_exit, int, status) {
     if (pthread_self() == main_pthread)
-        CALL_FUNC(exit, status);
+        CALL_FUNC(_exit, status);
     
     pthread_mutex_lock(&tasks_lock);
     task_lock(current);
@@ -7226,10 +7414,10 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     task_lock(zombiet);
     pthread_mutex_unlock(&tasks_lock);
     
-    if (list_empty(&zombiet->tsk_pthreads))
+    if (list_empty(&zombiet->tsk_threads))
         panic("waitpid tsk_pthreads empty");
-    struct pthread_entry *pentry = list_entry(zombiet->tsk_pthreads.next, struct pthread_entry, ptl_entry);
-    pthread_join(pentry->ptl_value, NULL);
+    struct thread *thr = list_entry(zombiet->tsk_threads.next, struct thread, thr_list);
+    pthread_join(thr->thr_pthread, NULL);
     
     pid_t childpid = zombiet->tsk_pid;
     if (wstatus)
@@ -7622,7 +7810,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     optind = 1;
 
     uint64_t ret;
-    int callerr = emulator_call(current->tsk_emulator, &ret, (uint64_t)main_func,
+    int callerr = emulator_call(current_thread->thr_emulator, &ret, (uint64_t)main_func,
                   (uint64_t)argc,
                   (uint64_t)argv,
                   (uint64_t)envp,
@@ -7792,7 +7980,7 @@ FUNCTION_DEFINE3(int, ttyname_r, int, fd, char *, buf, size_t, buflen) {
     struct tty *tt = tty_for_fd(t_fd(fd), TTM_MASTER);
     if (tt) {
         snprintf(buf, buflen, "%s", PTMX_FILE);
-        tty_unlock(tt);
+        tty_unlock(tt, 1);
         return 0;
     }
 
