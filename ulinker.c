@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1990,6 +1991,9 @@ struct ulinker {
     pthread_mutex_t  ul_dlinfo_mtx;
     struct dlinfo   *ul_dlinfo;
     void *ul_private;
+
+    void *ul_cb_arg;
+    void (*ul_cb_mmap)(struct ulinker *, void *, size_t, void *, size_t, int);
 };
 
 #define DLINFO_LOCK(_ul)   pthread_mutex_lock(&(_ul)->ul_dlinfo_mtx)
@@ -2004,11 +2008,13 @@ enum {
 };
 
 #define DLINFO_NAME_LEN 128
+#define DLINFO_PATH_LEN 4096
 struct dlinfo {
     struct dlinfo *dl_next;
     struct ulinker *dl_linker; // back pointer to owning linker
     void *dl_private;
     char dl_name[DLINFO_NAME_LEN];
+    char dl_pathname[DLINFO_PATH_LEN];
     uint64_t dl_refcnt;
     int dl_type; // DLT_*
     int dl_arch;
@@ -2434,6 +2440,7 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
 
     memset(dl, 0, sizeof(*dl));
     DLBASE(dl)->dl_type = DLT_ELF64;
+    strncpy(DLBASE(dl)->dl_pathname, filename, sizeof(DLBASE(dl)->dl_pathname)-1);
     DLPRIVATE(dl) = ulinker->ul_private;
 
     memcpy(dl->dle64_ehdr.e_ident, ident, EI_NIDENT);
@@ -2596,6 +2603,9 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
                 goto out;
             }
         }
+
+        if (ulinker->ul_cb_mmap)
+            ulinker->ul_cb_mmap(ulinker, DLBASE(dl)->dl_base, DLBASE(dl)->dl_size, (void *)seg_page_start, seg_page_end - seg_page_start, PFLAGS_TO_PROT(curr_phdr->p_flags));
     }
 
     // find phdr as it appears in the loaded segments
@@ -2882,6 +2892,7 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
 
     memset(dl, 0, sizeof(*dl));
     DLBASE(dl)->dl_type = DLT_MACHO64;
+    strncpy(DLBASE(dl)->dl_pathname, filename, sizeof(DLBASE(dl)->dl_pathname)-1);
     DLPRIVATE(dl) = ulinker->ul_private;
 
     dl->dlm64_hdr.magic = MH_MAGIC_64;
@@ -3052,6 +3063,9 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
                 goto out;
             }
         }
+
+        if (ulinker->ul_cb_mmap)
+            ulinker->ul_cb_mmap(ulinker, DLBASE(dl)->dl_base, DLBASE(dl)->dl_size, (void *)seg_page_start, seg_page_end - seg_page_start, VMPROT_TO_PROT(curr_sc->initprot));
     }
 
     // find phdr as it appears in the loaded segments
@@ -3686,4 +3700,74 @@ int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dla
     info->udli_farch = dl->dl_arch;
     info->udli_fabi  = dl->dl_abi;
     return 1;
+}
+
+struct dup_arg {
+    void *arg;
+    void *old_base;
+    void (*segment_cb)(void *, void *, void *, size_t, int);
+};
+
+static void dup_mmap_cb(struct ulinker *ulinker, void *dl_base, size_t dl_size, void *map_base, size_t map_size, int map_prot) {
+    struct dup_arg *dup_arg = (struct dup_arg *)ulinker->ul_cb_arg;
+
+    uint64_t old_map_base = (uint64_t)dup_arg->old_base + ((uint64_t)map_base - (uint64_t)dl_base);
+
+    if (dup_arg->segment_cb)
+        dup_arg->segment_cb(dup_arg->arg, (void *)old_map_base, map_base, map_size, map_prot);
+}
+
+int ulinker_duplicate(struct ulinker *old, struct ulinker *new, void (*segment_cb)(void *, void *, void *, size_t, int), void *arg)
+{
+    int ret = 1;
+
+    if (old == new)
+        return ret;
+
+    DLINFO_LOCK(old);
+
+    new->ul_cb_mmap = dup_mmap_cb;
+
+    for (struct dlinfo *dl = old->ul_dlinfo; dl; dl = dl->dl_next) {
+        // end of linker-specific list
+        if (dl->dl_type == DLT_EXTERNAL) {
+            break;
+        }
+
+        struct dup_arg dup_arg = {
+            .arg = arg,
+            .old_base = dl->dl_base,
+            .segment_cb = segment_cb
+        };
+
+        new->ul_cb_arg = (void *)&dup_arg;
+        if (!load_library(new, dl->dl_pathname))
+            goto out;
+    }
+
+    ret = 0;
+
+out:
+
+    new->ul_cb_arg = NULL;
+    new->ul_cb_mmap = NULL;
+
+    if (ret) {
+        while (new->ul_dlinfo) {
+            struct dlinfo *dl = new->ul_dlinfo;
+
+            // end of linker-specific list
+            if (dl->dl_type == DLT_EXTERNAL) {
+                break;
+            }
+
+            ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, dl);
+            new->ul_dlinfo = dl->dl_next;
+            free_library(dl);
+        }
+    }
+
+    DLINFO_UNLOCK(old);
+
+    return ret;
 }

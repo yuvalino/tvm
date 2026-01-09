@@ -61,7 +61,6 @@ int   ulinker_dlclose(void *handle);
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all);
 char *ulinker_dlerror(void);
 
-
 /**
  * opens an executable file, closing all previous open libraries.
  */
@@ -87,3 +86,9 @@ struct ulinker_dladdr_info {
     int         udli_fabi;
 };
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
+
+/**
+ * duplicate a linker with all loaded libraries and data.
+ * `segment_cb` is called with each writable segment.
+ */
+int ulinker_duplicate(struct ulinker *old, struct ulinker *new, void (*segment_cb)(void *, void *, void *, size_t, int), void *arg);

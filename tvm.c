@@ -497,7 +497,7 @@ struct emulator_context;
 struct emulator_context *emulator_context_create(struct ulinker *ulinker);
 void                     emulator_context_destroy(struct emulator_context *ec);
 
-void emulator_call_sighandler(struct emulator_context *ec, uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
+void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
 
 /////////////
 // Helpers
@@ -1967,12 +1967,12 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     
     if ((act->sa_flags & SA_SIGINFO) == 0) {
         task_unlock(current);
-        emulator_call_sighandler(current_thread->thr_emulator, (uint64_t)act->sa_handler, signum, 0, 0);
+        emulator_call_sighandler((uint64_t)act->sa_handler, signum, 0, 0);
         return;
     }
     
     task_unlock(current);
-    emulator_call_sighandler(current_thread->thr_emulator, (uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
+    emulator_call_sighandler((uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
     return;
 }
 
@@ -2797,8 +2797,7 @@ static ssize_t ttyop_read(int fd, void *buf, size_t count, int offset)
             poll_timeout = -1; // infinite wait for VMIN>0, VTIME=0
         }
         //INFO("ttyop_read VMIN %d VTIME %d poll_timeout %d", vmin, vtime, poll_timeout);
-        if (vtime == 21)
-            *(int *)0xDEAD = 0;
+
         int ret = CALL_FUNC(poll, &pfd, 1, poll_timeout);
         if (ret == 0) {
             // Timeout
@@ -3320,6 +3319,7 @@ struct cow_fixup_context {
         void *new;
         void *old;
         size_t size;
+        int fixup;
     } *ptrs;
     size_t count;
 };
@@ -3354,6 +3354,7 @@ static int cow_fixup_load_data_variables(struct cow_fixup_context *ctx, int new)
             ctx->ptrs[i].new = cow->getptr_fn();
         else
             ctx->ptrs[i].old = cow->getptr_fn();
+        ctx->ptrs[i].fixup = 1;
 
         i++;
     }
@@ -3364,7 +3365,7 @@ static int cow_fixup_load_data_variables(struct cow_fixup_context *ctx, int new)
     return 0;
 }
 
-static int cow_fixup_ctx_add(struct cow_fixup_context *dctx, void *new, void *old, size_t size)
+static int cow_fixup_ctx_add(struct cow_fixup_context *dctx, void *new, void *old, size_t size, int fixup)
 {
     void *nptrs = krealloc(dctx->ptrs, sizeof(dctx->ptrs[0]) * (dctx->count + 1));
     if (!nptrs) {
@@ -3376,6 +3377,7 @@ static int cow_fixup_ctx_add(struct cow_fixup_context *dctx, void *new, void *ol
     dctx->ptrs[dctx->count].new = new;
     dctx->ptrs[dctx->count].old = old;
     dctx->ptrs[dctx->count].size = size;
+    dctx->ptrs[dctx->count].fixup = fixup;
     dctx->count++;
 
     return 0;
@@ -3397,6 +3399,10 @@ static void *cow_fixup_translate(struct cow_fixup_context *dctx, void *p)
 static void cow_fixup_process(struct cow_fixup_context *dctx)
 {
     for (int i = 0; i < dctx->count; i++) {
+        // only used for other fixups
+        if (!dctx->ptrs[i].fixup)
+            continue;
+        
         for (
             void **p = (void **)dctx->ptrs[i].new;
             (uintptr_t)(p + 1) <= (uintptr_t)dctx->ptrs[i].new + dctx->ptrs[i].size;
@@ -4388,11 +4394,12 @@ int emulator_longjmp(jmp_buf env, int val) {
 
 static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
 
-int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pcinfo, struct emulator_call_params *params, uint64_t *out_ret)
+int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_params *params, uint64_t *out_ret)
 {
     int prevtvm;
     int r = 1;
     struct emulator_saved_state *ess = NULL;
+    struct emulator_context *ec = current_thread->thr_emulator;
     uc_err err;
 
     prevtvm = TVM_OFF;
@@ -4511,8 +4518,15 @@ int emulator_call_ex(struct emulator_context *ec, struct ulinker_dladdr_info *pc
 
                     // call with parameters and save ret
                     uint64_t fault_ret;
-                    if (0 != emulator_call_ex(ec, &fault_info, &fault_params, &fault_ret))
+                    if (0 != emulator_call_ex(&fault_info, &fault_params, &fault_ret))
                         goto out;
+
+                    // NOTE! It is possible `fork()` was called!
+                    // Update local variables from thread state
+                    ec = current_thread->thr_emulator;
+                    ee = emulator_context_get_or_create_engine(ec, pcinfo->udli_farch);
+                    ess = ec->ec_ss;
+
                     if (0 != emulator_saved_state_write_reg(ess, ESS_REG_RET, &fault_ret))
                         goto out;
                     
@@ -4563,16 +4577,16 @@ out:
     return r;
 }
 
-int emulator_call(struct emulator_context *ec, uint64_t *out_ret, uint64_t pc, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+int emulator_call(uint64_t *out_ret, uint64_t pc, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     struct emulator_call_params params = {
         .pc = pc,
         .arg = {arg0, arg1, arg2, arg3, arg4, arg5, 0}
     };
 
-    return emulator_call_ex(ec, NULL, &params, out_ret);
+    return emulator_call_ex(NULL, &params, out_ret);
 }
 
-void emulator_call_sighandler(struct emulator_context *ec, uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
 
     // handler is not in emulator
 #ifdef ENABLE_RWX
@@ -4586,7 +4600,7 @@ void emulator_call_sighandler(struct emulator_context *ec, uint64_t handler_pc, 
 
     // handler is in emulator, call emulator from signal handler so help me god
     handler_pc = EMUFUNC_UNMARK(handler_pc);
-    emulator_call(ec, NULL, handler_pc, arg0, arg1, arg2, 0, 0, 0);
+    emulator_call(NULL, handler_pc, arg0, arg1, arg2, 0, 0, 0);
 }
 
 struct emulator_pthread_create_arg {
@@ -4599,7 +4613,7 @@ void *tvm_emulator_thread_entry(struct emulator_pthread_create_arg *arg) {
     uintptr_t pc = (uintptr_t)arg->start_fn;
     uintptr_t arg1 = (uintptr_t)arg->arg;
 
-    emulator_call(current_thread->thr_emulator, &ret, pc, arg1, 0, 0, 0, 0, 0);
+    emulator_call(&ret, pc, arg1, 0, 0, 0, 0, 0);
 
     return (void *)ret;
 }
@@ -4620,6 +4634,90 @@ int emulator_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void 
         kfree(arg);
     }
 
+    return ret;
+}
+
+int emulator_duplicate(struct emulator_context *old, struct emulator_context *new, void (*dup_cb)(void *, void *, void *, size_t), void *arg)
+{
+    int ret = 1;
+
+    // duplicate engines
+    struct emulator_engine *new_prev_ee = NULL;
+    for (struct emulator_engine *old_ee = old->ec_all_engines; old_ee; old_ee = old_ee->ee_next) {
+        struct emulator_engine *new_ee = emulator_engine_create(new, old_ee->ee_arch);
+        if (!new_ee)
+            goto out;
+        
+        if (new_prev_ee)
+            new_prev_ee->ee_next = new_ee;
+        else
+            new->ec_all_engines = new_ee;
+        new_prev_ee = new_ee;
+
+        if (old->ec_curr_engine == old_ee)
+            new->ec_curr_engine == new_ee;
+        
+        // NOTE: we can just let the emulator re-populate this on its own
+        // struct emulator_map_entry *new_prev_eme = NULL;
+        // for (struct emulator_map_entry *old_eme = old_ee->ee_eme; old_eme; old_eme = old_eme->eme_next) {
+        //     struct emulator_map_entry *new_eme = emulator_map_entry(old_eme->eme_start, old_eme->eme_size);
+        //     if (!new_eme)
+        //         goto out;
+            
+        //     if (new_prev_eme)
+        //         new_prev_eme->eme_next = new_eme;
+        //     else
+        //         new_ee->ee_eme = new_eme;
+        //     new_prev_eme = new_eme;
+        // }
+
+        // new_ee->ee_refresh = 1;
+    }
+
+    struct emulator_saved_state *new_prev_ess = NULL;
+    for (struct emulator_saved_state *old_ess = old->ec_ss; old_ess; old_ess = old_ess->ess_next) {
+        struct emulator_engine *new_ee = emulator_context_get_or_create_engine(new, old_ess->ess_arch);
+        if (!new_ee)
+            goto out;
+        
+        struct emulator_saved_state *new_ess = emulator_saved_state_create(new_ee->ee_uc, old_ess->ess_arch, old_ess->ess_abi);
+        if (!new_ess)
+            goto out;
+        
+        if (new_prev_ess)
+            new_prev_ess->ess_next = new_ess;
+        else
+            new->ec_ss = new_ess;
+        new_prev_ess = new_ess;
+
+        new_ess->ess_intr = old_ess->ess_intr;
+        new_ess->ess_intr_memtype = old_ess->ess_intr_memtype;
+        new_ess->ess_intr_addr = old_ess->ess_intr_addr;
+        new_ess->ess_fault_lr = old_ess->ess_fault_lr;
+
+        uint64_t old_sp;
+        if (UC_ERR_OK == emulator_saved_state_read_reg(old_ess, ESS_REG_SP, &old_sp))
+            goto out;
+        
+        uint64_t new_sp = ((uint64_t)new_ess->ess_stack + (old_sp - (uint64_t)old_ess->ess_stack));
+        uint64_t size_sp = (uint64_t)old_ess->ess_stack + old_ess->ess_stack_size - old_sp;
+        
+        // TODO copy context
+
+        // copy the stack
+        memcpy((void *)new_sp, (void *)old_sp, size_sp);
+
+        if (dup_cb) {
+            // context dup
+            dup_cb(arg, (void *)old_sp, (void *)new_sp, size_sp);
+            dup_cb(arg, (void *)&old_ess->ess_fault_lr, (void *)&new_ess->ess_fault_lr, sizeof(new_ess->ess_fault_lr));
+            dup_cb(arg, (void *)&old_ess->ess_intr_addr, (void *)&new_ess->ess_intr_addr, sizeof(new_ess->ess_intr_addr));
+        }
+    }
+
+    ret = 0;
+
+out:
     return ret;
 }
 
@@ -5334,7 +5432,7 @@ static int tvm_sorunner(int argc, char **argv)
     printf("sorunner %s %s %p base %p\n", argv[1], "main", sym, info.udli_fbase);
 
     uint64_t ret;
-    int callerr = emulator_call(current_thread->thr_emulator, &ret, (uint64_t)sym,
+    int callerr = emulator_call(&ret, (uint64_t)sym,
                   (uint64_t)(argc - 1),
                   (uint64_t)(argv + 1),
                   (uint64_t)tvm_environ,
@@ -5451,7 +5549,6 @@ static void *ulinker_external_dlsym(void *arg, const char *s)
     if (0 == strcmp(s, "longjmp"))   return &emulator_longjmp;
 
     if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
-
     #endif
     return dlsym(RTLD_DEFAULT, s);
 }
@@ -6854,18 +6951,16 @@ struct fork_arg {
     struct task *parent;
     struct task *tsk;
     struct thread *thr;
+    struct thread *parent_thr;
 
     struct cow_fixup_context fixup;
     void *tmp_stack;
 
     pthread_mutex_t mtx;
     pthread_cond_t cond;
-    char ***parent_environ;
     jmp_buf jmpbuf_parent;
     jmp_buf jmpbuf_tmp;
     jmp_buf jmpbuf_fail;
-    
-    void *caller_fp;
     
     size_t duplicate_errors;
     int first_duplicate_error;
@@ -6873,16 +6968,30 @@ struct fork_arg {
     pid_t pid;
 };
 
-static void forkless_dup_cb(struct fork_arg *arg, void *old_slab, void *new_slab, size_t slabsize)
-{
-    if (0 != cow_fixup_ctx_add(&arg->fixup, new_slab, old_slab, slabsize)) {
+static void fork_dup_linker_cb(struct fork_arg *arg, void *old_map, void *new_map, size_t size, int prot) {
+
+    int has_rw = ((PROT_READ | PROT_WRITE) == (prot & (PROT_READ | PROT_WRITE)));
+
+    if (has_rw)
+        memcpy(new_map, old_map, size);
+
+    if (0 != cow_fixup_ctx_add(&arg->fixup, new_map, old_map, size, has_rw)) {
         arg->duplicate_errors++;
         if (!arg->first_duplicate_error)
             arg->first_duplicate_error = errno;
     }
 }
 
-static void forkless_done_cb(struct fork_arg *arg)
+static void fork_dup_heap_cb(struct fork_arg *arg, void *old_slab, void *new_slab, size_t slabsize)
+{
+    if (0 != cow_fixup_ctx_add(&arg->fixup, new_slab, old_slab, slabsize, 1)) {
+        arg->duplicate_errors++;
+        if (!arg->first_duplicate_error)
+            arg->first_duplicate_error = errno;
+    }
+}
+
+static void fork_done_heap_cb(struct fork_arg *arg)
 {
     if (arg->duplicate_errors == 0)
         cow_fixup_process(&arg->fixup);
@@ -6895,8 +7004,9 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
     // the error number is set to thread's errno
-    if ((setjmp(arg->jmpbuf_fail)))
+    if ((setjmp(arg->jmpbuf_fail))) {
         return (void *)(long)errno;
+    }
 
     // move to temporary stack
     if (0 == setjmp(arg->jmpbuf_tmp))
@@ -6969,7 +7079,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
      */
 
     uintptr_t parent_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_parent);
-    uintptr_t parent_fp = (uintptr_t)arg->caller_fp;
+    uintptr_t parent_fp = (uintptr_t)arg->parent_thr->thr_fork_fp;
 
     // its important to "link" the new frames copied from parent to the current stack for `pthread_exit()` to work
     // as `pthread_exit()` throws a C++ exception on some implmentations that is meant to be caught
@@ -6980,34 +7090,53 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
 
     // include prologue (fp + lr) when adjusting jmpbuf context regs (important for fixing up pointers to rbp)
-    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)child_sp, (void *)parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t)))
+    INFO("STACK %p %p %p", (void *)parent_sp, (void *)child_sp, (void *)(parent_fp - parent_sp + 2 * sizeof(uintptr_t)));
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)child_sp, (void *)parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t), 1))
         goto fail;
 
     // fix the environ pointer (which is allocated on the task's arena)
     arg->tsk->tsk_environ = arg->parent->tsk_environ;
-    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_environ, (void *)&arg->parent->tsk_environ, sizeof(arg->tsk->tsk_environ)))
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_environ, (void *)&arg->parent->tsk_environ, sizeof(arg->tsk->tsk_environ), 1))
+        goto fail;
+
+    if (0 != ulinker_duplicate(arg->parent->tsk_linker, arg->tsk->tsk_linker, (void (*)(void *arg, void *old_map, void *new_map, size_t size, int))fork_dup_linker_cb, (void *)arg))
+        goto fail;
+
+    if (arg->duplicate_errors) {
+        INFO("tvm_proc_entry - ulinker_duplicate() - %zu duplicate errors - first error: %d", arg->duplicate_errors, arg->first_duplicate_error);
+        errno = arg->first_duplicate_error;
+        goto fail;
+    }
+
+    if (0 != emulator_duplicate(arg->parent_thr->thr_emulator, arg->thr->thr_emulator))
         goto fail;
 
     arg->first_duplicate_error = 0;
     if (0 != rmem_arena_duplicate(
         arg->tsk->tsk_ar,
         arg->parent->tsk_ar,
-        (void (*)(void *, void *, void *, size_t))forkless_dup_cb,
-        (void (*)(void *))forkless_done_cb,
+        (void (*)(void *, void *, void *, size_t))fork_dup_heap_cb,
+        (void (*)(void *))fork_done_heap_cb,
         (void *)arg))
         goto fail;
 
     if (arg->duplicate_errors) {
-        INFO("tvm_proc_entry - %zu duplicate errors - first error: %d", arg->duplicate_errors, arg->first_duplicate_error);
+        INFO("tvm_proc_entry - rmem_arena_duplicate() - %zu duplicate errors - first error: %d", arg->duplicate_errors, arg->first_duplicate_error);
         errno = arg->first_duplicate_error;
         goto fail;
     }
 
-    // include prologue (fp + lr) when adjusting jmpbuf context regs
-    jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
-    jmpbuf_mangle(&arg->jmpbuf_parent);
-
     arg->thr->thr_fork_fp = (void *)child_fp;
+
+    // include prologue (fp + lr) when adjusting jmpbuf context regs
+    //jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
+
+    // fix the jmpbuf
+    uintptr_t *jb = (uintptr_t*) (&arg->jmpbuf_parent);
+    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
+        jb[i] = cow_fixup_translate(&arg->fixup, jb[i]);
+
+    jmpbuf_mangle(&arg->jmpbuf_parent);
 
     longjmp(arg->jmpbuf_parent, 1);
 
@@ -7018,6 +7147,8 @@ fail:
     arg->pid = -1;
     pthread_cond_broadcast(&arg->cond);
     pthread_mutex_unlock(&arg->mtx);
+
+    // TODO for some reason this crashes badly
 
     longjmp(arg->jmpbuf_fail, 1);
 }
@@ -7073,7 +7204,7 @@ pid_t fork(void) {
     arg->tsk = tsk;
     arg->thr = thr;
     arg->parent = current;
-    arg->caller_fp = current_thread->thr_fork_fp;
+    arg->parent_thr = current_thread;
 
     arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (arg->tmp_stack == MAP_FAILED) {
@@ -7313,7 +7444,7 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
 
     for (int i = 0; i < sizeof(current->tsk_exits)/sizeof(*current->tsk_exits); i++) {
         if (exits[i]) {
-            if (0 != emulator_call(current_thread->thr_emulator, NULL, (uint64_t)exits[i], 0, 0, 0, 0, 0, 0))
+            if (0 != emulator_call(NULL, (uint64_t)exits[i], 0, 0, 0, 0, 0, 0))
                 abort();
         }
     }
@@ -7822,7 +7953,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     optind = 1;
 
     uint64_t ret;
-    int callerr = emulator_call(current_thread->thr_emulator, &ret, (uint64_t)main_func,
+    int callerr = emulator_call(&ret, (uint64_t)main_func,
                   (uint64_t)argc,
                   (uint64_t)argv,
                   (uint64_t)envp,
