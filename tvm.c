@@ -1482,9 +1482,9 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
-    // TODO kill all threads, make sure refcount==1
-    if (current->tsk_refcount != 1)
-        panic("_exit refcount");
+    // TODO kill all threads, make sure tsk_threads_cnt==1
+    if (current->tsk_threads_cnt != 1)
+        panic("_exit tsk_threads_cnt");
     --current->tsk_refcount;
     --current->tsk_threads_cnt;
 
@@ -7766,6 +7766,10 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     }
 
     // No failing from here!
+
+    // TODO: kill all other threads
+    if (current->tsk_threads_cnt != 1)
+        panic("_exit tsk_threads_cnt");
 
     const char *basename = (const char *)strrchr(pathname, '/');
     if (!basename)
