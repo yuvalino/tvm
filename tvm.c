@@ -1038,11 +1038,12 @@ struct task {
 
 struct thread {
     struct list_head thr_list;
-    struct task *thr_task; // back pointer to owning task
+    struct task *thr_task;  // back pointer to owning task
     pthread_t thr_pthread;
     pthread_attr_t thr_pthread_attr;
     uint64_t thr_refcount;
     struct emulator_context *thr_emulator;
+    void *thr_fork_fp;  // copy frames from sp to this on fork()
 };
 
 static Dl_info main_dlinfo = {0};
@@ -3493,6 +3494,7 @@ static const char *find_program_pathname(const char *file)
     pthread_mutex_lock(&programs_lock);
     struct exec_program *prog;
     list_for_each_entry(prog, &exec_programs, list) {
+        INFO("%s %s", file, prog->file);
         if (0 == strcmp(file, prog->file)) {
             const char *p = prog->pathname;
             pthread_mutex_unlock(&programs_lock);
@@ -5521,6 +5523,9 @@ void tvm_init(const char *init_comm)
     current_thread->thr_pthread = pthread_self();
     current_thread->thr_task = current;
 
+    // wouldn't be able to fork if caller returned
+    current_thread->thr_fork_fp = *(void **)__builtin_frame_address(0);
+
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
     current->tsk_threads_cnt++;
 
@@ -7002,6 +7007,8 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
     jmpbuf_mangle(&arg->jmpbuf_parent);
 
+    arg->thr->thr_fork_fp = (void *)child_fp;
+
     longjmp(arg->jmpbuf_parent, 1);
 
 fail:
@@ -7066,7 +7073,7 @@ pid_t fork(void) {
     arg->tsk = tsk;
     arg->thr = thr;
     arg->parent = current;
-    arg->caller_fp = *(void **)__builtin_frame_address(0);
+    arg->caller_fp = current_thread->thr_fork_fp;
 
     arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (arg->tmp_stack == MAP_FAILED) {
@@ -7196,6 +7203,7 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
     current_thread = arg->thr;
 
     current_thread->thr_pthread = pthread_self();
+    current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
 
     task_lock(current);
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
@@ -7919,20 +7927,23 @@ FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
 }
 
 FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
+    INFO("execvp: %s", file);
     char file_abs[PATH_MAX];
-    if (!strchr(file, '/')) {
+    if (strchr(file, '/')) {
         if (!current_normalize_path(file, file_abs))
             return -1;
         file = file_abs;
     }
-
-    const char *pathname = find_program_pathname(file);
-    if (!pathname) {
-        errno = ENOENT;
-        return -1;
+    else {
+        const char *pathname = find_program_pathname(file);
+        if (!pathname) {
+            errno = ENOENT;
+            return -1;
+        }
+        file = pathname;
     }
 
-    return execve(pathname, argv, tvm_environ);
+    return execve(file, argv, tvm_environ);
 }
 
 #if defined(__linux__)
@@ -8433,19 +8444,21 @@ FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode,
 
 FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {
     char file_abs[PATH_MAX];
-    if (!strchr(file, '/')) {
+    if (strchr(file, '/')) {
         if (!current_normalize_path(file, file_abs))
             return -1;
         file = file_abs;
     }
-
-    const char *pathname = find_program_pathname(file);
-    if (!pathname) {
-        errno = ENOENT;
-        return -1;
+    else {
+        const char *pathname = find_program_pathname(file);
+        if (!pathname) {
+            errno = ENOENT;
+            return -1;
+        }
+        file = pathname;
     }
 
-    return execve(pathname, argv, envp);
+    return execve(file, argv, envp);
 }
 
 FUNCTION_DEFINE0(int, clearenv) {
