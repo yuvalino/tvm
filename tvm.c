@@ -3720,6 +3720,34 @@ int emulator_engine_add_map_entry(struct emulator_engine *ee, uint64_t start, si
     return 0;
 }
 
+struct emulator_saved_state_arm64 {
+    uint64_t x[29];
+    uint64_t fp;
+    uint64_t lr;
+    uint64_t sp;
+    uint64_t pc;
+};
+
+struct emulator_saved_state_x86_64 {
+    uint64_t rax;
+    uint64_t rbp;
+    uint64_t rbx;
+    uint64_t rcx;
+    uint64_t rdi;
+    uint64_t rdx;
+    uint64_t rip;
+    uint64_t rsi;
+    uint64_t rsp;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+};
+
 #define EMULATOR_STACK_SIZE (0x1000 * 2000) // 8Mb
 
 enum {
@@ -3731,7 +3759,10 @@ struct emulator_saved_state {
     struct emulator_saved_state *ess_next;
     int ess_arch;
     int ess_abi;
-    uc_context *ess_context;
+    union {
+        struct emulator_saved_state_arm64 arm64;
+        struct emulator_saved_state_x86_64 x86_64;
+    } ess_context;
     void   *ess_stack;
     size_t  ess_stack_size;
 
@@ -3755,60 +3786,39 @@ void emulator_saved_state_destroy(struct emulator_saved_state *ss) {
         ss->ess_stack_size = 0;
     }
 
-    if (ss->ess_context) {
-        uc_context_free(ss->ess_context);
-        ss->ess_context = NULL;
-    }
-
     kfree(ss);
 }
 
-int emulator_saved_state_read_reg(struct emulator_saved_state *ss, int reg, uint64_t *out) {
+uint64_t emulator_saved_state_read_reg(struct emulator_saved_state *ss, int reg) {
     uc_err err = UC_ERR_ARCH;
     if (ss->ess_arch == ULARCH_ARM64) {
-        if (reg == ESS_REG_PC)
-            err = uc_context_reg_read(ss->ess_context, UC_ARM64_REG_PC, out);
-        else if (reg == ESS_REG_SP)
-            err = uc_context_reg_read(ss->ess_context, UC_ARM64_REG_SP, out);
-        else if (reg == ESS_REG_RET)
-            err = uc_context_reg_read(ss->ess_context, UC_ARM64_REG_X0, out);
+        if (reg == ESS_REG_PC)  return ss->ess_context.arm64.pc;
+        if (reg == ESS_REG_SP)  return ss->ess_context.arm64.sp;
+        if (reg == ESS_REG_RET) return ss->ess_context.arm64.x[0];
     }
     else if (ss->ess_arch == ULARCH_X86_64) {
-        if (reg == ESS_REG_PC)
-            err = uc_context_reg_read(ss->ess_context, UC_X86_REG_RIP, out);
-        else if (reg == ESS_REG_SP)
-            err = uc_context_reg_read(ss->ess_context, UC_X86_REG_RSP, out);
-        else if (reg == ESS_REG_RET)
-            err = uc_context_reg_read(ss->ess_context, UC_X86_REG_RAX, out);
+        if (reg == ESS_REG_PC)  return ss->ess_context.x86_64.rip;
+        if (reg == ESS_REG_SP)  return ss->ess_context.x86_64.rsp;
+        if (reg == ESS_REG_RET) return ss->ess_context.x86_64.rax;
     }
 
-    if (err)
-        INFO("emulator_saved_state_read_reg(arch=%d, reg=%d) failed %s", ss->ess_arch, reg, uc_strerror(err));
-    return (int)err;
+    panic("emulator_saved_state_read_reg(arch=%d, reg=%d) unknown reg", ss->ess_arch, reg);
 }
 
-int emulator_saved_state_write_reg(struct emulator_saved_state *ss, int reg, const uint64_t *in) {
+void emulator_saved_state_write_reg(struct emulator_saved_state *ss, int reg, uint64_t val) {
     uc_err err = UC_ERR_ARCH;
     if (ss->ess_arch == ULARCH_ARM64) {
-        if (reg == ESS_REG_PC)
-            err = uc_context_reg_write(ss->ess_context, UC_ARM64_REG_PC, in);
-        else if (reg == ESS_REG_SP)
-            err = uc_context_reg_write(ss->ess_context, UC_ARM64_REG_SP, in);
-        else if (reg == ESS_REG_RET)
-            err = uc_context_reg_write(ss->ess_context, UC_ARM64_REG_X0, in);
+        if (reg == ESS_REG_PC)  { ss->ess_context.arm64.pc   = val; return; }
+        if (reg == ESS_REG_SP)  { ss->ess_context.arm64.sp   = val; return; }
+        if (reg == ESS_REG_RET) { ss->ess_context.arm64.x[0] = val; return; }
     }
     else if (ss->ess_arch == ULARCH_X86_64) {
-        if (reg == ESS_REG_PC)
-            err = uc_context_reg_write(ss->ess_context, UC_X86_REG_RIP, in);
-        else if (reg == ESS_REG_SP)
-            err = uc_context_reg_write(ss->ess_context, UC_X86_REG_RSP, in);
-        else if (reg == ESS_REG_RET)
-            err = uc_context_reg_write(ss->ess_context, UC_X86_REG_RAX, in);
+        if (reg == ESS_REG_PC)  { ss->ess_context.x86_64.rip = val; return; }
+        if (reg == ESS_REG_SP)  { ss->ess_context.x86_64.rsp = val; return; }
+        if (reg == ESS_REG_RET) { ss->ess_context.x86_64.rax = val; return; }
     }
 
-    if (err)
-        INFO("emulator_saved_state_write_reg(arch=%d, reg=%d) failed %s", ss->ess_arch, reg, uc_strerror(err));
-    return (int)err;
+    INFO("emulator_saved_state_write_reg(arch=%d, reg=%d) unknown reg", ss->ess_arch, reg);
 }
 
 uc_context *uc_context_alloc_arch(uc_engine *engine, int arch)
@@ -3841,21 +3851,17 @@ out:
     return ret;
 }
 
-struct emulator_saved_state *emulator_saved_state_create(uc_engine *engine, int arch, int abi)
+struct emulator_saved_state *emulator_saved_state_create(int arch, int abi)
 {
     struct emulator_saved_state *ess = NULL;
     struct emulator_saved_state *ret = NULL;
 
     if (!(ess = kalloc(sizeof(struct emulator_saved_state))))
         goto out;
+    memset(ess, 0, sizeof(*ess));
 
     ess->ess_arch = arch;
     ess->ess_abi  = abi;
-    ess->ess_intr = ESS_INTR_UNSPEC;
-    ess->ess_next = NULL;
-
-    if (!(ess->ess_context = uc_context_alloc_arch(engine, arch)))
-        goto out;
 
     void *stack = CALL_FUNC(mmap, NULL, EMULATOR_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (stack == MAP_FAILED)
@@ -3865,9 +3871,7 @@ struct emulator_saved_state *emulator_saved_state_create(uc_engine *engine, int 
 
     // point rsp to stack top
     uint64_t stack_top = (uint64_t)ess->ess_stack + ess->ess_stack_size;
-    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &stack_top))
-        goto out;
-
+    emulator_saved_state_write_reg(ess, ESS_REG_SP, stack_top);
     ret = ess;
 out:
     if (!ret && ess)
@@ -3979,14 +3983,230 @@ bool emulator_hook_cb(uc_engine *uc, uc_mem_type type,
     return false;
 }
 
+int emulator_saved_state_from_uc(struct emulator_saved_state *ess, uc_engine *uc)
+{
+    int ret = 1;
+    uc_err err;
+
+    if (ess->ess_arch == ULARCH_ARM64) {
+        for (int i = 0; i < 29; i++) {
+            if ((err = uc_reg_read(uc, UC_ARM64_REG_X0 + i, &ess->ess_context.arm64.x[i]))) {
+                INFO("uc_reg_read(UC_ARM64_REG_X%d) failed: %s", i, uc_strerror(err));
+                goto out;
+            }
+        }
+        if ((err = uc_reg_read(uc, UC_ARM64_REG_FP, &ess->ess_context.arm64.fp))) {
+            INFO("uc_reg_read(UC_ARM64_REG_FP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_ARM64_REG_LR, &ess->ess_context.arm64.lr))) {
+            INFO("uc_reg_read(UC_ARM64_REG_LR) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_ARM64_REG_SP, &ess->ess_context.arm64.sp))) {
+            INFO("uc_reg_read(UC_ARM64_REG_SP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_ARM64_REG_PC, &ess->ess_context.arm64.pc))) {
+            INFO("uc_reg_read(UC_ARM64_REG_PC) failed: %s", uc_strerror(err));
+            goto out;
+        }
+    }
+    else if (ess->ess_arch == ULARCH_X86_64) {
+        if ((err = uc_reg_read(uc, UC_X86_REG_RAX, &ess->ess_context.x86_64.rax))) {
+            INFO("uc_reg_read(UC_X86_REG_RAX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RBP, &ess->ess_context.x86_64.rbp))) {
+            INFO("uc_reg_read(UC_X86_REG_RBP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RBX, &ess->ess_context.x86_64.rbx))) {
+            INFO("uc_reg_read(UC_X86_REG_RBX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RCX, &ess->ess_context.x86_64.rcx))) {
+            INFO("uc_reg_read(UC_X86_REG_RCX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RDI, &ess->ess_context.x86_64.rdi))) {
+            INFO("uc_reg_read(UC_X86_REG_RDI) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RDX, &ess->ess_context.x86_64.rdx))) {
+            INFO("uc_reg_read(UC_X86_REG_RDX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RIP, &ess->ess_context.x86_64.rip))) {
+            INFO("uc_reg_read(UC_X86_REG_RIP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RSI, &ess->ess_context.x86_64.rsi))) {
+            INFO("uc_reg_read(UC_X86_REG_RSI) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_RSP, &ess->ess_context.x86_64.rsp))) {
+            INFO("uc_reg_read(UC_X86_REG_RSP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R8, &ess->ess_context.x86_64.r8))) {
+            INFO("uc_reg_read(UC_X86_REG_R8) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R9, &ess->ess_context.x86_64.r9))) {
+            INFO("uc_reg_read(UC_X86_REG_R9) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R10, &ess->ess_context.x86_64.r10))) {
+            INFO("uc_reg_read(UC_X86_REG_R10) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R11, &ess->ess_context.x86_64.r11))) {
+            INFO("uc_reg_read(UC_X86_REG_R11) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R12, &ess->ess_context.x86_64.r12))) {
+            INFO("uc_reg_read(UC_X86_REG_R12) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R13, &ess->ess_context.x86_64.r13))) {
+            INFO("uc_reg_read(UC_X86_REG_R13) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R14, &ess->ess_context.x86_64.r14))) {
+            INFO("uc_reg_read(UC_X86_REG_R14) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_read(uc, UC_X86_REG_R15, &ess->ess_context.x86_64.r15))) {
+            INFO("uc_reg_read(UC_X86_REG_R15) failed: %s", uc_strerror(err));
+            goto out;
+        }
+    }
+    else
+        panic("emulator_saved_state_from_uc(arch=%d) unknown arch", ess->ess_arch);
+    
+    ret = 0;
+
+out:
+
+    return ret;
+}
+
+int emulator_saved_state_to_uc(struct emulator_saved_state *ess, uc_engine *uc)
+{
+    int ret = 1;
+    uc_err err;
+
+    if (ess->ess_arch == ULARCH_ARM64) {
+        for (int i = 0; i < 29; i++) {
+            if ((err = uc_reg_write(uc, UC_ARM64_REG_X0 + i, &ess->ess_context.arm64.x[i]))) {
+                INFO("uc_reg_write(UC_ARM64_REG_X%d) failed: %s", i, uc_strerror(err));
+                goto out;
+            }
+        }
+        if ((err = uc_reg_write(uc, UC_ARM64_REG_FP, &ess->ess_context.arm64.fp))) {
+            INFO("uc_reg_write(UC_ARM64_REG_FP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_ARM64_REG_LR, &ess->ess_context.arm64.lr))) {
+            INFO("uc_reg_write(UC_ARM64_REG_LR) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_ARM64_REG_SP, &ess->ess_context.arm64.sp))) {
+            INFO("uc_reg_write(UC_ARM64_REG_SP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_ARM64_REG_PC, &ess->ess_context.arm64.pc))) {
+            INFO("uc_reg_write(UC_ARM64_REG_PC) failed: %s", uc_strerror(err));
+            goto out;
+        }
+    }
+    else if (ess->ess_arch == ULARCH_X86_64) {
+        if ((err = uc_reg_write(uc, UC_X86_REG_RAX, &ess->ess_context.x86_64.rax))) {
+            INFO("uc_reg_write(UC_X86_REG_RAX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RBP, &ess->ess_context.x86_64.rbp))) {
+            INFO("uc_reg_write(UC_X86_REG_RBP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RBX, &ess->ess_context.x86_64.rbx))) {
+            INFO("uc_reg_write(UC_X86_REG_RBX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RCX, &ess->ess_context.x86_64.rcx))) {
+            INFO("uc_reg_write(UC_X86_REG_RCX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RDI, &ess->ess_context.x86_64.rdi))) {
+            INFO("uc_reg_write(UC_X86_REG_RDI) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RDX, &ess->ess_context.x86_64.rdx))) {
+            INFO("uc_reg_write(UC_X86_REG_RDX) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RIP, &ess->ess_context.x86_64.rip))) {
+            INFO("uc_reg_write(UC_X86_REG_RIP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RSI, &ess->ess_context.x86_64.rsi))) {
+            INFO("uc_reg_write(UC_X86_REG_RSI) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_RSP, &ess->ess_context.x86_64.rsp))) {
+            INFO("uc_reg_write(UC_X86_REG_RSP) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R8, &ess->ess_context.x86_64.r8))) {
+            INFO("uc_reg_write(UC_X86_REG_R8) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R9, &ess->ess_context.x86_64.r9))) {
+            INFO("uc_reg_write(UC_X86_REG_R9) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R10, &ess->ess_context.x86_64.r10))) {
+            INFO("uc_reg_write(UC_X86_REG_R10) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R11, &ess->ess_context.x86_64.r11))) {
+            INFO("uc_reg_write(UC_X86_REG_R11) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R12, &ess->ess_context.x86_64.r12))) {
+            INFO("uc_reg_write(UC_X86_REG_R12) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R13, &ess->ess_context.x86_64.r13))) {
+            INFO("uc_reg_write(UC_X86_REG_R13) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R14, &ess->ess_context.x86_64.r14))) {
+            INFO("uc_reg_write(UC_X86_REG_R14) failed: %s", uc_strerror(err));
+            goto out;
+        }
+        if ((err = uc_reg_write(uc, UC_X86_REG_R15, &ess->ess_context.x86_64.r15))) {
+            INFO("uc_reg_write(UC_X86_REG_R15) failed: %s", uc_strerror(err));
+            goto out;
+        }
+    }
+    else
+        panic("emulator_saved_state_from_uc(arch=%d) unknown arch", ess->ess_arch);
+    
+    ret = 0;
+
+out:
+
+    return ret;
+}
+
 int emulator_step(struct emulator_context *ec)
 {
     int ret = 1;
     uc_err err = UC_ERR_ARCH;
     
-    uint64_t pc;
-    if (0 != emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC, &pc))
-        goto out;
+    uint64_t pc = emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC);
  
     if (ec->ec_curr_engine->ee_refresh) {
         if (0 != emulator_engine_reset(ec->ec_curr_engine))
@@ -3994,24 +4214,16 @@ int emulator_step(struct emulator_context *ec)
         ec->ec_curr_engine->ee_refresh = 0;
     }
 
-    err = uc_context_restore(ec->ec_curr_engine->ee_uc, ec->ec_ss->ess_context);
-    if (err) {
-        INFO("uc_context_restore(ess_arch=%d) failed: %s", ec->ec_ss->ess_arch, uc_strerror(err));
+    if (0 != emulator_saved_state_to_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc))
         goto out;
-    }
 
     ec->ec_ss->ess_intr = ESS_INTR_UNSPEC;
     err = uc_emu_start(ec->ec_curr_engine->ee_uc, pc, 0, 0, 0);
 
-    uc_err err2 = uc_context_save(ec->ec_curr_engine->ee_uc, ec->ec_ss->ess_context);
-    if (err2) {
-        INFO("uc_context_save(ess_arch=%d) failed: %s", ec->ec_ss->ess_arch, uc_strerror(err2));
-        goto out;
-    }
-
-    if (0 != emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC, &pc))
+    if (0 != emulator_saved_state_from_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc))
         goto out;
 
+    pc = emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC);
     if (ec->ec_ss->ess_intr == ESS_INTR_UNSPEC) {
         INFO("emulator_step: invalid stop pc=%p err=%d (%s)", (void *)pc, err, uc_strerror(err));
         goto out;
@@ -4031,171 +4243,74 @@ struct emulator_call_params {
     uint64_t arg[EMULATOR_PARAMS_COUNT];
 };
 
-int emulator_call_params_from_saved_state(struct emulator_call_params *params, struct emulator_saved_state *ess)
+void emulator_call_params_from_saved_state(struct emulator_call_params *params, struct emulator_saved_state *ess)
 {
-    int ret = 1;
-    uc_err err = UC_ERR_OK;
-
     int nonstack_param_count = EMULATOR_PARAMS_COUNT;
 
-    if (0 != emulator_saved_state_read_reg(ess, ESS_REG_PC, &params->pc))
-        goto out;
-
+    params->pc = emulator_saved_state_read_reg(ess, ESS_REG_PC);
     if (ess->ess_arch == ULARCH_ARM64) {
         nonstack_param_count = 8;
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X0, &params->arg[0]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X0) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X1, &params->arg[1]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X2, &params->arg[2]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X3, &params->arg[3]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X4, &params->arg[4]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X5, &params->arg[5]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X6, &params->arg[6]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X7, &params->arg[7]))) {
-            INFO("uc_context_reg_read(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
+        params->arg[0] = ess->ess_context.arm64.x[0];
+        params->arg[1] = ess->ess_context.arm64.x[1];
+        params->arg[2] = ess->ess_context.arm64.x[2];
+        params->arg[3] = ess->ess_context.arm64.x[3];
+        params->arg[4] = ess->ess_context.arm64.x[4];
+        params->arg[5] = ess->ess_context.arm64.x[5];
+        params->arg[6] = ess->ess_context.arm64.x[6];
+        params->arg[7] = ess->ess_context.arm64.x[7];
     }
     else if (ess->ess_arch == ULARCH_X86_64) {
         nonstack_param_count = 6;
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RDI, &params->arg[0]))) {
-            INFO("uc_context_reg_read(UC_X86_REG_RDI) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RSI, &params->arg[1]))) {
-            INFO("uc_context_reg_read(UC_X86_REG_RSI) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RDX, &params->arg[2]))) {
-            INFO("uc_context_reg_read(UC_X86_REG_RDX) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RCX, &params->arg[3]))) {
-            INFO("uc_context_reg_read(UC_X86_REG_RCX) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R8, &params->arg[4]))) {
-            INFO("uc_context_reg_read(UC_X86_REG_R8) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R9, &params->arg[5]))) {
-            INFO("uc_context_reg_read(UC_X86_REG_R9) failed %s", uc_strerror(err));
-            goto out;
-        }
+        params->arg[0] = ess->ess_context.x86_64.rdi;
+        params->arg[1] = ess->ess_context.x86_64.rsi;
+        params->arg[2] = ess->ess_context.x86_64.rdx;
+        params->arg[3] = ess->ess_context.x86_64.rcx;
+        params->arg[4] = ess->ess_context.x86_64.r8;
+        params->arg[5] = ess->ess_context.x86_64.r9;
     }
+    else
+        panic("emulator_call_params_from_saved_state(arch=%d) unknown arch", ess->ess_arch);
 
     // rest of arguments passed on stack
-    uint64_t sp;
-    if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
-        goto out;
+    uint64_t sp = emulator_saved_state_read_reg(ess, ESS_REG_SP);
     memcpy(&params->arg[nonstack_param_count], (void *)sp, (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8);
-
-    ret = 0;
-
-out:
-
-    return ret;
 }
 
-int emulator_saved_state_from_call_params(struct emulator_saved_state *ess, struct emulator_call_params *params)
+void emulator_saved_state_from_call_params(struct emulator_saved_state *ess, struct emulator_call_params *params)
 {
     int ret = 1;
     uc_err err = UC_ERR_OK;
 
     int nonstack_param_count = EMULATOR_PARAMS_COUNT;
-    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &params->pc))
-        goto out;
+    emulator_saved_state_write_reg(ess, ESS_REG_PC, params->pc);
 
     if (ess->ess_arch == ULARCH_ARM64) {
         nonstack_param_count = 8;
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X0, &params->arg[0]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X0) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X1, &params->arg[1]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X2, &params->arg[2]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X3, &params->arg[3]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X4, &params->arg[4]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X5, &params->arg[5]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X6, &params->arg[6]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X7, &params->arg[7]))) {
-            INFO("uc_context_reg_write(UC_ARM64_REG_X1) failed %s", uc_strerror(err));
-            goto out;
-        }
+        ess->ess_context.arm64.x[0] = params->arg[0];
+        ess->ess_context.arm64.x[1] = params->arg[1];
+        ess->ess_context.arm64.x[2] = params->arg[2];
+        ess->ess_context.arm64.x[3] = params->arg[3];
+        ess->ess_context.arm64.x[4] = params->arg[4];
+        ess->ess_context.arm64.x[5] = params->arg[5];
+        ess->ess_context.arm64.x[6] = params->arg[6];
+        ess->ess_context.arm64.x[7] = params->arg[7];
     }
     else if (ess->ess_arch == ULARCH_X86_64) {
         nonstack_param_count = 6;
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RDI, &params->arg[0]))) {
-            INFO("uc_context_reg_write(UC_X86_REG_RDI) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RSI, &params->arg[1]))) {
-            INFO("uc_context_reg_write(UC_X86_REG_RSI) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RDX, &params->arg[2]))) {
-            INFO("uc_context_reg_write(UC_X86_REG_RDX) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RCX, &params->arg[3]))) {
-            INFO("uc_context_reg_write(UC_X86_REG_RCX) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R8, &params->arg[4]))) {
-            INFO("uc_context_reg_write(UC_X86_REG_R8) failed %s", uc_strerror(err));
-            goto out;
-        }
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R9, &params->arg[5]))) {
-            INFO("uc_context_reg_write(UC_X86_REG_R9) failed %s", uc_strerror(err));
-            goto out;
-        }
+        ess->ess_context.x86_64.rdi = params->arg[0];
+        ess->ess_context.x86_64.rsi = params->arg[1];
+        ess->ess_context.x86_64.rdx = params->arg[2];
+        ess->ess_context.x86_64.rcx = params->arg[3];
+        ess->ess_context.x86_64.r8  = params->arg[4];
+        ess->ess_context.x86_64.r9  = params->arg[5];
     }
+    else
+        panic("emulator_saved_state_from_call_params(arch=%d) unknown arch", ess->ess_arch);
 
     // rest of arguments passed on stack
-    uint64_t sp;
-    if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
-        goto out;
+    uint64_t sp = emulator_saved_state_read_reg(ess, ESS_REG_SP);
     sp -= (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8;
-    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &sp))
-        goto out;
+    emulator_saved_state_write_reg(ess, ESS_REG_SP, sp);
     memcpy((void *)sp, &params->arg[nonstack_param_count], (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8);
 
     ret = 0;
@@ -4211,19 +4326,12 @@ int emulator_saved_state_enter_call(struct emulator_saved_state *ess, uint64_t l
     uc_err err;
 
     if (ess->ess_arch == ULARCH_ARM64) {
-        err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_LR, &lr);
-        if (err) {
-            INFO("emulator_saved_state_enter_call(arch=%d) failed %s", ess->ess_arch, uc_strerror(err));
-            goto out;
-        }
+        ess->ess_context.arm64.lr = lr;
     }
     else if (ess->ess_arch == ULARCH_X86_64) {
-        uint64_t sp;
-        if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
-            goto out;
+        uint64_t sp = emulator_saved_state_read_reg(ess, ESS_REG_SP);
         sp -= 8;
-        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &sp))
-            goto out;
+        emulator_saved_state_write_reg(ess, ESS_REG_SP, sp);
         memcpy((void *)sp, &lr, 8);
     }
 
@@ -4239,21 +4347,13 @@ int emulator_saved_state_exit_call(struct emulator_saved_state *ess, uint64_t *o
     uc_err err;
 
     if (ess->ess_arch == ULARCH_ARM64) {
-        err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_LR, out_lr);
-        if (err) {
-            INFO("emulator_saved_state_enter_call(arch=%d) failed %s", ess->ess_arch, uc_strerror(err));
-            goto out;
-        }
+        *out_lr = ess->ess_context.arm64.lr;
     }
     else if (ess->ess_arch == ULARCH_X86_64) {
-        uint64_t sp;
-        if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &sp))
-            goto out;
+        uint64_t sp = emulator_saved_state_read_reg(ess, ESS_REG_SP);
         memcpy(out_lr, (void *)sp, 8);
         sp += 8;
-        if (0 != emulator_saved_state_write_reg(ess, ESS_REG_SP, &sp))
-            goto out;
-        
+        emulator_saved_state_write_reg(ess, ESS_REG_SP, sp);
     }
 
     ret = 0;
@@ -4324,32 +4424,34 @@ int emulator_setjmp(jmp_buf env) {
     uint64_t *envarr = (uint64_t *)env;
 
     if (ess->ess_arch == ULARCH_X86_64/* && ess->ess_abi == ULABI_LINUX*/) {
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RBX, &envarr[0]))) panic("uc_context_reg_read(UC_X86_REG_RBX)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RBP, &envarr[1]))) panic("uc_context_reg_read(UC_X86_REG_RBP)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R12, &envarr[2]))) panic("uc_context_reg_read(UC_X86_REG_R12)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R13, &envarr[3]))) panic("uc_context_reg_read(UC_X86_REG_R13)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R14, &envarr[4]))) panic("uc_context_reg_read(UC_X86_REG_R14)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_R15, &envarr[5]))) panic("uc_context_reg_read(UC_X86_REG_R15)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_X86_REG_RSP, &envarr[6]))) panic("uc_context_reg_read(UC_X86_REG_RSP)");
+        envarr[0] = ess->ess_context.x86_64.rbx;
+        envarr[1] = ess->ess_context.x86_64.rbp;
+        envarr[2] = ess->ess_context.x86_64.r12;
+        envarr[3] = ess->ess_context.x86_64.r13;
+        envarr[4] = ess->ess_context.x86_64.r14;
+        envarr[5] = ess->ess_context.x86_64.r15;
+        envarr[6] = ess->ess_context.x86_64.rsp;
         envarr[7] = ess->ess_fault_lr;
     }
     else if (ess->ess_arch == ULARCH_ARM64/* && ess->ess_abi == ULABI_DARWIN*/)
     {
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X19, &envarr[0])))  panic("uc_context_reg_read(UC_ARM64_REG_X19)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X20, &envarr[1])))  panic("uc_context_reg_read(UC_ARM64_REG_X20)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X21, &envarr[2])))  panic("uc_context_reg_read(UC_ARM64_REG_X21)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X22, &envarr[3])))  panic("uc_context_reg_read(UC_ARM64_REG_X22)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X23, &envarr[4])))  panic("uc_context_reg_read(UC_ARM64_REG_X23)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X24, &envarr[5])))  panic("uc_context_reg_read(UC_ARM64_REG_X24)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X25, &envarr[6])))  panic("uc_context_reg_read(UC_ARM64_REG_X25)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X26, &envarr[7])))  panic("uc_context_reg_read(UC_ARM64_REG_X26)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X27, &envarr[8])))  panic("uc_context_reg_read(UC_ARM64_REG_X27)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X28, &envarr[9])))  panic("uc_context_reg_read(UC_ARM64_REG_X28)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X29, &envarr[10]))) panic("uc_context_reg_read(UC_ARM64_REG_X29)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_X30, &envarr[11]))) panic("uc_context_reg_read(UC_ARM64_REG_X30)");
-        if ((err = uc_context_reg_read(ess->ess_context, UC_ARM64_REG_SP,  &envarr[12]))) panic("uc_context_reg_read(UC_ARM64_REG_SP)");
+        envarr[0]  = ess->ess_context.arm64.x[19];
+        envarr[1]  = ess->ess_context.arm64.x[20];
+        envarr[2]  = ess->ess_context.arm64.x[21];
+        envarr[3]  = ess->ess_context.arm64.x[22];
+        envarr[4]  = ess->ess_context.arm64.x[23];
+        envarr[5]  = ess->ess_context.arm64.x[24];
+        envarr[6]  = ess->ess_context.arm64.x[25];
+        envarr[7]  = ess->ess_context.arm64.x[26];
+        envarr[8]  = ess->ess_context.arm64.x[27];
+        envarr[9]  = ess->ess_context.arm64.x[28];
+        envarr[10] = ess->ess_context.arm64.fp;
+        envarr[11] = ess->ess_context.arm64.lr;
+        envarr[12] = ess->ess_context.arm64.sp;
         envarr[13] = ess->ess_fault_lr;
     }
+    else
+        panic("emulator_setjmp(arch=%d) unknown arch", ess->ess_arch);
 
     return 0;
 }
@@ -4362,32 +4464,34 @@ int emulator_longjmp(jmp_buf env, int val) {
     if (!val) val = 1;
 
     if (ess->ess_arch == ULARCH_X86_64/* && ess->ess_abi == ULABI_LINUX*/) {
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RBX, &envarr[0]))) panic("uc_context_reg_write(UC_X86_REG_RBX)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RBP, &envarr[1]))) panic("uc_context_reg_write(UC_X86_REG_RBP)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R12, &envarr[2]))) panic("uc_context_reg_write(UC_X86_REG_R12)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R13, &envarr[3]))) panic("uc_context_reg_write(UC_X86_REG_R13)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R14, &envarr[4]))) panic("uc_context_reg_write(UC_X86_REG_R14)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_R15, &envarr[5]))) panic("uc_context_reg_write(UC_X86_REG_R15)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_X86_REG_RSP, &envarr[6]))) panic("uc_context_reg_write(UC_X86_REG_RSP)");
-        ess->ess_fault_lr = envarr[7];
+        ess->ess_context.x86_64.rbx = envarr[0];
+        ess->ess_context.x86_64.rbp = envarr[1];
+        ess->ess_context.x86_64.r12 = envarr[2];
+        ess->ess_context.x86_64.r13 = envarr[3];
+        ess->ess_context.x86_64.r14 = envarr[4];
+        ess->ess_context.x86_64.r15 = envarr[5];
+        ess->ess_context.x86_64.rsp = envarr[6];
+        ess->ess_fault_lr           = envarr[7];
     }
     else if (ess->ess_arch == ULARCH_ARM64/* && ess->ess_abi == ULABI_DARWIN*/)
     {
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X19, &envarr[0])))  panic("uc_context_reg_write(UC_ARM64_REG_X19)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X20, &envarr[1])))  panic("uc_context_reg_write(UC_ARM64_REG_X20)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X21, &envarr[2])))  panic("uc_context_reg_write(UC_ARM64_REG_X21)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X22, &envarr[3])))  panic("uc_context_reg_write(UC_ARM64_REG_X22)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X23, &envarr[4])))  panic("uc_context_reg_write(UC_ARM64_REG_X23)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X24, &envarr[5])))  panic("uc_context_reg_write(UC_ARM64_REG_X24)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X25, &envarr[6])))  panic("uc_context_reg_write(UC_ARM64_REG_X25)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X26, &envarr[7])))  panic("uc_context_reg_write(UC_ARM64_REG_X26)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X27, &envarr[8])))  panic("uc_context_reg_write(UC_ARM64_REG_X27)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X28, &envarr[9])))  panic("uc_context_reg_write(UC_ARM64_REG_X28)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X29, &envarr[10]))) panic("uc_context_reg_write(UC_ARM64_REG_X29)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_X30, &envarr[11]))) panic("uc_context_reg_write(UC_ARM64_REG_X30)");
-        if ((err = uc_context_reg_write(ess->ess_context, UC_ARM64_REG_SP,  &envarr[12]))) panic("uc_context_reg_write(UC_ARM64_REG_SP)");
-        ess->ess_fault_lr = envarr[13];
+        ess->ess_context.arm64.x[19] = envarr[0];
+        ess->ess_context.arm64.x[20] = envarr[1];
+        ess->ess_context.arm64.x[21] = envarr[2];
+        ess->ess_context.arm64.x[22] = envarr[3];
+        ess->ess_context.arm64.x[23] = envarr[4];
+        ess->ess_context.arm64.x[24] = envarr[5];
+        ess->ess_context.arm64.x[25] = envarr[6];
+        ess->ess_context.arm64.x[26] = envarr[7];
+        ess->ess_context.arm64.x[27] = envarr[8];
+        ess->ess_context.arm64.x[28] = envarr[9];
+        ess->ess_context.arm64.fp    = envarr[10];
+        ess->ess_context.arm64.lr    = envarr[11];
+        ess->ess_context.arm64.sp    = envarr[12];
+        ess->ess_fault_lr            = envarr[13];
     }
+    else
+        panic("emulator_longjmp(arch=%d) unknown arch", ess->ess_arch);
 
     return val;
 }
@@ -4465,7 +4569,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
         goto out;
     ec->ec_curr_engine = ee;
 
-    if (!(ess = emulator_saved_state_create(ee->ee_uc, pcinfo->udli_farch, pcinfo->udli_fabi)))
+    if (!(ess = emulator_saved_state_create(pcinfo->udli_farch, pcinfo->udli_fabi)))
         goto out;
 
     ess->ess_next = ec->ec_ss;
@@ -4473,9 +4577,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
 
     // initialize initial context
 
-    if (0 != emulator_saved_state_from_call_params(ess, params))
-        goto out;
-
+    emulator_saved_state_from_call_params(ess, params);
     
     // writes to SP in x86_64
     if (0 != emulator_saved_state_enter_call(ess, EMULATOR_CALL_END_LR))
@@ -4492,12 +4594,11 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
             }
 
             if (ess->ess_intr_addr == EMULATOR_CALL_END_LR) {
+                //INFO("emulator_call_ex ret: %p", (void *)emulator_saved_state_read_reg(ess, ESS_REG_RET));
                 // returned
-                uint64_t ret;
-                if (0 == emulator_saved_state_read_reg(ess, ESS_REG_RET, &ret))
-                    r = 0;
+                r = 0;
                 if (out_ret)
-                    *out_ret = ret;
+                    *out_ret = emulator_saved_state_read_reg(ess, ESS_REG_RET);
                 goto out;
             }
 
@@ -4507,19 +4608,22 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
             struct ulinker_dladdr_info fault_info;
             if (0 == emulator_find_dl(ec, ess->ess_intr_addr, &fault_info)) {
                 if (fault_info.udli_farch != ess->ess_arch) {
-                    
+
                     // read lr before call so stack is adjusted for emulator_call_params_from_saved_state()
                     if (0 != emulator_saved_state_exit_call(ess, &ess->ess_fault_lr))
                         goto out;
 
                     struct emulator_call_params fault_params;
-                    if (0 != emulator_call_params_from_saved_state(&fault_params, ess))
-                        goto out;
+                    emulator_call_params_from_saved_state(&fault_params, ess);
+
+                    // INFO("emulator_call_ex subcall: %p ( %p, %p )", (void *)fault_params.pc, (void *)fault_params.arg[0], (void *)fault_params.arg[1]);
 
                     // call with parameters and save ret
                     uint64_t fault_ret;
                     if (0 != emulator_call_ex(&fault_info, &fault_params, &fault_ret))
                         goto out;
+
+                    // INFO("emulator_call_ex subcall ret: %p", (void *)fault_ret);
 
                     // NOTE! It is possible `fork()` was called!
                     // Update local variables from thread state
@@ -4527,11 +4631,8 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
                     ee = emulator_context_get_or_create_engine(ec, pcinfo->udli_farch);
                     ess = ec->ec_ss;
 
-                    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_RET, &fault_ret))
-                        goto out;
-                    
-                    if (0 != emulator_saved_state_write_reg(ess, ESS_REG_PC, &ess->ess_fault_lr))
-                        goto out;
+                    emulator_saved_state_write_reg(ess, ESS_REG_RET, fault_ret);
+                    emulator_saved_state_write_reg(ess, ESS_REG_PC, ess->ess_fault_lr);
                     continue;
                 }
 
@@ -4542,10 +4643,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
             if (!fault_range_start || !fault_range_size) {
                 INFO("EMULATOR SEGFAULT AT %p", (void *)ess->ess_intr_addr);
 
-                uint64_t segfault_sp;
-                if (0 != emulator_saved_state_read_reg(ess, ESS_REG_SP, &segfault_sp))
-                    goto out;
-
+                uint64_t segfault_sp = emulator_saved_state_read_reg(ess, ESS_REG_SP);
                 INFO("emulator_call_ex segfault sp=%p", (void *)segfault_sp);
 
                 uint64_t ulr = 5;
@@ -4641,6 +4739,8 @@ int emulator_duplicate(struct emulator_context *old, struct emulator_context *ne
 {
     int ret = 1;
 
+    int prevtvm = TVM_OFF;
+
     // duplicate engines
     struct emulator_engine *new_prev_ee = NULL;
     for (struct emulator_engine *old_ee = old->ec_all_engines; old_ee; old_ee = old_ee->ee_next) {
@@ -4655,7 +4755,7 @@ int emulator_duplicate(struct emulator_context *old, struct emulator_context *ne
         new_prev_ee = new_ee;
 
         if (old->ec_curr_engine == old_ee)
-            new->ec_curr_engine == new_ee;
+            new->ec_curr_engine = new_ee;
         
         // NOTE: we can just let the emulator re-populate this on its own
         // struct emulator_map_entry *new_prev_eme = NULL;
@@ -4676,11 +4776,7 @@ int emulator_duplicate(struct emulator_context *old, struct emulator_context *ne
 
     struct emulator_saved_state *new_prev_ess = NULL;
     for (struct emulator_saved_state *old_ess = old->ec_ss; old_ess; old_ess = old_ess->ess_next) {
-        struct emulator_engine *new_ee = emulator_context_get_or_create_engine(new, old_ess->ess_arch);
-        if (!new_ee)
-            goto out;
-        
-        struct emulator_saved_state *new_ess = emulator_saved_state_create(new_ee->ee_uc, old_ess->ess_arch, old_ess->ess_abi);
+        struct emulator_saved_state *new_ess = emulator_saved_state_create(old_ess->ess_arch, old_ess->ess_abi);
         if (!new_ess)
             goto out;
         
@@ -4695,29 +4791,32 @@ int emulator_duplicate(struct emulator_context *old, struct emulator_context *ne
         new_ess->ess_intr_addr = old_ess->ess_intr_addr;
         new_ess->ess_fault_lr = old_ess->ess_fault_lr;
 
-        uint64_t old_sp;
-        if (UC_ERR_OK == emulator_saved_state_read_reg(old_ess, ESS_REG_SP, &old_sp))
-            goto out;
-        
+        uint64_t old_sp = emulator_saved_state_read_reg(old_ess, ESS_REG_SP);
         uint64_t new_sp = ((uint64_t)new_ess->ess_stack + (old_sp - (uint64_t)old_ess->ess_stack));
         uint64_t size_sp = (uint64_t)old_ess->ess_stack + old_ess->ess_stack_size - old_sp;
         
-        // TODO copy context
+        // copy the context (regs)
+        memcpy(&new_ess->ess_context, &old_ess->ess_context, sizeof(new_ess->ess_context));
 
         // copy the stack
         memcpy((void *)new_sp, (void *)old_sp, size_sp);
 
         if (dup_cb) {
-            // context dup
+            TVM_ON;
+            dup_cb(arg, (void *)&old_ess->ess_context, (void *)&new_ess->ess_context, sizeof(new_ess->ess_context));
             dup_cb(arg, (void *)old_sp, (void *)new_sp, size_sp);
             dup_cb(arg, (void *)&old_ess->ess_fault_lr, (void *)&new_ess->ess_fault_lr, sizeof(new_ess->ess_fault_lr));
             dup_cb(arg, (void *)&old_ess->ess_intr_addr, (void *)&new_ess->ess_intr_addr, sizeof(new_ess->ess_intr_addr));
+            TVM_OFF;
         }
     }
 
     ret = 0;
 
 out:
+
+    TVM_RESTORE(prevtvm);
+
     return ret;
 }
 
@@ -6968,6 +7067,14 @@ struct fork_arg {
     pid_t pid;
 };
 
+static void fork_dup_emulator_cb(struct fork_arg *arg, void *old_mem, void *new_mem, size_t size) {
+    if (0 != cow_fixup_ctx_add(&arg->fixup, new_mem, old_mem, size, 1)) {
+        arg->duplicate_errors++;
+        if (!arg->first_duplicate_error)
+            arg->first_duplicate_error = errno;
+    }
+}
+
 static void fork_dup_linker_cb(struct fork_arg *arg, void *old_map, void *new_map, size_t size, int prot) {
 
     int has_rw = ((PROT_READ | PROT_WRITE) == (prot & (PROT_READ | PROT_WRITE)));
@@ -7108,8 +7215,14 @@ static void *tvm_proc_entry(struct fork_arg *arg)
         goto fail;
     }
 
-    if (0 != emulator_duplicate(arg->parent_thr->thr_emulator, arg->thr->thr_emulator))
+    if (0 != emulator_duplicate(arg->parent_thr->thr_emulator, arg->thr->thr_emulator, (void (*)(void *arg, void *old_mem, void *new_mem, size_t size))fork_dup_emulator_cb, (void *)arg))
         goto fail;
+
+    if (arg->duplicate_errors) {
+        INFO("tvm_proc_entry - emulator_duplicate() - %zu duplicate errors - first error: %d", arg->duplicate_errors, arg->first_duplicate_error);
+        errno = arg->first_duplicate_error;
+        goto fail;
+    }
 
     arg->first_duplicate_error = 0;
     if (0 != rmem_arena_duplicate(
