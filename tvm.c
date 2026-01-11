@@ -3964,13 +3964,14 @@ int emulator_find_dl(struct emulator_context *ec, uint64_t pc, struct ulinker_dl
         return 0;
     }
 
-    Dl_info info;
-    if (dladdr((void *)pc, &info) && info.dli_fbase) {
+    // NOTE: This is way too slow, cache it or smth
+    // Dl_info info;
+    // if (dladdr((void *)pc, &info) && info.dli_fbase) {
         out_info->udli_farch = ULARCH_NONE;
         return 0;
-    }
+    // }
 
-    return 1;
+    // return 1;
 }
 
 bool emulator_hook_cb(uc_engine *uc, uc_mem_type type,
