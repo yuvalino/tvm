@@ -3803,6 +3803,7 @@ uint64_t emulator_saved_state_read_reg(struct emulator_saved_state *ss, int reg)
     }
 
     panic("emulator_saved_state_read_reg(arch=%d, reg=%d) unknown reg", ss->ess_arch, reg);
+    __builtin_unreachable();
 }
 
 void emulator_saved_state_write_reg(struct emulator_saved_state *ss, int reg, uint64_t val) {
@@ -3818,7 +3819,8 @@ void emulator_saved_state_write_reg(struct emulator_saved_state *ss, int reg, ui
         if (reg == ESS_REG_RET) { ss->ess_context.x86_64.rax = val; return; }
     }
 
-    INFO("emulator_saved_state_write_reg(arch=%d, reg=%d) unknown reg", ss->ess_arch, reg);
+    panic("emulator_saved_state_write_reg(arch=%d, reg=%d) unknown reg", ss->ess_arch, reg);
+    __builtin_unreachable();
 }
 
 uc_context *uc_context_alloc_arch(uc_engine *engine, int arch)
@@ -4312,12 +4314,6 @@ void emulator_saved_state_from_call_params(struct emulator_saved_state *ess, str
     sp -= (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8;
     emulator_saved_state_write_reg(ess, ESS_REG_SP, sp);
     memcpy((void *)sp, &params->arg[nonstack_param_count], (EMULATOR_PARAMS_COUNT - nonstack_param_count) * 8);
-
-    ret = 0;
-
-out:
-
-    return ret;
 }
 
 int emulator_saved_state_enter_call(struct emulator_saved_state *ess, uint64_t lr)
@@ -7245,7 +7241,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     //jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
 
     // fix the jmpbuf
-    uintptr_t *jb = (uintptr_t*) (&arg->jmpbuf_parent);
+    void **jb = (void **) (&arg->jmpbuf_parent);
     for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
         jb[i] = cow_fixup_translate(&arg->fixup, jb[i]);
 
