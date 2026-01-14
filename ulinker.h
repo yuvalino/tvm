@@ -43,6 +43,8 @@ struct ulinker_ops {
     void *(*uo_mmap)(void *, void *, size_t, int, int, int, off_t);
     int   (*uo_munmap)(void *, void *, size_t);
     int   (*uo_mprotect)(void *, void *, size_t, int);
+
+    void *(*uo_call)(void *, void *);
 };
 
 struct ulinker_external_dlinfo_args {
@@ -60,11 +62,6 @@ void *ulinker_dlopen(struct ulinker *ulinker, const char *filename, int flags);
 int   ulinker_dlclose(void *handle);
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all);
 char *ulinker_dlerror(void);
-
-/**
- * opens an executable file, closing all previous open libraries.
- */
-void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename);
 
 enum {
     ULARCH_NONE = 0,

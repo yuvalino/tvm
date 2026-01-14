@@ -1900,6 +1900,8 @@ static void *mmap_wrapper(void *arg, void *hint, size_t length, int prot, int fl
 static int   munmap_wrapper(void *arg, void *addr, size_t size)                                            { return munmap(addr, size); }
 static int   mprotect_wrapper(void *arg, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
 
+static void *call_wrapper(void *arg, void *addr) { return ((void *(*)(void))addr)(); }
+
 static struct ulinker_ops uo = {
     .uo_malloc = malloc_wrapper,
     .uo_free = free_wrapper,
@@ -1912,7 +1914,9 @@ static struct ulinker_ops uo = {
 
     .uo_mmap = mmap_wrapper,
     .uo_munmap = munmap_wrapper,
-    .uo_mprotect = mprotect_wrapper
+    .uo_mprotect = mprotect_wrapper,
+
+    .uo_call = call_wrapper,
 };
 
 /* ------------------- GDB JIT Interface ------------------- */
@@ -2022,6 +2026,7 @@ struct dlinfo {
     void *dl_base;
     size_t dl_size;
     int dl_linked;
+    int dl_constructors_called;
 };
 
 #define DLBASE(_ptr) ((struct dlinfo *)_ptr)
@@ -3447,6 +3452,53 @@ out:
     return ret;
 }
 
+static void call_function(struct ulinker *linker, struct dlinfo *dl, void *func) {
+    uo.uo_call(linker->ul_private, func);
+}
+
+static void call_macho64_constructors(struct dlinfo_macho64 *dl) {
+    const struct load_command *curr_lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd != LC_SEGMENT_64)
+            continue;
+        
+        const struct segment_command_64 *curr_sc = (const struct segment_command_64 *)curr_lc;
+
+        const struct section_64 *curr_sect = (const struct section_64 *)((uintptr_t)curr_sc + sizeof(struct segment_command_64));
+        for (size_t j = 0; j < curr_sc->nsects; ++j, curr_sect++) {
+            
+            if ( (curr_sect->flags & SECTION_TYPE) != S_INIT_FUNC_OFFSETS )
+                continue;
+            
+            // MachOAnalyzer::forEachInitializer implements various sanity checks here (prot, alignment)
+
+            const uint32_t *initsStart = (uint32_t *)(dl->dlm64_load_bias + curr_sect->addr);
+            const uint32_t *initsEnd = (uint32_t *)((uintptr_t)initsStart + curr_sect->size);
+            for (const uint32_t *p = initsStart; p < initsEnd; ++p) {
+                uint32_t initOffset = *p;
+                uintptr_t initAddr = vaddr_macho64(dl, initOffset);
+                if (initAddr)
+                    call_function(DLBASE(dl)->dl_linker, (struct dlinfo *)dl, (void *)initAddr);
+            }
+        }
+    }
+}
+
+static void call_constructors(struct dlinfo *dl) {
+    if (dl->dl_constructors_called)
+        return;
+
+    // We set constructors_called before actually calling the constructors, otherwise it doesn't
+    // protect against recursive constructor calls. One simple example of constructor recursion
+
+    dl->dl_constructors_called = 1;
+
+    // TODO call children ctors here
+
+    if (dl->dl_type == DLT_MACHO64)
+        call_macho64_constructors((struct dlinfo_macho64 *)dl);
+}
+
 static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename) {
     struct dlinfo *ret = NULL;
     struct dlinfo *dl = NULL;
@@ -3456,6 +3508,8 @@ static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename
     
     if (link_library(dl))
         goto out;
+
+    call_constructors(dl);
 
     ret = dl;
 
@@ -3630,60 +3684,6 @@ void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, i
 
 char *ulinker_dlerror(void) {
     return errormsg;
-}
-
-void *ulinker_dlopen_executable(struct ulinker *ulinker, const char *filename)
-{
-    struct ulinker *tmp_linker = ulinker_create(ulinker->ul_private);
-    if (!tmp_linker) {
-        ERROR("failed to load executable library \"%s\": -%d (%s)", filename, ENOMEM, strerror(ENOMEM));
-        return NULL;
-    }
-
-    struct dlinfo *dl = load_library(tmp_linker, filename);
-    if (!dl) {
-        ulinker_destroy(tmp_linker);
-        return NULL;
-    }
-
-    void *entry = lookup_symbol(dl, "main", 1);
-    if (!entry) {
-        ERROR("failed to load executable library \"%s\": symbol \"main\" not found", filename);
-        ulinker_destroy(tmp_linker);
-        return NULL;
-    }
-
-    // from here on out, no failing!
-
-    DLINFO_LOCK(ulinker);
-
-    // destroy all loaded libraries
-    while (ulinker->ul_dlinfo) {
-        struct dlinfo *curr_dl = ulinker->ul_dlinfo;
-
-        // end of linker-specific list
-        if (curr_dl->dl_type == DLT_EXTERNAL) {
-            ulinker->ul_dlinfo = NULL;
-            break;
-        }
-
-        ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, curr_dl);
-        ulinker->ul_dlinfo = curr_dl->dl_next;
-        free_library(curr_dl);
-    }
-
-    // move loaded libraries from tmp_linker to ulinker (fix linker back pointer too!)
-    ulinker->ul_dlinfo = tmp_linker->ul_dlinfo;
-    for (struct dlinfo *curr_dl = ulinker->ul_dlinfo; curr_dl; curr_dl = curr_dl->dl_next) {
-        // end of linker-specific list
-        if (curr_dl->dl_type == DLT_EXTERNAL) 
-            break;
-        curr_dl->dl_linker = ulinker;
-    }
-
-    DLINFO_UNLOCK(ulinker);
-
-    return entry;
 }
 
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {

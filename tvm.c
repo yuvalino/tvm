@@ -4503,16 +4503,16 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
     struct emulator_context *ec = current_thread->thr_emulator;
     uc_err err;
 
-    prevtvm = TVM_OFF;
-
     struct ulinker_dladdr_info local_pcinfo;
     if (!pcinfo) {
         if (0 != emulator_find_dl(ec, params->pc, &local_pcinfo)) {
             INFO("emulator_find_dl(pc=%p) failed", (void *)params->pc);
-            goto out;
+            return 1;
         }
         pcinfo = &local_pcinfo;
     }
+
+    prevtvm = TVM_OFF;
 
     // fast path: upcall to host
 #ifdef ENABLE_RWX
@@ -5620,6 +5620,13 @@ static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int fl
 static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            { return CALL_FUNC(munmap, addr, size); }
 static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return CALL_FUNC(mprotect, addr, size, flags); }
 
+static void *ulinker_call(void *arg, void *addr) {
+    uint64_t ret;
+    if (0 != emulator_call(&ret, (uint64_t)addr, 0, 0, 0, 0, 0, 0))
+        panic("ulinker_call emulator_call failed");
+    return (void *)ret;
+}
+
 static struct ulinker_ops ulinker_ops = {
     .uo_malloc = ulinker_malloc,
     .uo_free = ulinker_free,
@@ -5632,7 +5639,9 @@ static struct ulinker_ops ulinker_ops = {
 
     .uo_mmap = ulinker_mmap,
     .uo_munmap = ulinker_munmap,
-    .uo_mprotect = ulinker_mprotect
+    .uo_mprotect = ulinker_mprotect,
+
+    .uo_call = ulinker_call,
 };
 
 static void *ulinker_external_dlsym(void *arg, const char *s)
@@ -8005,7 +8014,37 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
-        main_func = (main_func_t)ulinker_dlopen_executable(current->tsk_linker, pathname);
+
+        struct ulinker *new_linker = ulinker_create((void *)current);
+        if (!new_linker) {
+            INFO("   failed(ENOMEM)");
+            errno = ENOMEM;
+            return -1;
+        }
+
+        struct ulinker *old_linker = current->tsk_linker;
+        current->tsk_linker = current_thread->thr_emulator->ec_ulinker = new_linker;
+
+        void *handle = ulinker_dlopen(new_linker, pathname, 0);
+        if (!handle) {
+            current->tsk_linker = current_thread->thr_emulator->ec_ulinker = old_linker;
+            ulinker_destroy(new_linker);
+            errno = ENOENT;
+            return -1;
+        }
+
+        void *entry = ulinker_dlsym(new_linker, handle, "main", 1);
+        if (!entry) {
+            INFO("failed to load executable library \"%s\": symbol \"main\" not found", pathname);
+            current->tsk_linker = current_thread->thr_emulator->ec_ulinker = old_linker;
+            ulinker_destroy(new_linker);
+            errno = EINVAL;
+            return -1;
+        }
+
+        ulinker_destroy(old_linker);
+
+        main_func = (main_func_t)entry;
     }
 
     if (!main_func) {
