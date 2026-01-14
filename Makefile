@@ -27,7 +27,6 @@ clean:
 	@rm *.a *.o || true
 	@rm test_tvm || true
 	@rm test_rmem || true
-	@rm forkless || true
 
 libtvm: dropbear mksh toybox unicorn minivim
 	$(CC) $(CFLAGS) -g -I.  -I./unicorn/include -c rmem.c ulinker.c tvm.c main.c
