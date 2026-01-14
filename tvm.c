@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <poll.h>
 #include <unistd.h>
+#include <err.h>
 #include <errno.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -365,6 +366,9 @@ DECL_FUNC(exit);
 DECL_FUNC(_exit);
 DECL_FUNC(_Exit);
 DECL_FUNC(abort);
+
+DECL_FUNC(verr);
+DECL_FUNC(verrx);
 
 DECL_FUNC(getpid);
 DECL_FUNC(getppid);
@@ -5056,6 +5060,21 @@ _rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
 FUNCTION_METADATA(_name, &_name); \
 _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 
+#define __FUNCTION_DEFINE_NORET_VAx(_x, _name, ...) \
+void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
+void _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
+    struct tvm_call __call = { call, __builtin_return_address(0) }; \
+    call = &__call; \
+    va_list __ap; \
+    va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
+    __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
+    va_end(__ap); \
+    panic("returned"); \
+    __builtin_unreachable(); \
+} \
+FUNCTION_METADATA(_name, &_name); \
+void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
+
 #define FUNCTION_DEFINE0(_rettype, _name)      __FUNCTION_DEFINEx(0, _rettype, _name)
 #define FUNCTION_DEFINE1(_rettype, _name, ...) __FUNCTION_DEFINEx(1, _rettype, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE2(_rettype, _name, ...) __FUNCTION_DEFINEx(2, _rettype, _name, __VA_ARGS__)
@@ -5074,13 +5093,25 @@ _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 
 #define FUNCTION_DEFINE_NORET0(_name)      __FUNCTION_DEFINE_NORETx(0, _name)
 #define FUNCTION_DEFINE_NORET1(_name, ...) __FUNCTION_DEFINE_NORETx(1, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET2(_name, ...) __FUNCTION_DEFINE_NORETx(2, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET3(_name, ...) __FUNCTION_DEFINE_NORETx(3, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET4(_name, ...) __FUNCTION_DEFINE_NORETx(4, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET5(_name, ...) __FUNCTION_DEFINE_NORETx(5, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET6(_name, ...) __FUNCTION_DEFINE_NORETx(6, _name, __VA_ARGS__)
 
-#define FUNCTION_DEFINE_VA1(_name, ...) __FUNCTION_DEFINE_VAx(1, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_VA2(_name, ...) __FUNCTION_DEFINE_VAx(2, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_VA3(_name, ...) __FUNCTION_DEFINE_VAx(3, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_VA4(_name, ...) __FUNCTION_DEFINE_VAx(4, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_VA5(_name, ...) __FUNCTION_DEFINE_VAx(5, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_VA6(_name, ...) __FUNCTION_DEFINE_VAx(6, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA1(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(1, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA2(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(2, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA3(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(3, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA4(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(4, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA5(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(5, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VA6(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(6, _rettype, _name, __VA_ARGS__)
+
+#define FUNCTION_DEFINE_NORET_VA1(_name, ...) __FUNCTION_DEFINE_NORET_VAx(1, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET_VA2(_name, ...) __FUNCTION_DEFINE_NORET_VAx(2, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET_VA3(_name, ...) __FUNCTION_DEFINE_NORET_VAx(3, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET_VA4(_name, ...) __FUNCTION_DEFINE_NORET_VAx(4, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET_VA5(_name, ...) __FUNCTION_DEFINE_NORET_VAx(5, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_NORET_VA6(_name, ...) __FUNCTION_DEFINE_NORET_VAx(6, _name, __VA_ARGS__)
 
 /////////////
 // TVM builtins
@@ -7622,6 +7653,41 @@ int atexit(exit_t function) {
 
     errno = ENOMEM;
     return -1;
+}
+
+FUNCTION_DEFINE_NORET_VA2(errx, int, eval, const char *, fmt) {
+    verrx(eval, fmt, __ap);
+}
+
+FUNCTION_DEFINE_NORET_VA2(err, int, eval, const char *, fmt) {
+    verr(eval, fmt, __ap);
+}
+
+FUNCTION_DEFINE_NORET3(verr, int, eval, const char *, fmt, va_list, args) {
+    int saved_errno = errno;
+
+    if (*current->tsk_comm)
+        fprintf(stderr, "%s: ", current->tsk_comm);
+
+    if (fmt) {
+        vfprintf(stderr, fmt, args);
+        fprintf(stderr, ": ");
+    }
+
+    fprintf(stderr, "%s\n", strerror(saved_errno));
+    exit(eval);
+}
+
+FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
+    if (*current->tsk_comm)
+        fprintf(stderr, "%s: ", current->tsk_comm);
+
+    if (fmt) {
+        vfprintf(stderr, fmt, args);
+    }
+
+    fprintf(stderr, "\n");
+    exit(eval);
 }
 
 FUNCTION_DEFINE0(pid_t, getpid) {
