@@ -1215,6 +1215,8 @@ struct fops {
     int (*f_readdir)(struct file *file, struct dirent *out);
     ssize_t (*f_write)(struct file *file, const void *buf, size_t count, int offset);
     void (*f_close)(struct file *file);
+
+    void *(*f_mmap)(void *hint, size_t size, int prot, int flags, struct file *file, off_t offset);
 };
 
 struct device {
@@ -1420,10 +1422,36 @@ struct file *file_dup_locked(struct file *oldfile) {
     return newfile;
 }
 
+int file_access(const char *pathname, int mode, int flags) {
+    struct stat st;
+    struct device *dev;
+    list_for_each_entry(dev, &devices, dev_list) {
+        int last_errno = errno;
+        if (0 == dev->dev_fops.f_stat(pathname, &st, flags)) {
+            if (mode == 0 || mode == F_OK)
+                return 0;
+            if ((mode & X_OK) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
+                return 0;
+            if ((mode & W_OK) && (st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
+                return 0;
+            if ((mode & R_OK) && (st.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)))
+                return 0;
+            errno = EACCES;
+            return -1;
+        }
+
+        if (errno != ENOTSUP) {
+            return -1;
+        }
+        
+        errno = last_errno;
+    };
+
+    return CALL_FUNC(faccessat, AT_FDCWD, pathname, mode, flags);
+}
+
 int file_stat(const char *pathname, struct stat *statbuf, int flag)
 {
-    // TODO support opening devices when dirfd != AT_FDCWD
-
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
@@ -1441,10 +1469,8 @@ int file_stat(const char *pathname, struct stat *statbuf, int flag)
     return CALL_FUNC(fstatat, AT_FDCWD, pathname, statbuf, flag);
 }
 
-int file_chmod(int dirfd, const char *pathname, mode_t mode, int flag)
+int file_chmod(const char *pathname, mode_t mode, int flag)
 {
-    // TODO support opening devices when dirfd != AT_FDCWD
-
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
@@ -1459,13 +1485,11 @@ int file_chmod(int dirfd, const char *pathname, mode_t mode, int flag)
         errno = last_errno;
     };
 
-    return CALL_FUNC(fchmodat, dirfd, pathname, mode, flag);
+    return CALL_FUNC(fchmodat, AT_FDCWD, pathname, mode, flag);
 }
 
-int file_chown(int dirfd, const char *pathname, uid_t owner, gid_t group, int flag)
+int file_chown(const char *pathname, uid_t owner, gid_t group, int flag)
 {
-    // TODO support opening devices when dirfd != AT_FDCWD
-
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
@@ -1480,7 +1504,7 @@ int file_chown(int dirfd, const char *pathname, uid_t owner, gid_t group, int fl
         errno = last_errno;
     };
 
-    return CALL_FUNC(fchownat, dirfd, pathname, owner, group, flag);
+    return CALL_FUNC(fchownat, AT_FDCWD, pathname, owner, group, flag);
 }
 
 
@@ -4843,6 +4867,45 @@ static int vfsop_readdir(struct file *file, struct dirent *out)
     return 0;
 }
 
+void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file, off_t offset) {
+    struct vfs_node *vn = vn_for_file_locked(file);
+    if (!vn)
+        return MAP_FAILED;
+
+    if (!S_ISREG(vn->vn_st.st_mode)) {
+        vn_unlock(vn, 1);
+        errno = ENOTSUP;
+        return MAP_FAILED;
+    }
+
+    void *ret = CALL_FUNC(mmap, hint, size, prot | PROT_WRITE, flags | MAP_ANONYMOUS, -1, 0);
+    if (ret == MAP_FAILED) {
+        vn_unlock(vn, 1);
+        return MAP_FAILED;
+    }
+
+    size_t op_offset = offset;
+    size_t op_left = 0;
+
+    if (op_offset < vn->vn_size)
+        op_left = vn->vn_size - op_offset;
+
+    size_t op_size = size;
+    if (op_size > op_left)
+        op_size = op_left;
+
+    memcpy(ret, vn->vn_data + op_offset, op_size);
+
+    if (0 == (prot & PROT_WRITE)) {
+        // if this fails, its probably some new RWX mitigation
+        VERIFY(0 == CALL_FUNC(mprotect, ret, size, prot));
+    }
+
+    vn_unlock(vn, 1);
+
+    return ret;
+}
+
 static struct device devvfs = {
     .dev_type = DEV_VFS,
     .dev_fops = {
@@ -4863,6 +4926,7 @@ static struct device devvfs = {
         .f_close = vfsop_close,
 
         .f_readdir = vfsop_readdir,
+        .f_mmap = vfsop_mmap,
     }
 };
 
@@ -7400,16 +7464,18 @@ struct rmem_ops rmem_ops = {
 
 #define ULINKER_ARENA(_arg) ((_arg) ? ((struct task *)arg)->tsk_ar : global_arena)
 
+// NOTE: we want to support destroying a linker from a different task, but we can safely assume no task wil dlopen for another so `VERIFY(arg == current);` is legit
+
 static void *ulinker_malloc(void *arg, size_t size)             { return rmem_arena_alloc(ULINKER_ARENA(arg), size); }
 static void  ulinker_free(void *arg, void *ptr)                 { rmem_arena_free(ULINKER_ARENA(arg), ptr); }
 static void *ulinker_realloc(void *arg, void *ptr, size_t size) { return rmem_arena_realloc(ULINKER_ARENA(arg), ptr, size); }
 
-static int     ulinker_open(void *arg, const char *name)                { return CALL_FUNC(open, name, O_RDONLY); }
-static int     ulinker_close(void *arg, int fd)                         { return CALL_FUNC(close, fd); }
-static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { return CALL_FUNC(read, fd, buf, count); }
-static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { return CALL_FUNC(fstat, fd, statbuf); }
+static int     ulinker_open(void *arg, const char *name)                { VERIFY(arg == current); return open(name, O_RDONLY); }
+static int     ulinker_close(void *arg, int fd)                         { VERIFY(arg == current); return close(fd); }
+static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { VERIFY(arg == current); return read(fd, buf, count); }
+static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { VERIFY(arg == current); return fstat(fd, statbuf); }
 
-static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return CALL_FUNC(mmap, hint, length, prot, flags, fd, offset); }
+static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { VERIFY(arg == current); return mmap(hint, length, prot, flags, fd, offset); }
 static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            { return CALL_FUNC(munmap, addr, size); }
 static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return CALL_FUNC(mprotect, addr, size, flags); }
 
@@ -8863,18 +8929,26 @@ FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
             mode = F_OK;
     }
 
-    return CALL_FUNC(access, pathname, mode);
+    return file_access(pathname, mode, 0);
 }
 
 FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, int, flags) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
+    if(!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
+
+    // make sure the shell finds our programs
+    if (find_program(pathname))
+        return 0;
+
+    if (mode & X_OK) {
+        mode &= ~X_OK;
+        if (!mode)
+            mode = F_OK;
     }
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(faccessat, __rfd, pathname, mode, flags));
+    return file_access(pathname, mode, flags);
 }
 
 FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
@@ -8883,7 +8957,7 @@ FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
         return -1;
     pathname = pathname_abs;
 
-    return file_chmod(AT_FDCWD, pathname, mode, 0);
+    return file_chmod(pathname, mode, 0);
 }
 
 FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
@@ -8892,7 +8966,7 @@ FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
         return -1;
     pathname = pathname_abs;
 
-    return file_chmod(AT_FDCWD, pathname, mode, AT_SYMLINK_NOFOLLOW);
+    return file_chmod(pathname, mode, AT_SYMLINK_NOFOLLOW);
 }
 
 FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
@@ -8918,13 +8992,11 @@ FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
 
 FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode, int, flag) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if(!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
 
-    return CURRENT_RFD(dirfd, file_chmod(__rfd, pathname, mode, flag));
+    return file_chmod(pathname, mode, flag);
 }
 
 FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group) {
@@ -8933,7 +9005,7 @@ FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group)
         return -1;
     pathname = pathname;
 
-    return file_chown(AT_FDCWD, pathname, owner, group, 0);
+    return file_chown(pathname, owner, group, 0);
 }
 
 FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group) {
@@ -8942,7 +9014,7 @@ FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group
         return -1;
     pathname = pathname;
 
-    return file_chown(AT_FDCWD, pathname, owner, group, AT_SYMLINK_NOFOLLOW);
+    return file_chown(pathname, owner, group, AT_SYMLINK_NOFOLLOW);
 }
 
 FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
@@ -8968,13 +9040,11 @@ FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
 
 FUNCTION_DEFINE5(int, fchownat, int, dirfd, const char *, pathname, uid_t, owner, gid_t, group, int, flag) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if(!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
 
-    return CURRENT_RFD(dirfd, file_chown(__rfd, pathname, owner, group, flag));
+    return file_chown(pathname, owner, group, flag);
 }
 
 FUNCTION_DEFINE2(int, flock, int, fd, int, operation) {
@@ -9497,6 +9567,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
 
     // NOTE: had to split logic to new func to deal with some pesky compiler optimizations that couldn't handle stack being changed midway through this func
     tvm_proc_entry_cont(arg);
+    __builtin_unreachable();
 }
 
 static void tvm_proc_entry_cont(struct fork_arg *arg)
@@ -11028,7 +11099,30 @@ FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, F
 }
 
 FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, flags, int, fd, off_t, offset) {
-    return (void *)CURRENT_RFD(fd, (long)CALL_FUNC(mmap, addr, length, prot, flags, __rfd, offset));
+    struct file *file = NULL;
+    if (fd >= 0) {
+        file = file_for_task(current, fd);
+        if (!file) {
+            errno = EBADF;
+            return MAP_FAILED;
+        }
+    }
+
+    void *ret;
+    if (!file || !file->f_ops || !file->f_ops->f_mmap) {
+        if (file)
+            file_unlock(file, 0);
+        ret = CALL_FUNC(mmap, addr, length, prot, flags, (file ? file->f_rfd : -1), offset);
+        if (file)
+            file_lock(file, 0);
+    }
+    else
+        ret = file->f_ops->f_mmap(addr, length, prot, flags, file, offset);
+    
+    if (file)
+        file_unlock(file, 1);
+    
+    return ret;
 }
 
 FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, optstring) {
