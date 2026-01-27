@@ -2528,8 +2528,6 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
     DLBASE(dl)->dl_base = base;
     DLBASE(dl)->dl_size = load_size;
 
-    PRINT("elf64 %s base at %p", filename, base);
-
     dl->dle64_load_bias = (uintptr_t)base - min_vaddr;
 
     // load segments
@@ -3214,30 +3212,31 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
         switch (type) {
             case R_X86_64_COPY:
             case R_AARCH64_COPY:
-                PRINT("RELO COPY %p %p %s %zu", (void *)reloc, (void *)(sym_addr + addend), sym_name, sym_size);
+                //PRINT("RELO COPY %p %p %s %zu", (void *)reloc, (void *)(sym_addr + addend), sym_name, sym_size);
                 memcpy(( void *)reloc, (void *)(sym_addr + addend), sym_size);
                 break;
             case R_X86_64_JUMP_SLOT:
             case R_AARCH64_JUMP_SLOT:
-                PRINT("RELO JMP_SLOT %p %p %s", (void *)reloc, (void *)(sym_addr + addend), sym_name);
+                //PRINT("RELO JMP_SLOT %p %p %s", (void *)reloc, (void *)(sym_addr + addend), sym_name);
                 *(Elf64_Addr *)(reloc) = (sym_addr + addend);
                 break;
             
             case R_X86_64_GLOB_DAT:
             case R_AARCH64_GLOB_DAT:
-                PRINT("RELO GLOB_SLOT %p %p %s", (void *)reloc, (void *)(sym_addr + addend), sym_name);
+                //PRINT("RELO GLOB_SLOT %p %p %s", (void *)reloc, (void *)(sym_addr + addend), sym_name);
                 *(Elf64_Addr *)(reloc) = (sym_addr + addend);
                 break;
             
             case R_X86_64_RELATIVE:
             case R_AARCH64_RELATIVE:
-                PRINT("RELO RELATIVE %p %p", (void *)reloc, (void *)(dl->dle64_load_bias + addend));
+                //PRINT("RELO RELATIVE %p %p", (void *)reloc, (void *)(dl->dle64_load_bias + addend));
                 *(Elf64_Addr *)(reloc) = (dl->dle64_load_bias + addend);
                 break;
             
             case R_X86_64_IRELATIVE:
             case R_AARCH64_IRELATIVE:
-                PRINT("RELO IRELATIVE %p %p", (void *)reloc, (void *)(dl->dle64_load_bias + addend));
+                //PRINT("RELO IRELATIVE %p %p", (void *)reloc, (void *)(dl->dle64_load_bias + addend));
+                (void)0;
                 typedef Elf64_Addr (*ifunc_resolver_t)(void);
                 ifunc_resolver_t ifunc_resolver = (ifunc_resolver_t)(dl->dle64_load_bias + addend);
                 Elf64_Addr ifunc_addr = ifunc_resolver();
@@ -3330,12 +3329,12 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                                 ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
                                 return 1;
                             }
-                            PRINT("DYLD_CHAINED_PTR_64_BIND %p %p %s", p.ptr8, (void *)sym_addr, s - 1);
+                            //PRINT("DYLD_CHAINED_PTR_64_BIND %p %p %s", p.ptr8, (void *)sym_addr, s - 1);
                             *p.ptr8 = sym_addr;
                         }
                         else {
                             next = p.ptr_64_rebase->next * 4;
-                            PRINT("DYLD_CHAINED_PTR_64_REBASE %p %p", p.ptr8, (void *)(dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero));
+                            //PRINT("DYLD_CHAINED_PTR_64_REBASE %p %p", p.ptr8, (void *)(dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero));
                             *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero;
                         }
                         break;
