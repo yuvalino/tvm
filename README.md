@@ -111,3 +111,6 @@ TembleOS is a play on a few things. First and foremost a tribute to Terry A. Dav
 
 iOS compilation:
 CC="$(xcrun --sdk iphoneos --find clang)" CFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" LDFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" CONFFLAGS="--host=arm-apple-darwin --build=arm64-apple-darwin" CMAKE_FLAGS="-DCMAKE_SYSTEM_NAME=iOS" make libtvm && cp libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm
+
+iOS compile and run:
+CC="$(xcrun --sdk iphoneos --find clang)" CFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" LDFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" CONFFLAGS="--host=arm-apple-darwin --build=arm64-apple-darwin" CMAKE_FLAGS="-DCMAKE_SYSTEM_NAME=iOS" make libtvm && cp libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm && (cd ../devtool && xcodebuild -scheme devtool -destination "name=fulg3ns" -derivedDataPath output/ && xcrun devicectl device install app --device fulg3ns ./output/Build/Products/Debug-iphoneos/devtool.app && xcrun devicectl device process launch --device fulg3ns com.yuvalino.devtool)

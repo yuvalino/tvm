@@ -1398,7 +1398,7 @@ struct file *file_dup_locked(struct file *oldfile) {
     int newfd = CALL_FUNC(dup, oldfile->f_rfd);
     if (newfd == -1)
         return NULL;
-    
+
     struct file *newfile = filealloc_from_rfd(newfd);
     if (!newfile) {
         if (0 != CALL_FUNC(close, newfd))
@@ -2450,7 +2450,7 @@ void init_file_stream_fp()
         }
     }
 
-    INFO("filep_fd_offset %d (size %zu)", filep_fd_offset, sizeof(FILE_FD_TYPE));
+    //INFO("filep_fd_offset %d (size %zu)", filep_fd_offset, sizeof(FILE_FD_TYPE));
     // make sure we found offset of FILE->fd
     VERIFY(filep_fd_offset != -1);
     fp_setfileno(fp123, 21235);
@@ -2473,7 +2473,7 @@ void dp_setfileno(DIR *dp, int fd) {
 
 void init_file_stream_dp()
 {
-    int dev = CALL_FUNC(open, "/dev", O_RDONLY | O_DIRECTORY);
+    int dev = CALL_FUNC(open, "/", O_RDONLY | O_DIRECTORY);
     VERIFY(dev != -1);
 
     int fd123;
@@ -2490,7 +2490,7 @@ void init_file_stream_dp()
         }
     }
 
-    INFO("dirp_fd_offset %d (size %zu)", dirp_fd_offset, sizeof(DIR_FD_TYPE));
+    //INFO("dirp_fd_offset %d (size %zu)", dirp_fd_offset, sizeof(DIR_FD_TYPE));
     // make sure we found offset of DIR->fd
     VERIFY(dirp_fd_offset != -1);
     dp_setfileno(dp123, 21235);
@@ -2619,6 +2619,8 @@ int task_filestreamrealloc_locked(struct task *t, struct file_stream *fs) {
             file_unlock(file, 1);
             return -1;
         }
+
+        VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
     }
 
     file_unlock(file, 1);
@@ -2668,10 +2670,21 @@ static struct file *file_for_task_stream_locked(struct task *t, struct file_stre
     if (!file)
         return NULL;
 
+    /**
+     * If a `file`'s NFD was dupped recently, it updated the underlying fd -> update info
+     */
     if (file->f_gencnt != fs->fs_gencnt) {
-        file_unlock(file, 1);
-        errno = EBADF;
-        return NULL;
+        if (fs->fs_type == FS_FILE)
+            fp_setfileno(fs->fs_fp, file->f_rfd);
+        else if (fs->fs_type == FS_DIR)
+            dp_setfileno(fs->fs_dp, file->f_rfd);
+        else {
+            // unknown type?
+            file_unlock(file, 1);
+            errno = EINVAL;
+            return NULL;
+        }
+        fs->fs_gencnt = file->f_gencnt;
     }
 
     return file;
@@ -7353,6 +7366,23 @@ static int tvm_cpio(int argc, char **argv)
     return 0;
 }
 
+int tvm_mount_cpio(const char *pathname, const void *buf, unsigned long size) {
+    struct vfs_node *root = vnalloc(pathname, S_IFDIR | 0766, getuid(), getgid());
+    if (!root)
+        return -1;
+    
+    if (0 != vfs_load_cpio(root, buf, size)) {
+        vn_unlock(root, 1);
+        return -1;
+    }
+
+    vn_unlock(root, 0);
+    vfs_add_root(root);
+    vn_lock(root, 0);
+    vn_unlock(root, 1);
+    return 0;
+}
+
 static int tvm_mount(int argc, char **argv)
 {
     if (argc < 3)
@@ -7375,19 +7405,8 @@ static int tvm_mount(int argc, char **argv)
         return 1;
     }
 
-    struct vfs_node *root = vnalloc(pathname_abs, S_IFDIR | 0766, getuid(), getgid());
-    if (!root)
-        err(1, "vnalloc");
-    
-    if (0 != vfs_load_cpio(root, buf, size )) {
-        vn_unlock(root, 1);
-        err(1, "vfs_load_cpio");
-    }
-
-    vn_unlock(root, 0);
-    vfs_add_root(root);
-    vn_lock(root, 0);
-    vn_unlock(root, 1);
+    if (0 != tvm_mount_cpio(pathname_abs, buf, size))
+        err(1, "tvm_mount_cpio");
 
     return 0;
 }
@@ -7533,8 +7552,16 @@ static void ulinker_event_cb(int event, void *arg)
     }
 }
 
+void tvm_init_with_outfd(const char *init_comm, int outfd)
+{
+    g_outfd = outfd;
+    tvm_init(init_comm);
+}
+
 void tvm_init(const char *init_comm)
 {
+    INFO("tvm_init()");
+
     init_file_stream();
 
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
@@ -7577,7 +7604,6 @@ void tvm_init(const char *init_comm)
         int nfd = task_assign_file_locked(current, f, i);
         if (nfd != i)
             panic("tvm_init::task_assign_file %d %d", i, nfd);
-
     }
 
     // allocate stdin, stdout, stderr filestreams
@@ -7657,10 +7683,12 @@ int tvm_setopt(int opt, void *val) {
         // internalize r as r2, f2
         if (-1 == (r2 = CALL_FUNC(dup, r)))
             return -1;
-        if (-1 == (f2 = task_new_fd(current, r))) {
-            VERIFY(0 == CALL_FUNC(close, r));
+        if (-1 == (f2 = task_new_fd(current, r2))) {
+            VERIFY(0 == CALL_FUNC(close, r2));
             return -1;
         }
+
+        // r2 is internalized as f2, so use close() instead of CALL_FUNC(close, ...) to close it
 
         // dup to target `f`
         if (-1 == dup2(f2, f)) {

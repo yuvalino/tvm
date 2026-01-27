@@ -17,7 +17,8 @@
 #define COW_DECL(TypeName) extern __thread TypeName
     
 void _tvm_register_cow(void *(*getptr_fn)(void), unsigned size, void (*init_fn)(void), int deepcopy, char *name);
-    
+
+void tvm_init_with_outfd(const char *init_comm, int outfd);
 void tvm_init(const char *init_comm);
 
 enum {
@@ -44,3 +45,5 @@ enum {
     TVM_DUMP_FUNCS
 };
 void tvm_dump(int mode);
+
+int tvm_mount_cpio(const char *pathname, const void *buf, unsigned long size);
