@@ -36,6 +36,7 @@
 #if defined(__APPLE__)
 #include <util.h>
 #include <mach-o/getsect.h>
+#include <CoreFoundation/CoreFoundation.h>
 #elif defined(__linux__)
 #include <pty.h>
 #include <sys/vfs.h>
@@ -236,17 +237,20 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
  */
 
 #define LOCAL_SYM(Name) o_##Name
-#define DECL_FUNC(Name) \
+#define DECL_FUNC_EX(Name, Opt) \
     static typeof(Name) *LOCAL_SYM(Name) = NULL; \
-    static struct original_func_t _of_ ## Name = { .ptrdest = (void *)&LOCAL_SYM(Name), .name = #Name }; \
+    static struct original_func_t _of_ ## Name = { .ptrdest = (void *)&LOCAL_SYM(Name), .name = #Name, .opt = (Opt) }; \
     __attribute__((constructor)) \
     static void _ofc_ ## Name () { list_add_tail( & (_of_ ## Name).list, &original_functions); }
+#define DECL_FUNC(Name)     DECL_FUNC_EX(Name, 0)
+#define DECL_FUNC_OPT(Name) DECL_FUNC_EX(Name, 1)
 #define CALL_FUNC(Name, ...) (LOCAL_SYM(Name) (__VA_ARGS__))
 
 struct original_func_t {
     struct list_head list;
     void **ptrdest;
     const char *name;
+    int opt;
 };
 
 static LIST_HEAD(original_functions);
@@ -460,6 +464,9 @@ DECL_FUNC(fchdir);
 DECL_FUNC(getcwd);
 DECL_FUNC(getwd);
 
+DECL_FUNC(bsearch);
+DECL_FUNC(qsort);
+
 #if defined(__linux__)
 DECL_FUNC(mknod);
 DECL_FUNC(mknodat);
@@ -477,6 +484,8 @@ DECL_FUNC(fstatat64);
 DECL_FUNC(lseek64);
 DECL_FUNC(ftruncate64);
 DECL_FUNC(get_current_dir_name);
+#elif defined(__APPLE__)
+DECL_FUNC_OPT(CFDictionaryApplyFunction);
 #endif
 
 __attribute__((constructor))
@@ -485,8 +494,11 @@ static void init_funcs()
     struct original_func_t *curr_func;
     list_for_each_entry(curr_func, &original_functions, list) {
         *curr_func->ptrdest = dlsym(RTLD_NEXT, curr_func->name);
-        if (NULL == *curr_func->ptrdest)
-            panic("function '%s' not found", curr_func->name);
+        if (NULL == *curr_func->ptrdest) {
+            if (!curr_func->opt)
+                panic("function '%s' not found", curr_func->name);
+            *curr_func->ptrdest = (void *)0x4141DEAD;
+        }
     }
 };
 
@@ -11280,7 +11292,42 @@ FUNCTION_DEFINE1(char *, getwd, char *, buf) {
     return getcwd(buf, PATH_MAX);
 }
 
+typedef int (*compar_t) (const void *, const void *);
 
+static __thread compar_t bsearch_compar = NULL;
+
+static int bsearch_compar_emulator(const void *a, const void *b)
+{
+    uint64_t ret;
+    if (0 != emulator_call(&ret, (uint64_t)bsearch_compar, (uint64_t)a, (uint64_t)b, 0, 0, 0, 0))
+        err(1, "emulator_call(bsearch_compar)");
+
+    return (int)ret;
+}
+
+FUNCTION_DEFINE5(void *, bsearch, const void *, key, const void *, base, size_t, nel, size_t, width, compar_t, compar) {
+    bsearch_compar = compar;
+    void *ret = CALL_FUNC(bsearch, key, base, nel, width, bsearch_compar_emulator);
+    bsearch_compar = NULL;
+    return ret;
+}
+
+static __thread compar_t qsort_compar = NULL;
+
+static int qsort_compar_emulator(const void *a, const void *b)
+{
+    uint64_t ret;
+    if (0 != emulator_call(&ret, (uint64_t)qsort_compar, (uint64_t)a, (uint64_t)b, 0, 0, 0, 0))
+        err(1, "emulator_call(qsort_compar)");
+
+    return (int)ret;
+}
+
+FUNCTION_DEFINE_VOID4(qsort, void *, base, size_t, nel, size_t, width, compar_t, compar) {
+    qsort_compar = compar;
+    CALL_FUNC(qsort, base, nel, width, qsort_compar_emulator);
+    qsort_compar = NULL;
+}
 
 #if defined(__linux__)
 
@@ -11446,6 +11493,22 @@ FUNCTION_DEFINE0(char *, get_current_dir_name) {
     if (pwd)
         return strdup(pwd);
     return getcwd(NULL, 0);
+}
+
+#elif defined(__APPLE__)
+
+static __thread CFDictionaryApplierFunction CFDictionaryApplyFunction_function = NULL;
+
+static void CFDictionaryApplyFunction_emulator(const void *key, const void *value, void *context)
+{
+    if (0 != emulator_call(NULL, (uint64_t)CFDictionaryApplyFunction_function, (uint64_t)key, (uint64_t)value, (uint64_t)context, 0, 0, 0))
+        err(1, "emulator_call(CFDictionaryApplyFunction_function)");
+}
+
+FUNCTION_DEFINE_VOID3(CFDictionaryApplyFunction, CFDictionaryRef, theDict, CFDictionaryApplierFunction CF_NOESCAPE, applier, void *, context) {
+    CFDictionaryApplyFunction_function = applier;
+    CALL_FUNC(CFDictionaryApplyFunction, theDict, CFDictionaryApplyFunction_emulator, context);
+    CFDictionaryApplyFunction_function = NULL;
 }
 
 #endif
