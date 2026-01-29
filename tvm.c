@@ -4408,7 +4408,9 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
     char tmp[PATH_MAX];
     struct vfs_node *cur = root;
 
-    strlcpy(tmp, relpath, sizeof(tmp));
+    strncpy(tmp, relpath, sizeof(tmp)-1);
+    tmp[PATH_MAX-1] = 0;
+
 
     char *saveptr;
     char *tok = strtok_r(tmp, "/", &saveptr);
@@ -8193,9 +8195,17 @@ FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
 
 #if defined(__linux__)
 FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
+    struct file *file = file_for_task_fp(current, stream);
+    if (!file)
+        return;
+
+    file_unlock(file, 0);
+    CALL_FUNC(setlinebuf, real_fp(stream));
+    file_lock(file, 0);
+    file_unlock(file, 1);
+}
 #elif defined(__APPLE__)
 FUNCTION_DEFINE1(int, setlinebuf, FILE *, stream) {
-#endif
     struct file *file = file_for_task_fp(current, stream);
     if (!file)
         return -1;
@@ -8206,6 +8216,7 @@ FUNCTION_DEFINE1(int, setlinebuf, FILE *, stream) {
     file_unlock(file, 1);
     return ret;
 }
+#endif
 
 FUNCTION_DEFINE4(int, setvbuf, FILE *, stream, char *, buf, int, mode, size_t, size) {
     struct file *file = file_for_task_fp(current, stream);
