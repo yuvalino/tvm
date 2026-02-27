@@ -69,8 +69,8 @@
 
 // LOCK ORDERING
 
-// tty
-// task | vfs_node
+// tty | vfs_node
+// task
 // file
 // file_stream
 // vfs_file
