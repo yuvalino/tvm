@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -1094,6 +1095,42 @@ static int runtest_gdb(struct testinfo_t *testinfo, int verbose)
     return 0;
 }
 
+static struct testinfo_t *g_testinfo = NULL;
+
+static void sigint_handler(int sig) {
+    if (!g_testinfo) {
+        printf("\n======== KEYBOARD INTERRUPT ========\n");    
+        exit(-sig);
+    }
+
+    printf("\n======== KEYBOARD INTERRUPT: %s ========\n", g_testinfo->n);
+    if (g_testinfo->out_s) {
+        printf("\n==== captured stdout ====\n");
+        while (g_testinfo->out_s) {
+            size_t w = write(1, g_testinfo->out, g_testinfo->out_s);
+            if (w == -1 || 0 == w) {
+                perror("write(out)");
+                break;
+            }
+            g_testinfo->out_s -= w;
+           g_testinfo->out = (void *) (((char *) g_testinfo->out) + w);
+        }
+    }
+    if (g_testinfo->err_s) {
+        printf("\n==== captured stderr ====\n");
+        while (g_testinfo->err_s) {
+            size_t w = write(1, g_testinfo->err, g_testinfo->err_s);
+            if (w == -1 || 0 == w) {
+                perror("write(err)");
+                break;
+            }
+            g_testinfo->err_s -= w;
+            g_testinfo->err = (void *) (((char *) g_testinfo->err) + w);
+        }
+    }
+    exit(-sig);
+}
+
 static int runtest(struct testinfo_t *testinfo, int verbose)
 {
     int outp[2] = {-1, -1};
@@ -1110,6 +1147,16 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
 
     if (-1 == fcntl(outp[0], F_SETFL, O_NONBLOCK) || -1 == fcntl(errp[0], F_SETFL, O_NONBLOCK)) {
         perror("test_tvm: fcntl");
+        abort();
+    }
+
+    struct sigaction act, oldact;
+    act.sa_handler = sigint_handler;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    g_testinfo = testinfo;
+    if (-1 == sigaction(SIGINT, &act, &oldact)) {
+        perror("test_tvm: sigaction");
         abort();
     }
 
@@ -1218,6 +1265,12 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
 
     close(outp[1]);
     close(errp[1]);
+
+    if (-1 == sigaction(SIGINT, &oldact, NULL)) {
+        perror("test_tvm: sigaction restore");
+        abort();
+    }
+    g_testinfo = NULL;
 
     if (!WIFEXITED(status)) {
         testinfo->r = -WTERMSIG(status);
