@@ -1589,7 +1589,6 @@ struct thread {
 
 static Dl_info main_dlinfo = {0};
 static struct rmem_arena *global_arena = NULL;
-static pthread_t main_pthread;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct task *current;
@@ -2985,6 +2984,7 @@ struct tty {
     struct list_head t_list;
     pthread_mutex_t t_lock;
     unsigned t_refcnt;
+    unsigned t_master_refcnt;
 
     pid_t t_sid;
     pid_t t_pgid;
@@ -3057,6 +3057,7 @@ static struct tty *ttyalloc()
     }
 
     tt->t_refcnt = 0;
+    tt->t_master_refcnt = 0;
     tt->t_mfd = ends[0];
     tt->t_sfd = ends[1];
 
@@ -3171,11 +3172,26 @@ static int islocaltty(int fd)
     }
     task_unlock(current);
 
-    int tty = (file->f_type == DEV_TTY);
-    file_unlock(file, 1);
-    if (!tty)
+    if (file->f_type != DEV_TTY) {
+        file_unlock(file, 1);
         errno = ENOTTY;
-    return tty;
+        return 0;
+    }
+
+    int ttymode;
+    struct tty *tt = tty_for_file_locked(file, &ttymode);
+    if (!tt) {
+        file_unlock(file, 1);
+        errno = ENOTTY;
+        return 0;
+    }
+
+    int ok = (ttymode == TTM_MASTER || tt->t_master_refcnt > 0);
+    tty_unlock(tt, 1);
+    file_unlock(file, 1);
+    if (!ok)
+        errno = ENOTTY;
+    return ok;
 }
 
 /**
@@ -3374,7 +3390,8 @@ static int ttyop_open(const char *pathname, int flags, mode_t mode, uid_t uid, g
 static int ttyop_dup(struct file *oldfile, struct file *newfile) {
     // tty_for_file_locked unlocks, so keep lock order between files
     file_unlock(newfile, 0);
-    struct tty *tt = tty_for_file_locked(oldfile, NULL);
+    int ttymode;
+    struct tty *tt = tty_for_file_locked(oldfile, &ttymode);
     file_unlock(oldfile, 0);
     files_lock(oldfile, newfile);
 
@@ -3383,8 +3400,10 @@ static int ttyop_dup(struct file *oldfile, struct file *newfile) {
     }
 
     tt->t_refcnt++;
+    if (ttymode == TTM_MASTER)
+        tt->t_master_refcnt++;
     newfile->f_data = (void *)tt;
-    
+
     tty_unlock(tt, 1);
     return 0;
 }
@@ -4090,14 +4109,45 @@ static ssize_t ttyop_write(struct file *file, const void *buf, size_t count, int
 }
 
 static void ttyop_close(struct file *file) {
-    struct tty *tt = tty_for_file_locked(file, NULL);
+    int ttymode;
+    struct tty *tt = tty_for_file_locked(file, &ttymode);
     if (!tt)
         return;
 
     // we took ref in tty_for_file_locked()
     tt->t_refcnt--;
-    if (tt->t_refcnt > 1) {
+    int master_closed = (ttymode == TTM_MASTER && --tt->t_master_refcnt == 0);
+    int last_file = (tt->t_refcnt == 1); // only the temp ref from tty_for_file_locked remains
+
+    if (!last_file && !master_closed) {
         tty_unlock(tt, 1);
+        return;
+    }
+
+    int tty_sid = tt->t_sid;
+    pid_t tty_pgid = tt->t_pgid;
+
+    if (!last_file) {
+        // master just closed but slave still open: signal session, don't destroy tty
+        tty_unlock(tt, 1);
+        file_unlock(file, 0);
+
+        if (tty_sid != -1) {
+            pthread_mutex_lock(&tasks_lock);
+            struct task *t;
+            list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
+                task_lock(t);
+                if (t->tsk_sid == tty_sid)
+                    t->tsk_state &= ~TS_CTTY;
+                task_unlock(t);
+            }
+            pthread_mutex_unlock(&tasks_lock);
+
+            kill(-tty_pgid, SIGHUP);
+            kill(-tty_pgid, SIGCONT);
+        }
+
+        file_lock(file, 0);
         return;
     }
 
@@ -4105,28 +4155,19 @@ static void ttyop_close(struct file *file) {
 
     // leave refcnt at 0, no one will take ref in global list after unlocking
     tt->t_refcnt--;
-    int tty_sid = tt->t_sid;
     tty_unlock(tt, 0);
     file_unlock(file, 0);
 
     // Disassociate the entire session
 
-    struct task *signaltask = NULL;
-    if (tty_sid != -1) {
+    if (master_closed && tty_sid != -1) {
         pthread_mutex_lock(&tasks_lock);
         struct task *t;
         list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
             task_lock(t);
-
-            // disassociate task in session
             if (t->tsk_sid == tty_sid)
                 t->tsk_state &= ~TS_CTTY;
-
-            // signal session leader, keep it locked
-            if (t->tsk_pid == tty_sid)
-                signaltask = t;
-            else
-                task_unlock(t);
+            task_unlock(t);
         }
         pthread_mutex_unlock(&tasks_lock);
     }
@@ -4137,11 +4178,11 @@ static void ttyop_close(struct file *file) {
 
     ttydealloc(tt);
 
-    if (signaltask) {
-        pid_t p = signaltask->tsk_pid;
-        task_unlock(signaltask);
-        kill(p, SIGHUP);
-        kill(p, SIGCONT);
+    // Signal after all locks released: session leader may be current task,
+    // and signal_handler acquires tasks_lock.
+    if (master_closed && tty_sid != -1) {
+        kill(tty_sid, SIGHUP);
+        kill(tty_sid, SIGCONT);
     }
 
     file_lock(file, 0);
@@ -4234,6 +4275,7 @@ static struct file *ptm_open()
 
     file_lock(file, 1);
     tt->t_refcnt++;
+    tt->t_master_refcnt++;
     file->f_type = DEV_TTY;
     file->f_data = tt;
     file->f_ops = ttyops();
@@ -10061,7 +10103,7 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
 }
 
 FUNCTION_DEFINE_NORET1(_exit, int, status) {
-    if (pthread_self() == main_pthread)
+    if (current == main_task)
         CALL_FUNC(_exit, status);
     
     pthread_mutex_lock(&tasks_lock);
