@@ -65,7 +65,6 @@
 
 // TODOLIST
 // 2. taskfreelastref taskslock deadlock
-// 3. signal safety
 // 4. waitpid signal delivery
 
 // LOCK ORDERING
@@ -1607,6 +1606,7 @@ static __thread struct thread *current_thread;
 static __thread int thread_tvm_disallow = 0;
 static __thread int tvm_sig_blocked = 0;
 static __thread int tvm_sig_draining = 0;
+static __thread int tvm_sig_interrupted = 0;
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
 #define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
@@ -2111,11 +2111,11 @@ static int task_kill_locked(struct task *t, int signum) {
             return pthread_kill(thr->thr_pthread, signum);
     }
 
-    // All threads blocked — defer at task level (process-directed)
-    t->tsk_pending_siginfo[signum] = (siginfo_t){ .si_signo = signum };
-    memset(&t->tsk_pending_ucontext[signum], 0, sizeof(ucontext_t));
-    __atomic_fetch_or(&t->tsk_pending_sigs, 1u << signum, __ATOMIC_RELEASE);
-    return 0;
+    // All threads blocked — still deliver via pthread_kill so that any
+    // blocking syscall (read/write/poll/…) gets interrupted with EINTR.
+    // signal_handler will see tvm_sig_blocked and defer the signal; it
+    // gets drained on the next tvm_sig_leave().
+    return pthread_kill(fallback->thr_pthread, signum);
 }
 
 /**
@@ -3067,6 +3067,8 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     if (signum < 1 || signum >= MAX_SIGNALS)
         return;
 
+    tvm_sig_interrupted = signum;
+
     if (tvm_sig_blocked) {
         // Real hardware fault while in critical section = bug in our implementation
         // si_code > 0 distinguishes kernel-generated (real fault) from user-sent (kill/sigqueue)
@@ -3897,8 +3899,6 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
             // Timeout
             break;
         } else if (ret < 0) {
-            if (errno == EINTR)
-                continue;
             tty_lock(tt, 0);
             tty_unlock(tt, 1);
             file_lock(file, 0);
@@ -3909,8 +3909,6 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
         unsigned char c;
         ssize_t n = CALL_FUNC(read, file->f_rfd, &c, 1);
         if (n < 0) {
-            if (errno == EINTR)
-                continue;
             tty_lock(tt, 0);
             tty_unlock(tt, 1);
             file_lock(file, 0);
@@ -7849,7 +7847,7 @@ void tvm_init(const char *init_comm)
     
     struct sigaction act = {
         .sa_sigaction = signal_handler,
-        .sa_flags = SA_SIGINFO | SA_RESTART,
+        .sa_flags = SA_SIGINFO,
     };
 
     for (int i = 0; i < MAX_SIGNALS; i++) {
@@ -8840,6 +8838,8 @@ FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags)
 }
 
 FUNCTION_DEFINE3(ssize_t, read, int, fd, void *, buf, size_t, count) {
+    tvm_sig_interrupted = 0;
+retry:
     tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
@@ -8850,20 +8850,28 @@ FUNCTION_DEFINE3(ssize_t, read, int, fd, void *, buf, size_t, count) {
 
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_read) {
+        int rfd = file->f_rfd;
         file_unlock(file, 0);
-        ret = CALL_FUNC(read, file->f_rfd, buf, count);
+        ret = CALL_FUNC(read, rfd, buf, count);
         file_lock(file, 0);
     }
     else
         ret = file->f_ops->f_read(file, buf, count, -1);
-    
+
     file_unlock(file, 1);
     tvm_sig_leave();
+
+    // restart if interrupt an SA_RESTART flag for the interrupt signal is on
+    if (ret == (size_t)-1 && errno == EINTR && tvm_sig_interrupted &&
+        current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
+        goto retry;
 
     return ret;
 }
 
 FUNCTION_DEFINE3(ssize_t, write, int, fd, const void *, buf, size_t, count) {
+    tvm_sig_interrupted = 0;
+retry:
     tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
@@ -8874,16 +8882,22 @@ FUNCTION_DEFINE3(ssize_t, write, int, fd, const void *, buf, size_t, count) {
 
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_write) {
+        int wfd = file->f_rfd;
         file_unlock(file, 0);
-        ret = CALL_FUNC(write, file->f_rfd, buf, count);
+        ret = CALL_FUNC(write, wfd, buf, count);
         file_lock(file, 0);
     }
     else
         ret = file->f_ops->f_write(file, buf, count, -1);
-    
+
     file_unlock(file, 1);
     tvm_sig_leave();
     
+    // restart if interrupt an SA_RESTART flag for the interrupt signal is on
+    if (ret == (size_t)-1 && errno == EINTR && tvm_sig_interrupted &&
+        current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
+        goto retry;
+
     return ret;
 }
 
@@ -8934,8 +8948,11 @@ FUNCTION_DEFINE3(ssize_t, readv, int, fd, const struct iovec *, iov, int, iovcnt
             if (curr == 0)
                 break;
             if (curr < 0) {
-                if (ret == 0)
+                if (ret == 0) {
+                    file_unlock(file, 1);
+                    tvm_sig_leave();
                     return -1;
+                }
                 break;
             }
 
@@ -8975,8 +8992,11 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
             if (curr == 0)
                 break;
             if (curr < 0) {
-                if (ret == 0)
+                if (ret == 0) {
+                    file_unlock(file, 1);
+                    tvm_sig_leave();
                     return -1;
+                }
                 break;
             }
 
@@ -10841,6 +10861,21 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
     
     pthread_mutex_lock(&tasks_lock);
     struct task *t;
+    // main_task is the list head and not visited by list_for_each_entry,
+    // so check it explicitly first
+    if (main_task->tsk_pid == pid || main_task->tsk_pgid == -pid) {
+        if (main_task == current)
+            self = 1;
+        else {
+            ntasks++;
+            task_lock(main_task);
+            if (main_task->tsk_state & TS_ZOMBIE)
+                errno = ESRCH;
+            else if (0 == task_kill_locked(main_task, sig))
+                kills_confirmed++;
+            task_unlock(main_task);
+        }
+    }
     list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
         if (t->tsk_pid == pid || t->tsk_pgid == -pid) {
             if (t == current) {
@@ -11026,12 +11061,9 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 }
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
-    tvm_sig_enter();
-
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
-        { tvm_sig_leave();
-        return -1; }
+        return -1;
     pathname = pathname_abs;
 
     INFO("execve(\"%s\")", pathname);
@@ -11043,9 +11075,10 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     if (argc == INT_MAX) {
         INFO("  failed(E2BIG)");
         errno = E2BIG;
-        tvm_sig_leave();
         return -1;
     }
+
+    tvm_sig_enter();
 
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
@@ -11142,6 +11175,9 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     optind = 1;
 
     uint64_t ret;
+
+    tvm_sig_leave();
+
     int callerr = emulator_call(&ret, (uint64_t)main_func,
                   (uint64_t)argc,
                   (uint64_t)argv,
