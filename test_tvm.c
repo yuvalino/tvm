@@ -1051,6 +1051,478 @@ TEST(TTYDetachTIOCNOTTY) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+// =========================================================================
+// Signal edge-case tests
+// =========================================================================
+
+TEST(SignalZombie) {
+    // Use a pipe so we know when the child has exited (i.e. is now a zombie)
+    int pip[2];
+    ASSERT_EQ(0, pipe(pip));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(pip[0]);
+        close(pip[1]); // closing write end signals EOF to parent
+        _exit(0);
+    }
+    close(pip[1]);
+
+    // Read returns 0 (EOF) once child has exited and is zombie
+    char c;
+    read(pip[0], &c, 1);
+    close(pip[0]);
+
+    // Zombie: any real signal should fail with ESRCH
+    ASSERT_EQ(-1, kill(p, SIGUSR1));
+    ASSERT_EQ(ESRCH, errno);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(SignalIgnFork) {
+    // Install SIG_IGN for SIGUSR1, then fork. Child should inherit SIG_IGN.
+    struct sigaction act = { .sa_handler = SIG_IGN };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        // Verify child inherited disposition
+        struct sigaction old;
+        ASSERT_EQ(0, sigaction(SIGUSR1, NULL, &old));
+        ASSERT_EQ(SIG_IGN, old.sa_handler);
+
+        // Raising an ignored signal: process survives
+        ASSERT_EQ(0, raise(SIGUSR1));
+        exit(0);
+    }
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+// Pipe written from signal handler to confirm each delivery (write is async-signal-safe)
+static int sig_multi_pipe = -1;
+static COW_IMPL_INIT(int, sig_multi_count, 0);
+static void sig_multi_handler(int sig) {
+    sig_multi_count++;
+    char c = '!';
+    write(sig_multi_pipe, &c, 1);
+}
+
+TEST(SignalMultiDeliver) {
+    sig_multi_count = 0;
+
+    int notify[2];
+    ASSERT_EQ(0, pipe(notify));
+    sig_multi_pipe = notify[1]; // handler writes here
+
+    struct sigaction act = { .sa_handler = sig_multi_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
+
+    int done[2];
+    ASSERT_EQ(0, pipe(done));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(notify[0]);
+        close(done[1]);
+        // Block until parent says done
+        char c;
+        while (read(done[0], &c, 1) == -1 && errno == EINTR)
+            ;
+        close(done[0]);
+        exit(sig_multi_count > 0 ? 0 : 1);
+    }
+    close(notify[1]);
+    close(done[0]);
+
+    // Send 3 signals, waiting for each to be acknowledged via notify pipe
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(0, kill(p, SIGUSR1));
+        char c;
+        // read one byte per delivery — ensures signal was processed
+        while (read(notify[0], &c, 1) == -1 && errno == EINTR)
+            ;
+    }
+    close(notify[0]);
+
+    write(done[1], "x", 1);
+    close(done[1]);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+static COW_IMPL_INIT(int, sig_intr_count, 0);
+static void sig_intr_handler(int sig) { sig_intr_count++; }
+
+TEST(SignalInterruptRead) {
+    sig_intr_count = 0;
+
+    struct sigaction act = { .sa_handler = sig_intr_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
+
+    // data: parent blocks reading here; child holds write end open until
+    //       after sending SIGUSR1 so the pipe doesn't prematurely EOF.
+    // sync: child signals it is about to sleep+send so parent can enter read().
+    int data[2];
+    int sync[2];
+    ASSERT_EQ(0, pipe(data));
+    ASSERT_EQ(0, pipe(sync));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(data[0]);
+        close(sync[0]);
+
+        write(sync[1], "x", 1); // tell parent we're ready
+        close(sync[1]);
+
+        usleep(10000); // give parent time to enter read()
+        kill(getppid(), SIGUSR1);
+        usleep(5000);  // give signal time to be processed
+        close(data[1]); // now EOF-close so parent isn't stuck if no EINTR
+        _exit(0);
+    }
+    close(data[1]);
+    close(sync[1]);
+
+    char c;
+    while (read(sync[0], &c, 1) == -1 && errno == EINTR)
+        ;
+    close(sync[0]);
+
+    // Expect EINTR from SIGUSR1 interrupting this read
+    char buf[1];
+    int r = read(data[0], buf, 1);
+    int saved_errno = errno;
+    close(data[0]);
+
+    ASSERT_EQ(-1, r);
+    ASSERT_EQ(EINTR, saved_errno);
+    ASSERT_EQ(1, sig_intr_count);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+}
+
+TEST(SignalGrandchild) {
+    int pip[2];
+    ASSERT_EQ(0, pipe(pip));
+
+    pid_t child = fork();
+    ASSERT_NEQ(child, -1);
+    if (!child) {
+        close(pip[0]);
+        pid_t grandchild = fork();
+        ASSERT_NEQ(grandchild, -1);
+        if (!grandchild) {
+            close(pip[1]);
+            pause(); // wait for signal
+            _exit(0);
+        }
+        // Send grandchild PID to grandparent
+        write(pip[1], &grandchild, sizeof(grandchild));
+        close(pip[1]);
+        // Reap grandchild after it's killed
+        int s;
+        ASSERT_EQ(grandchild, wait(&s));
+        ASSERT_EQ(WIFSIGNALED(s), 1);
+        ASSERT_EQ(WTERMSIG(s), SIGUSR2);
+        exit(0);
+    }
+    close(pip[1]);
+
+    pid_t grandchild;
+    ASSERT_EQ((ssize_t)sizeof(grandchild), read(pip[0], &grandchild, sizeof(grandchild)));
+    close(pip[0]);
+
+    ASSERT_EQ(0, kill(grandchild, SIGUSR2));
+
+    int s;
+    ASSERT_EQ(child, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+static COW_IMPL_INIT(int, sig_pgrp_count, 0);
+static void sig_pgrp_handler(int sig) { sig_pgrp_count++; }
+
+TEST(SignalKillZero) {
+    sig_pgrp_count = 0;
+    struct sigaction act = { .sa_handler = sig_pgrp_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
+
+    // Pipe: child writes its count to parent after receiving signal
+    int pip[2];
+    ASSERT_EQ(0, pipe(pip));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        // Stay in same process group as parent
+        close(pip[0]);
+        PHASE_WAIT(1);
+        // Wait briefly for signal to arrive
+        for (int i = 0; i < 50 && !sig_pgrp_count; i++)
+            usleep(2000);
+        int cnt = sig_pgrp_count;
+        write(pip[1], &cnt, sizeof(cnt));
+        close(pip[1]);
+        _exit(0);
+    }
+    close(pip[1]);
+
+    PHASE_SET(1);
+    // Send to process group (both parent and child are in same pgrp)
+    ASSERT_EQ(0, kill(0, SIGUSR1));
+
+    int child_count;
+    while (read(pip[0], &child_count, sizeof(child_count)) == -1 && errno == EINTR)
+        ;
+    close(pip[0]);
+
+    ASSERT_EQ(1, sig_pgrp_count);
+    ASSERT_EQ(1, child_count);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+}
+
+static COW_IMPL_INIT(int, sig_fork_count, 0);
+static void sig_fork_handler(int sig) { sig_fork_count++; }
+
+TEST(SignalWhileFork) {
+    sig_fork_count = 0;
+    struct sigaction act = { .sa_handler = sig_fork_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
+
+    // Pipe: child writes after sending signal so parent knows to check
+    int pip[2];
+    ASSERT_EQ(0, pipe(pip));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(pip[0]);
+        // Race a SIGUSR1 against the parent's fork return path
+        kill(getppid(), SIGUSR1);
+        write(pip[1], "x", 1);
+        close(pip[1]);
+        _exit(0);
+    }
+    close(pip[1]);
+
+    // Wait for child to confirm it sent the signal
+    char c;
+    while (read(pip[0], &c, 1) == -1 && errno == EINTR)
+        ;
+    close(pip[0]);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+
+    // Signal racing with fork should still be delivered to parent
+    ASSERT_EQ(1, sig_fork_count);
+}
+
+// =========================================================================
+// Stress / race tests
+// =========================================================================
+
+TEST(StressForkExit) {
+    int N = 20;
+    for (int i = 0; i < N; i++) {
+        pid_t p = fork();
+        ASSERT_NEQ(p, -1);
+        if (!p)
+            _exit(i % 64);
+    }
+    for (int i = 0; i < N; i++) {
+        int s;
+        pid_t p = wait(&s);
+        ASSERT_NEQ(-1, p);
+        ASSERT_EQ(WIFEXITED(s), 1);
+    }
+}
+
+TEST(TTYSighupRace) {
+    int master, slave;
+    ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(-1, p);
+    if (!p) {
+        close(master);
+        ASSERT_EQ(getpid(), setsid());
+        ASSERT_EQ(0, ioctl(slave, TIOCSCTTY, 0));
+
+        struct sigaction act = { .sa_handler = SIG_IGN };
+        sigaction(SIGHUP, &act, NULL);
+
+        PHASE_SET(1);
+
+        // Poll for POLLIN/POLLHUP with a timeout so we don't hang if EIO
+        // is not yet implemented — the important thing is we don't crash.
+        struct pollfd pfd = { .fd = slave, .events = POLLIN | POLLHUP };
+        poll(&pfd, 1, 3000); // 3s timeout
+
+        exit(0);
+    }
+
+    PHASE_WAIT(1);
+    usleep(5000); // ensure child is blocking in poll()
+    close(master); // triggers SIGHUP + EIO/POLLHUP on slave
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+static COW_IMPL_INIT(int, cc_count, 0);
+static void cc_handler(int sig) { cc_count++; }
+
+TEST(ConcurrentKills) {
+    cc_count = 0;
+    struct sigaction act = { .sa_handler = cc_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
+
+    // Two pipes for PID exchange
+    int p1pip[2], p2pip[2];
+    ASSERT_EQ(0, pipe(p1pip));
+    ASSERT_EQ(0, pipe(p2pip));
+
+    pid_t p1 = fork();
+    ASSERT_NEQ(p1, -1);
+    if (!p1) {
+        close(p1pip[1]); close(p2pip[0]); close(p2pip[1]);
+        pid_t other;
+        read(p1pip[0], &other, sizeof(other));
+        close(p1pip[0]);
+        kill(other, SIGUSR1);
+        // Wait for reciprocal signal
+        while (!cc_count) pause();
+        _exit(cc_count == 1 ? 0 : 1);
+    }
+
+    pid_t p2 = fork();
+    ASSERT_NEQ(p2, -1);
+    if (!p2) {
+        close(p2pip[1]); close(p1pip[0]); close(p1pip[1]);
+        pid_t other;
+        read(p2pip[0], &other, sizeof(other));
+        close(p2pip[0]);
+        kill(other, SIGUSR1);
+        while (!cc_count) pause();
+        _exit(cc_count == 1 ? 0 : 1);
+    }
+
+    close(p1pip[0]); close(p2pip[0]);
+
+    // Give each child the other's PID
+    write(p1pip[1], &p2, sizeof(p2));
+    write(p2pip[1], &p1, sizeof(p1));
+    close(p1pip[1]); close(p2pip[1]);
+
+    int s1, s2;
+    waitpid(p1, &s1, 0);
+    waitpid(p2, &s2, 0);
+    ASSERT_EQ(WIFEXITED(s1), 1);
+    ASSERT_EQ(WEXITSTATUS(s1), 0);
+    ASSERT_EQ(WIFEXITED(s2), 1);
+    ASSERT_EQ(WEXITSTATUS(s2), 0);
+}
+
+// =========================================================================
+// Multi-threading tests
+// NOTE: exit() with >1 thread alive is NOT supported — always join first.
+//       SIGALRM is not supported.
+// =========================================================================
+
+static void *thread_basic_fn(void *arg) {
+    *(int *)arg = 42;
+    return NULL;
+}
+
+TEST(ThreadBasic) {
+    int val = 0;
+    pthread_t thr;
+    ASSERT_EQ(0, pthread_create(&thr, NULL, thread_basic_fn, &val));
+    ASSERT_EQ(0, pthread_join(thr, NULL));
+    ASSERT_EQ(42, val);
+}
+
+static volatile int thread_sig_flag = 0;
+static void thread_sig_handler(int sig) { thread_sig_flag = 1; }
+
+static void *thread_sig_worker(void *arg) {
+    while (!thread_sig_flag)
+        usleep(1000);
+    return NULL;
+}
+
+TEST(ThreadSignal) {
+    thread_sig_flag = 0;
+    struct sigaction act = { .sa_handler = thread_sig_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
+
+    pthread_t thr;
+    ASSERT_EQ(0, pthread_create(&thr, NULL, thread_sig_worker, NULL));
+
+    usleep(5000); // let worker start spinning
+    ASSERT_EQ(0, raise(SIGUSR1));
+
+    ASSERT_EQ(0, pthread_join(thr, NULL));
+    ASSERT_EQ(1, thread_sig_flag);
+}
+
+static void *thread_exit_fn(void *arg) {
+    usleep(10000);
+    return NULL;
+}
+
+TEST(ThreadExitNoDeadlock) {
+    // Thread exits while main holds a user mutex — verify no deadlock
+    pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&m);
+
+    pthread_t thr;
+    ASSERT_EQ(0, pthread_create(&thr, NULL, thread_exit_fn, NULL));
+
+    usleep(30000); // let thread run and exit
+    pthread_mutex_unlock(&m);
+
+    ASSERT_EQ(0, pthread_join(thr, NULL));
+}
+
+static void *thread_pid_fn(void *arg) {
+    *(pid_t *)arg = getpid();
+    return NULL;
+}
+
+TEST(ThreadPidShared) {
+    pid_t thread_pid = 0;
+    pthread_t thr;
+    ASSERT_EQ(0, pthread_create(&thr, NULL, thread_pid_fn, &thread_pid));
+    ASSERT_EQ(0, pthread_join(thr, NULL));
+    // All threads of the same TVM task share the same pid
+    ASSERT_EQ(getpid(), thread_pid);
+}
+
 //////////
 //// Framework
 //////////
