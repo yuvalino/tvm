@@ -1205,7 +1205,7 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
             b = 0;
         }
         if (b) {
-            if (verbose)
+            if (verbose >= 2)
             {
                 if (newline) {
                     printf("\n");
@@ -1231,7 +1231,7 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
             b = 0;
         }
         if (b) {
-            if (verbose) {
+            if (verbose >= 2) {
                 if (newline) {
                     printf("\n");
                     newline = 0;
@@ -1406,8 +1406,11 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!in_gdb)
+    if (!in_gdb) {
         printf("tvm ");
+        if (verbose)
+            printf("\n\n");
+    }
         
     int r = 0, i = 0;
     for (; tests[i].f; i++) {
@@ -1424,6 +1427,10 @@ int main(int argc, char **argv)
         }
 
         if (!in_gdb) {
+            if (verbose) {
+                printf("%s ", tests[i].n);
+                fflush(stdout);
+            }
             r = runtest(tests + i, verbose);
             if (r) {
                 printf((r>0)?"F":"C");
@@ -1432,6 +1439,10 @@ int main(int argc, char **argv)
             else {
                 printf(".");
             }
+            if (verbose) {
+                printf("\n");
+            }
+            fflush(stdout);
         }
         else {
             runtest_gdb(tests + i, verbose);
