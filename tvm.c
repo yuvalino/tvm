@@ -66,6 +66,7 @@
 // TODOLIST
 // 2. taskfreelastref taskslock deadlock
 // 3. signal safety
+// 4. waitpid signal delivery
 
 // LOCK ORDERING
 
@@ -535,6 +536,9 @@ struct emulator_context *emulator_context_create(struct ulinker *ulinker);
 void                     emulator_context_destroy(struct emulator_context *ec);
 
 void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
+
+static inline void tvm_sig_enter(void);
+static inline void tvm_sig_leave(void);
 
 /////////////
 // Helpers
@@ -1575,6 +1579,9 @@ struct task {
     struct ulinker *tsk_linker;
     char tsk_cwd[PATH_MAX];
     exit_t tsk_exits[32];
+    uint32_t tsk_pending_sigs;  // bitmask of deferred signals (atomic via __atomic builtins)
+    siginfo_t tsk_pending_siginfo[MAX_SIGNALS];
+    ucontext_t tsk_pending_ucontext[MAX_SIGNALS];
 };
 
 struct thread {
@@ -1585,6 +1592,10 @@ struct thread {
     uint64_t thr_refcount;
     struct emulator_context *thr_emulator;
     void *thr_fork_fp;  // copy frames from sp to this on fork()
+    int thr_sig_blocked;  // nonzero when signals are deferred on this thread (atomic via __atomic builtins)
+    uint32_t thr_pending_sigs;  // thread-directed deferred signals (atomic via __atomic builtins)
+    siginfo_t thr_pending_siginfo[MAX_SIGNALS];
+    ucontext_t thr_pending_ucontext[MAX_SIGNALS];
 };
 
 static Dl_info main_dlinfo = {0};
@@ -1594,6 +1605,8 @@ static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct task *current;
 static __thread struct thread *current_thread;
 static __thread int thread_tvm_disallow = 0;
+static __thread int tvm_sig_blocked = 0;
+static __thread int tvm_sig_draining = 0;
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
 #define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
@@ -1640,13 +1653,15 @@ static struct file *file_for_task(struct task *t, int nfd) {
  * If `NFD` is invalid, `Expression` is executed with `__rfd = -1`.
  */
 #define WITH_RFD(Task, NFD, Expression) ({                          \
-    long __RET;                                                      \
+    long __RET;                                                     \
+    tvm_sig_enter();                                                \
     struct file *__FILE = file_for_task((Task), (NFD));             \
     int __rfd = (__FILE ? __FILE->f_rfd : -1);                      \
     if ((NFD) < 0) { __rfd = (NFD); }  /*AT_FDCWD*/                 \
     if (__FILE) file_unlock(__FILE, 0);                             \
     __RET = (Expression);                                           \
     if (__FILE) { file_lock(__FILE, 0); file_unlock(__FILE, 1); }   \
+    tvm_sig_leave();                                                \
     __RET;                                                          \
 })
 
@@ -1664,12 +1679,14 @@ static struct file *file_for_task(struct task *t, int nfd) {
  */
 #define WITH_FILE(Task, NFD, Expression) ({                         \
     int __RET = -1;                                                 \
+    tvm_sig_enter();                                                \
     struct file *__file = file_for_task((Task), (NFD));             \
     if (!__file) { errno = EBADF; }                                 \
     else {                                                          \
         __RET = (Expression);                                       \
         file_unlock(__file, 1);                                     \
     }                                                               \
+    tvm_sig_leave();                                                \
     __RET;                                                          \
 })
 
@@ -1953,16 +1970,19 @@ static struct file *task_new_regular_file_locked(struct task *t, int rfd) {
 }
 
 static int task_new_fd(struct task *t, int rfd) {
+    tvm_sig_enter();
     task_lock(t);
     struct file *file = task_new_regular_file_locked(t, rfd);
     if (!file) {
         task_unlock(t);
+        tvm_sig_leave();
         return -1;
     }
 
     int fd = file->f_nfd;
     task_unlock(t);
     file_unlock(file, 1);
+    tvm_sig_leave();
     return fd;
 }
 
@@ -2074,14 +2094,28 @@ static int task_set_pgid(struct task *t, int pgid)
 }
 
 /**
- * needs tasks_lock and t locked
+ * needs tasks_lock and t locked.
+ * Prefers delivering to a thread that isn't in a signal-deferred section.
  */
 static int task_kill_locked(struct task *t, int signum) {
     if (list_empty(&t->tsk_threads))
         return ESRCH;
-    
-    struct thread *thr = list_entry(t->tsk_threads.next, struct thread, thr_list);
-    return pthread_kill(thr->thr_pthread, signum);
+
+    // Try to find a thread that isn't blocking signals
+    struct thread *fallback = NULL;
+    struct thread *thr;
+    list_for_each_entry(thr, &t->tsk_threads, thr_list) {
+        if (!fallback)
+            fallback = thr;
+        if (!__atomic_load_n(&thr->thr_sig_blocked, __ATOMIC_ACQUIRE))
+            return pthread_kill(thr->thr_pthread, signum);
+    }
+
+    // All threads blocked — defer at task level (process-directed)
+    t->tsk_pending_siginfo[signum] = (siginfo_t){ .si_signo = signum };
+    memset(&t->tsk_pending_ucontext[signum], 0, sizeof(ucontext_t));
+    __atomic_fetch_or(&t->tsk_pending_sigs, 1u << signum, __ATOMIC_RELEASE);
+    return 0;
 }
 
 /**
@@ -2644,6 +2678,7 @@ DIR *real_dp(DIR *dp) {
 
 struct file_stream *file_stream_fp(FILE *fp) {
     struct file_stream *fs = (struct file_stream *)fp;
+    tvm_sig_enter();
     task_lock(current);
     if (fp == stdin)
         fs = current->tsk_io_filestreams[0];
@@ -2652,6 +2687,7 @@ struct file_stream *file_stream_fp(FILE *fp) {
     else if (fp == stderr)
         fs = current->tsk_io_filestreams[2];
     task_unlock(current);
+    tvm_sig_leave();
     return fs;
 }
 
@@ -2894,7 +2930,14 @@ static void dump_stacktrace()
     }
 }
 
-void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
+/**
+ * Dispatch a signal on the current thread.  Must NOT be called while
+ * tvm_sig_blocked — callers are responsible for checking.
+ *
+ * This is the shared core used by both the OS signal handler (immediate
+ * delivery) and tvm_sig_drain (deferred delivery).
+ */
+static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext)
 {
     if (!sigshutup) {
         if (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL)
@@ -2906,9 +2949,6 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         }
     }
 
-    if (!current)
-        panic("signal %d on pthread_exit", signum);
-    
     // `tasks_lock` required for `terminate_current_locked()`
     pthread_mutex_lock(&tasks_lock);
     task_lock(current);
@@ -2941,16 +2981,109 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         // TODO anything else we need to do?
         return;
     }
-    
+
     if ((act->sa_flags & SA_SIGINFO) == 0) {
         task_unlock(current);
         emulator_call_sighandler((uint64_t)act->sa_handler, signum, 0, 0);
         return;
     }
-    
+
     task_unlock(current);
     emulator_call_sighandler((uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
     return;
+}
+
+/**
+ * Drain all pending (deferred) signals on the current task/thread.
+ * Called when tvm_sig_blocked transitions from 1 → 0.
+ *
+ * Thread-level pending is drained first (thread-directed signals),
+ * then task-level pending (process-directed signals).
+ */
+static void tvm_sig_drain(void)
+{
+    if (!current)
+        return;
+
+    // Prevent recursive drain (signal_dispatch may re-enter)
+    if (tvm_sig_draining)
+        return;
+    tvm_sig_draining = 1;
+
+    uint32_t pending;
+
+    // Drain thread-directed pending signals
+    struct thread *thr = current_thread;
+    if (thr) {
+        while ((pending = __atomic_exchange_n(&thr->thr_pending_sigs, 0, __ATOMIC_ACQ_REL)) != 0) {
+            for (int sig = 1; sig < MAX_SIGNALS; sig++) {
+                if (pending & (1u << sig))
+                    signal_dispatch(sig, &thr->thr_pending_siginfo[sig], &thr->thr_pending_ucontext[sig]);
+            }
+        }
+    }
+
+    // Drain process-directed pending signals
+    struct task *t = current;
+    while ((pending = __atomic_exchange_n(&t->tsk_pending_sigs, 0, __ATOMIC_ACQ_REL)) != 0) {
+        for (int sig = 1; sig < MAX_SIGNALS; sig++) {
+            if (pending & (1u << sig))
+                signal_dispatch(sig, &t->tsk_pending_siginfo[sig], &t->tsk_pending_ucontext[sig]);
+        }
+    }
+
+    tvm_sig_draining = 0;
+}
+
+static inline void tvm_sig_enter(void)
+{
+    tvm_sig_blocked++;
+    if (tvm_sig_blocked == 1 && current_thread)
+        __atomic_store_n(&current_thread->thr_sig_blocked, 1, __ATOMIC_RELEASE);
+}
+
+static inline void tvm_sig_leave(void)
+{
+    VERIFY(tvm_sig_blocked > 0);
+    if (!--tvm_sig_blocked) {
+        if (current_thread)
+            __atomic_store_n(&current_thread->thr_sig_blocked, 0, __ATOMIC_RELEASE);
+        tvm_sig_drain();
+    }
+}
+
+/**
+ * OS-level signal handler installed via sigaction.
+ *
+ * If the current thread has signals blocked (inside a critical section),
+ * the signal is deferred into the task's pending bitmask.  Otherwise it
+ * is dispatched immediately.
+ */
+static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
+{
+    if (!current)
+        panic("signal %d on pthread_exit", signum);
+
+    if (signum < 1 || signum >= MAX_SIGNALS)
+        return;
+
+    if (tvm_sig_blocked) {
+        // Real hardware fault while in critical section = bug in our implementation
+        // si_code > 0 distinguishes kernel-generated (real fault) from user-sent (kill/sigqueue)
+        if (siginfo->si_code > 0 &&
+            (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE))
+            panic("hardware fault %d (si_code=%d) while signals blocked", signum, siginfo->si_code);
+
+        // Thread-directed: defer at thread level
+        struct thread *thr = current_thread;
+        thr->thr_pending_siginfo[signum] = *siginfo;
+        if (ucontext)
+            thr->thr_pending_ucontext[signum] = *(ucontext_t *)ucontext;
+        __atomic_fetch_or(&thr->thr_pending_sigs, 1u << signum, __ATOMIC_RELEASE);
+        return;
+    }
+
+    signal_dispatch(signum, siginfo, (ucontext_t *)ucontext);
 }
 
 /////////////
@@ -3163,10 +3296,12 @@ static struct tty *tty_for_nfd(int nfd, int *out_ttymode)
  */
 static int islocaltty(int fd)
 {
+    tvm_sig_enter();
     task_lock(current);
     struct file *file = file_for_task_locked(current, fd);
     if (!file) {
         task_unlock(current);
+        tvm_sig_leave();
         errno = EBADF;
         return 0;
     }
@@ -3174,6 +3309,7 @@ static int islocaltty(int fd)
 
     if (file->f_type != DEV_TTY) {
         file_unlock(file, 1);
+        tvm_sig_leave();
         errno = ENOTTY;
         return 0;
     }
@@ -3182,6 +3318,7 @@ static int islocaltty(int fd)
     struct tty *tt = tty_for_file_locked(file, &ttymode);
     if (!tt) {
         file_unlock(file, 1);
+        tvm_sig_leave();
         errno = ENOTTY;
         return 0;
     }
@@ -3189,6 +3326,7 @@ static int islocaltty(int fd)
     int ok = (ttymode == TTM_MASTER || tt->t_master_refcnt > 0);
     tty_unlock(tt, 1);
     file_unlock(file, 1);
+    tvm_sig_leave();
     if (!ok)
         errno = ENOTTY;
     return ok;
@@ -7833,8 +7971,10 @@ static void __panic(const char *msg, const char *file, int line)
 
 FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
     char pathname_abs[PATH_MAX];
+
     if (!normalize_path(NULL, pathname, pathname_abs))
         return NULL;
+
     pathname = pathname_abs;
 
     int fd = open(pathname, O_RDONLY | O_DIRECTORY);
@@ -7842,16 +7982,18 @@ FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
         return NULL;
 
     DIR *dp = fdopendir(fd);
-    if (!dp)
+    if (dp)
         close(fd);
     return dp;
 }
 
 FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
+    tvm_sig_enter();
     task_lock(current);
     struct file_stream *fs = task_filestreamalloc_locked(current);
     if (!fs) {
         task_unlock(current);
+        tvm_sig_leave();
         return NULL;
     }
 
@@ -7859,6 +8001,7 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     if (!file) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
+        tvm_sig_leave();
         return NULL;
     }
 
@@ -7869,6 +8012,7 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return NULL;
     }
 
@@ -7880,6 +8024,8 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     
     fs->fs_type = FS_DIR;
     fs->fs_dp = dp;
+
+    tvm_sig_leave();
     
     return (DIR *)fs;
 }
@@ -7893,9 +8039,11 @@ FUNCTION_DEFINE1(int, closedir, DIR *, dir) {
 
     int nfd = fs->fs_nfd;
 
+    tvm_sig_enter();
     task_lock(current);
     task_filestreamdealloc_locked(current, fs);
     task_unlock(current);
+    tvm_sig_leave();
     
     if (-1 == close(nfd))
         return errno;
@@ -7903,9 +8051,12 @@ FUNCTION_DEFINE1(int, closedir, DIR *, dir) {
 }
 
 FUNCTION_DEFINE1(struct dirent *, readdir, DIR *, dir) {
+    tvm_sig_enter();
     struct file *file = file_for_task_dp(current, dir);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return NULL;
+    }
 
     struct file_stream *fs = (struct file_stream *)dir;
 
@@ -7914,16 +8065,19 @@ FUNCTION_DEFINE1(struct dirent *, readdir, DIR *, dir) {
         struct dirent *dent = CALL_FUNC(readdir, real_dp(dir));
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return dent;
     }
 
     struct dirent *de = &fs->fs_dirent;
     if (0 != file->f_ops->f_readdir(file, de)) {
         file_unlock(file, 1);
+        tvm_sig_leave();
         return NULL;
     }
 
     file_unlock(file, 1);
+    tvm_sig_leave();
     return de;
 }
 
@@ -7957,8 +8111,10 @@ static int fmode_to_flags(const char *mode)
 FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
 {
     char pathname_abs[PATH_MAX];
+
     if (!normalize_path(NULL, pathname, pathname_abs))
         return NULL;
+
     pathname = pathname_abs;
 
     int flags = fmode_to_flags(mode);
@@ -7976,10 +8132,12 @@ FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
 }
 
 FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
+    tvm_sig_enter();
     task_lock(current);
     struct file_stream *fs = task_filestreamalloc_locked(current);
     if (!fs) {
         task_unlock(current);
+        tvm_sig_leave();
         return NULL;
     }
 
@@ -7987,6 +8145,7 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     if (!file) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
+        tvm_sig_leave();
         return NULL;
     }
 
@@ -7997,6 +8156,7 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return NULL;
     }
 
@@ -8012,6 +8172,8 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     fs->fs_type = FS_FILE;
     fs->fs_fp = fp;
     
+    tvm_sig_leave();
+
     return (FILE *)fs;
 }
 
@@ -8023,9 +8185,11 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
 
     int nfd = fs->fs_nfd;
 
+    tvm_sig_enter();
     task_lock(current);
     task_filestreamdealloc_locked(current, fs);
     task_unlock(current);
+    tvm_sig_leave();
     
     return close(nfd);
 }
@@ -8047,6 +8211,9 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     fs->fs_nfd = -1;
 
     int fd = open(pathname, flags, 0666);
+
+    tvm_sig_enter();
+
     task_lock(current);
 
     fp_setfileno(fs->fs_fp, -1);
@@ -8055,12 +8222,14 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
 
     if (-1 == fd) {
         task_unlock(current);
+        tvm_sig_leave();
         return NULL;
     }
 
     struct file *file = file_for_task_locked(current, fd);
     if (!file) {
         task_unlock(current);
+        tvm_sig_leave();
         close(fd);
         return NULL;
     }
@@ -8071,6 +8240,7 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     if (!fp) {
         task_unlock(current);
         file_unlock(file, 1);
+        tvm_sig_leave();
         close(fd);
         return NULL;
     }
@@ -8086,26 +8256,35 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
 
     fs->fs_type = FS_FILE;
     fs->fs_fp = fp;
+
+    tvm_sig_leave();
     
     return (FILE *)fs;
 }
 
 FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb, FILE *, stream) {
     size_t ret;
+
+    tvm_sig_enter();
+
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return 0;
+    }
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fwrite, ptr, size, nmemb, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return ret;
     }
     
     if (!size) {
         file_unlock(file, 1);
+        tvm_sig_leave();
         return 0;
     }
     
@@ -8116,25 +8295,32 @@ FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb,
         ret = (size_t)r;
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret / size;
 }
 
 FUNCTION_DEFINE4(size_t, fread, void *, ptr, size_t, size, size_t, nmemb, FILE *, stream) {
-        size_t ret;
+    size_t ret;
+
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return 0;
+    }
 
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fread, ptr, size, nmemb, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return ret;
     }
     
     if (!size) {
         file_unlock(file, 1);
+        tvm_sig_leave();
         return 0;
     }
     
@@ -8145,34 +8331,44 @@ FUNCTION_DEFINE4(size_t, fread, void *, ptr, size_t, size, size_t, nmemb, FILE *
         ret = (size_t)r;
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret / size;
 }
 
 FUNCTION_DEFINE3(int, fseek, FILE *, stream, long, offset, int, whence) {
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return -1;
+    }
 
     file_unlock(file, 0);
     int ret = CALL_FUNC(fseek, real_fp(stream), offset, whence);
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret;
 }
 
 FUNCTION_DEFINE1(long, ftell, FILE *, stream) {
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return -1;
+    }
 
     file_unlock(file, 0);
     long ret = CALL_FUNC(ftell, real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret;
 }
 
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
+    tvm_sig_enter();
 
     // fflush all open streams
     if (!stream) {
@@ -8185,27 +8381,34 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
             ret |= CALL_FUNC(fflush, fsle->fsle_stream->fs_fp);
         }
         task_unlock(current);
+        tvm_sig_leave();
         return ret;
     }
 
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return EOF;
+    }
 
     file_unlock(file, 0);
     int ret = CALL_FUNC(fflush, real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret;
 }
 
 FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
+    tvm_sig_enter();
+
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
         int last_fd = CALL_FUNC(fileno, real_fp(stream));
         fp_setfileno(real_fp(stream), -1);
         CALL_FUNC(setbuf, real_fp(stream), buf);
         fp_setfileno(real_fp(stream), last_fd);
+        tvm_sig_leave();
         return;
     }
 
@@ -8213,6 +8416,7 @@ FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
     CALL_FUNC(setbuf, real_fp(stream), buf);
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
 }
 
 #if defined(__linux__)
@@ -8220,74 +8424,99 @@ FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, size_t, size) {
 #elif defined(__APPLE__)
 FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
 #endif
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
         int last_fd = CALL_FUNC(fileno, real_fp(stream));
         fp_setfileno(real_fp(stream), -1);
         CALL_FUNC(setbuffer, real_fp(stream), buf, size);
         fp_setfileno(real_fp(stream), last_fd);
+        tvm_sig_leave();
         return;
     }
 
     file_unlock(file, 0);
     CALL_FUNC(setbuffer, real_fp(stream), buf, size);
     file_lock(file, 0);
-    file_unlock(file, 1);    
+    file_unlock(file, 1);
+    tvm_sig_leave();
 }
 
 #if defined(__linux__)
 FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
+    tvm_sig_enter();
+
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return;
+    }
 
     file_unlock(file, 0);
     CALL_FUNC(setlinebuf, real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
 }
 #elif defined(__APPLE__)
 FUNCTION_DEFINE1(int, setlinebuf, FILE *, stream) {
+    tvm_sig_enter();
+
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return -1;
+    }
 
     file_unlock(file, 0);
     int ret = CALL_FUNC(setlinebuf, real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret;
 }
 #endif
 
 FUNCTION_DEFINE4(int, setvbuf, FILE *, stream, char *, buf, int, mode, size_t, size) {
+    tvm_sig_enter();
+
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return -1;
+    }
 
     file_unlock(file, 0);
     int ret = CALL_FUNC(setvbuf, real_fp(stream), buf, mode, size);
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret;
 }
 
 FUNCTION_DEFINE2(int, fputc, int, c, FILE *, stream) {
     int ret;
+
+    tvm_sig_enter();
+
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return EOF;
+    }
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fputc, c, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return ret;
     }
     
     ssize_t r = file->f_ops->f_write(file, &c, 1, -1);
     file_unlock(file, 1);
+    tvm_sig_leave();
     if (r == 1)
         return c;
     return EOF;
@@ -8296,20 +8525,26 @@ FUNCTION_DEFINE2(int, fputc, int, c, FILE *, stream) {
 FUNCTION_DEFINE2(int, fputs, const char *, s, FILE *, stream) {
     size_t n = strlen(s);
     int ret;
+
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return EOF;
+    }
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fputs, s, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return ret;
     }
     
     ssize_t r = file->f_ops->f_write(file, s, n, -1);
     file_unlock(file, 1);
+    tvm_sig_leave();
     if (r >= 0)
         return (int)r;
     return EOF;
@@ -8331,21 +8566,26 @@ FUNCTION_DEFINE1(int, puts, const char *, s) {
 
 FUNCTION_DEFINE1(int, fgetc, FILE *, stream) {
     int ret;
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return EOF;
+    }
 
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fgetc, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return ret;
     }
     
     char c;
     ssize_t r = file->f_ops->f_read(file, &c, 1, -1);
     file_unlock(file, 1);
+    tvm_sig_leave();
     if (r == 1)
         return c;
     return EOF;
@@ -8353,25 +8593,31 @@ FUNCTION_DEFINE1(int, fgetc, FILE *, stream) {
 
 FUNCTION_DEFINE3(char *, fgets, char *, s, int, size, FILE *, stream) {
     char *ret;
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return NULL;
+    }
 
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fgets, s, size, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return ret;
     }
     
     if (size <= 0) {
         file_unlock(file, 1);
+        tvm_sig_leave();
         return NULL;
     }
 
     if (size == 1) {
         file_unlock(file, 1);
+        tvm_sig_leave();
         s[0] = 0;
         return s;
     }
@@ -8391,6 +8637,7 @@ FUNCTION_DEFINE3(char *, fgets, char *, s, int, size, FILE *, stream) {
     }
     
     file_unlock(file, 1);
+    tvm_sig_leave();
 
     if (i == 0 && err)
         return NULL;
@@ -8408,9 +8655,7 @@ FUNCTION_DEFINE0(int, getchar) {
 }
 
 FUNCTION_DEFINE2(int, ungetc, int, c, FILE *, stream) {
-
     // TODO support for file->f_ops
-
     return CALL_FUNC(ungetc, c, real_fp(stream));
 }
 
@@ -8448,26 +8693,33 @@ FUNCTION_DEFINE2(int, vprintf, const char *, format, va_list, ap) {
 
 FUNCTION_DEFINE3(int, vfprintf, FILE *, stream, const char *, format, va_list, ap) {
     int ret;
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return -1;
+    }
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
         ret = CALL_FUNC(vfprintf, real_fp(stream), format, ap);
         file_lock(file, 0);
         file_unlock(file, 1);
+        tvm_sig_leave();
         return ret;
     }
 
     file_unlock(file, 1);
+    tvm_sig_leave();
 
     return vdprintf(fileno(stream), format, ap);
 }
 
 FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -8502,7 +8754,8 @@ FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
     
 out:
     file_unlock(file, 1);
-    
+    tvm_sig_leave();
+
     return ret;
 }
 
@@ -8519,14 +8772,18 @@ FUNCTION_DEFINE2(int, vscanf, const char *, format, va_list, ap) {
 }
 
 FUNCTION_DEFINE3(int, vfscanf, FILE *, stream, const char *, format, va_list, ap) {
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return EOF;
+    }
 
     file_unlock(file, 0);
     int ret = CALL_FUNC(vfscanf, real_fp(stream), format, ap);
     file_lock(file, 0);
     file_unlock(file, 1);
+    tvm_sig_leave();
     return ret;
 }
 
@@ -8558,28 +8815,35 @@ FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags)
         pathname = pathname_abs;
     }
 
+    tvm_sig_enter();
     struct file *file = (void *)CURRENT_RFD(dirfd, (long)file_open(__rfd, pathname, flags, mode, getuid(), getgid()));
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return -1;
+    }
 
     task_lock(current);
     int fd;
     if (-1 == (fd = task_assign_file_locked(current, file, 0))) {
         task_unlock(current);
         file_unlock(file, 1);
+        tvm_sig_leave();
         errno = EMFILE;
         return -1;
     }
 
     task_unlock(current);
     file_unlock(file, 1);
+    tvm_sig_leave();
 
     return fd;
 }
 
 FUNCTION_DEFINE3(ssize_t, read, int, fd, void *, buf, size_t, count) {
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -8594,13 +8858,16 @@ FUNCTION_DEFINE3(ssize_t, read, int, fd, void *, buf, size_t, count) {
         ret = file->f_ops->f_read(file, buf, count, -1);
     
     file_unlock(file, 1);
-    
+    tvm_sig_leave();
+
     return ret;
 }
 
 FUNCTION_DEFINE3(ssize_t, write, int, fd, const void *, buf, size_t, count) {
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -8615,11 +8882,14 @@ FUNCTION_DEFINE3(ssize_t, write, int, fd, const void *, buf, size_t, count) {
         ret = file->f_ops->f_write(file, buf, count, -1);
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     
     return ret;
 }
 
 FUNCTION_DEFINE1(int, close, int, fd) {
+    tvm_sig_enter();
+
     task_lock(current);
 
     // detach from current before closing
@@ -8627,6 +8897,7 @@ FUNCTION_DEFINE1(int, close, int, fd) {
     struct file *file = task_unassign_fd_locked(current, fd);
     if (!file) {
         task_unlock(current);
+        tvm_sig_leave();
         errno = EMFILE;
         return -1;
     }
@@ -8636,12 +8907,15 @@ FUNCTION_DEFINE1(int, close, int, fd) {
     // lowest refcnt possible is 1, so may dealloc
     file_unlock(file, 1);
     
+    tvm_sig_leave();
     return 0;
 }
 
 FUNCTION_DEFINE3(ssize_t, readv, int, fd, const struct iovec *, iov, int, iovcnt) {
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -8673,13 +8947,16 @@ FUNCTION_DEFINE3(ssize_t, readv, int, fd, const struct iovec *, iov, int, iovcnt
     }
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     
     return ret;
 }
 
 FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcnt) {
-        struct file *file = file_for_task(current, fd);
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -8711,6 +8988,7 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
     }
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     
     return ret;
 }
@@ -8728,10 +9006,13 @@ FUNCTION_DEFINE1(int, dup, int, oldfd) {
 }
 
 FUNCTION_DEFINE2(int, dup2, int, oldfd, int, newfd) {
+    tvm_sig_enter();
+
     task_lock(current);
     struct file *oldfile = file_for_task_locked(current, oldfd);
     if (!oldfile) {
         task_unlock(current);
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -8743,8 +9024,10 @@ FUNCTION_DEFINE2(int, dup2, int, oldfd, int, newfd) {
     task_unlock(current);
     file_unlock(oldfile, 1);
 
-    if (!newfile)
+    if (!newfile) {
+        tvm_sig_leave();
         return -1;
+    }
 
     file_unlock(newfile, 0);
     task_lock(current);
@@ -8761,27 +9044,38 @@ FUNCTION_DEFINE2(int, dup2, int, oldfd, int, newfd) {
     file_unlock(newfile, 1);
     if (prevnewfile)
         file_unlock(prevnewfile, 1); // may dealloc
+    tvm_sig_leave();
     return newfd;
 }
 
 FUNCTION_DEFINE1(int, pipe, int *, pipefd) {
+
+    tvm_sig_enter();
+
     int r[2], f[2];
-    if (0 != CALL_FUNC(pipe, r))
+    if (0 != CALL_FUNC(pipe, r)) {
+        tvm_sig_leave();
         return -1;
-    
+    }
+
     if (-1 == (f[0] = task_new_fd(current, r[0]))) {
         VERIFY(0 == CALL_FUNC(close, r[0]));
         VERIFY(0 == CALL_FUNC(close, r[1]));
+        tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f[1] = task_new_fd(current, r[1]))) {
         VERIFY(0 == close(f[0]));
         VERIFY(0 == CALL_FUNC(close, r[1]));
+        tvm_sig_leave();
         return -1;
     }
 
+    tvm_sig_leave();
+
     memcpy(pipefd, f, sizeof(f));
+    
     return 0;
 }
 
@@ -8867,6 +9161,8 @@ FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
         return ret;
     }
 
+    tvm_sig_enter();
+
     for (int i = 0; i < nfds; i++) {
         files[i] = file_for_task(current, fds[i].fd);
         if (!files[i]) {
@@ -8874,6 +9170,7 @@ FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
                 file_lock(files[j], 0);
                 file_unlock(files[j], 1);
             }
+            tvm_sig_leave();
             free(files);
             free(realfds);
             return ret;
@@ -8893,6 +9190,8 @@ FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
         file_unlock(files[i], 1);
     }
 
+    tvm_sig_leave();
+
     free(files);
     free(realfds);
     return ret;
@@ -8906,10 +9205,13 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     if (cmd == F_DUPFD) {
         // TODO: F_DUPFD_CLOEXEC
 
+        tvm_sig_enter();
+
         task_lock(current);
         struct file *oldfile = file_for_task_locked(current, fd);
         if (!oldfile) {
             task_unlock(current);
+            tvm_sig_leave();
             errno = EBADF;
             return -1;
         }
@@ -8920,8 +9222,10 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         task_unlock(current);
         file_unlock(oldfile, 1);
         
-        if (!newfile)
+        if (!newfile) {
+            tvm_sig_leave();
             return -1;
+        }
 
         file_unlock(newfile, 0);
         task_lock(current);
@@ -8931,12 +9235,14 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         if (-1 == (fd = task_assign_file_locked(current, newfile, (int)(long)arg))) {
             task_unlock(current);
             file_unlock(newfile, 1);
+            tvm_sig_leave();
             errno = EMFILE;
             return -1;
         }
 
         task_unlock(current);
         file_unlock(newfile, 1);
+        tvm_sig_leave();
 
         return fd;
     }
@@ -8954,12 +9260,16 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
         return -1;
     pathname = pathname_abs;
 
+    tvm_sig_enter();
     if (find_program(pathname)) {
+        tvm_sig_leave();
         statbuf->st_mode = S_IFREG | S_IXUSR | S_IXGRP | S_IXOTH;
         return 0;
     }
     
-    return file_stat(pathname, statbuf, 0);
+    int ret = file_stat(pathname, statbuf, 0);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, lstat, const char *, pathname, struct stat *, statbuf) {
@@ -8968,17 +9278,23 @@ FUNCTION_DEFINE2(int, lstat, const char *, pathname, struct stat *, statbuf) {
         return -1;
     pathname = pathname_abs;
 
+    tvm_sig_enter();
     if (find_program(pathname)) {
+        tvm_sig_leave();
         statbuf->st_mode = S_IFREG | S_IXUSR | S_IXGRP | S_IXOTH;
         return 0;
     }
     
-    return file_stat(pathname, statbuf, AT_SYMLINK_NOFOLLOW);
+    int ret = file_stat(pathname, statbuf, AT_SYMLINK_NOFOLLOW);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -8993,6 +9309,7 @@ FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
         ret = file->f_ops->f_fstat(file, statbuf);
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     
     return ret;
 }
@@ -9003,7 +9320,10 @@ FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *
         return -1;
     pathname = pathname_abs;
     
-    return file_stat(pathname, statbuf, flag);
+    tvm_sig_enter();
+    int ret = file_stat(pathname, statbuf, flag);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
@@ -9012,17 +9332,23 @@ FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
         return -1;
     pathname = pathname_abs;
 
+    tvm_sig_enter();
+
     // make sure the shell finds our programs
-    if (find_program(pathname))
+    if (find_program(pathname)) {
+        tvm_sig_leave();
         return 0;
+    }
 
     if (mode & X_OK) {
         mode &= ~X_OK;
         if (!mode)
             mode = F_OK;
     }
-
-    return file_access(pathname, mode, 0);
+    
+    int ret = file_access(pathname, mode, 0);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, int, flags) {
@@ -9031,9 +9357,13 @@ FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, 
         return -1;
     pathname = pathname_abs;
 
+    tvm_sig_enter();
+
     // make sure the shell finds our programs
-    if (find_program(pathname))
+    if (find_program(pathname)) {
+        tvm_sig_leave();
         return 0;
+    }
 
     if (mode & X_OK) {
         mode &= ~X_OK;
@@ -9041,7 +9371,9 @@ FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, 
             mode = F_OK;
     }
 
-    return file_access(pathname, mode, flags);
+    int ret = file_access(pathname, mode, flags);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
@@ -9050,7 +9382,10 @@ FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
         return -1;
     pathname = pathname_abs;
 
-    return file_chmod(pathname, mode, 0);
+    tvm_sig_enter();
+    int ret = file_chmod(pathname, mode, 0);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
@@ -9059,12 +9394,17 @@ FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
         return -1;
     pathname = pathname_abs;
 
-    return file_chmod(pathname, mode, AT_SYMLINK_NOFOLLOW);
+    tvm_sig_enter();
+    int ret = file_chmod(pathname, mode, AT_SYMLINK_NOFOLLOW);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -9079,6 +9419,7 @@ FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
         ret = file->f_ops->f_fchmod(file, mode);
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     
     return ret;
 }
@@ -9089,7 +9430,10 @@ FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode
         return -1;
     pathname = pathname_abs;
 
-    return file_chmod(pathname, mode, flag);
+    tvm_sig_enter();
+    int ret = file_chmod(pathname, mode, flag);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group) {
@@ -9098,7 +9442,10 @@ FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group)
         return -1;
     pathname = pathname;
 
-    return file_chown(pathname, owner, group, 0);
+    tvm_sig_enter();
+    int ret = file_chown(pathname, owner, group, 0);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group) {
@@ -9107,12 +9454,17 @@ FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group
         return -1;
     pathname = pathname;
 
-    return file_chown(pathname, owner, group, AT_SYMLINK_NOFOLLOW);
+    tvm_sig_enter();
+    int ret = file_chown(pathname, owner, group, AT_SYMLINK_NOFOLLOW);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -9127,6 +9479,7 @@ FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
         ret = file->f_ops->f_fchown(file, owner, group);
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     
     return ret;
 }
@@ -9137,7 +9490,10 @@ FUNCTION_DEFINE5(int, fchownat, int, dirfd, const char *, pathname, uid_t, owner
         return -1;
     pathname = pathname_abs;
 
-    return file_chown(pathname, owner, group, flag);
+    tvm_sig_enter();
+    int ret = file_chown(pathname, owner, group, flag);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, flock, int, fd, int, operation) {
@@ -9217,6 +9573,8 @@ FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirf
         newpath = newpath_abs;
     }
 
+    tvm_sig_enter();
+
     int olddirrfd = -1;
     struct file *olddirfile = file_for_task(current, olddirfd);
     if (olddirfile) {
@@ -9242,6 +9600,8 @@ FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirf
         file_lock(olddirfile, 0);
         file_unlock(olddirfile, 1);
     }
+
+    tvm_sig_leave();
 
     return ret;
 }
@@ -9275,6 +9635,8 @@ FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdi
         newpath = newpath_abs;
     }
 
+    tvm_sig_enter();
+
     int olddirrfd = -1;
     struct file *olddirfile = file_for_task(current, olddirfd);
     if (olddirfile) {
@@ -9301,6 +9663,8 @@ FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdi
         file_unlock(olddirfile, 1);
     }
 
+    tvm_sig_leave();
+    
     return ret;
 }
 
@@ -9375,7 +9739,9 @@ FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode
 
 FUNCTION_DEFINE1(int, mkstemp, char *, template) {
     int r, f;
+    tvm_sig_enter();
     if (-1 == (r = CALL_FUNC(mkstemp, template))) {
+        tvm_sig_leave();
         return -1;
     }
 
@@ -9383,13 +9749,19 @@ FUNCTION_DEFINE1(int, mkstemp, char *, template) {
         VERIFY(0 == CALL_FUNC(close, r));
         errno = EMFILE;
     }
+
+    tvm_sig_leave();
 
     return f;
 }
 
 FUNCTION_DEFINE3(int, socket, int, domain, int, type, int, protocol) {
     int r, f;
+
+    tvm_sig_enter();
+
     if (-1 == (r = CALL_FUNC(socket, domain, type, protocol))) {
+        tvm_sig_leave();
         return -1;
     }
 
@@ -9397,6 +9769,8 @@ FUNCTION_DEFINE3(int, socket, int, domain, int, type, int, protocol) {
         VERIFY(0 == CALL_FUNC(close, r));
         errno = EMFILE;
     }
+
+    tvm_sig_leave();
 
     return f;
 }
@@ -9404,13 +9778,19 @@ FUNCTION_DEFINE3(int, socket, int, domain, int, type, int, protocol) {
 FUNCTION_DEFINE3(int, accept, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen) {
     int r, f;
     
-    if (-1 == (r = CURRENT_RFD(sockfd, CALL_FUNC(accept, __rfd, addr, addrlen))))
+    tvm_sig_enter();
+
+    if (-1 == (r = CURRENT_RFD(sockfd, CALL_FUNC(accept, __rfd, addr, addrlen)))) {
+        tvm_sig_leave();
         return -1;
+    }
 
     if (-1 == (f = task_new_fd(current, r))) {
         VERIFY(0 == CALL_FUNC(close, r));
         errno = EMFILE;
     }
+
+    tvm_sig_leave();
 
     return f;
 }
@@ -9472,23 +9852,30 @@ FUNCTION_DEFINE2(int, shutdown, int, sockfd, int, how) {
 }
 
 FUNCTION_DEFINE4(int, socketpair, int, domain, int, type, int, protocol, int *, sv) {
+    tvm_sig_enter();
+
     int r[2], f[2];
-    if (0 != CALL_FUNC(socketpair, domain, type, protocol, r))
+    if (0 != CALL_FUNC(socketpair, domain, type, protocol, r)) {
+        tvm_sig_leave();
         return -1;
+    }
     
     if (-1 == (f[0] = task_new_fd(current, r[0]))) {
         VERIFY(0 == CALL_FUNC(close, r[0]));
         VERIFY(0 == CALL_FUNC(close, r[1]));
+        tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f[1] = task_new_fd(current, r[1]))) {
         VERIFY(0 == close(f[0]));
         VERIFY(0 == CALL_FUNC(close, r[1]));
+        tvm_sig_leave();
         return -1;
     }
 
     memcpy(sv, f, sizeof(f));
+    tvm_sig_leave();
     return 0;
 }
 
@@ -9497,8 +9884,10 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(ioctl, fd, request, arg);
 
+    tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
+        tvm_sig_leave();
         errno = EBADF;
         return -1;
     }
@@ -9513,6 +9902,7 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
         ret = file->f_ops->f_ioctl(file, request, arg);
     
     file_unlock(file, 1);
+    tvm_sig_leave();
     
     return ret;
 }
@@ -9999,6 +10389,8 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
 }
 
 FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t *, attr, start_routine_fn, start_routine, void *, _arg) {
+    tvm_sig_enter();
+
     int ret = EINVAL;
     struct pthread_create_arg *arg = NULL;
     struct thread *thr = NULL;
@@ -10058,10 +10450,12 @@ out:
         task_unlock(current);
     }
 
+    tvm_sig_leave();
     return ret;
 }
 
 FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
+    tvm_sig_enter();
 
     task_lock(current);
     if (current->tsk_threads_cnt == 1) {
@@ -10086,6 +10480,7 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
 }
 
 FUNCTION_DEFINE_NORET1(exit, int, status) {
+    tvm_sig_enter();
     task_lock(current);
     exit_t exits[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
     memcpy(&exits, current->tsk_exits, sizeof(exits));
@@ -10103,6 +10498,7 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
 }
 
 FUNCTION_DEFINE_NORET1(_exit, int, status) {
+    tvm_sig_enter();
     if (current == main_task)
         CALL_FUNC(_exit, status);
     
@@ -10136,6 +10532,8 @@ int atexit(exit_t function) {
     if (!can_enter_tvm(NULL))
         return 0;
 
+    tvm_sig_enter();
+
     if (!function) {
         errno = EINVAL;
         return -1;
@@ -10146,10 +10544,13 @@ int atexit(exit_t function) {
         if (!current->tsk_exits[i]) {
             current->tsk_exits[i] = function;
             task_unlock(current);
+            tvm_sig_leave();
             return 0;
         }
     }
     task_unlock(current);
+
+    tvm_sig_leave();
 
     errno = ENOMEM;
     return -1;
@@ -10164,6 +10565,7 @@ FUNCTION_DEFINE_NORET_VA2(err, int, eval, const char *, fmt) {
 }
 
 FUNCTION_DEFINE_NORET3(verr, int, eval, const char *, fmt, va_list, args) {
+    tvm_sig_enter();
     int saved_errno = errno;
 
     if (*current->tsk_comm)
@@ -10179,6 +10581,7 @@ FUNCTION_DEFINE_NORET3(verr, int, eval, const char *, fmt, va_list, args) {
 }
 
 FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
+    tvm_sig_enter();
     if (*current->tsk_comm)
         fprintf(stderr, "%s: ", current->tsk_comm);
 
@@ -10198,9 +10601,11 @@ FUNCTION_DEFINE0(pid_t, getppid) {
     if (main_task == current)
         return CALL_FUNC(getppid);
 
+    tvm_sig_enter();
     task_lock(current);
     pid_t ppid = (current->tsk_parent ? current->tsk_parent->tsk_pid : 1);
     task_unlock(current);
+    tvm_sig_leave();
 
     return ppid;
 }
@@ -10212,6 +10617,8 @@ FUNCTION_DEFINE1(pid_t, wait, int *, wstatus) {
 FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     struct task *zombiet = NULL;
     int found;
+
+    tvm_sig_enter();
 
     pthread_mutex_lock(&tasks_lock);
 
@@ -10225,11 +10632,13 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     while (!(zombiet = task_next_zombie_child(current, pid, &found))) {
         if (!found) {
             pthread_mutex_unlock(&tasks_lock);
+            tvm_sig_leave();
             errno = ECHILD;
             return -1;
         }
         if (options & WNOHANG) {
             pthread_mutex_unlock(&tasks_lock);
+            tvm_sig_leave();
             return 0;
         }
         pthread_cond_wait(&current->tsk_wait_cond, &tasks_lock);
@@ -10251,16 +10660,21 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     task_unlock(zombiet);
     taskfreelastref(zombiet, 1, 1);
 
+    tvm_sig_leave();
+
     return childpid;
 }
 
 FUNCTION_DEFINE0(pid_t, setsid) {
+    tvm_sig_enter();
+
     pthread_mutex_lock(&tasks_lock);
     task_lock(current);
 
     if (-1 == task_set_pgid(current, current->tsk_pid)) {
         task_unlock(current);
         pthread_mutex_unlock(&tasks_lock);
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10271,25 +10685,34 @@ FUNCTION_DEFINE0(pid_t, setsid) {
     pthread_mutex_unlock(&tasks_lock);
 
     // no need to lock because only set in `taskalloc()`
+    tvm_sig_leave();
     return current->tsk_pid;
 }
 
 FUNCTION_DEFINE1(pid_t, getsid, pid_t, pid) {
+    tvm_sig_enter();
+
     if (!pid)
         pid = current->tsk_pid;
     
     struct task *t = task_for_pid(pid, 1);
-    if (!t)
+    if (!t) {
+        tvm_sig_leave();tvm_sig_leave();
         return CALL_FUNC(getsid, pid);
+    }
     pid_t sid = t->tsk_sid;
     task_unlock(t);
 
+    tvm_sig_leave();
     return sid;
 }
 
 FUNCTION_DEFINE2(int, setpgid, pid_t, pid, pid_t, pgid) {
+    tvm_sig_enter();
+
     if (pgid < 0) {
         errno = EINVAL;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10304,25 +10727,32 @@ FUNCTION_DEFINE2(int, setpgid, pid_t, pid, pid_t, pgid) {
     struct task *t = task_for_pid(pid, 0);
     if (!t) {
         pthread_mutex_unlock(&tasks_lock);
+        tvm_sig_leave();
         return CALL_FUNC(setpgid, pid, pgid);
     }
 
     int ret = task_set_pgid(t, pgid);
     task_unlock(t);
     pthread_mutex_unlock(&tasks_lock);
+    tvm_sig_leave();
     return ret;
 }
 
 FUNCTION_DEFINE1(pid_t, getpgid, pid_t, pid) {
+    tvm_sig_enter();
+
     if (!pid)
         pid = current->tsk_pid;
     
     struct task *t = task_for_pid(pid, 1);
-    if (!t)
+    if (!t) {
+        tvm_sig_leave();
         return CALL_FUNC(getpgid, pid);
+    }
     
     pid_t pgid = t->tsk_pgid;
     task_unlock(t);
+    tvm_sig_leave();
     return pgid;
 }
 
@@ -10352,9 +10782,12 @@ FUNCTION_DEFINE2(sig_t, signal, int, signum, sig_t, handler) {
 }
 
 FUNCTION_DEFINE3(int, sigaction, int, signum, const struct sigaction *, act, struct sigaction *, oldact) {
+    tvm_sig_enter();
+
     if (signum >= MAX_SIGNALS || signum < 1 ||
         signum == SIGKILL || signum == SIGSTOP) {
         errno = EINVAL;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10365,19 +10798,26 @@ FUNCTION_DEFINE3(int, sigaction, int, signum, const struct sigaction *, act, str
         memcpy(current->tsk_sighandlers + signum, act, sizeof(*current->tsk_sighandlers));
     task_unlock(current);
 
+    tvm_sig_leave();
     return 0;
 }
 
 FUNCTION_DEFINE1(int, raise, int, sig) {
+    tvm_sig_enter();
+
     int r = pthread_kill(pthread_self(), sig);
     if (r != 0) {
         errno = r;
         r = -1;
     }
+    
+    tvm_sig_leave();
     return r;
 }
 
 FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
+    tvm_sig_enter();
+
     if (pid == 0) {
         task_lock(current);
         pid = -current->tsk_pgid;
@@ -10391,6 +10831,7 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
     // Kill all processes with permissions not supported
     if (pid == -1) {
         errno = EINVAL;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10420,6 +10861,7 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
 
     if (!self && !ntasks) {
         errno = ESRCH;
+        tvm_sig_leave();
         return -1;
     }
     
@@ -10429,10 +10871,13 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
             kills_confirmed++;
     }
 
+    tvm_sig_leave();
     return (kills_confirmed ? 0 : -1);
 }
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
+    tvm_sig_enter();
+
     task_lock(current);
     char **env = NULL;
     if (current->tsk_environ)
@@ -10440,18 +10885,24 @@ FUNCTION_DEFINE1(char *, getenv, const char *, name) {
 
     if (!env) {
         task_unlock(current);
+        tvm_sig_leave();
         return NULL;
     }
     
     char *ret = strchr(*env, '=');
     task_unlock(current);
-    if (ret)
+    if (ret) {
+        tvm_sig_leave();
         return ret+1;
+    }
     
+    tvm_sig_leave();
     return ret;
 }
 
 FUNCTION_DEFINE1(int, putenv, char *, string) {
+    tvm_sig_enter();
+
     char *value = strchr(string, '=');
     size_t klen;
     if (NULL == value) {
@@ -10471,6 +10922,7 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
     if (env) {
         *env = string;
         task_unlock(current);
+        tvm_sig_leave();
         return 0;
     }
 
@@ -10478,6 +10930,7 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
     if (!new_environ) {
         task_unlock(current);
         errno = ENOMEM;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10486,15 +10939,19 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
     current->tsk_environ = new_environ;
     task_unlock(current);
 
+    tvm_sig_leave();
     return 0;
 }
 
 FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, overwrite) {
+    tvm_sig_enter();
+
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
     char *string = malloc(name_len + value_len + 2);
     if (!string) {
         errno = ENOMEM;
+        tvm_sig_leave();
         return -1;
     }
     memcpy(string, name, name_len);
@@ -10512,6 +10969,7 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
         else
             free(string);
         task_unlock(current);
+        tvm_sig_leave();
         return 0;    
     }
 
@@ -10520,6 +10978,7 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
         task_unlock(current);
         free(string);
         errno = ENOMEM;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10528,13 +10987,17 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
     current->tsk_environ = new_environ;
     task_unlock(current);
 
+    tvm_sig_leave();
     return 0;
 }
 
 FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
+    tvm_sig_enter();
+
     if (name == NULL || *name == '\0' || strchr(name, '=') != NULL)
     {
         errno = EINVAL;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10543,6 +11006,7 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
     task_lock(current);
     if (!current->tsk_environ) {
         task_unlock(current);
+        tvm_sig_leave();
         return 0;
     }
 
@@ -10557,13 +11021,17 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 
     task_unlock(current);
 
+    tvm_sig_leave();
     return 0;
 }
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
+    tvm_sig_enter();
+
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
-        return -1;
+        { tvm_sig_leave();
+        return -1; }
     pathname = pathname_abs;
 
     INFO("execve(\"%s\")", pathname);
@@ -10571,10 +11039,11 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     int argc = 0;
     for (char * const*a = argv; *a && argc < INT_MAX; a++)
         argc++;
-    
+
     if (argc == INT_MAX) {
         INFO("  failed(E2BIG)");
         errno = E2BIG;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10585,6 +11054,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         if (!new_linker) {
             INFO("   failed(ENOMEM)");
             errno = ENOMEM;
+            tvm_sig_leave();
             return -1;
         }
 
@@ -10596,6 +11066,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             current->tsk_linker = current_thread->thr_emulator->ec_ulinker = old_linker;
             ulinker_destroy(new_linker);
             errno = ENOENT;
+            tvm_sig_leave();
             return -1;
         }
 
@@ -10605,6 +11076,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             current->tsk_linker = current_thread->thr_emulator->ec_ulinker = old_linker;
             ulinker_destroy(new_linker);
             errno = EINVAL;
+            tvm_sig_leave();
             return -1;
         }
 
@@ -10616,6 +11088,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     if (!main_func) {
         INFO("  failed(ENOENT)");
         errno = ENOENT;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10802,9 +11275,13 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
     if (name || termp || winp)
         panic("openpty todo");
 
+    tvm_sig_enter();
+
     struct file *master = ptm_open();
-    if (!master)
+    if (!master) {
+        tvm_sig_leave();
         return -1;
+    }
 
     struct tty *tt = tty_for_file_locked(master, NULL);
     VERIFY(tt);
@@ -10821,6 +11298,7 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
         task_unlock(current);
         tty_unlock(tt, 1);
         file_unlock(master, 1);
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10832,6 +11310,7 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
         task_unlock(current);
         tty_unlock(tt, 1);
         VERIFY(0 == close(fmaster));
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10844,12 +11323,15 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
         tty_unlock(tt, 1);
         file_unlock(slave, 1);
         VERIFY(0 == close(fmaster));
+        tvm_sig_leave();
         return -1;
     }
 
     task_unlock(current);
     tty_unlock(tt, 1);
     file_unlock(slave, 1);
+
+    tvm_sig_leave();
 
     *amaster = fmaster;
     *aslave = fslave;
@@ -10868,14 +11350,19 @@ FUNCTION_DEFINE3(int, ttyname_r, int, fd, char *, buf, size_t, buflen) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(ttyname_r, __rfd, buf, buflen));
     
+    tvm_sig_enter();
+
     int ttymode;
     struct tty *tt = tty_for_nfd(fd, &ttymode);
-    if (!tt)
+    if (!tt) {
+        tvm_sig_leave();
         return -1;
+    }
     
     if (ttymode == TTM_MASTER) {
         snprintf(buf, buflen, "%s", PTMX_FILE);
         tty_unlock(tt, 1);
+        tvm_sig_leave();
         return 0;
     }
 
@@ -10904,15 +11391,20 @@ FUNCTION_DEFINE3(int, ptsname_r, int, fd, char *, buf, size_t, buflen) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(ptsname_r, __rfd, buf, buflen));
     
+    tvm_sig_enter();
     struct tty *tt = tty_for_nfd(fd, NULL);
-    if (!tt)
+    if (!tt) {
+        tvm_sig_leave();
         return -1;
+    }
     
     int ret = tty_slavename_locked(tt, buf, buflen);
     if (0 != ret)
         ret = errno;
     
     tty_unlock(tt, 1);
+    tvm_sig_leave();
+
     return ret;
 }
 
@@ -11159,9 +11651,12 @@ FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, F
     char *tmp = NULL;
     size_t tmpn = 0;
 
+    tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
-    if (!file)
+    if (!file) {
+        tvm_sig_leave();
         return -1;
+    }
 
     // TODO f_ops
 
@@ -11172,6 +11667,7 @@ FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, F
 
     if (r < 0) {
         CALL_FUNC(free, tmp);
+        tvm_sig_leave();
         return -1;
     }
 
@@ -11179,6 +11675,7 @@ FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, F
         char *newp = realloc(*lineptr, (size_t)r + 1);
         if (!newp) {
             CALL_FUNC(free, tmp);
+            tvm_sig_leave();
             return -1;
         }
         *lineptr = newp;
@@ -11187,15 +11684,20 @@ FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, F
 
     memcpy(*lineptr, tmp, (size_t)r + 1);
     CALL_FUNC(free, tmp);
+    tvm_sig_leave();
 
     return r;
 }
 
 FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, flags, int, fd, off_t, offset) {
     struct file *file = NULL;
+    
+    tvm_sig_enter();
+
     if (fd >= 0) {
         file = file_for_task(current, fd);
         if (!file) {
+            tvm_sig_leave();
             errno = EBADF;
             return MAP_FAILED;
         }
@@ -11215,10 +11717,13 @@ FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, fla
     if (file)
         file_unlock(file, 1);
     
+    tvm_sig_leave();
+
     return ret;
 }
 
 FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, optstring) {
+    tvm_sig_enter();
     pthread_mutex_lock(&getopt_lock);
     optarg = tvm_optarg;
     optind = tvm_optind;
@@ -11230,10 +11735,12 @@ FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, opt
     tvm_opterr = opterr;
     tvm_optopt = optopt;
     pthread_mutex_unlock(&getopt_lock);
+    tvm_sig_leave();
     return r;
 }
 
 FUNCTION_DEFINE5(int, getopt_long, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
+    tvm_sig_enter();
     pthread_mutex_lock(&getopt_lock);
     optarg = tvm_optarg;
     optind = tvm_optind;
@@ -11245,10 +11752,12 @@ FUNCTION_DEFINE5(int, getopt_long, int, argc, char * const *, argv, const char *
     tvm_opterr = opterr;
     tvm_optopt = optopt;
     pthread_mutex_unlock(&getopt_lock);
+    tvm_sig_leave();
     return r;
 }
 
 FUNCTION_DEFINE5(int, getopt_long_only, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
+    tvm_sig_enter();
     pthread_mutex_lock(&getopt_lock);
     optarg = tvm_optarg;
     optind = tvm_optind;
@@ -11260,6 +11769,7 @@ FUNCTION_DEFINE5(int, getopt_long_only, int, argc, char * const *, argv, const c
     tvm_opterr = opterr;
     tvm_optopt = optopt;
     pthread_mutex_unlock(&getopt_lock);
+    tvm_sig_leave();
     return r;
 }
 
@@ -11269,6 +11779,8 @@ FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_nam
     char tmp[PATH_MAX];
     tmp[0] = 0;
 
+    tvm_sig_enter();
+
     task_lock(current);
     if (file_name[0] == '/')
         c = snprintf(tmp, PATH_MAX, "%s", file_name);
@@ -11277,6 +11789,7 @@ FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_nam
     else
         c = snprintf(tmp, PATH_MAX, "%s/%s", current->tsk_cwd, file_name);
     task_unlock(current);
+    tvm_sig_leave();
 
     if (c >= PATH_MAX) {
         errno = ENAMETOOLONG;
@@ -11313,10 +11826,12 @@ FUNCTION_DEFINE1(int, chdir, const char *, path) {
         return -1;
     }
 
+    tvm_sig_enter();
     task_lock(current);
     strcpy(current->tsk_cwd, path);
     task_unlock(current);
-
+    tvm_sig_leave();
+    
     return 0;
 }
 
@@ -11329,15 +11844,18 @@ FUNCTION_DEFINE1(int, fchdir, int, fildes) {
 }
 
 FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
+    tvm_sig_enter();
     task_lock(current);
     if (buf != NULL) {
         strncpy(buf, current->tsk_cwd, size);
         task_unlock(current);
+        tvm_sig_leave();
         return buf;
     }
     
     char *ret = strdup(current->tsk_cwd);
     task_unlock(current);
+    tvm_sig_leave();
     return ret;
 }
 
@@ -11416,7 +11934,9 @@ FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * 
         file = file_abs;
     }
     else {
+        tvm_sig_enter();
         const char *pathname = find_program_pathname(file);
+        tvm_sig_leave();
         if (!pathname) {
             errno = ENOENT;
             return -1;
@@ -11428,9 +11948,11 @@ FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * 
 }
 
 FUNCTION_DEFINE0(int, clearenv) {
+    tvm_sig_enter();
     task_lock(current);
     current->tsk_environ = NULL;
     task_unlock(current);
+    tvm_sig_leave();
 
     return 0;
 }
@@ -11438,13 +11960,18 @@ FUNCTION_DEFINE0(int, clearenv) {
 FUNCTION_DEFINE1(int, epoll_create, int, size) {
     int r, f;
     
-    if (-1 == (r = CALL_FUNC(epoll_create, size)))
+    tvm_sig_enter();
+    if (-1 == (r = CALL_FUNC(epoll_create, size))) {
+        tvm_sig_leave();
         return -1;
+    }
 
     if (-1 == (f = task_new_fd(current, r))) {
         CALL_FUNC(close, r);
         errno = EMFILE;
     }
+
+    tvm_sig_leave();
 
     return f;
 }
@@ -11452,13 +11979,18 @@ FUNCTION_DEFINE1(int, epoll_create, int, size) {
 FUNCTION_DEFINE1(int, epoll_create1, int, flags) {
     int r, f;
     
-    if (-1 == (r = CALL_FUNC(epoll_create1, flags)))
+    tvm_sig_enter();
+    if (-1 == (r = CALL_FUNC(epoll_create1, flags))) {
+        tvm_sig_leave();
         return -1;
+    }
 
     if (-1 == (f = task_new_fd(current, r))) {
         CALL_FUNC(close, r);
         errno = EMFILE;
     }
+
+    tvm_sig_leave();
 
     return f;
 }
@@ -11466,33 +11998,48 @@ FUNCTION_DEFINE1(int, epoll_create1, int, flags) {
 FUNCTION_DEFINE2(int, timerfd_create, int, clockid, int, flags) {
     int r, f;
     
-    if (-1 == (r = CALL_FUNC(timerfd_create, clockid, flags)))
+    tvm_sig_enter();
+
+    if (-1 == (r = CALL_FUNC(timerfd_create, clockid, flags))) {
+        tvm_sig_leave();
         return -1;
+    }
 
     if (-1 == (f = task_new_fd(current, r))) {
         CALL_FUNC(close, r);
         errno = EMFILE;
     }
 
+    tvm_sig_leave();
+
     return f;
 }
 
 FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
     int r[2], f[2];
-    if (0 != CALL_FUNC(pipe2, r, flags))
+
+    tvm_sig_enter();
+
+    if (0 != CALL_FUNC(pipe2, r, flags)) {
+        tvm_sig_leave();
         return -1;
+    }
     
     if (-1 == (f[0] = task_new_fd(current, r[0]))) {
         VERIFY(0 == CALL_FUNC(close, r[0]));
         VERIFY(0 == CALL_FUNC(close, r[1]));
+        tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f[1] = task_new_fd(current, r[1]))) {
         VERIFY(0 == close(f[0]));
         VERIFY(0 == CALL_FUNC(close, r[1]));
+        tvm_sig_leave();
         return -1;
     }
+    
+    tvm_sig_leave();
 
     memcpy(pipefd, f, sizeof(f));
     return 0;
