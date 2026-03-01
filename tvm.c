@@ -10521,6 +10521,8 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
         }
     }
 
+    fflush(NULL);
+
     _exit(status);
 }
 
