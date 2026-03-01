@@ -66,6 +66,7 @@
 // TODOLIST
 // 2. taskfreelastref taskslock deadlock
 // 4. waitpid signal delivery
+// 5. race for signal delivery before blocking IO operation
 
 // LOCK ORDERING
 
