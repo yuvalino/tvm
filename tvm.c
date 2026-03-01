@@ -67,6 +67,7 @@
 // 2. taskfreelastref taskslock deadlock
 // 4. waitpid signal delivery
 // 5. race for signal delivery before blocking IO operation
+// 6. external signal delivery may be received in TVM threads, needs to be handled outside
 
 // LOCK ORDERING
 
