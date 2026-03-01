@@ -10227,7 +10227,10 @@ pid_t fork(void) {
     pid_t ret = -1;
     int r;
 
+    tvm_sig_enter();
+
     if ((r = pthread_attr_init(&attr))) {
+        tvm_sig_leave();
         errno = r;
         return -1;
     }
@@ -10375,6 +10378,8 @@ out:
     }
 
     pthread_attr_destroy(&attr);
+
+    tvm_sig_leave();
 
     return ret;
 }
