@@ -10289,7 +10289,7 @@ pid_t fork(void) {
     }
 
     if (0 != setjmp(arg->jmpbuf_parent)) {
-        
+
         // child
 
         current = arg->tsk;
@@ -10556,6 +10556,7 @@ int atexit(exit_t function) {
 
     if (!function) {
         errno = EINVAL;
+        tvm_sig_leave();
         return -1;
     }
 
@@ -10717,7 +10718,7 @@ FUNCTION_DEFINE1(pid_t, getsid, pid_t, pid) {
     
     struct task *t = task_for_pid(pid, 1);
     if (!t) {
-        tvm_sig_leave();tvm_sig_leave();
+        tvm_sig_leave();
         return CALL_FUNC(getsid, pid);
     }
     pid_t sid = t->tsk_sid;
@@ -11405,8 +11406,9 @@ FUNCTION_DEFINE3(int, ttyname_r, int, fd, char *, buf, size_t, buflen) {
     int ret = tty_slavename_locked(tt, buf, buflen);
     if (0 != ret)
         ret = errno;
-    
+
     tty_unlock(tt, 1);
+    tvm_sig_leave();
     return ret;
 }
 
