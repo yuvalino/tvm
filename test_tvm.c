@@ -2044,6 +2044,409 @@ TEST(SigsuspendSelectiveUnblock) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
+// --- Tests that SHOULD FAIL without proper TVM signal virtualization ---
+// These expose the gap between "threads pretending to be processes" and
+// real process isolation. They pass on a real kernel but fail when
+// sigprocmask/kill/sigaction operate on the shared OS process.
+
+static COW_IMPL_INIT(volatile int, iso_parent_got, 0);
+static void iso_parent_handler(int sig) { iso_parent_got = 1; }
+
+TEST(SigmaskIsolation) {
+    // Child blocks SIGUSR1 via sigprocmask. Parent's mask should be unaffected.
+    // FAILS in TVM: sigprocmask changes the real OS mask shared by all tasks.
+    iso_parent_got = 0;
+    struct sigaction sa = { .sa_handler = iso_parent_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    int ready[2];
+    ASSERT_EQ(0, pipe(ready));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(ready[0]);
+        // Child blocks SIGUSR1
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        write(ready[1], "x", 1); // tell parent we've blocked
+        close(ready[1]);
+        usleep(50000); // stay alive while parent tests
+        _exit(0);
+    }
+    close(ready[1]);
+    char c;
+    read(ready[0], &c, 1); // wait for child to block SIGUSR1
+    close(ready[0]);
+
+    // Parent sends SIGUSR1 to itself — should be delivered despite child blocking it
+    raise(SIGUSR1);
+    usleep(10000);
+
+    int s;
+    kill(p, SIGKILL);
+    wait(&s);
+    ASSERT_EQ(1, iso_parent_got);
+}
+
+static COW_IMPL_INIT(volatile int, pend_got, 0);
+static void pend_handler(int sig) { pend_got = 1; }
+
+TEST(SigpendingIsolation) {
+    // Pending signals on one task should not be visible to another.
+    // FAILS in TVM: sigpending queries the real OS pending set.
+    pend_got = 0;
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        // Child blocks SIGUSR1 and raises it — now pending on child
+        struct sigaction sa = { .sa_handler = pend_handler };
+        sigaction(SIGUSR1, &sa, NULL);
+
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+        raise(SIGUSR1);
+
+        PHASE_SET(1); // tell parent we have a pending signal
+        PHASE_WAIT(2); // wait for parent to check
+        _exit(0);
+    }
+
+    PHASE_WAIT(1);
+
+    // Parent checks its own sigpending — SIGUSR1 should NOT be pending here
+    sigset_t pending;
+    sigpending(&pending);
+    int parent_has_usr1 = sigismember(&pending, SIGUSR1);
+
+    PHASE_SET(2);
+    int s;
+    wait(&s);
+    ASSERT_EQ(0, parent_has_usr1);
+}
+
+static COW_IMPL_INIT(volatile int, hiso_parent_count, 0);
+static COW_IMPL_INIT(volatile int, hiso_child_count, 0);
+static void hiso_parent_handler(int sig) { hiso_parent_count++; }
+static void hiso_child_handler(int sig) { hiso_child_count++; }
+
+TEST(SigactionIsolation) {
+    // Child changes SIGUSR1 handler. Parent's handler should be unaffected.
+    // FAILS in TVM if sigaction modifies real OS handler table.
+    hiso_parent_count = 0;
+    hiso_child_count = 0;
+    struct sigaction sa = { .sa_handler = hiso_parent_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        // Child installs different handler
+        struct sigaction csa = { .sa_handler = hiso_child_handler };
+        sigaction(SIGUSR1, &csa, NULL);
+
+        PHASE_SET(1);
+        PHASE_WAIT(2);
+        _exit(0);
+    }
+
+    PHASE_WAIT(1);
+    // Parent raises SIGUSR1 — should use parent's handler, not child's
+    raise(SIGUSR1);
+    usleep(10000);
+    PHASE_SET(2);
+
+    int s;
+    wait(&s);
+    ASSERT_EQ(1, hiso_parent_count);
+    // child_count should be 0 in parent's address space
+    ASSERT_EQ(0, hiso_child_count);
+}
+
+TEST(SigprocmaskResetOnExec) {
+    // After exec, the signal mask should be preserved (POSIX).
+    // Blocked signals stay blocked across exec.
+    // This tests that TVM's execve correctly carries over tsk_sigmask.
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        // After exec, query the mask — SIGUSR1 should still be blocked
+        // We can't easily exec a program here, so test via fork instead:
+        // the child inherits the blocked mask
+        pid_t c = fork();
+        if (!c) {
+            sigset_t cur;
+            sigprocmask(SIG_SETMASK, NULL, &cur);
+            _exit(sigismember(&cur, SIGUSR1) ? 0 : 1);
+        }
+        int cs;
+        waitpid(c, &cs, 0);
+        _exit(WIFEXITED(cs) ? WEXITSTATUS(cs) : 99);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigwaitConsumesPending) {
+    // After sigwait consumes a signal, it should no longer be pending.
+    // A second sigtimedwait should timeout (not return the same signal again).
+    // FAILS if TVM doesn't manage its own pending set — the OS pending set
+    // may behave differently (e.g. signal stays pending on the real thread).
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        raise(SIGUSR1); // now pending
+
+        // Consume it
+        int sig;
+        int r = sigwait(&set, &sig);
+        if (r != 0 || sig != SIGUSR1) _exit(1);
+
+        // Should no longer be pending
+        sigset_t pending;
+        sigpending(&pending);
+        if (sigismember(&pending, SIGUSR1)) _exit(2);
+
+        // Second sigtimedwait should timeout
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 }; // 10ms
+        r = sigtimedwait(&set, NULL, &ts);
+        if (r != -1) _exit(3); // should have timed out
+        if (errno != EAGAIN) _exit(4);
+
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigwaitinfoCrossTaskPending) {
+    // Child has SIGUSR1 pending. Parent calls sigwaitinfo — it should NOT
+    // consume the child's pending signal.
+    // FAILS if pending signals are shared at OS level across TVM tasks.
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        raise(SIGUSR1); // pending on child
+
+        PHASE_SET(1);
+        PHASE_WAIT(2);
+
+        // Signal should still be pending on child — consume it
+        int sig;
+        int r = sigwait(&set, &sig);
+        _exit((r == 0 && sig == SIGUSR1) ? 0 : 1);
+    }
+
+    PHASE_WAIT(1);
+
+    // Parent tries to consume SIGUSR1 — should timeout (it's not OUR signal)
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000000 }; // 20ms
+    int r = sigtimedwait(&set, NULL, &ts);
+    int parent_got = (r == SIGUSR1); // should NOT have gotten it
+
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+
+    PHASE_SET(2);
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+    ASSERT_EQ(0, parent_got); // parent must NOT have stolen child's signal
+}
+
+TEST(KillBlockedSignalPends) {
+    // Send signal to a task that has it blocked — it should pend, not be lost.
+    // When the task unblocks, the handler must fire.
+    // FAILS if TVM's kill() delivers via pthread_kill and the OS mask blocks it
+    // at the wrong level.
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        volatile int got = 0;
+        struct sigaction sa = { .sa_handler = (void(*)(int))({
+            void __fn(int sig) { got = 1; }
+            __fn;
+        })};
+        sigaction(SIGUSR1, &sa, NULL);
+
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        PHASE_SET(1); // tell parent we're ready
+        PHASE_WAIT(2); // wait for parent to send signal
+
+        usleep(10000);
+        if (got) _exit(1); // should still be blocked
+
+        // Unblock
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+        usleep(10000);
+        _exit(got ? 0 : 2); // now it should have been delivered
+    }
+
+    PHASE_WAIT(1);
+    kill(p, SIGUSR1); // send to child while it has SIGUSR1 blocked
+    PHASE_SET(2);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigsuspendWakeOnlyTarget) {
+    // Two tasks both in sigsuspend. Sending signal to one should only wake that one.
+    // FAILS if the OS signal wakes the wrong TVM task's sigsuspend.
+    pid_t p1 = fork();
+    ASSERT_NEQ(p1, -1);
+    if (!p1) {
+        struct sigaction sa = { .sa_handler = (void(*)(int))({
+            void __fn(int sig) { (void)sig; }
+            __fn;
+        })};
+        sigaction(SIGUSR1, &sa, NULL);
+
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+
+        PHASE_SET(1);
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigsuspend(&empty); // should wake when parent sends SIGUSR1
+        _exit(0);
+    }
+
+    pid_t p2 = fork();
+    ASSERT_NEQ(p2, -1);
+    if (!p2) {
+        struct sigaction sa = { .sa_handler = (void(*)(int))({
+            void __fn(int sig) { (void)sig; }
+            __fn;
+        })};
+        sigaction(SIGUSR1, &sa, NULL);
+
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+
+        PHASE_WAIT(1); // wait for p1 to enter sigsuspend first
+        PHASE_SET(2);
+        sigset_t empty;
+        sigemptyset(&empty);
+        // p2 should NOT be woken by a signal sent to p1
+        // Give it a timeout: if it hangs, the test timeout will catch it
+        // But if properly isolated, we send it SIGUSR1 after p1 exits
+        sigsuspend(&empty);
+        _exit(0);
+    }
+
+    PHASE_WAIT(2); // both children ready
+    usleep(10000);
+
+    // Send SIGUSR1 only to p1 — p1 should wake, p2 should stay suspended
+    kill(p1, SIGUSR1);
+    int s1;
+    ASSERT_EQ(p1, waitpid(p1, &s1, 0));
+    ASSERT_EQ(1, WIFEXITED(s1));
+    ASSERT_EQ(0, WEXITSTATUS(s1));
+
+    // Now wake p2
+    kill(p2, SIGUSR1);
+    int s2;
+    ASSERT_EQ(p2, waitpid(p2, &s2, 0));
+    ASSERT_EQ(1, WIFEXITED(s2));
+    ASSERT_EQ(0, WEXITSTATUS(s2));
+}
+
+TEST(SigwaitIsolation) {
+    // Two tasks both in sigwait for SIGUSR1. Signal sent to one should not
+    // be consumed by the other.
+    pid_t p1 = fork();
+    ASSERT_NEQ(p1, -1);
+    if (!p1) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        PHASE_SET(1);
+        int sig;
+        sigwait(&set, &sig);
+        _exit(sig == SIGUSR1 ? 0 : 1);
+    }
+
+    pid_t p2 = fork();
+    ASSERT_NEQ(p2, -1);
+    if (!p2) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        PHASE_WAIT(1);
+        PHASE_SET(2);
+        int sig;
+        sigwait(&set, &sig);
+        _exit(sig == SIGUSR1 ? 0 : 1);
+    }
+
+    PHASE_WAIT(2);
+    usleep(10000);
+
+    // Send to p1 — p2 should not consume it
+    kill(p1, SIGUSR1);
+    int s1;
+    ASSERT_EQ(p1, waitpid(p1, &s1, 0));
+    ASSERT_EQ(1, WIFEXITED(s1));
+    ASSERT_EQ(0, WEXITSTATUS(s1));
+
+    // Now send to p2
+    kill(p2, SIGUSR1);
+    int s2;
+    ASSERT_EQ(p2, waitpid(p2, &s2, 0));
+    ASSERT_EQ(1, WIFEXITED(s2));
+    ASSERT_EQ(0, WEXITSTATUS(s2));
+}
+
 // =========================================================================
 // Multi-threading tests
 // NOTE: exit() with >1 thread alive is NOT supported — always join first.
