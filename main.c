@@ -1,6 +1,5 @@
 #include <unistd.h>
 #include <stdio.h>
-#include <tvm.h>
 #include <setjmp.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -8,135 +7,109 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
-void xxd(void *addr, int len)
+#include "tvm.h"
+
+static int mount_cpio(const char *target, const char *cpio_path)
 {
-    char *caddr = (char *) addr;
-    int off = 0;
-    while (off < len)
-    {
-        size_t start_off = off;
-
-        char currptr[17];
-        printf("%08x: ", off);
-
-        memset(currptr, ' ', sizeof(currptr)-1); currptr[sizeof(currptr)-1] = 0;
-        for (int i = 0; off < len && i < 8; off++, i++) {
-            char a[3];
-            snprintf(a, 3, "%02hhx", caddr[off]);
-            memcpy(currptr + (2*(7-i)), a, 2);
-        }
-        printf("%s", currptr);
-
-        printf(" ");
-
-        memset(currptr, ' ', sizeof(currptr)-1);
-        if (off < len) {
-            for (int i = 0; off < len && i < 8; off++, i++) {
-                char a[3];
-                snprintf(a, 3, "%02hhx", caddr[off]);
-                memcpy(currptr + (2*(7-i)), a, 2);
-            }
-        }
-        printf("%s", currptr);
-
-        printf("  ");
-
-        for (; start_off < off; start_off++) {
-            printf("%c", (isprint(caddr[start_off]))?caddr[start_off]:'.');
-        }
-
-        printf("\n");
+    int fd = open(cpio_path, O_RDONLY);
+    if (fd == -1) {
+        perror(cpio_path);
+        return -1;
     }
-}
 
-int mksh_main(int argc, char **argv);
-int dropbear_main(int argc, char **argv);
-int scp_main(int argc, char **argv);
-int _toybox_main(int argc, char **argv);
-void toybox_iter_toy_names(void (*fn)(const char *, void *), void * arg);
-int minivim_main(int argc, char **argv);
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+        perror(cpio_path);
+        close(fd);
+        return -1;
+    }
 
-static void add_toy(const char *toy_name, void *arg)
-{
-    char pathname[4096] = {0};
-    snprintf(pathname, sizeof(pathname), "/usr/bin/%s", toy_name);
-    tvm_register_program(pathname, (main_func_t) _toybox_main);
+    void *buf = malloc(st.st_size);
+    if (!buf) {
+        perror("malloc");
+        close(fd);
+        return -1;
+    }
+
+    size_t total = 0;
+    while (total < (size_t)st.st_size) {
+        ssize_t n = read(fd, (char *)buf + total, st.st_size - total);
+        if (n <= 0) {
+            perror("read");
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        total += n;
+    }
+    close(fd);
+
+    if (tvm_mount_cpio(target, buf, total) != 0) {
+        fprintf(stderr, "tvm_mount_cpio: failed to mount %s at %s\n", cpio_path, target);
+        free(buf);
+        return -1;
+    }
+
+    free(buf);
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-    tvm_init("forkless");
-    tvm_register_program("/bin/sh", (main_func_t) mksh_main);
-    tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
-    tvm_register_program("/usr/bin/toybox", (main_func_t) _toybox_main);
-    toybox_iter_toy_names(add_toy, NULL);
-    tvm_register_program("/usr/bin/vim", (main_func_t) minivim_main);
-
     // set home to current directory
     char cwd[PATH_MAX];
     getcwd(cwd, sizeof(cwd));
     setenv("HOME", cwd, 1);
 
     if (argc < 2) {
-        fprintf(stderr, "forkless: no command\n");
-        goto err;
+        fprintf(stderr, "USAGE: %s [OPTIONS] PROGRAM [ARG...]\n", argv[0]);
+        fprintf(stderr, "Try '%s -h' for more information.\n", argv[0]);
+        return 1;
     }
 
-    if (0 == strcmp(argv[1], "-h")) {
-        printf("USAGE: forkless COMMAND\n");
-        printf("VM for sh + ssh\n\n");
-        printf("COMMANDs:\n");
-        printf("  sh   [ARG...]  shell\n");
-        printf("  sshd [PORT]    ssh server\n");
-        printf("  dump           dump tvm diagnostics\n");
-        printf("\n");
-        printf("Options:\n");
-        printf("  -h             display this help and exit\n");
-        return 0;
-    }
-    else if (0 == strcmp(argv[1], "sh")) {
-        return mksh_main(argc - 1, argv + 1);
-    }
-    else if (0 == strcmp(argv[1], "sshd")) {
-        char *addr_port = (char *)"2222";
-        if (argc >= 3) {
-            if (0 == strcmp(argv[2], "-h")) {
-                printf("USAGE: forkless sshd [PORT]\n");
-                printf("dropbear ssh server\n\n");
-                printf("COMMANDs:\n");
-                printf("  sh   [ARG...]  shell\n");
-                printf("  sshd [PORT]    ssh server\n");
-                printf("\n");
-                printf("Options:\n");
-                printf("  -h             display this help and exit\n");
-                return 0;
+    tvm_init("tvm");
+
+    int i = 1;
+
+    while (i < argc) {
+        if (strcmp(argv[i], "-h") == 0) {
+            printf("USAGE: %s [OPTIONS] PROGRAM [ARG...]\n\n", argv[0]);
+            printf("Run programs in TVM (Thread Virtual Machine)\n\n");
+            printf("Options:\n");
+            printf("  -h             display this help and exit\n");
+            printf("  -v PATH:CPIO   mount CPIO archive at PATH (repeatable)\n");
+            return 0;
+        } else if (strcmp(argv[i], "-v") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: -v requires argument PATH:CPIO\n", argv[0]);
+                return 1;
             }
-
-            addr_port = argv[2];
-            // fprintf(stderr, "forkless: sshd: invalid argument '%s'\n", argv[2]);
-            // fprintf(stderr, "Try 'forkless sshd -h' for more information.\n");
-            // return 1;
+            i++;
+            char *sep = strchr(argv[i], ':');
+            if (!sep) {
+                fprintf(stderr, "%s: -v argument must be PATH:CPIO (got '%s')\n", argv[0], argv[i]);
+                return 1;
+            }
+            *sep = '\0';
+            const char *target = argv[i];
+            const char *cpio_path = sep + 1;
+            if (mount_cpio(target, cpio_path) != 0)
+                return 1;
+            i++;
+        } else {
+            break;
         }
-        char *nargv[] = {
-            argv[0],
-            //"-vvvvvv",
-            "-e",
-            "-F",
-            "-E",
-            "-p",
-            addr_port,
-            NULL
-        };
-        return dropbear_main(sizeof(nargv)/sizeof(char *) - 1, nargv);
     }
-    else if (0 == strcmp(argv[1], "dump")) {
-        tvm_dump(TVM_DUMP_FUNCS);
-        return 0;
+
+    if (i >= argc) {
+        fprintf(stderr, "%s: no command specified\n", argv[0]);
+        return 1;
     }
-    
-    fprintf(stderr, "forkless: invalid argument '%s'\n", argv[1]);
-err:
-    fprintf(stderr, "Try 'forkless -h' for more information.\n");
-    return 1;
+
+    execvp(argv[i], &argv[i]);
+    perror(argv[i]);
+    return 127;
 }
