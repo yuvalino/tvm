@@ -1477,6 +1477,574 @@ TEST(ConcurrentKills) {
 }
 
 // =========================================================================
+// Signal mask & waiting tests (sigprocmask, sigsuspend, pause, sigwait, etc.)
+// =========================================================================
+
+// --- sigprocmask / pthread_sigmask ---
+
+static COW_IMPL_INIT(volatile int, spm_got, 0);
+static void spm_handler(int sig) { spm_got = 1; }
+
+TEST(SigprocmaskBlock) {
+    // Block SIGUSR1, raise it, verify it stays pending until unblocked
+    spm_got = 0;
+    struct sigaction sa = { .sa_handler = spm_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set, old;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        ASSERT_EQ(0, sigprocmask(SIG_BLOCK, &set, &old));
+
+        raise(SIGUSR1);
+        usleep(10000);
+        if (spm_got) _exit(1); // should NOT have been delivered yet
+
+        ASSERT_EQ(0, sigprocmask(SIG_SETMASK, &old, NULL));
+        usleep(10000);
+        _exit(spm_got ? 0 : 2);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigprocmaskInheritFork) {
+    // Blocked signals should be inherited across fork
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        pid_t c = fork();
+        if (!c) {
+            // Child: check that SIGUSR2 is still blocked
+            sigset_t cur;
+            sigprocmask(SIG_SETMASK, NULL, &cur);
+            _exit(sigismember(&cur, SIGUSR2) ? 0 : 1);
+        }
+        int cs;
+        waitpid(c, &cs, 0);
+        _exit(WIFEXITED(cs) ? WEXITSTATUS(cs) : 99);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+static COW_IMPL_INIT(volatile int, ptm_got, 0);
+static void ptm_handler(int sig) { ptm_got = 1; }
+
+TEST(PthreadSigmaskBlock) {
+    // pthread_sigmask should work identically to sigprocmask
+    ptm_got = 0;
+    struct sigaction sa = { .sa_handler = ptm_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set, old;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        ASSERT_EQ(0, pthread_sigmask(SIG_BLOCK, &set, &old));
+
+        raise(SIGUSR1);
+        usleep(10000);
+        if (ptm_got) _exit(1);
+
+        ASSERT_EQ(0, pthread_sigmask(SIG_SETMASK, &old, NULL));
+        usleep(10000);
+        _exit(ptm_got ? 0 : 2);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigprocmaskQuery) {
+    // SIG_SETMASK with NULL set should just query current mask
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigaddset(&set, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        sigset_t query;
+        sigprocmask(SIG_SETMASK, NULL, &query);
+        if (!sigismember(&query, SIGUSR1)) _exit(1);
+        if (!sigismember(&query, SIGUSR2)) _exit(2);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// --- sigpending ---
+
+TEST(Sigpending) {
+    // After blocking + raising, sigpending should report the signal
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct sigaction sa = { .sa_handler = SIG_IGN };
+        sigaction(SIGUSR1, &sa, NULL);
+
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        raise(SIGUSR1);
+
+        sigset_t pending;
+        sigpending(&pending);
+        _exit(sigismember(&pending, SIGUSR1) ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// --- sigsuspend ---
+
+static COW_IMPL_INIT(volatile int, susp_got, 0);
+static void susp_handler(int sig) { susp_got = 1; }
+
+TEST(SigsuspendBasic) {
+    // sigsuspend atomically unblocks a signal and waits for it
+    susp_got = 0;
+    struct sigaction sa = { .sa_handler = susp_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        // Block SIGUSR1
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+
+        // Schedule signal from child
+        pid_t c = fork();
+        if (!c) {
+            usleep(20000);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+
+        // sigsuspend with empty mask — SIGUSR1 should be deliverable
+        sigset_t empty;
+        sigemptyset(&empty);
+        int r = sigsuspend(&empty);
+        // sigsuspend always returns -1/EINTR
+        if (r != -1 || errno != EINTR) _exit(2);
+        if (!susp_got) _exit(3);
+
+        int cs;
+        wait(&cs);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigsuspendMaskRestore) {
+    // After sigsuspend returns, the original mask must be restored
+    struct sigaction sa = { .sa_handler = susp_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+
+        pid_t c = fork();
+        if (!c) {
+            usleep(20000);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigsuspend(&empty);
+
+        // After return, SIGUSR1 should be blocked again
+        sigset_t cur;
+        sigprocmask(SIG_SETMASK, NULL, &cur);
+        int cs;
+        wait(&cs);
+        _exit(sigismember(&cur, SIGUSR1) ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// --- pause ---
+
+TEST(PauseBasic) {
+    // pause() returns -1/EINTR when any signal is delivered
+    struct sigaction sa = { .sa_handler = susp_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        pid_t c = fork();
+        if (!c) {
+            usleep(20000);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+
+        int r = pause();
+        if (r != -1) _exit(1);
+        if (errno != EINTR) _exit(2);
+
+        int cs;
+        wait(&cs);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// --- sigwait ---
+
+TEST(SigwaitBasic) {
+    // sigwait synchronously consumes a pending signal
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        // Block SIGUSR1 so it becomes pending (sigwait requires this)
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        pid_t c = fork();
+        if (!c) {
+            usleep(20000);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+
+        int sig = 0;
+        int r = sigwait(&set, &sig);
+        if (r != 0) _exit(1);     // sigwait returns 0 on success
+        if (sig != SIGUSR1) _exit(2);
+
+        int cs;
+        wait(&cs);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+static COW_IMPL_INIT(volatile int, swh_called, 0);
+static void swh_handler(int sig) { swh_called = 1; }
+
+TEST(SigwaitDoesNotInvokeHandler) {
+    // sigwait should consume the signal without calling the handler
+    swh_called = 0;
+    struct sigaction sa = { .sa_handler = swh_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        pid_t c = fork();
+        if (!c) {
+            usleep(20000);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+
+        int sig;
+        sigwait(&set, &sig);
+        usleep(10000); // give handler time to fire if it would
+
+        int cs;
+        wait(&cs);
+        _exit(swh_called ? 1 : 0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigwaitinfoBasic) {
+    // sigwaitinfo returns signal number and fills siginfo_t
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        pid_t c = fork();
+        if (!c) {
+            usleep(20000);
+            kill(getppid(), SIGUSR2);
+            _exit(0);
+        }
+
+        siginfo_t info = {0};
+        int r = sigwaitinfo(&set, &info);
+        if (r != SIGUSR2) _exit(1);
+        if (info.si_signo != SIGUSR2) _exit(2);
+
+        int cs;
+        wait(&cs);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigtimedwaitTimeout) {
+    // sigtimedwait with no pending signal should timeout
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        // Don't send any signal — should timeout
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50ms
+        int r = sigtimedwait(&set, NULL, &ts);
+        if (r != -1) _exit(1);
+        if (errno != EAGAIN) _exit(2);
+
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SigtimedwaitImmediate) {
+    // sigtimedwait with already-pending signal should return immediately
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, NULL);
+
+        raise(SIGUSR1); // now pending
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 0 }; // zero timeout
+        int r = sigtimedwait(&set, NULL, &ts);
+        if (r != SIGUSR1) _exit(1);
+
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// --- pthread_kill ---
+
+static volatile int ptkill_got = 0;
+static void ptkill_handler(int sig) { ptkill_got = 1; }
+
+static void *ptkill_target(void *arg) {
+    while (!ptkill_got)
+        usleep(1000);
+    return NULL;
+}
+
+TEST(PthreadKillToThread) {
+    // pthread_kill should deliver signal to a specific thread
+    ptkill_got = 0;
+    struct sigaction sa = { .sa_handler = ptkill_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pthread_t thr;
+    ASSERT_EQ(0, pthread_create(&thr, NULL, ptkill_target, NULL));
+    usleep(5000);
+
+    ASSERT_EQ(0, pthread_kill(thr, SIGUSR1));
+    ASSERT_EQ(0, pthread_join(thr, NULL));
+    ASSERT_EQ(1, ptkill_got);
+}
+
+TEST(PthreadKillZeroProbe) {
+    // pthread_kill with sig=0 should check thread existence without sending
+    ptkill_got = 0;
+    pthread_t thr;
+    ASSERT_EQ(0, pthread_create(&thr, NULL, ptkill_target, NULL));
+    usleep(5000);
+
+    // Thread is alive — should succeed
+    ASSERT_EQ(0, pthread_kill(thr, 0));
+
+    // Let it exit
+    ptkill_got = 1;
+    ASSERT_EQ(0, pthread_join(thr, NULL));
+
+    // Thread is dead — TVM should return ESRCH
+    // (glibc may return 0 for a joined-but-not-yet-recycled pthread_t)
+    int r = pthread_kill(thr, 0);
+    if (r != 0 && r != ESRCH)
+        FAIL("pthread_kill on dead thread returned %d", r);
+}
+
+static COW_IMPL_INIT(volatile int, ptkill_cross_got, 0);
+static void ptkill_cross_handler(int sig) { ptkill_cross_got = 1; }
+
+TEST(PthreadKillCrossProcess) {
+    // raise in child should not affect parent
+    ptkill_cross_got = 0;
+    struct sigaction sa = { .sa_handler = ptkill_cross_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        raise(SIGUSR1);
+        usleep(10000);
+        _exit(ptkill_cross_got ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// --- Combined: block + wait + deliver across fork ---
+
+static COW_IMPL_INIT(volatile int, smb_count, 0);
+static void smb_handler(int sig) { smb_count++; }
+
+TEST(SigmaskBlockMultiple) {
+    // Block multiple signals, raise all, unblock — all should deliver
+    smb_count = 0;
+    struct sigaction sa = { .sa_handler = smb_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+    ASSERT_EQ(0, sigaction(SIGUSR2, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t set, old;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigaddset(&set, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &set, &old);
+
+        raise(SIGUSR1);
+        raise(SIGUSR2);
+        usleep(10000);
+        if (smb_count != 0) _exit(1); // should still be blocked
+
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        usleep(10000);
+        _exit(smb_count >= 2 ? 0 : 2);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+static COW_IMPL_INIT(volatile int, ssu_got1, 0);
+static COW_IMPL_INIT(volatile int, ssu_got2, 0);
+static void ssu_handler1(int sig) { ssu_got1 = 1; }
+static void ssu_handler2(int sig) { ssu_got2 = 1; }
+
+TEST(SigsuspendSelectiveUnblock) {
+    // sigsuspend should only unblock signals NOT in the provided mask
+    ssu_got1 = 0;
+    ssu_got2 = 0;
+    struct sigaction sa1 = { .sa_handler = ssu_handler1 };
+    struct sigaction sa2 = { .sa_handler = ssu_handler2 };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa1, NULL));
+    ASSERT_EQ(0, sigaction(SIGUSR2, &sa2, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        // Block both
+        sigset_t both;
+        sigemptyset(&both);
+        sigaddset(&both, SIGUSR1);
+        sigaddset(&both, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &both, NULL);
+
+        pid_t c = fork();
+        if (!c) {
+            usleep(20000);
+            kill(getppid(), SIGUSR1);
+            kill(getppid(), SIGUSR2);
+            _exit(0);
+        }
+
+        // sigsuspend with SIGUSR1 still blocked — only SIGUSR2 unblocked
+        sigset_t keep_usr1;
+        sigemptyset(&keep_usr1);
+        sigaddset(&keep_usr1, SIGUSR1);
+        sigsuspend(&keep_usr1);
+
+        // SIGUSR2 should have been delivered, SIGUSR1 should still be pending
+        int cs;
+        wait(&cs);
+        if (!ssu_got2) _exit(1);
+        if (ssu_got1) _exit(2); // SIGUSR1 was blocked during sigsuspend
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// =========================================================================
 // Multi-threading tests
 // NOTE: exit() with >1 thread alive is NOT supported — always join first.
 //       SIGALRM is not supported.
