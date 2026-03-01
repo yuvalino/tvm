@@ -1142,6 +1142,10 @@ static void sig_multi_handler(int sig) {
     write(sig_multi_pipe, &c, 1);
 }
 
+TEST(tmp) {
+    sleep(10);
+}
+
 TEST(SignalMultiDeliver) {
     sig_multi_count = 0;
 
@@ -1628,6 +1632,8 @@ static void sigint_handler(int sig) {
     exit(-sig);
 }
 
+static int test_timeout_secs = 0;
+
 static int runtest(struct testinfo_t *testinfo, int verbose)
 {
     int outp[2] = {-1, -1};
@@ -1687,10 +1693,38 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
     char tmp[0x4000] = {0};
     int newline = 1;
 
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     while (1) {
         if (-1 == usleep(2000)) {
             perror("test_tvm: usleep");
             abort();
+        }
+
+        if (test_timeout_secs > 0) {
+            struct timespec t_now;
+            clock_gettime(CLOCK_MONOTONIC, &t_now);
+            double elapsed = (t_now.tv_sec - t_start.tv_sec)
+                           + (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
+            if (elapsed >= test_timeout_secs) {
+                kill(-p, SIGKILL); // kill process group
+                if (p != waitpid(p, &status, 0)) {
+                    perror("waitpid on timeout");
+                    abort();
+                }
+                testinfo->err = realloc(testinfo->err, testinfo->err_s + 32);
+                if (!testinfo->err) {
+                    perror("realloc(err) on timeout");
+                    abort();
+                }
+
+                int n = snprintf((char *)testinfo->err + testinfo->err_s, 32,
+                                 "TIMEOUT after %ds\n", test_timeout_secs);
+                testinfo->err_s += n;
+                testinfo->r = SIGALRM;
+                goto out;
+            }
         }
 
         ssize_t b = read(outp[0], tmp, 0x4000);
@@ -1760,6 +1794,12 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
         }
     }
 
+    if (!WIFEXITED(status))
+        testinfo->r = -WTERMSIG(status);
+    else
+        testinfo->r = WEXITSTATUS(status);;
+
+out:
     close(outp[1]);
     close(errp[1]);
 
@@ -1769,12 +1809,6 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
     }
     g_testinfo = NULL;
 
-    if (!WIFEXITED(status)) {
-        testinfo->r = -WTERMSIG(status);
-        return testinfo->r;
-    }
-
-    testinfo->r = WEXITSTATUS(status);;
     return testinfo->r;
 }
 
@@ -1784,6 +1818,7 @@ void helpexit(char *exe)
     printf("Run tests\n\n");
     printf("  -l             print test list and exit\n");
     printf("  -k=TEST        only run TEST (can be passed multiple times)\n");
+    printf("  -t=SECONDS     per-test timeout in seconds\n");
     printf("  -v             verbose output\n");
     printf("  -g             debug with gdb\n");
     printf("  -h             display this help and exit\n");
@@ -1840,7 +1875,7 @@ int main(int argc, char **argv)
     int verbose = 0;
     int do_gdb = 0;
     do {
-        c = getopt(argc, argv, "hlgvk:");
+        c = getopt(argc, argv, "hlgvk:t:");
 
         if (c == 'h') {
             helpexit(argv[0]);
@@ -1854,6 +1889,13 @@ int main(int argc, char **argv)
         }
         else if (c == 'v') {
             verbose++;
+        }
+        else if (c == 't') {
+            test_timeout_secs = atoi(optarg);
+            if (test_timeout_secs <= 0) {
+                fprintf(stderr, "%s: invalid timeout '%s'\n", argv[0], optarg);
+                exit(1);
+            }
         }
         else if (c == 'k') {
             test_names = realloc(test_names, sizeof(char *) * (test_names_s+1));
