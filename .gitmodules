@@ -1,15 +1,3 @@
-[submodule "dropbear"]
-	path = dropbear
-	url = git@github.com:yuvalino/dropbear-forkless.git
-[submodule "mksh"]
-	path = mksh
-	url = git@github.com:yuvalino/mksh-forkless.git
-[submodule "toybox"]
-	path = toybox
-	url = git@github.com:yuvalino/toybox-forkless.git
 [submodule "unicorn"]
 	path = unicorn
 	url = git@github.com:yuvalino/unicorn-forkless.git
-[submodule "mini-vim"]
-	path = mini-vim
-	url = git@github.com:yuvalino/mini-vim-forkless.git
