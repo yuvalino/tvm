@@ -3373,7 +3373,8 @@ static struct tty *tty_for_path(const char *pathname) {
         }
         pthread_mutex_unlock(&ttys_lock);
 
-        errno = ENXIO;
+        // No TVM tty found — fall back to host /dev/tty
+        errno = ENOTSUP;
         return NULL;
     }
 
