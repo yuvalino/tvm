@@ -606,6 +606,31 @@ TEST(FDsFcntl) {
     ASSERT_EQ(nf2, 11);
 }
 
+TEST(FDsCloseOnExit) {
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(pp[0]); // child doesn't need read end
+        // child holds write end open, then exits — write end should close
+        _exit(0);
+    }
+    close(pp[1]); // parent doesn't need write end
+
+    // After child exits, its write end is closed, so read should return 0 (EOF)
+    char buf[1];
+    int r = read(pp[0], buf, 1);
+    ASSERT_EQ(0, r);
+    close(pp[0]);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
 static COW_IMPL(int, cow_int);
 
 TEST(COWSingleThreaded) {
