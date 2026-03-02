@@ -1,4 +1,4 @@
-.PHONY: first all clean tvm libtvm unicorn
+.PHONY: first all clean clean_tvm tvm libtvm unicorn
 
 first: all
 
@@ -22,6 +22,9 @@ clean:
 	@rm *.a *.o || true
 	@rm test_tvm || true
 	@rm test_rmem || true
+
+clean_tvm:
+	@rm *.o || true
 
 libtvm: unicorn
 	$(CC) $(CFLAGS) -g -Wno-deprecated-declarations -I.  -I./unicorn/include -c rmem.c ulinker.c tvm.c main.c
