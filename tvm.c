@@ -1227,6 +1227,10 @@ struct fops {
      * errno set to ENOTSUP if pathname not relevant to this device.
      */
     int (*f_chmod)(const char *pathname, mode_t mode, int flag);
+    /**
+     * errno set to ENOTSUP if pathname not relevant to this device.
+     */
+    ssize_t (*f_readlink)(const char *pathname, char *buf, size_t bufsiz);
     int (*f_ioctl)(struct file *file, unsigned long request, void *arg);
     ssize_t (*f_read)(struct file *file, void *buf, size_t count, int offset);
     int (*f_readdir)(struct file *file, struct dirent *out);
@@ -1522,6 +1526,27 @@ int file_chown(const char *pathname, uid_t owner, gid_t group, int flag)
     };
 
     return CALL_FUNC(fchownat, AT_FDCWD, pathname, owner, group, flag);
+}
+
+ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
+{
+    struct device *dev;
+    list_for_each_entry(dev, &devices, dev_list) {
+        if (!dev->dev_fops.f_readlink)
+            continue;
+        
+        int last_errno = errno;
+        ssize_t ret = dev->dev_fops.f_readlink(pathname, buf, bufsiz);
+        if (ret >= 0)
+            return ret;
+
+        if (errno != ENOTSUP)
+            return -1;
+
+        errno = last_errno;
+    };
+
+    return CALL_FUNC(readlink, pathname, buf, bufsiz);
 }
 
 
@@ -4584,7 +4609,34 @@ static struct vfs_node *vfs_find_child_locked(struct vfs_node *dir, const char *
     return NULL;
 }
 
-static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *relpath, int create, mode_t mode, uid_t uid, gid_t gid)
+/* build the path from root to vn by walking vn_parent pointers.
+   root must be an ancestor of vn. result does NOT include root's name.
+   vn must be locked. returns path in out (e.g. "bin" for /tvm/bin). */
+static void vfs_build_path_locked(struct vfs_node *root, struct vfs_node *vn, char *out, size_t outlen)
+{
+    if (vn == root) { out[0] = 0; return; }
+
+    int depth = 0;
+    for (struct vfs_node *p = vn; p && p != root; p = p->vn_parent)
+        depth++;
+
+    const char **names = kalloc(depth * sizeof(*names));
+    if (!names) { out[0] = 0; return; }
+
+    int i = 0;
+    for (struct vfs_node *p = vn; p && p != root && i < depth; p = p->vn_parent)
+        names[i++] = p->vn_name;
+
+    out[0] = 0;
+    for (i = depth - 1; i >= 0; i--) {
+        if (out[0]) strncat(out, "/", outlen - strlen(out) - 1);
+        strncat(out, names[i], outlen - strlen(out) - 1);
+    }
+
+    kfree(names);
+}
+
+static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *relpath, int create, int nofollow, mode_t mode, uid_t uid, gid_t gid)
 {
     char tmp[PATH_MAX];
     struct vfs_node *cur = root;
@@ -4600,7 +4652,7 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
     while (tok) {
         next_tok = strtok_r(NULL, "/", &saveptr);
         struct vfs_node *child = vfs_find_child_locked(cur, tok);
-        
+
         if (!child) {
             if (create && next_tok == NULL) {
                 /* Only create the leaf */
@@ -4610,6 +4662,7 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
                         vn_unlock(cur, 1);
                     return NULL;
                 }
+                child->vn_parent = cur;
                 vfs_add_child_locked(cur, child);
                 if (cur != root)
                     vn_unlock(cur, 1);
@@ -4619,14 +4672,68 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
                     vn_unlock(cur, 1);
                 return NULL;
             }
-        } else {
-            /* If intermediate exists but is not a directory, fail */
-            if (next_tok && !S_ISDIR(child->vn_st.st_mode)) {
+        }
+
+        /* resolve symlinks for intermediate components, and for the
+           final component when not creating */
+        if (S_ISLNK(child->vn_st.st_mode) && (next_tok || (!create && !nofollow))) {
+            if (!child->vn_data || child->vn_size >= PATH_MAX) {
                 vn_unlock(child, 1);
-                if (cur != root)
-                    vn_unlock(cur, 1);
+                if (cur != root) vn_unlock(cur, 1);
+                errno = EINVAL;
                 return NULL;
             }
+
+            char link_target[PATH_MAX];
+            memcpy(link_target, child->vn_data, child->vn_size);
+            link_target[child->vn_size] = 0;
+
+            if (link_target[0] == '/') {
+                /* absolute symlink — can't resolve within VFS root */
+                vn_unlock(child, 1);
+                if (cur != root) vn_unlock(cur, 1);
+                errno = ENOTSUP;
+                return NULL;
+            }
+
+            /* relative symlink: resolve against cur (the parent dir)
+               build new path = path_to_cur/target[/remaining...] */
+            char newpath[PATH_MAX];
+            char cur_path[PATH_MAX];
+            vfs_build_path_locked(root, cur, cur_path, sizeof(cur_path));
+
+            vn_unlock(child, 1);
+
+            /* reconstruct remaining components after the symlink */
+            if (next_tok) {
+                char rest[PATH_MAX];
+                if (saveptr && saveptr[0])
+                    snprintf(rest, sizeof(rest), "%s/%s", next_tok, saveptr);
+                else
+                    strncpy(rest, next_tok, sizeof(rest)-1);
+
+                if (cur_path[0])
+                    snprintf(newpath, sizeof(newpath), "%s/%s/%s", cur_path, link_target, rest);
+                else
+                    snprintf(newpath, sizeof(newpath), "%s/%s", link_target, rest);
+            } else {
+                if (cur_path[0])
+                    snprintf(newpath, sizeof(newpath), "%s/%s", cur_path, link_target);
+                else
+                    strncpy(newpath, link_target, sizeof(newpath)-1);
+            }
+
+            if (cur != root)
+                vn_unlock(cur, 1);
+
+            return vfs_lookup_locked(root, newpath, 0, 0, 0, 0, 0);
+        }
+
+        if (next_tok && !S_ISDIR(child->vn_st.st_mode)) {
+            vn_unlock(child, 1);
+            if (cur != root)
+                vn_unlock(cur, 1);
+            return NULL;
         }
 
         if (cur != root)
@@ -4638,7 +4745,7 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
     return cur;
 }
 
-static struct vfs_node *vfs_lookup(const char *abspath, int create, mode_t mode, uid_t uid, gid_t gid)
+static struct vfs_node *vfs_lookup(const char *abspath, int create, int nofollow, mode_t mode, uid_t uid, gid_t gid)
 {
     int pathlen = strlen(abspath);
 
@@ -4657,7 +4764,7 @@ static struct vfs_node *vfs_lookup(const char *abspath, int create, mode_t mode,
             if (abspath[vnlen] == 0)
                 return root;
 
-            struct vfs_node *vn = vfs_lookup_locked(root, abspath + vnlen + 1, create, mode, uid, gid);
+            struct vfs_node *vn = vfs_lookup_locked(root, abspath + vnlen + 1, create, nofollow, mode, uid, gid);
             vn_unlock(root, 1);
             return vn;
         }
@@ -4756,7 +4863,11 @@ static struct vfs_node *vn_for_file_locked(struct file *file) {
 }
 
 static struct vfs_node *vn_for_pathname(const char *pathname) {
-    return vfs_lookup(pathname, 0, 0, 0, 0);
+    return vfs_lookup(pathname, 0, 0, 0, 0, 0);
+}
+
+static struct vfs_node *vn_for_pathname_nofollow(const char *pathname) {
+    return vfs_lookup(pathname, 0, 1, 0, 0, 0);
 }
 
 static struct fops *vfsops();
@@ -4764,9 +4875,17 @@ static struct fops *vfsops();
 static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out) {
     file_unlock(out, 0);
 
-    struct vfs_node *vn = vfs_lookup(pathname, flags & O_CREAT, mode, uid, gid);
+    int nofollow = !!(flags & O_NOFOLLOW);
+    struct vfs_node *vn = vfs_lookup(pathname, flags & O_CREAT, nofollow, mode, uid, gid);
     if (!vn) {
         file_lock(out, 0);
+        return -1;
+    }
+
+    if (nofollow && S_ISLNK(vn->vn_st.st_mode)) {
+        vn_unlock(vn, 1);
+        file_lock(out, 0);
+        errno = ELOOP;
         return -1;
     }
 
@@ -4874,13 +4993,34 @@ static int vfsop_fstat(struct file *file, struct stat *st)
 
 static int vfsop_stat(const char *pathname, struct stat *st, int flag)
 {
-    struct vfs_node *vn = vn_for_pathname(pathname);
+    struct vfs_node *vn = (flag & AT_SYMLINK_NOFOLLOW)
+        ? vn_for_pathname_nofollow(pathname)
+        : vn_for_pathname(pathname);
     if (!vn)
         return -1;
 
     int ret = vn_stat_locked(vn, st);
     vn_unlock(vn, 1);
     return ret;
+}
+
+static ssize_t vfsop_readlink(const char *pathname, char *buf, size_t bufsiz)
+{
+    struct vfs_node *vn = vn_for_pathname_nofollow(pathname);
+    if (!vn)
+        return -1;
+
+    if (!S_ISLNK(vn->vn_st.st_mode)) {
+        vn_unlock(vn, 1);
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t len = vn->vn_size;
+    if (len > bufsiz) len = bufsiz;
+    memcpy(buf, vn->vn_data, len);
+    vn_unlock(vn, 1);
+    return (ssize_t)len;
 }
 
 static int vn_chmod_locked(struct vfs_node *vn, mode_t mode)
@@ -5127,6 +5267,7 @@ static struct device devvfs = {
         .f_stat = vfsop_stat,
         .f_chmod = vfsop_chmod,
         .f_chown = vfsop_chown,
+        .f_readlink = vfsop_readlink,
 
         .f_ioctl = vfsop_ioctl,
         .f_read = vfsop_read,
@@ -5145,9 +5286,10 @@ static struct fops *vfsops() {
 }
 
 static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
-    if (S_ISDIR(cpio->c_mode) || 
-        S_ISREG(cpio->c_mode)) {
-        struct vfs_node *child = vfs_lookup_locked(vn, cpio->name, 1, cpio->c_mode, cpio->c_uid, cpio->c_gid);
+    if (S_ISDIR(cpio->c_mode) ||
+        S_ISREG(cpio->c_mode) ||
+        S_ISLNK(cpio->c_mode)) {
+        struct vfs_node *child = vfs_lookup_locked(vn, cpio->name, 1, 0, cpio->c_mode, cpio->c_uid, cpio->c_gid);
         if (!child) {
             // TODO clear all children
             return -1;
@@ -5155,13 +5297,14 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
 
         if (!S_ISDIR(cpio->c_mode)) {
             if (cpio->c_filesize) {
-                void *buf = kalloc(cpio->c_filesize);
+                void *buf = kalloc(cpio->c_filesize + 1);
                 if (!buf) {
                     // TODO clear all children
                     vn_unlock(child, 1);
                     return -1;
                 }
                 memcpy(buf, cpio->data, cpio->c_filesize);
+                ((char *)buf)[cpio->c_filesize] = 0;
 
                 child->vn_data = buf;
                 child->vn_size = cpio->c_filesize;
@@ -5170,8 +5313,6 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
 
         vn_unlock(child, 1);
     }
-
-    // skip unsupported modes
 
     return 0;
 }
@@ -9289,7 +9430,7 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
         statbuf->st_mode = S_IFREG | S_IXUSR | S_IXGRP | S_IXOTH;
         return 0;
     }
-    
+
     int ret = file_stat(pathname, statbuf, 0);
     tvm_sig_leave();
     return ret;
@@ -9307,7 +9448,7 @@ FUNCTION_DEFINE2(int, lstat, const char *, pathname, struct stat *, statbuf) {
         statbuf->st_mode = S_IFREG | S_IXUSR | S_IXGRP | S_IXOTH;
         return 0;
     }
-    
+
     int ret = file_stat(pathname, statbuf, AT_SYMLINK_NOFOLLOW);
     tvm_sig_leave();
     return ret;
@@ -9342,7 +9483,7 @@ FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *
     if(!dirfd_normalize_path(dirfd, pathname, pathname_abs))
         return -1;
     pathname = pathname_abs;
-    
+
     tvm_sig_enter();
     int ret = file_stat(pathname, statbuf, flag);
     tvm_sig_leave();
@@ -9533,18 +9674,22 @@ FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t,
         return -1;
     pathname = pathname_abs;
 
-    return CALL_FUNC(readlink, pathname, buf, bufsiz);
+    tvm_sig_enter();
+    ssize_t ret = file_readlink(pathname, buf, bufsiz);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE4(ssize_t, readlinkat, int, dirfd, const char *, pathname, char *, buf, size_t, bufsiz) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(readlinkat, __rfd, pathname, buf, bufsiz));
+    tvm_sig_enter();
+    ssize_t ret = file_readlink(pathname, buf, bufsiz);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, symlink, const char *, target, const char *, linkpath) {
@@ -12145,13 +12290,14 @@ FUNCTION_DEFINE_VA3(int, openat64, int, dirfd, const char *, pathname, int, flag
 
 FUNCTION_DEFINE4(int, fstatat64, int, dirfd, const char *, pathname, struct stat64 *, statbuf, int, flags) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if(!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    pathname = pathname_abs;
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(fstatat64, __rfd, pathname, statbuf, flags));
+    tvm_sig_enter();
+    int ret = file_stat(pathname, (struct stat *)statbuf, flags);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE3(off_t, lseek64, int, fd, off64_t, offset, int, whence) {
