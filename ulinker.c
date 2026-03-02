@@ -2110,6 +2110,305 @@ struct dlinfo_external {
 static pthread_mutex_t g_external_dlinfos_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct dlinfo_external *g_external_dlinfos = NULL;
 
+/* -------------------- DWARF fixup helpers -------------------- */
+
+static const uint8_t *read_uleb128(const uint8_t *p, const uint8_t *end, uint64_t *out)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    while (p < end) {
+        uint8_t byte = *p++;
+        result |= (uint64_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    *out = result;
+    return p;
+}
+
+static void dwarf_fixup_debug_line(uint8_t *sec, size_t size, int64_t load_bias)
+{
+    uint8_t *p = sec;
+    uint8_t *end = sec + size;
+
+    while (p < end) {
+        uint8_t *cu_start = p;
+        if (p + 4 > end) break;
+        uint32_t unit_length = *(uint32_t *)p; p += 4;
+        if (unit_length == 0xFFFFFFFF) break; // DWARF64 — skip
+        uint8_t *cu_end = p + unit_length;
+        if (cu_end > end) break;
+
+        if (p + 2 > cu_end) break;
+        uint16_t version = *(uint16_t *)p; p += 2;
+
+        if (p + 4 > cu_end) break;
+        uint32_t header_length = *(uint32_t *)p; p += 4;
+        uint8_t *after_header = p + header_length;
+
+        if (p + 4 > after_header) { p = cu_end; continue; }
+        uint8_t min_inst_length = *p++;
+        if (version >= 4) p++; // max_ops_per_instruction
+        p++; // default_is_stmt
+        p++; // line_base (signed)
+        uint8_t line_range = *p++;
+        uint8_t opcode_base = *p++;
+
+        uint8_t std_opcode_lengths[256];
+        for (int i = 1; i < opcode_base && p < after_header; i++)
+            std_opcode_lengths[i] = *p++;
+
+        // skip directory table (null-terminated strings, ended by empty string)
+        while (p < after_header && *p != 0) {
+            while (p < after_header && *p != 0) p++;
+            if (p < after_header) p++; // skip null terminator
+        }
+        if (p < after_header) p++; // skip final null
+
+        // skip file table
+        while (p < after_header && *p != 0) {
+            while (p < after_header && *p != 0) p++;
+            if (p < after_header) p++; // skip null
+            uint64_t tmp;
+            p = (uint8_t *)read_uleb128(p, after_header, &tmp); // dir index
+            p = (uint8_t *)read_uleb128(p, after_header, &tmp); // time
+            p = (uint8_t *)read_uleb128(p, after_header, &tmp); // size
+        }
+        if (p < after_header) p++; // skip final null
+
+        // walk line program opcodes
+        while (p < cu_end) {
+            uint8_t op = *p++;
+            if (op == 0) {
+                // extended opcode
+                uint64_t ext_len;
+                p = (uint8_t *)read_uleb128(p, cu_end, &ext_len);
+                uint8_t *ext_end = p + ext_len;
+                if (ext_end > cu_end) break;
+                if (ext_len >= 1) {
+                    uint8_t ext_op = *p;
+                    if (ext_op == 0x02 && ext_len >= 9) { // DW_LNE_set_address
+                        uint64_t *addr = (uint64_t *)(p + 1);
+                        *addr += load_bias;
+                    }
+                }
+                p = ext_end;
+            } else if (op < opcode_base) {
+                // standard opcode — skip ULEB128 args
+                uint64_t tmp;
+                for (int i = 0; i < std_opcode_lengths[op]; i++)
+                    p = (uint8_t *)read_uleb128(p, cu_end, &tmp);
+            }
+            // else: special opcode, no operands
+        }
+
+        p = cu_end;
+    }
+}
+
+static void dwarf_fixup_debug_aranges(uint8_t *sec, size_t size, int64_t load_bias)
+{
+    uint8_t *p = sec;
+    uint8_t *end = sec + size;
+
+    while (p < end) {
+        if (p + 4 > end) break;
+        uint32_t unit_length = *(uint32_t *)p; p += 4;
+        if (unit_length == 0xFFFFFFFF) break;
+        uint8_t *cu_end = p + unit_length;
+        if (cu_end > end) break;
+
+        if (p + 2 > cu_end) break;
+        /* uint16_t version = */ p += 2;
+        /* uint32_t debug_info_offset = */ p += 4;
+        if (p + 2 > cu_end) break;
+        uint8_t addr_size = *p++;
+        uint8_t seg_size = *p++;
+
+        // align to 2 * addr_size
+        size_t tuple_size = 2 * addr_size;
+        size_t off = (p - sec);
+        size_t align = tuple_size;
+        size_t aligned_off = (off + align - 1) & ~(align - 1);
+        p = sec + aligned_off;
+
+        while (p + tuple_size <= cu_end) {
+            if (addr_size == 8) {
+                uint64_t addr = *(uint64_t *)p;
+                uint64_t len  = *(uint64_t *)(p + 8);
+                if (addr == 0 && len == 0) { p += tuple_size; break; }
+                *(uint64_t *)p = addr + load_bias;
+            } else if (addr_size == 4) {
+                uint32_t addr = *(uint32_t *)p;
+                uint32_t len  = *(uint32_t *)(p + 4);
+                if (addr == 0 && len == 0) { p += tuple_size; break; }
+                *(uint32_t *)p = addr + (uint32_t)load_bias;
+            }
+            p += tuple_size;
+        }
+
+        p = cu_end;
+    }
+}
+
+static const uint8_t *skip_form(const uint8_t *p, const uint8_t *end, uint64_t form,
+                                 uint8_t addr_size, uint16_t version, int64_t load_bias)
+{
+    uint64_t tmp;
+    switch (form) {
+    case 0x01: // DW_FORM_addr
+        if (p + addr_size <= end) {
+            if (addr_size == 8) *(uint64_t *)((uintptr_t)p) += load_bias;
+            else if (addr_size == 4) *(uint32_t *)((uintptr_t)p) += (uint32_t)load_bias;
+        }
+        return p + addr_size;
+    case 0x03: // DW_FORM_block2
+        if (p + 2 > end) return end;
+        { uint16_t len = *(uint16_t *)p; return p + 2 + len; }
+    case 0x04: // DW_FORM_block4
+        if (p + 4 > end) return end;
+        { uint32_t len = *(uint32_t *)p; return p + 4 + len; }
+    case 0x05: return p + 2;  // DW_FORM_data2
+    case 0x06: return p + 4;  // DW_FORM_data4
+    case 0x07: return p + 8;  // DW_FORM_data8
+    case 0x08: // DW_FORM_string (null-terminated)
+        while (p < end && *p) p++;
+        return p < end ? p + 1 : end;
+    case 0x09: // DW_FORM_block (ULEB128 length + data)
+        p = read_uleb128(p, end, &tmp);
+        return p + tmp;
+    case 0x0a: // DW_FORM_block1
+        if (p >= end) return end;
+        { uint8_t len = *p; return p + 1 + len; }
+    case 0x0b: return p + 1;  // DW_FORM_data1
+    case 0x0c: return p + 1;  // DW_FORM_flag
+    case 0x0d: // DW_FORM_sdata
+        return (uint8_t *)read_uleb128(p, end, &tmp);
+    case 0x0e: return p + 4;  // DW_FORM_strp
+    case 0x0f: // DW_FORM_udata
+        return (uint8_t *)read_uleb128(p, end, &tmp);
+    case 0x10: // DW_FORM_ref_addr
+        return p + ((version >= 3) ? 4 : addr_size);
+    case 0x11: return p + 1;  // DW_FORM_ref1
+    case 0x12: return p + 2;  // DW_FORM_ref2
+    case 0x13: return p + 4;  // DW_FORM_ref4
+    case 0x14: return p + 8;  // DW_FORM_ref8
+    case 0x15: // DW_FORM_ref_udata
+        return (uint8_t *)read_uleb128(p, end, &tmp);
+    case 0x16: // DW_FORM_indirect
+    {
+        p = read_uleb128(p, end, &tmp);
+        return skip_form(p, end, tmp, addr_size, version, load_bias);
+    }
+    case 0x17: return p + 4;  // DW_FORM_sec_offset
+    case 0x18: // DW_FORM_exprloc
+        p = read_uleb128(p, end, &tmp);
+        return p + tmp;
+    case 0x19: return p;      // DW_FORM_flag_present (0 bytes)
+    case 0x20: return p + 8;  // DW_FORM_ref_sig8
+    default:
+        return end; // unknown form — bail
+    }
+}
+
+static void dwarf_fixup_debug_info(uint8_t *info, size_t info_size,
+                                    uint8_t *abbrev, size_t abbrev_size,
+                                    int64_t load_bias)
+{
+    uint8_t *p = info;
+    uint8_t *end = info + info_size;
+    uint8_t *abbrev_end = abbrev + abbrev_size;
+
+    while (p < end) {
+        if (p + 4 > end) break;
+        uint32_t unit_length = *(uint32_t *)p; p += 4;
+        if (unit_length == 0xFFFFFFFF) break;
+        uint8_t *cu_end = p + unit_length;
+        if (cu_end > end) break;
+
+        if (p + 2 > cu_end) break;
+        uint16_t version = *(uint16_t *)p; p += 2;
+        if (p + 4 > cu_end) break;
+        uint32_t abbrev_offset = *(uint32_t *)p; p += 4;
+        if (p + 1 > cu_end) break;
+        uint8_t addr_size = *p++;
+
+        while (p < cu_end) {
+            uint64_t abbrev_code;
+            p = (uint8_t *)read_uleb128(p, cu_end, &abbrev_code);
+            if (abbrev_code == 0) continue; // null DIE
+
+            // find abbreviation in .debug_abbrev
+            const uint8_t *ap = abbrev + abbrev_offset;
+            uint64_t ab_code, ab_tag, ab_children;
+            for (;;) {
+                if (ap >= abbrev_end) goto next_cu;
+                ap = read_uleb128(ap, abbrev_end, &ab_code);
+                if (ab_code == 0) goto next_cu; // end of table
+                ap = read_uleb128(ap, abbrev_end, &ab_tag);
+                if (ap >= abbrev_end) goto next_cu;
+                ab_children = *ap++;
+
+                if (ab_code == abbrev_code) break;
+
+                // skip attributes
+                for (;;) {
+                    uint64_t attr, form;
+                    ap = read_uleb128(ap, abbrev_end, &attr);
+                    ap = read_uleb128(ap, abbrev_end, &form);
+                    if (attr == 0 && form == 0) break;
+                }
+            }
+
+            // process attributes for this DIE
+            for (;;) {
+                uint64_t attr, form;
+                ap = read_uleb128(ap, abbrev_end, &attr);
+                ap = read_uleb128(ap, abbrev_end, &form);
+                if (attr == 0 && form == 0) break;
+                p = (uint8_t *)skip_form(p, cu_end, form, addr_size, version, load_bias);
+            }
+        }
+next_cu:
+        p = cu_end;
+    }
+}
+
+static void dwarf_fixup_debug_ranges(uint8_t *sec, size_t size, int64_t load_bias, uint8_t addr_size)
+{
+    uint8_t *p = sec;
+    uint8_t *end = sec + size;
+
+    if (addr_size == 8) {
+        while (p + 16 <= end) {
+            uint64_t start = *(uint64_t *)p;
+            uint64_t stop  = *(uint64_t *)(p + 8);
+            if (start == 0 && stop == 0) { p += 16; continue; }
+            if (start == 0xFFFFFFFFFFFFFFFF) {
+                // base address selection — fix the base in 'stop'
+                *(uint64_t *)(p + 8) = stop + load_bias;
+            } else {
+                *(uint64_t *)p = start + load_bias;
+                *(uint64_t *)(p + 8) = stop + load_bias;
+            }
+            p += 16;
+        }
+    } else if (addr_size == 4) {
+        while (p + 8 <= end) {
+            uint32_t start = *(uint32_t *)p;
+            uint32_t stop  = *(uint32_t *)(p + 4);
+            if (start == 0 && stop == 0) { p += 8; continue; }
+            if (start == 0xFFFFFFFF) {
+                *(uint32_t *)(p + 4) = stop + (uint32_t)load_bias;
+            } else {
+                *(uint32_t *)p = start + (uint32_t)load_bias;
+                *(uint32_t *)(p + 4) = stop + (uint32_t)load_bias;
+            }
+            p += 8;
+        }
+    }
+}
+
 /* -------------------- Private functions -------------------- */
 
 int create_elf64_jit_entry(struct dlinfo_elf64 *dl, const char *filename)
@@ -2178,8 +2477,42 @@ int create_elf64_jit_entry(struct dlinfo_elf64 *dl, const char *filename)
     if (symtab) {
         Elf64_Sym *sym0 = (Elf64_Sym *)(data + symtab->sh_offset);
         for (Elf64_Sym *sym = sym0; sym < &sym0[symtab->sh_size / sizeof(Elf64_Sym)]; sym++) {
-            sym->st_value -= shdr0[sym->st_shndx].sh_addr;
+            if (sym->st_shndx < ehdr->e_shnum)
+                sym->st_value -= shdr0[sym->st_shndx].sh_addr;
         }
+    }
+
+    // fixup DWARF debug sections to match loaded addresses
+    {
+        Elf64_Shdr *debug_line = NULL, *debug_aranges = NULL;
+        Elf64_Shdr *debug_info = NULL, *debug_abbrev = NULL;
+        Elf64_Shdr *debug_ranges = NULL;
+
+        for (Elf64_Shdr *shdr = shdr0; shdr < &shdr0[ehdr->e_shnum]; shdr++) {
+            const char *name = &shnstrtab_str[shdr->sh_name];
+            if (0 == strcmp(name, ".debug_line"))        debug_line = shdr;
+            else if (0 == strcmp(name, ".debug_aranges")) debug_aranges = shdr;
+            else if (0 == strcmp(name, ".debug_info"))    debug_info = shdr;
+            else if (0 == strcmp(name, ".debug_abbrev"))  debug_abbrev = shdr;
+            else if (0 == strcmp(name, ".debug_ranges"))  debug_ranges = shdr;
+        }
+
+        int64_t bias = (int64_t)dl->dle64_load_bias;
+
+        if (debug_line)
+            dwarf_fixup_debug_line((uint8_t *)(data + debug_line->sh_offset),
+                                   debug_line->sh_size, bias);
+        if (debug_aranges)
+            dwarf_fixup_debug_aranges((uint8_t *)(data + debug_aranges->sh_offset),
+                                      debug_aranges->sh_size, bias);
+        if (debug_info && debug_abbrev)
+            dwarf_fixup_debug_info((uint8_t *)(data + debug_info->sh_offset),
+                                   debug_info->sh_size,
+                                   (uint8_t *)(data + debug_abbrev->sh_offset),
+                                   debug_abbrev->sh_size, bias);
+        if (debug_ranges)
+            dwarf_fixup_debug_ranges((uint8_t *)(data + debug_ranges->sh_offset),
+                                     debug_ranges->sh_size, bias, 8);
     }
 
     // fixup section addresses to absolute values
