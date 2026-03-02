@@ -10007,8 +10007,18 @@ static void tvm_proc_entry_cont(struct fork_arg *arg);
 
 static void *tvm_proc_entry(struct fork_arg *arg)
 {
+    // save fp before modifying
     uintptr_t curr_fp = (uintptr_t)__builtin_frame_address(0);
     arg->thread_fp = curr_fp;
+
+    // set thread-local current/current_thread early so ulinker callbacks
+    // (which VERIFY(arg == current)) work during ulinker_duplicate
+    current = arg->tsk;
+    current_thread = arg->thr;
+    current->tsk_pid = __gettid();
+    current_thread->thr_pthread = pthread_self();
+    list_add_tail(&current_thread->thr_list, &current->tsk_threads);
+    current->tsk_threads_cnt++;
 
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
@@ -10298,16 +10308,7 @@ pid_t fork(void) {
 
         // child
 
-        current = arg->tsk;
-        current_thread = arg->thr;
-
-        current->tsk_pid = __gettid();
-        current_thread->thr_pthread = pthread_self();
-
-        list_add_tail(&current_thread->thr_list, &current->tsk_threads);
-        current->tsk_threads_cnt++;
-
-        // finally, add child task to tasks list
+        // add child task to tasks list
         pthread_mutex_lock(&tasks_lock);
         list_add_tail(&current->tsk_list, &main_task->tsk_list);
         pthread_mutex_unlock(&tasks_lock);
@@ -11091,23 +11092,37 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     tvm_sig_enter();
 
+    struct ulinker *new_linker = ulinker_create((void *)current);
+    if (!new_linker) {
+        INFO("   failed(ENOMEM)");
+        errno = ENOMEM;
+        tvm_sig_leave();
+        return -1;
+    }
+
+    // destroy old emulator context (with stale engine/map entries) and
+    // create a fresh one so the new executable starts clean
+    struct emulator_context *new_emulator = emulator_context_create(new_linker);
+    if (!new_emulator) {
+        ulinker_destroy(new_linker);
+        INFO("   failed(ENOMEM)");
+        errno = ENOMEM;
+        tvm_sig_leave();
+    }
+
+    struct ulinker *old_linker = current->tsk_linker;
+    struct emulator_context *old_emulator = current_thread->thr_emulator;
+    current->tsk_linker = new_linker;
+    current_thread->thr_emulator = new_emulator;
+
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
 
-        struct ulinker *new_linker = ulinker_create((void *)current);
-        if (!new_linker) {
-            INFO("   failed(ENOMEM)");
-            errno = ENOMEM;
-            tvm_sig_leave();
-            return -1;
-        }
-
-        struct ulinker *old_linker = current->tsk_linker;
-        current->tsk_linker = current_thread->thr_emulator->ec_ulinker = new_linker;
-
         void *handle = ulinker_dlopen(new_linker, pathname, 0);
         if (!handle) {
-            current->tsk_linker = current_thread->thr_emulator->ec_ulinker = old_linker;
+            current->tsk_linker = old_linker;
+            current_thread->thr_emulator = old_emulator;
+            emulator_context_destroy(new_emulator);
             ulinker_destroy(new_linker);
             errno = ENOENT;
             tvm_sig_leave();
@@ -11117,26 +11132,34 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         void *entry = ulinker_dlsym(new_linker, handle, "main", 1);
         if (!entry) {
             INFO("failed to load executable library \"%s\": symbol \"main\" not found", pathname);
-            current->tsk_linker = current_thread->thr_emulator->ec_ulinker = old_linker;
+            current->tsk_linker = old_linker;
+            current_thread->thr_emulator = old_emulator;
+            emulator_context_destroy(new_emulator);
             ulinker_destroy(new_linker);
             errno = EINVAL;
             tvm_sig_leave();
             return -1;
         }
 
-        ulinker_destroy(old_linker);
-
         main_func = (main_func_t)entry;
     }
 
     if (!main_func) {
         INFO("  failed(ENOENT)");
+        current->tsk_linker = old_linker;
+        current_thread->thr_emulator = old_emulator;
+        emulator_context_destroy(new_emulator);
+        ulinker_destroy(new_linker);
         errno = ENOENT;
         tvm_sig_leave();
         return -1;
     }
 
     // No failing from here!
+
+    // cleanup old emulator and linker
+    emulator_context_destroy(old_emulator);
+    ulinker_destroy(old_linker);
 
     // TODO: kill all other threads
     if (current->tsk_threads_cnt != 1)
@@ -11470,9 +11493,12 @@ FUNCTION_DEFINE1(char *, ptsname, int, fd) {
 }
 
 FUNCTION_DEFINE1(pid_t, tcgetpgrp, int, fd) {
-    if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcgetpgrp, __rfd));
-    
+    if (!islocaltty(fd)) {
+        // For native (host) TTYs, TVM tasks are threads sharing one real PID
+        // so real tcsetpgrp/tcgetpgrp cannot work.  Virtualise it.
+        return CURRENT_RFD(fd, CALL_FUNC(isatty, __rfd) ? (long)current->tsk_pgid : (long)CALL_FUNC(tcgetpgrp, __rfd));
+    }
+
     pid_t ret;
     if (0 != CURRENT_FILE(fd, ttyop_ioctl(__file, TIOCGPGRP, &ret)))
         return -1;
@@ -11480,9 +11506,12 @@ FUNCTION_DEFINE1(pid_t, tcgetpgrp, int, fd) {
 }
 
 FUNCTION_DEFINE2(int, tcsetpgrp, int, fd, pid_t, pgrp) {
-    if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcsetpgrp, __rfd, pgrp));
-    
+    if (!islocaltty(fd)) {
+        // For native (host) TTYs, TVM tasks are threads sharing one real PID
+        // so real tcsetpgrp/tcgetpgrp cannot work.  Virtualise it: no-op success.
+        return CURRENT_RFD(fd, CALL_FUNC(isatty, __rfd) ? 0L : (long)CALL_FUNC(tcsetpgrp, __rfd, pgrp));
+    }
+
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TIOCSPGRP, &pgrp));
 }
 
