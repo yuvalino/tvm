@@ -1634,6 +1634,8 @@ static __thread int thread_tvm_disallow = 0;
 static __thread int tvm_sig_blocked = 0;
 static __thread int tvm_sig_draining = 0;
 static __thread int tvm_sig_interrupted = 0;
+static __thread int tvm_sig_depth = 0;
+static __thread int tvm_sig_synchronous_depth = 0;
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
 #define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
@@ -2948,12 +2950,34 @@ static void dump_stacktrace()
 
     for (int i = 0; i < nstack; i++) {
         memset(&dlinfo, 0, sizeof(dlinfo));
-        if (0 == dladdr(stack[i], &dlinfo) || (!dlinfo.dli_fname))
+        if (0 == dladdr(stack[i], &dlinfo) || (!dlinfo.dli_fname)) {
             INFO("  stacktrace[% 2d] = %08lx", i, (long)stack[i]);
-        else if (!dlinfo.dli_sname)
-            INFO("  stacktrace[% 2d] = %s + %lx", i, dlinfo.dli_fname, (long)stack[i] - (long)dlinfo.dli_fbase);
-        else
+            continue;
+        }
+
+        ////// for extended debugging, see source
+        // char a2l[256] = {0};
+        // char cmd[512];
+        // snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C -p %lx 2>/dev/null", dlinfo.dli_fname, stack[i] - (long)dlinfo.dli_fbase);
+        // FILE *fp = popen(cmd, "r");
+        // if (fp) {
+        //     if (CALL_FUNC(fgets, a2l, sizeof(a2l) - 1, fp)) {
+        //         size_t len = strlen(a2l);
+        //         if (len > 0 && a2l[len-1] == '\n') a2l[len-1] = '\0';
+        //     }
+        //     pclose(fp);
+        // }
+        // if (a2l[0] && !strstr(a2l, "??")) {
+        //     INFO("  stacktrace[% 2d] = %s", i, a2l);
+        //     continue;
+        // }
+        
+        if (dlinfo.dli_sname) {
             INFO("  stacktrace[% 2d] = %s : %s + %lx", i, dlinfo.dli_fname, dlinfo.dli_sname, (long)stack[i] - (long)dlinfo.dli_saddr);
+            continue;
+        }
+        
+        INFO("  stacktrace[% 2d] = %s + %lx", i, dlinfo.dli_fname, (long)stack[i] - (long)dlinfo.dli_fbase);
     }
 }
 
@@ -2991,12 +3015,15 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
             whatdo = default_signal_actions[signum];
     }
 
-    if (whatdo == SAD_TERM || whatdo == SAD_CORE)
+    if (whatdo == SAD_TERM || whatdo == SAD_CORE) {
+        tvm_sig_depth--;
         terminate_current_locked(mkwstatus(0, signum));
+    }
     pthread_mutex_unlock(&tasks_lock);
 
     if (whatdo == SAD_IGN) {
         task_unlock(current);
+        tvm_sig_depth--;
         return;
     }
     if (whatdo == SAD_STOP) {
@@ -3005,17 +3032,20 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
     }
     if (whatdo == SAD_CONT) {
         task_unlock(current);
+        tvm_sig_depth--;
         // TODO anything else we need to do?
         return;
     }
 
     if ((act->sa_flags & SA_SIGINFO) == 0) {
         task_unlock(current);
+        tvm_sig_depth--;
         emulator_call_sighandler((uint64_t)act->sa_handler, signum, 0, 0);
         return;
     }
 
     task_unlock(current);
+    tvm_sig_depth--;
     emulator_call_sighandler((uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
     return;
 }
@@ -3096,6 +3126,23 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 
     tvm_sig_interrupted = signum;
 
+    if (tvm_sig_depth && siginfo->si_code > 0 && (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE))
+        tvm_sig_synchronous_depth++;
+    tvm_sig_depth++;
+
+    // crash in signal handler
+    if (tvm_sig_synchronous_depth) {
+        
+        // recursive crash in panic, gotta go with the nuclear option
+        if (tvm_sig_synchronous_depth > 3) {
+            INFO("RECURSIVE SIGNAL DEPTH (signum %d)", signum);
+            CALL_FUNC(abort);
+            __builtin_unreachable();
+        }
+        
+        panic("crash in signal handler");
+    }
+
     if (tvm_sig_blocked) {
         // Real hardware fault while in critical section = bug in our implementation
         // si_code > 0 distinguishes kernel-generated (real fault) from user-sent (kill/sigqueue)
@@ -3109,6 +3156,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         if (ucontext)
             thr->thr_pending_ucontext[signum] = *(ucontext_t *)ucontext;
         __atomic_fetch_or(&thr->thr_pending_sigs, 1u << signum, __ATOMIC_RELEASE);
+        tvm_sig_depth--;
         return;
     }
 
@@ -10258,6 +10306,9 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
 
     memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
+    // for debugging when unwinder crashes
+    // *(uintptr_t *)(child_fp) = 0xDEADBEEF46464646;
+    // *(uintptr_t *)(child_fp + 8) = 0xDEADBEEF42424242;
 
     // load and copy all data vars
     if (0 != cow_fixup_load_data_variables(&arg->fixup, 1))
@@ -11222,6 +11273,18 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     INFO("execve(\"%s\")", pathname);
 
+    // since we zero out the callers here, this is a small snippet to get a quick stacktrace if crashes occur
+    // INFO("execve fp %p lr %p", (void *)__builtin_frame_address(0), (void *)__builtin_return_address(0));
+    // if ((void *)__builtin_frame_address(0)) {
+    //     INFO("       fp %p lr %p", *(void **)__builtin_frame_address(0), *((void **)__builtin_frame_address(0)+1));
+    //     if (*(void **)__builtin_frame_address(0)) {
+    //         INFO("       fp %p lr %p", **(void ***)__builtin_frame_address(0), *(*(void ***)__builtin_frame_address(0) + 1));
+    //         if (**(void ***)__builtin_frame_address(0)) {
+    //             INFO("       fp %p lr %p", ***(void ****)__builtin_frame_address(0), *(**(void ****)__builtin_frame_address(0) + 1));
+    //         }
+    //     }
+    // }
+
     int argc = 0;
     for (char * const*a = argv; *a && argc < INT_MAX; a++)
         argc++;
@@ -11299,9 +11362,19 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     // No failing from here!
 
+    // next fork, no reason to copy stack frames above this one
+    current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
+
     // cleanup old emulator and linker
     emulator_context_destroy(old_emulator);
     ulinker_destroy(old_linker);
+
+    // we've possibly unloaded the caller
+    // gotta make sure the unwinder won't crash by setting the previous frame pointers to NULL (return address is unmapped!)
+    current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
+    void **frame = (void **)__builtin_frame_address(0);
+    frame[0] = NULL;
+    frame[1] = NULL;
 
     // TODO: kill all other threads
     if (current->tsk_threads_cnt != 1)
