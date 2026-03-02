@@ -7795,6 +7795,14 @@ static int tvm_mount(int argc, char **argv)
     return 0;
 }
 
+int tvm_info(int argc, char **argv) {
+    int rwx = 0;
+#ifdef ENABLE_RWX
+    rwx = 1;
+#endif
+    printf("rwx        %d\n", rwx);
+}
+
 static int tvm_main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -7824,6 +7832,7 @@ static int tvm_main(int argc, char **argv)
     if (0 == strcmp(argv[1], "sorunner")) return tvm_sorunner(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "cpio")) return tvm_cpio(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "mount")) return tvm_mount(argc - 1, argv + 1);
+    if (0 == strcmp(argv[1], "info")) return tvm_info(argc - 1, argv + 1);
     
     fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
     fprintf(stderr, "Try 'tvm -h' for more information.\n");
