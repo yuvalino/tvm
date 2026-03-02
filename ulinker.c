@@ -2757,8 +2757,6 @@ static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *s
         dl = dl->dl_next;
     }
     DLINFO_UNLOCK(ulinker);
-
-    ERROR("symbol \"%s\" not found", symbol);
     return NULL;
 }
 
