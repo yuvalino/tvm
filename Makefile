@@ -24,7 +24,7 @@ clean:
 	@rm test_rmem || true
 
 libtvm: unicorn
-	$(CC) $(CFLAGS) -g -I.  -I./unicorn/include -c rmem.c ulinker.c tvm.c main.c
+	$(CC) $(CFLAGS) -g -Wno-deprecated-declarations -I.  -I./unicorn/include -c rmem.c ulinker.c tvm.c main.c
 	ar rcs libtvm.a rmem.o ulinker.o tvm.o main.o
 
 tvm: unicorn
