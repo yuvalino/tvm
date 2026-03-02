@@ -7983,7 +7983,7 @@ FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
         return NULL;
 
     DIR *dp = fdopendir(fd);
-    if (dp)
+    if (!dp)
         close(fd);
     return dp;
 }
