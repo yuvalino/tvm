@@ -1636,6 +1636,7 @@ static __thread int tvm_sig_draining = 0;
 static __thread int tvm_sig_interrupted = 0;
 static __thread int tvm_sig_depth = 0;
 static __thread int tvm_sig_synchronous_depth = 0;
+static __thread int tvm_in_emu = 0;
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
 #define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
@@ -3126,8 +3127,15 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 
     tvm_sig_interrupted = signum;
 
-    if (tvm_sig_depth && siginfo->si_code > 0 && (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE))
+    int hardware_fault = siginfo->si_code > 0 && (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE);
+
+    if (hardware_fault && tvm_in_emu)
+        panic("crash in emulator");
+
+    if (tvm_sig_depth && hardware_fault) {
+        INFO("fault in signal handler (signum %d)", signum);
         tvm_sig_synchronous_depth++;
+    }
     tvm_sig_depth++;
 
     // crash in signal handler
@@ -3140,7 +3148,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             __builtin_unreachable();
         }
         
-        panic("crash in signal handler");
+        panic("crash in signal handler (signum %s)", signum);
     }
 
     if (tvm_sig_blocked) {
@@ -5662,9 +5670,12 @@ struct emulator_engine {
     int ee_arch;
     struct emulator_map_entry *ee_eme;
     int ee_refresh;
+    int ee_inuse;
 };
 
 void emulator_engine_destroy(struct emulator_engine *ee) {
+    VERIFY(!ee->ee_inuse);
+
     while (ee->ee_eme) {
         struct emulator_map_entry *eme = ee->ee_eme;
         ee->ee_eme = eme->eme_next;
@@ -5728,6 +5739,10 @@ static void emulator_debug_hook_cb(uc_engine *uc,
 
 #define EMULATOR_ADDRESS_MIN ((uint64_t)0x4000)
 #define EMULATOR_ADDRESS_MAX ((uint64_t)0xFFFFFFFFFFFFC000)
+// Page containing EMULATOR_CALL_END_LR (0xDEADBEEF4141) — must remain unmapped
+// so unicorn fires UC_MEM_FETCH_UNMAPPED instead of trying to execute bytes there
+#define EMULATOR_SENTINEL_PAGE ((uint64_t)0xDEADBEEF4000)
+#define EMULATOR_SENTINEL_SIZE ((uint64_t)0x1000)
 
 int emulator_engine_reset(struct emulator_engine *ee) {
     int ret = 1;
@@ -5754,16 +5769,38 @@ int emulator_engine_reset(struct emulator_engine *ee) {
 
     // Map emulator map entries as RWX while the rest are mapped as RW
     // NOTE: This is to allow passthrough memory to host but allow us to tightly control which code is executed on guest and which on host
+    // The sentinel page (containing EMULATOR_CALL_END_LR) is left unmapped so
+    // unicorn fires UC_MEM_FETCH_UNMAPPED cleanly instead of trying to execute bytes there.
+
+    #define EMU_MAP_RW(eng, start, size) do { \
+        uint64_t _s = (start), _sz = (size); \
+        uint64_t _sentinel = EMULATOR_SENTINEL_PAGE; \
+        uint64_t _sentinel_end = _sentinel + EMULATOR_SENTINEL_SIZE; \
+        if (_s < _sentinel && _s + _sz > _sentinel) { \
+            if (_s < _sentinel) { \
+                err = uc_mem_map_ptr(eng, _s, _sentinel - _s, UC_PROT_READ | UC_PROT_WRITE, (void *)_s); \
+                if (err) { INFO("uc_mem_map_ptr failed: %s", uc_strerror(err)); goto out; } \
+            } \
+            if (_sentinel_end < _s + _sz) { \
+                err = uc_mem_map_ptr(eng, _sentinel_end, (_s + _sz) - _sentinel_end, UC_PROT_READ | UC_PROT_WRITE, (void *)_sentinel_end); \
+                if (err) { INFO("uc_mem_map_ptr failed: %s", uc_strerror(err)); goto out; } \
+            } \
+        } else if (_s >= _sentinel && _s < _sentinel_end) { \
+            if (_sentinel_end < _s + _sz) { \
+                err = uc_mem_map_ptr(eng, _sentinel_end, (_s + _sz) - _sentinel_end, UC_PROT_READ | UC_PROT_WRITE, (void *)_sentinel_end); \
+                if (err) { INFO("uc_mem_map_ptr failed: %s", uc_strerror(err)); goto out; } \
+            } \
+        } else if (_sz > 0) { \
+            err = uc_mem_map_ptr(eng, _s, _sz, UC_PROT_READ | UC_PROT_WRITE, (void *)_s); \
+            if (err) { INFO("uc_mem_map_ptr failed: %s", uc_strerror(err)); goto out; } \
+        } \
+    } while (0)
 
     uint64_t last_entry_end = EMULATOR_ADDRESS_MIN; // incase there are no entries, map everything
 
     for (struct emulator_map_entry *eme = ee->ee_eme; eme; eme = eme->eme_next) {
         if (eme->eme_start > last_entry_end) {
-            err = uc_mem_map_ptr(engine, last_entry_end, eme->eme_start - last_entry_end, UC_PROT_READ | UC_PROT_WRITE, (void *)last_entry_end);
-            if (err) {
-                INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE) failed: %s", (void *)last_entry_end, (void *)(eme->eme_start - last_entry_end), uc_strerror(err));
-                goto out;
-            }
+            EMU_MAP_RW(engine, last_entry_end, eme->eme_start - last_entry_end);
         }
 
         err = uc_mem_map_ptr(engine, eme->eme_start, eme->eme_size, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC, (void *)eme->eme_start);
@@ -5776,12 +5813,10 @@ int emulator_engine_reset(struct emulator_engine *ee) {
     }
 
     if (last_entry_end < EMULATOR_ADDRESS_MAX) {
-        err = uc_mem_map_ptr(engine, last_entry_end, EMULATOR_ADDRESS_MAX - last_entry_end, UC_PROT_READ | UC_PROT_WRITE, (void *)last_entry_end);
-        if (err) {
-            INFO("uc_mem_map_ptr(addr=%p, size=%p, perms=UC_PROT_READ|UC_PROT_WRITE) failed: %s", (void *)last_entry_end, (void *)(EMULATOR_ADDRESS_MAX - last_entry_end), uc_strerror(err));
-            goto out;
-        }
+        EMU_MAP_RW(engine, last_entry_end, EMULATOR_ADDRESS_MAX - last_entry_end);
     }
+
+    #undef EMU_MAP_RW
 
     if (ee->ee_uc) {
         uc_close(ee->ee_uc);
@@ -5790,7 +5825,7 @@ int emulator_engine_reset(struct emulator_engine *ee) {
 
     ee->ee_uc = engine;
     ret = 0;
-    
+
 out:
 
     if (ret && engine) {
@@ -5814,6 +5849,7 @@ struct emulator_engine *emulator_engine_create(struct emulator_context *ec, int 
     ee->ee_eme = NULL;
     ee->ee_uc = NULL;
     ee->ee_refresh = 0;
+    ee->ee_inuse = 0;
 
     if (0 != emulator_engine_reset(ee))
         goto out;
@@ -5899,6 +5935,9 @@ enum {
 
 void emulator_saved_state_destroy(struct emulator_saved_state *ss) {
     if (ss->ess_stack) {
+#ifdef TRACE_MMAP
+        INFO("munmap %p-%p (emu stack)", ss->ess_stack, (uintptr_t)ss->ess_stack + ss->ess_stack_size);
+#endif
         CALL_FUNC(munmap, ss->ess_stack, ss->ess_stack_size);
         ss->ess_stack = NULL;
         ss->ess_stack_size = 0;
@@ -5984,6 +6023,9 @@ struct emulator_saved_state *emulator_saved_state_create(int arch, int abi)
     ess->ess_abi  = abi;
 
     void *stack = CALL_FUNC(mmap, NULL, EMULATOR_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#ifdef TRACE_MMAP
+    INFO("mmap %p-%p (emu stack)", stack, (uintptr_t)stack + EMULATOR_STACK_SIZE);
+#endif
     if (stack == MAP_FAILED)
         goto out;
     ess->ess_stack = stack;
@@ -6044,7 +6086,7 @@ struct emulator_engine *emulator_context_get_or_create_engine(struct emulator_co
 {
     struct emulator_engine *ee = NULL;
     for (ee = ec->ec_all_engines; ee; ee = ee->ee_next) {
-        if (ee->ee_arch == arch)
+        if (ee->ee_arch == arch && !ee->ee_inuse)
             return ee;
     }
 
@@ -6339,7 +6381,14 @@ int emulator_step(struct emulator_context *ec)
         goto out;
 
     ec->ec_ss->ess_intr = ESS_INTR_UNSPEC;
+
+    tvm_in_emu = 1;
+    ec->ec_curr_engine->ee_inuse = 1;
+
     err = uc_emu_start(ec->ec_curr_engine->ee_uc, pc, 0, 0, 0);
+
+    ec->ec_curr_engine->ee_inuse = 0;
+    tvm_in_emu = 0;
 
     if (0 != emulator_saved_state_from_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc))
         goto out;
@@ -6679,6 +6728,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
 
     // this should run in an emulator
 
+    struct emulator_engine *prev_engine = ec->ec_curr_engine;
     struct emulator_engine *ee = emulator_context_get_or_create_engine(ec, pcinfo->udli_farch);
     if (!ee)
         goto out;
@@ -6703,13 +6753,13 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
             goto out;
         
         if (ess->ess_intr == ESS_INTR_MEM) {
-            if (ess->ess_intr_memtype != UC_MEM_FETCH_PROT) {
-                INFO("ess->ess_intr_memtype %d != UC_MEM_FETCH_PROT at %p", ess->ess_intr_memtype, (void *)ess->ess_intr_addr);
+            if (ess->ess_intr_memtype != UC_MEM_FETCH_PROT && ess->ess_intr_memtype != UC_MEM_FETCH_UNMAPPED) {
+                INFO("ess->ess_intr_memtype %d != UC_MEM_FETCH_PROT/UNMAPPED at %p", ess->ess_intr_memtype, (void *)ess->ess_intr_addr);
                 raise(SIGSEGV);
             }
 
             if (ess->ess_intr_addr == EMULATOR_CALL_END_LR) {
-                //INFO("emulator_call_ex ret: %p", (void *)emulator_saved_state_read_reg(ess, ESS_REG_RET));
+                // INFO("emulator_call_ex ret: %p", (void *)emulator_saved_state_read_reg(ess, ESS_REG_RET));
                 // returned
                 r = 0;
                 if (out_ret)
@@ -6745,6 +6795,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
                     ec = current_thread->thr_emulator;
                     ee = emulator_context_get_or_create_engine(ec, pcinfo->udli_farch);
                     ess = ec->ec_ss;
+                    ec->ec_curr_engine = ee;
 
                     emulator_saved_state_write_reg(ess, ESS_REG_RET, fault_ret);
                     emulator_saved_state_write_reg(ess, ESS_REG_PC, ess->ess_fault_lr);
@@ -6783,6 +6834,7 @@ out:
         ec->ec_ss = ess->ess_next;
         emulator_saved_state_destroy(ess);
         ess = NULL;
+        ec->ec_curr_engine = prev_engine;
     }
 
     TVM_RESTORE(prevtvm);
@@ -6813,7 +6865,9 @@ void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1,
 
     // handler is in emulator, call emulator from signal handler so help me god
     handler_pc = EMUFUNC_UNMARK(handler_pc);
+    INFO("sighandler in emulator start");
     emulator_call(NULL, handler_pc, arg0, arg1, arg2, 0, 0, 0);
+    INFO("sighandler in emulator end");
 }
 
 struct emulator_pthread_create_arg {
@@ -7862,10 +7916,17 @@ static void ulinker_print_cb(char *msg) {
 }
 
 void *rmem_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
-    return CALL_FUNC(mmap, hint, size, prot, flags, fd, offset);
+    void *map = CALL_FUNC(mmap, hint, size, prot, flags, fd, offset);
+#ifdef TRACE_MMAP
+    INFO("mmap %p-%p (rmem)", map, (uintptr_t)map + size);
+#endif
+    return map;
 }
 
 int rmem_munmap(void *addr, size_t size) {
+#ifdef TRACE_MMAP
+    INFO("munmap %p-%p (rmem)", addr, (uintptr_t)addr + size);
+#endif
     return CALL_FUNC(munmap, addr, size);
 }
 
@@ -7888,7 +7949,12 @@ static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { VERIFY
 static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { VERIFY(arg == current); return fstat(fd, statbuf); }
 
 static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { VERIFY(arg == current); return mmap(hint, length, prot, flags, fd, offset); }
-static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            { return CALL_FUNC(munmap, addr, size); }
+static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            {
+                                                                    #ifdef TRACE_MMAP
+                                                                        INFO("munmap %p-%p (ulinker)", addr, (uintptr_t)addr + size);
+                                                                    #endif
+                                                                    return CALL_FUNC(munmap, addr, size);
+                                                                }
 static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return CALL_FUNC(mprotect, addr, size, flags); }
 
 static void *ulinker_call(void *arg, void *addr) {
@@ -9348,17 +9414,28 @@ FUNCTION_DEFINE5(int, select, int, nfds, fd_set *, readfds, fd_set *, writefds, 
         FD_ZERO(exceptfds);
 
     for (int i = 0; i < fdcount; i++) {
-        if (fds[i].revents & POLLIN) {
-            FD_SET(fds[i].fd, readfds);
-            r++;
+        if (fds[i].revents & POLLNVAL) {
+            free(fds);
+            errno = EBADF;
+            return -1;
         }
-        if (fds[i].revents & POLLOUT) {
-            FD_SET(fds[i].fd, writefds);
-            r++;
+        if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+            if (readfds) {
+                FD_SET(fds[i].fd, readfds);
+                r++;
+            }
+        }
+        if (fds[i].revents & (POLLOUT | POLLERR)) {
+            if (writefds) {
+                FD_SET(fds[i].fd, writefds);
+                r++;
+            }
         }
         if (fds[i].revents & POLLPRI) {
-            FD_SET(fds[i].fd, exceptfds);
-            r++;
+            if (exceptfds) {
+                FD_SET(fds[i].fd, exceptfds);
+                r++;
+            }
         }
     }
 
@@ -10485,6 +10562,9 @@ pid_t fork(void) {
     arg->parent_thr = current_thread;
 
     arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#ifdef TRACE_MMAP
+    INFO("mmap %p-%p (tmp stack)", arg->tmp_stack, (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE);
+#endif
     if (arg->tmp_stack == MAP_FAILED) {
         arg->tmp_stack = NULL;
         errno = ENOMEM;
@@ -10562,6 +10642,9 @@ out:
         pthread_mutex_destroy(&arg->mtx);        
 
         if (arg->tmp_stack) {
+#ifdef TRACE_MMAP
+            INFO("munmap %p-%p (tmp stack)", arg->tmp_stack, (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE);
+#endif
             CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
             arg->tmp_stack = NULL;
         }        
@@ -12034,6 +12117,9 @@ FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, fla
         if (file)
             file_unlock(file, 0);
         ret = CALL_FUNC(mmap, addr, length, prot, flags, (file ? file->f_rfd : -1), offset);
+#ifdef TRACE_MMAP
+        INFO("mmap %p-%p (mmap)", ret, (uintptr_t)ret + length);
+#endif
         if (file)
             file_lock(file, 0);
     }
