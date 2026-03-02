@@ -3199,8 +3199,14 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
         if (sym) {
             sym_name = string_elf64(dl, dl->dle64_symtab[sym].st_name);
             sym_size = dl->dle64_symtab[sym].st_size;
-            // lookup symbol with external libraries as this is for internal use
-            sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1, 0);
+            // For COPY relocations, skip the current library to avoid
+            // resolving the symbol to its own copy target.
+            if (type == R_X86_64_COPY || type == R_AARCH64_COPY) {
+                sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, (void *)DLBASE(dl)->dl_next, sym_name, NULL, 1, 0);
+            } else {
+                // lookup symbol with external libraries as this is for internal use
+                sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1, 0);
+            }
             if (!sym_addr) {
                 if (ELF64_ST_BIND(dl->dle64_symtab[sym].st_info) != STB_WEAK) {
                     ERROR("failed to relocate ELF \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, sym_name);
@@ -3213,6 +3219,7 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
             case R_X86_64_COPY:
             case R_AARCH64_COPY:
                 //PRINT("RELO COPY %p %p %s %zu", (void *)reloc, (void *)(sym_addr + addend), sym_name, sym_size);
+                if (!sym_addr) break;
                 memcpy(( void *)reloc, (void *)(sym_addr + addend), sym_size);
                 break;
             case R_X86_64_JUMP_SLOT:
