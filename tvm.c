@@ -11371,6 +11371,31 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     // No failing from here!
 
+    // deep-copy argv and envp onto the stack — the originals may point
+    // into the caller's emulator stack which we're about to unload with emulator_context_destroy()
+    int envc = 0;
+    for (char * const *e = envp; *e; e++)
+        envc++;
+
+    char **new_argv = alloca(sizeof(char *) * (argc + 1));
+    for (int i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        new_argv[i] = alloca(len);
+        memcpy(new_argv[i], argv[i], len);
+    }
+    new_argv[argc] = NULL;
+
+    char **new_envp = alloca(sizeof(char *) * (envc + 1));
+    for (int i = 0; i < envc; i++) {
+        size_t len = strlen(envp[i]) + 1;
+        new_envp[i] = alloca(len);
+        memcpy(new_envp[i], envp[i], len);
+    }
+    new_envp[envc] = NULL;
+
+    argv = new_argv;
+    envp = new_envp;
+
     // next fork, no reason to copy stack frames above this one
     current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
 
