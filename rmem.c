@@ -3,8 +3,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <inttypes.h>
-#include <sys/time.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
@@ -38,12 +36,6 @@ static void (*print_cb)(char *, int) = NULL;
     abort(); \
 } while (0)
 
-
-#define TIME_MS() ({ \
-    struct timeval __tv; \
-    gettimeofday(&__tv, NULL); \
-    (uint64_t)__tv.tv_sec * 1000 + (uint64_t)__tv.tv_usec / 1000; \
-})
 
 struct rmem_ops rops = {
     .ro_mmap = mmap,
@@ -655,8 +647,6 @@ int rmem_arena_duplicate(struct rmem_arena *dst_ar, struct rmem_arena *src_ar, v
         last_sl2 = last_sl2->sl_next;
     struct rmem_slab **prev_sl2 = (last_sl2 ? &last_sl2->sl_next : &dst_ar->ar_slabs);
 
-    uint64_t start_ms = TIME_MS();
-
     for (struct rmem_slab *sl = src_ar->ar_slabs; sl; sl = sl->sl_next) {
         struct rmem_slab *sl2 = rmem_slab_create(sl->sl_size, sl->sl_objsize);
         if (!sl2) {
@@ -667,7 +657,13 @@ int rmem_arena_duplicate(struct rmem_arena *dst_ar, struct rmem_arena *src_ar, v
         }
 
         memcpy(sl2->sl_bitmap, sl->sl_bitmap, sl->sl_bitmap_words * sizeof(BITMAP_WORD));
-        memcpy(sl2->sl_base, sl->sl_base, sl->sl_nobj * sl->sl_objsize);
+
+        /* only copy the allocated range [sl_low..sl_high), rest is zero from mmap */
+        if (sl->sl_low && sl->sl_high) {
+            size_t copy_off = (size_t)((char *)sl->sl_low - (char *)sl->sl_base);
+            size_t copy_len = (size_t)((char *)sl->sl_high - (char *)sl->sl_low);
+            memcpy((char *)sl2->sl_base + copy_off, sl->sl_low, copy_len);
+        }
 
         (*prev_sl2) = sl2;
         prev_sl2 = &sl2->sl_next;
@@ -679,17 +675,13 @@ int rmem_arena_duplicate(struct rmem_arena *dst_ar, struct rmem_arena *src_ar, v
 
         if (sl->sl_low && sl->sl_high && sl->sl_low != sl->sl_high) {
             if (dup_cb)
-                dup_cb(arg, sl->sl_low, sl2->sl_low, (size_t)sl->sl_high - (size_t)sl->sl_low);
+                dup_cb(arg, sl->sl_low, sl2->sl_low,
+                       (size_t)sl->sl_high - (size_t)sl->sl_low);
         }
     }
 
-    uint64_t mid_ms = TIME_MS();
-
     if (done_cb)
         done_cb(arg);
-
-    uint64_t end_ms = TIME_MS();
-    PRINT("duplicate mid %" PRIu64 " ms last %" PRIu64 " ms", mid_ms - start_ms, end_ms - mid_ms);
 
     pthread_mutex_unlock(&src_ar->ar_lock);
     pthread_mutex_unlock(&dst_ar->ar_lock);

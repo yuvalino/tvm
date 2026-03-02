@@ -10089,7 +10089,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
 static void tvm_proc_entry_cont(struct fork_arg *arg)
 {
     uintptr_t curr_fp = arg->thread_fp;
-    
+
     /**
      * setup child stack as a copy of a few important frames from parent stack
      *
@@ -10113,9 +10113,6 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
 
     memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
-
-    // INFO("longjmp(arg->jmpbuf_tmp) land curr-stack %p-%p next-stack %p-%p", child_sp, child_fp, child_sp, child_fp);
-    // INFO("  arg = %p *%p", &arg, arg);
 
     // load and copy all data vars
     if (0 != cow_fixup_load_data_variables(&arg->fixup, 1))
