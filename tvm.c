@@ -106,26 +106,37 @@ static void __panic(const char *m, const char *f, int l);
 
 static __thread char msgbuf[0x1000];
 
+static long g_tz_offset; // seconds east of UTC, cached at startup
+
 static void format_time(char *buf, size_t buflen)
 {
     struct timeval tv;
-    struct tm tm;
-
     gettimeofday(&tv, NULL);
-    localtime_r(&tv.tv_sec, &tm);
 
+    // apply cached tz offset to avoid localtime_r which takes glibc's
+    // tzset_lock and deadlocks when called from malloc/strdup hooks
+    long long t = tv.tv_sec + g_tz_offset;
     int ms = tv.tv_usec / 1000;
+
+    int sec = t % 60; t /= 60;
+    int min = t % 60; t /= 60;
+    int hour = t % 24; t /= 24;
+
+    // days since epoch -> y/m/d  (civil_from_days, Howard Hinnant)
+    long long z = t + 719468;
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    long long doe = z - era * 146097;
+    long long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    long long y = yoe + era * 400;
+    long long doy = doe - (365*yoe + yoe/4 - yoe/100);
+    long long mp = (5*doy + 2) / 153;
+    int day = doy - (153*mp + 2)/5 + 1;
+    int mon = mp + (mp < 10 ? 3 : -9);
+    if (mon <= 2) y++;
 
     snprintf(buf, buflen,
         "%04d-%02d-%02d %02d:%02d:%02d.%03d",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
-        ms
-    );
+        (int)y, mon, day, hour, min, sec, ms);
 }
 
 static int g_outfd = STDOUT_FILENO;
@@ -503,6 +514,12 @@ static void init_funcs()
         }
     }
 };
+
+__attribute__((constructor))
+static void format_time_init(void) {
+    tzset();
+    g_tz_offset = -timezone + (daylight ? 3600 : 0);
+}
 
 /////////////
 // Declarations
@@ -7068,7 +7085,7 @@ void remove_ulinker_loaded_range(struct ulinker_load_event *ule) {
     struct ulinker_loaded_range *ulr;
     pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
     list_for_each_entry(ulr, &all_ulinker_loaded_ranges, ulr_list) {
-        if (0 == memcpy(&ulr->ulr_event, ule, sizeof(*ule))) {
+        if (0 == memcmp(&ulr->ulr_event, ule, sizeof(*ule))) {
             list_del(&ulr->ulr_list);
             kfree(ulr);
             break;
@@ -8003,11 +8020,12 @@ static struct ulinker_external_dlinfo_args ulinker_tvm_external_args = {
 
 static void ulinker_event_cb(int event, void *arg)
 {
+    struct ulinker_load_event *ule = (struct ulinker_load_event *)arg;
     if (event == ULEVENT_LOAD) {
-        add_ulinker_loaded_range((struct ulinker_load_event *)arg);
+        add_ulinker_loaded_range(ule);
     }
     else if (event == ULEVENT_UNLOAD) {
-        remove_ulinker_loaded_range((struct ulinker_load_event *)arg);
+        remove_ulinker_loaded_range(ule);
     }
 }
 
@@ -10509,8 +10527,10 @@ fail:
 // so do not use wrapper
 //FUNCTION_DEFINE0(pid_t, fork) {
 pid_t fork(void) {
-    if (!can_enter_tvm(__builtin_return_address(0)))
+    if (!can_enter_tvm(__builtin_return_address(0))) {
+        INFO("fork() BYPASSING TVM: lr=%p", __builtin_return_address(0));
         return CALL_FUNC(fork);
+    }
     
     struct task *tsk = NULL;
     struct thread *thr = NULL;
@@ -11492,6 +11512,9 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     void **frame = (void **)__builtin_frame_address(0);
     frame[0] = NULL;
     frame[1] = NULL;
+
+    // reset stale call chain from the old executable
+    call = NULL;
 
     // TODO: kill all other threads
     if (current->tsk_threads_cnt != 1)
