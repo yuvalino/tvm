@@ -289,7 +289,9 @@ DECL_FUNC(fclose);
 DECL_FUNC(fwrite);
 DECL_FUNC(fread);
 DECL_FUNC(fseek);
+DECL_FUNC(fseeko);
 DECL_FUNC(ftell);
+DECL_FUNC(ftello);
 DECL_FUNC(fflush);
 DECL_FUNC(setbuf);
 DECL_FUNC(setbuffer);
@@ -481,6 +483,9 @@ DECL_FUNC(getwd);
 DECL_FUNC(bsearch);
 DECL_FUNC(qsort);
 
+extern int tputs(const char *, int, int (*)(int));
+DECL_FUNC(tputs);
+
 #if defined(__linux__)
 DECL_FUNC(mknod);
 DECL_FUNC(mknodat);
@@ -489,6 +494,7 @@ DECL_FUNC(execvpe);
 DECL_FUNC(epoll_create);
 DECL_FUNC(epoll_create1);
 DECL_FUNC(timerfd_create);
+DECL_FUNC(timer_create);
 DECL_FUNC(pipe2);
 DECL_FUNC(fstatfs);
 DECL_FUNC(fstatfs64);
@@ -1253,6 +1259,7 @@ struct fops {
     ssize_t (*f_read)(struct file *file, void *buf, size_t count, int offset);
     int (*f_readdir)(struct file *file, struct dirent *out);
     ssize_t (*f_write)(struct file *file, const void *buf, size_t count, int offset);
+    off_t (*f_lseek)(struct file *file, off_t offset, int whence);
     void (*f_close)(struct file *file);
 
     void *(*f_mmap)(void *hint, size_t size, int prot, int flags, struct file *file, off_t offset);
@@ -5257,6 +5264,41 @@ static ssize_t vfsop_write(struct file *file, const void *buf, size_t count, int
     return -1;
 }
 
+static off_t vfsop_lseek(struct file *file, off_t offset, int whence)
+{
+    struct vfs_file *vf = vf_for_file_locked(file);
+    if (!vf)
+        return -1;
+
+    file_unlock(file, 0);
+    struct vfs_node *vn = vn_for_vf_locked(vf);
+    file_lock(file, 0);
+
+    off_t new_pos;
+    switch (whence) {
+    case SEEK_SET: new_pos = offset; break;
+    case SEEK_CUR: new_pos = vf->vf_cursor + offset; break;
+    case SEEK_END: new_pos = (off_t)vn->vn_size + offset; break;
+    default:
+        vf_unlock(vf, 1);
+        vn_unlock(vn, 1);
+        errno = EINVAL;
+        return -1;
+    }
+
+    vn_unlock(vn, 1);
+
+    if (new_pos < 0) {
+        vf_unlock(vf, 1);
+        errno = EINVAL;
+        return -1;
+    }
+
+    vf->vf_cursor = new_pos;
+    vf_unlock(vf, 1);
+    return new_pos;
+}
+
 static int vfsop_readdir(struct file *file, struct dirent *out)
 {
     struct vfs_file *vf = vf_for_file_locked(file);
@@ -5379,6 +5421,7 @@ static struct device devvfs = {
         .f_ioctl = vfsop_ioctl,
         .f_read = vfsop_read,
         .f_write = vfsop_write,
+        .f_lseek = vfsop_lseek,
         .f_close = vfsop_close,
 
         .f_readdir = vfsop_readdir,
@@ -8675,9 +8718,14 @@ FUNCTION_DEFINE3(int, fseek, FILE *, stream, long, offset, int, whence) {
         return -1;
     }
 
-    file_unlock(file, 0);
-    int ret = CALL_FUNC(fseek, real_fp(stream), offset, whence);
-    file_lock(file, 0);
+    int ret;
+    if (file->f_ops && file->f_ops->f_lseek) {
+        ret = file->f_ops->f_lseek(file, offset, whence) < 0 ? -1 : 0;
+    } else {
+        file_unlock(file, 0);
+        ret = CALL_FUNC(fseek, real_fp(stream), offset, whence);
+        file_lock(file, 0);
+    }
     file_unlock(file, 1);
     tvm_sig_leave();
     return ret;
@@ -8691,12 +8739,25 @@ FUNCTION_DEFINE1(long, ftell, FILE *, stream) {
         return -1;
     }
 
-    file_unlock(file, 0);
-    long ret = CALL_FUNC(ftell, real_fp(stream));
-    file_lock(file, 0);
+    long ret;
+    if (file->f_ops && file->f_ops->f_lseek) {
+        ret = (long)file->f_ops->f_lseek(file, 0, SEEK_CUR);
+    } else {
+        file_unlock(file, 0);
+        ret = CALL_FUNC(ftell, real_fp(stream));
+        file_lock(file, 0);
+    }
     file_unlock(file, 1);
     tvm_sig_leave();
     return ret;
+}
+
+FUNCTION_DEFINE3(int, fseeko, FILE *, stream, off_t, offset, int, whence) {
+    return fseek(stream, (long)offset, whence);
+}
+
+FUNCTION_DEFINE1(off_t, ftello, FILE *, stream) {
+    return (off_t)ftell(stream);
 }
 
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
@@ -8971,9 +9032,9 @@ FUNCTION_DEFINE3(char *, fgets, char *, s, int, size, FILE *, stream) {
     file_unlock(file, 1);
     tvm_sig_leave();
 
-    if (i == 0 && err)
+    if (i == 0)
         return NULL;
-    
+
     s[i] = 0;
     return s;
 }
@@ -9348,7 +9409,23 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
 }
 
 FUNCTION_DEFINE3(off_t, lseek, int, fd, off_t, offset, int, whence) {
-    return CURRENT_RFD(fd, CALL_FUNC(lseek, __rfd, offset, whence));
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+
+    off_t ret;
+    if (file->f_ops && file->f_ops->f_lseek)
+        ret = file->f_ops->f_lseek(file, offset, whence);
+    else
+        ret = CALL_FUNC(lseek, file->f_rfd, offset, whence);
+
+    file_unlock(file, 1);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE1(int, fsync, int, fd) {
@@ -11454,6 +11531,102 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         return -1;
     }
 
+    // Open the file and inspect magic bytes before entering the signal-critical section.
+    // If it's a #! script, rewrite pathname/argv to point at the interpreter.
+    char hdr[256];
+    int sfd = open(pathname, O_RDONLY);
+    if (sfd < 0) {
+        INFO("  failed(ENOENT)");
+        errno = ENOENT;
+        return -1;
+    }
+    ssize_t n = read(sfd, hdr, sizeof(hdr) - 1);
+    close(sfd);
+
+    if (n < 4) {
+        INFO("  failed(ENOEXEC)");
+        errno = ENOEXEC;
+        return -1;
+    }
+
+    if (hdr[0] == '#' && hdr[1] == '!') {
+        hdr[n] = '\0';
+        char *eol = strchr(hdr + 2, '\n');
+        if (eol) *eol = '\0';
+
+        char *interp = hdr + 2;
+        while (*interp == ' ' || *interp == '\t') interp++;
+
+        char *interp_arg = NULL;
+        char *sp = strchr(interp, ' ');
+        if (!sp) sp = strchr(interp, '\t');
+        if (sp) {
+            *sp = '\0';
+            interp_arg = sp + 1;
+            while (*interp_arg == ' ' || *interp_arg == '\t') interp_arg++;
+            if (*interp_arg == '\0') interp_arg = NULL;
+        }
+
+        if (!*interp) {
+            errno = ENOEXEC;
+            return -1;
+        }
+
+        INFO("execve shebang: interp=\"%s\" arg=\"%s\" script=\"%s\"",
+             interp, interp_arg ? interp_arg : "(none)", pathname);
+
+        // Save the script path before overwriting pathname_abs with the interpreter
+        char *script_path = alloca(strlen(pathname) + 1);
+        strcpy(script_path, pathname);
+
+        // Resolve interpreter path (overwrites pathname_abs)
+        if (!normalize_path(NULL, interp, pathname_abs)) {
+            errno = ENOENT;
+            return -1;
+        }
+        pathname = pathname_abs;
+
+        // Rebuild argv: [interp, interp_arg?, script, original argv[1:]]
+        int extra = interp_arg ? 2 : 1;
+        int new_argc = extra + 1 + (argc > 0 ? argc - 1 : 0);
+        char **new_argv = alloca(sizeof(char *) * (new_argc + 1));
+        int i = 0;
+        new_argv[i++] = interp;
+        if (interp_arg) new_argv[i++] = interp_arg;
+        new_argv[i++] = script_path;
+        for (int j = 1; j < argc; j++)
+            new_argv[i++] = argv[j];
+        new_argv[i] = NULL;
+        argv = new_argv;
+        argc = i;
+    }
+
+    // Deep-copy argv and envp onto the stack — the originals may point into the
+    // caller's emulator stack or shebang_buf which we're about to destroy.
+    int envc = 0;
+    if (envp)
+        for (char * const *e = envp; *e; e++)
+            envc++;
+
+    char **new_argv = alloca(sizeof(char *) * (argc + 1));
+    for (int i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        new_argv[i] = alloca(len);
+        memcpy(new_argv[i], argv[i], len);
+    }
+    new_argv[argc] = NULL;
+
+    char **new_envp = alloca(sizeof(char *) * (envc + 1));
+    for (int i = 0; i < envc; i++) {
+        size_t len = strlen(envp[i]) + 1;
+        new_envp[i] = alloca(len);
+        memcpy(new_envp[i], envp[i], len);
+    }
+    new_envp[envc] = NULL;
+
+    argv = new_argv;
+    envp = new_envp;
+
     tvm_sig_enter();
 
     struct ulinker *new_linker = ulinker_create((void *)current);
@@ -11488,7 +11661,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             current_thread->thr_emulator = old_emulator;
             emulator_context_destroy(new_emulator);
             ulinker_destroy(new_linker);
-            errno = ENOENT;
+            errno = ENOEXEC;
             tvm_sig_leave();
             return -1;
         }
@@ -11520,32 +11693,6 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     }
 
     // No failing from here!
-
-    // deep-copy argv and envp onto the stack — the originals may point
-    // into the caller's emulator stack which we're about to unload with emulator_context_destroy()
-    int envc = 0;
-    if (envp)
-        for (char * const *e = envp; *e; e++)
-            envc++;
-
-    char **new_argv = alloca(sizeof(char *) * (argc + 1));
-    for (int i = 0; i < argc; i++) {
-        size_t len = strlen(argv[i]) + 1;
-        new_argv[i] = alloca(len);
-        memcpy(new_argv[i], argv[i], len);
-    }
-    new_argv[argc] = NULL;
-
-    char **new_envp = alloca(sizeof(char *) * (envc + 1));
-    for (int i = 0; i < envc; i++) {
-        size_t len = strlen(envp[i]) + 1;
-        new_envp[i] = alloca(len);
-        memcpy(new_envp[i], envp[i], len);
-    }
-    new_envp[envc] = NULL;
-
-    argv = new_argv;
-    envp = new_envp;
 
     // next fork, no reason to copy stack frames above this one
     current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
@@ -12547,6 +12694,24 @@ FUNCTION_DEFINE_VOID4(qsort, void *, base, size_t, nel, size_t, width, compar_t,
     qsort_compar = NULL;
 }
 
+typedef int (*tputs_putc_t)(int);
+static __thread tputs_putc_t tputs_putc = NULL;
+
+static int tputs_putc_emulator(int c)
+{
+    uint64_t ret;
+    if (0 != emulator_call(&ret, (uint64_t)tputs_putc, (uint64_t)c, 0, 0, 0, 0, 0))
+        err(1, "emulator_call(tputs_putc)");
+    return (int)ret;
+}
+
+FUNCTION_DEFINE3(int, tputs, const char *, str, int, affcnt, tputs_putc_t, putc_fn) {
+    tputs_putc = putc_fn;
+    int ret = CALL_FUNC(tputs, str, affcnt, tputs_putc_emulator);
+    tputs_putc = NULL;
+    return ret;
+}
+
 #if defined(__linux__)
 
 /////////////
@@ -12655,6 +12820,18 @@ FUNCTION_DEFINE2(int, timerfd_create, int, clockid, int, flags) {
     tvm_sig_leave();
 
     return f;
+}
+
+FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp, timer_t *, timerid) {
+#ifndef ENABLE_RWX
+    // SIGEV_THREAD creates a real OS thread that calls a function pointer
+    // in the emulated binary — can't work in emulator mode.
+    if (sevp && sevp->sigev_notify == SIGEV_THREAD) {
+        errno = ENOSYS;
+        return -1;
+    }
+#endif
+    return CALL_FUNC(timer_create, clockid, sevp, timerid);
 }
 
 FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {

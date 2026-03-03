@@ -733,6 +733,9 @@ typedef struct
 #define ELF64_R_TYPE(i)			((i) & 0xffffffff)
 #define ELF64_R_INFO(sym,type)		((((Elf64_Xword) (sym)) << 32) + (type))
 
+#define R_X86_64_64		1	/* Direct 64-bit */
+#define R_AARCH64_ABS64        257	/* Direct 64-bit.  */
+
 #define R_X86_64_COPY		5	/* Copy symbol at runtime */
 #define R_AARCH64_COPY         1024	/* Copy symbol at runtime.  */
 
@@ -3547,6 +3550,11 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
         }
 
         switch (type) {
+            case R_X86_64_64:
+            case R_AARCH64_ABS64:
+                //PRINT("RELO ABS64 %p %p %s", (void *)reloc, (void *)(sym_addr + addend), sym_name);
+                *(Elf64_Addr *)(reloc) = (sym_addr + addend);
+                break;
             case R_X86_64_COPY:
             case R_AARCH64_COPY:
                 //PRINT("RELO COPY %p %p %s %zu", (void *)reloc, (void *)(sym_addr + addend), sym_name, sym_size);
