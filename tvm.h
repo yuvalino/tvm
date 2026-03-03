@@ -33,11 +33,6 @@ char ***_tvm_environ(void);
 typedef int (*main_func_t)(int, char * const*, char * const*);
 void tvm_register_program(const char *pathname, main_func_t main_routine);
 
-extern __thread char *tvm_optarg;
-extern __thread int tvm_optind;
-extern __thread int tvm_opterr;
-extern __thread int tvm_optopt;
-
 void tvm_log(const char *function, const char *msg, ...);
 #define TVM_INFO(_msg, ...) tvm_log(__func__, _msg, ##__VA_ARGS__)
 

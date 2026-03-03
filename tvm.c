@@ -1566,6 +1566,19 @@ ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
     return CALL_FUNC(readlink, pathname, buf, bufsiz);
 }
 
+/////////////
+// Task Data
+/////////////
+
+/**
+ * This is TVM's "data section" for each program. 
+ */
+struct task_data {
+    char **__environ;
+
+    char  *optarg;
+    int    optind, opterr, optopt;
+};
 
 /////////////
 // Task
@@ -1616,7 +1629,6 @@ struct task {
     struct list_head tsk_threads;  // thread
     pid_t tsk_sid;
     pid_t tsk_pgid;
-    char **tsk_environ;
     char tsk_comm[16];
     struct rmem_arena *tsk_ar;
     struct ulinker *tsk_linker;
@@ -1625,6 +1637,7 @@ struct task {
     uint32_t tsk_pending_sigs;  // bitmask of deferred signals (atomic via __atomic builtins)
     siginfo_t tsk_pending_siginfo[MAX_SIGNALS];
     ucontext_t tsk_pending_ucontext[MAX_SIGNALS];
+    struct task_data *tsk_data; // malloc()ed from tsk_ar
 };
 
 struct thread {
@@ -1801,6 +1814,12 @@ static struct task *taskalloc_common()
     if (!t->tsk_linker)
         goto out;
 
+    t->tsk_data = rmem_arena_alloc(t->tsk_ar, sizeof(*t->tsk_data));
+    if (!t->tsk_data)
+        goto out;
+    memset(t->tsk_data, 0, sizeof(*t->tsk_data));
+    t->tsk_data->optind = 1;
+
     if (pthread_mutex_init(&t->tsk_lock, NULL) != 0) {
         goto out;
     }
@@ -1832,7 +1851,7 @@ static void taskdealloc(struct task *t)
 
     rmem_arena_destroy(t->tsk_ar);
     t->tsk_ar = NULL;
-    t->tsk_environ = NULL; // allocated in the task arena
+    t->tsk_data = NULL; // allocated in the task arena
 
     pthread_cond_destroy(&t->tsk_wait_cond);
     pthread_mutex_unlock(&t->tsk_lock);
@@ -5557,20 +5576,6 @@ static void cow_fixup_process(struct cow_fixup_context *dctx)
 }
 
 /////////////
-// Getopt
-/////////////
-
-/**
- * Atleast I tried to do something with this shitty API.
- */
-
-__thread char *tvm_optarg;
-__thread int   tvm_optind = 1;
-__thread int   tvm_opterr;
-__thread int   tvm_optopt;
-static pthread_mutex_t getopt_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/////////////
 // Exec
 /////////////
 
@@ -7712,7 +7717,7 @@ static int tvm_pwd(int argc, char **argv)
 
 static int tvm_env(int argc, char **argv)
 {
-    char **p = tvm_environ;
+    char **p = current->tsk_data->__environ;
     if (argc > 1)
         p = environ;
     for (; p && *p; p++)
@@ -7754,7 +7759,7 @@ static int tvm_sorunner(int argc, char **argv)
     int callerr = emulator_call(&ret, (uint64_t)sym,
                   (uint64_t)(argc - 1),
                   (uint64_t)(argv + 1),
-                  (uint64_t)tvm_environ,
+                  (uint64_t)current->tsk_data->__environ,
                 0, 0, 0);
     if (callerr)
         printf("sorunner emulator_call failed!\n");
@@ -8000,7 +8005,7 @@ static struct ulinker_ops ulinker_ops = {
 
 static void *ulinker_external_dlsym(void *arg, const char *s)
 {
-    #ifndef ENABLE_RWX
+#ifndef ENABLE_RWX
     if (0 == strcmp(s, "sigaction")) return &emulator_sigaction;
     if (0 == strcmp(s, "signal"))    return &emulator_signal;
     if (0 == strcmp(s, "_setjmp"))   return &emulator_setjmp;  // linux
@@ -8008,7 +8013,15 @@ static void *ulinker_external_dlsym(void *arg, const char *s)
     if (0 == strcmp(s, "longjmp"))   return &emulator_longjmp;
 
     if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
-    #endif
+#endif
+
+    if (0 == strcmp(s, "optarg"))   return &current->tsk_data->optarg;
+    if (0 == strcmp(s, "optind"))   return &current->tsk_data->optind;
+    if (0 == strcmp(s, "opterr"))   return &current->tsk_data->opterr;
+    if (0 == strcmp(s, "optopt"))   return &current->tsk_data->optopt;
+
+    if (0 == strcmp(s, "__environ"))  return &current->tsk_data->__environ;
+
     return dlsym(RTLD_DEFAULT, s);
 }
 
@@ -8105,8 +8118,8 @@ void tvm_init(const char *init_comm)
         VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
     }
 
-    current->tsk_environ = copyenv(current->tsk_ar, environ);
-    if (!current->tsk_environ)
+    current->tsk_data->__environ = copyenv(current->tsk_ar, environ);
+    if (!current->tsk_data->__environ)
         panic("tvm_init::copyenv");
 
     current_thread = threadalloc(current);
@@ -8184,7 +8197,7 @@ char ***_tvm_environ()
     if (!main_task)
         return &environ;
     
-    return &current->tsk_environ;
+    return &current->tsk_data->__environ;
 }
 
 void tvm_log(const char *function, const char *msg, ...)
@@ -10426,9 +10439,9 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)child_sp, (void *)parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t), 1))
         goto fail;
 
-    // fix the environ pointer (which is allocated on the task's arena)
-    arg->tsk->tsk_environ = arg->parent->tsk_environ;
-    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_environ, (void *)&arg->parent->tsk_environ, sizeof(arg->tsk->tsk_environ), 1))
+    // fix the tvm data section pointer (which is allocated on the task's arena)
+    arg->tsk->tsk_data = arg->parent->tsk_data;
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_data, (void *)&arg->parent->tsk_data, sizeof(arg->tsk->tsk_data), 1))
         goto fail;
 
     if (0 != ulinker_duplicate(arg->parent->tsk_linker, arg->tsk->tsk_linker, (void (*)(void *arg, void *old_map, void *new_map, size_t size, int))fork_dup_linker_cb, (void *)arg))
@@ -11228,33 +11241,21 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
 }
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
-    tvm_sig_enter();
-
-    task_lock(current);
     char **env = NULL;
-    if (current->tsk_environ)
-        env = findenv(current->tsk_environ, name, strlen(name));
+    if (current->tsk_data->__environ)
+        env = findenv(current->tsk_data->__environ, name, strlen(name));
 
-    if (!env) {
-        task_unlock(current);
-        tvm_sig_leave();
+    if (!env)
         return NULL;
-    }
-    
+
     char *ret = strchr(*env, '=');
-    task_unlock(current);
-    if (ret) {
-        tvm_sig_leave();
+    if (ret)
         return ret+1;
-    }
-    
-    tvm_sig_leave();
+
     return ret;
 }
 
 FUNCTION_DEFINE1(int, putenv, char *, string) {
-    tvm_sig_enter();
-
     char *value = strchr(string, '=');
     size_t klen;
     if (NULL == value) {
@@ -11266,103 +11267,76 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
         value++;
     }
     
-    task_lock(current);
     char **env = NULL;
-    if (current->tsk_environ)
-        env = findenv(current->tsk_environ, string, klen);
+    if (current->tsk_data->__environ)
+        env = findenv(current->tsk_data->__environ, string, klen);
     
     if (env) {
         *env = string;
-        task_unlock(current);
-        tvm_sig_leave();
         return 0;
     }
 
-    char **new_environ = addenv(current->tsk_environ, string);
+    char **new_environ = addenv(current->tsk_data->__environ, string);
     if (!new_environ) {
-        task_unlock(current);
         errno = ENOMEM;
-        tvm_sig_leave();
         return -1;
     }
 
     // TODO not sure if this is a good idea
-    //free(current->tsk_environ);
-    current->tsk_environ = new_environ;
-    task_unlock(current);
-
-    tvm_sig_leave();
+    //free(current->tsk_data->__environ);
+    current->tsk_data->__environ = new_environ;
     return 0;
 }
 
 FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, overwrite) {
-    tvm_sig_enter();
-
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
     char *string = malloc(name_len + value_len + 2);
     if (!string) {
         errno = ENOMEM;
-        tvm_sig_leave();
         return -1;
     }
     memcpy(string, name, name_len);
     string[name_len] = '=';
     memcpy(string + name_len + 1, value, value_len);
 
-    task_lock(current);
     char **env = NULL;
-    if (current->tsk_environ)
-        env = findenv(current->tsk_environ, name, strlen(name));
+    if (current->tsk_data->__environ)
+        env = findenv(current->tsk_data->__environ, name, strlen(name));
     
     if (env) {
         if (overwrite)
             *env = string;
         else
             free(string);
-        task_unlock(current);
-        tvm_sig_leave();
         return 0;    
     }
 
-    char **new_environ = addenv(current->tsk_environ, string);
+    char **new_environ = addenv(current->tsk_data->__environ, string);
     if (!new_environ) {
-        task_unlock(current);
         free(string);
         errno = ENOMEM;
-        tvm_sig_leave();
         return -1;
     }
 
     // TODO not sure if this is a good idea
-    //free(current->tsk_environ);
-    current->tsk_environ = new_environ;
-    task_unlock(current);
-
-    tvm_sig_leave();
+    //free(current->tsk_data->__environ);
+    current->tsk_data->__environ = new_environ;
     return 0;
 }
 
 FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
-    tvm_sig_enter();
-
     if (name == NULL || *name == '\0' || strchr(name, '=') != NULL)
     {
         errno = EINVAL;
-        tvm_sig_leave();
         return -1;
     }
 
     size_t len = strlen(name);
-
-    task_lock(current);
-    if (!current->tsk_environ) {
-        task_unlock(current);
-        tvm_sig_leave();
+    if (!current->tsk_data->__environ)
         return 0;
-    }
 
-    for (char **e = current->tsk_environ; *e != NULL;) {
+    for (char **e = current->tsk_data->__environ; *e != NULL;) {
 	    if (!strncmp (*e, name, len) && (*e)[len] == '=') {
             for (char **e2 = e; *e2 != NULL; e2++)
                 e2[0] = e2[1];
@@ -11370,10 +11344,6 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 	    }
         e++;
     }
-
-    task_unlock(current);
-
-    tvm_sig_leave();
     return 0;
 }
 
@@ -11559,13 +11529,13 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     cow_run_init_funcs(); // re-initialize copy-on-write vars with init statements
 
-    // TODO hack, getopt should have a tvm thread-safe version
-    extern int optind;
-    optind = 1;
-
     uint64_t ret;
 
     tvm_sig_leave();
+
+    // re-initialize tvm data section
+    current->tsk_data->__environ = new_envp;
+    current->tsk_data->optind = 1;
 
     int callerr = emulator_call(&ret, (uint64_t)main_func,
                   (uint64_t)argc,
@@ -11668,7 +11638,7 @@ FUNCTION_DEFINE_VA2(int, execle, const char *, pathname, const char *, arg/*, ..
 }
 
 FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
-    return execve(pathname, argv, tvm_environ);
+    return execve(pathname, argv, current->tsk_data->__environ);
 }
 
 FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
@@ -11688,7 +11658,7 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
         file = pathname;
     }
 
-    return execve(file, argv, tvm_environ);
+    return execve(file, argv, current->tsk_data->__environ);
 }
 
 #if defined(__linux__)
@@ -12157,18 +12127,21 @@ FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, fla
     return ret;
 }
 
+// atleast I tried to get shitty API working
+static pthread_mutex_t getopt_lock = PTHREAD_MUTEX_INITIALIZER;
+
 FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, optstring) {
     tvm_sig_enter();
     pthread_mutex_lock(&getopt_lock);
-    optarg = tvm_optarg;
-    optind = tvm_optind;
-    opterr = tvm_opterr;
-    optopt = tvm_optopt;
+    optarg = current->tsk_data->optarg;
+    optind = current->tsk_data->optind;
+    opterr = current->tsk_data->opterr;
+    optopt = current->tsk_data->optopt;
     int r = CALL_FUNC(getopt, argc, argv, optstring);
-    tvm_optarg = optarg;
-    tvm_optind = optind;
-    tvm_opterr = opterr;
-    tvm_optopt = optopt;
+    current->tsk_data->optarg = optarg;
+    current->tsk_data->optind = optind;
+    current->tsk_data->opterr = opterr;
+    current->tsk_data->optopt = optopt;
     pthread_mutex_unlock(&getopt_lock);
     tvm_sig_leave();
     return r;
@@ -12177,15 +12150,15 @@ FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, opt
 FUNCTION_DEFINE5(int, getopt_long, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
     tvm_sig_enter();
     pthread_mutex_lock(&getopt_lock);
-    optarg = tvm_optarg;
-    optind = tvm_optind;
-    opterr = tvm_opterr;
-    optopt = tvm_optopt;
+    optarg = current->tsk_data->optarg;
+    optind = current->tsk_data->optind;
+    opterr = current->tsk_data->opterr;
+    optopt = current->tsk_data->optopt;
     int r = CALL_FUNC(getopt_long, argc, argv, optstring, longopts, longindex);
-    tvm_optarg = optarg;
-    tvm_optind = optind;
-    tvm_opterr = opterr;
-    tvm_optopt = optopt;
+    current->tsk_data->optarg = optarg;
+    current->tsk_data->optind = optind;
+    current->tsk_data->opterr = opterr;
+    current->tsk_data->optopt = optopt;
     pthread_mutex_unlock(&getopt_lock);
     tvm_sig_leave();
     return r;
@@ -12194,15 +12167,15 @@ FUNCTION_DEFINE5(int, getopt_long, int, argc, char * const *, argv, const char *
 FUNCTION_DEFINE5(int, getopt_long_only, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
     tvm_sig_enter();
     pthread_mutex_lock(&getopt_lock);
-    optarg = tvm_optarg;
-    optind = tvm_optind;
-    opterr = tvm_opterr;
-    optopt = tvm_optopt;
+    optarg = current->tsk_data->optarg;
+    optind = current->tsk_data->optind;
+    opterr = current->tsk_data->opterr;
+    optopt = current->tsk_data->optopt;
     int r = CALL_FUNC(getopt_long_only, argc, argv, optstring, longopts, longindex);
-    tvm_optarg = optarg;
-    tvm_optind = optind;
-    tvm_opterr = opterr;
-    tvm_optopt = optopt;
+    current->tsk_data->optarg = optarg;
+    current->tsk_data->optind = optind;
+    current->tsk_data->opterr = opterr;
+    current->tsk_data->optopt = optopt;
     pthread_mutex_unlock(&getopt_lock);
     tvm_sig_leave();
     return r;
@@ -12383,12 +12356,7 @@ FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * 
 }
 
 FUNCTION_DEFINE0(int, clearenv) {
-    tvm_sig_enter();
-    task_lock(current);
-    current->tsk_environ = NULL;
-    task_unlock(current);
-    tvm_sig_leave();
-
+    current->tsk_data->__environ = NULL;
     return 0;
 }
 
