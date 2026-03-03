@@ -8012,11 +8012,15 @@ static struct ulinker_ops ulinker_ops = {
 static void *ulinker_external_dlsym(void *arg, const char *s)
 {
 #ifndef ENABLE_RWX
-    if (0 == strcmp(s, "sigaction")) return &emulator_sigaction;
-    if (0 == strcmp(s, "signal"))    return &emulator_signal;
-    if (0 == strcmp(s, "_setjmp"))   return &emulator_setjmp;  // linux
-    if (0 == strcmp(s, "setjmp"))    return &emulator_setjmp;  // darwin
-    if (0 == strcmp(s, "longjmp"))   return &emulator_longjmp;
+    if (0 == strcmp(s, "sigaction"))    return &emulator_sigaction;
+    if (0 == strcmp(s, "signal"))       return &emulator_signal;
+    if (0 == strcmp(s, "_setjmp"))      return &emulator_setjmp;
+    if (0 == strcmp(s, "setjmp"))       return &emulator_setjmp;
+    if (0 == strcmp(s, "__sigsetjmp"))  return &emulator_setjmp;
+    if (0 == strcmp(s, "sigsetjmp"))    return &emulator_setjmp;
+    if (0 == strcmp(s, "longjmp"))      return &emulator_longjmp;
+    if (0 == strcmp(s, "_longjmp"))     return &emulator_longjmp;
+    if (0 == strcmp(s, "siglongjmp"))   return &emulator_longjmp;
 
     if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
 #endif
