@@ -1577,7 +1577,18 @@ struct task_data {
     char **__environ;
 
     char  *optarg;
-    int    optind, opterr, optopt;
+    int    optind, opterr, optopt, optpos, optreset;
+};
+
+/**
+ * Executables may override storage for these in their own data segment.
+ * This is an indirection struct that imitates relocations, we access variables here rather than from task_data.
+ */
+struct task_relocations {
+    char ***__environ;
+
+    char **optarg;
+    int *optind, *opterr, *optopt;
 };
 
 /////////////
@@ -1638,6 +1649,7 @@ struct task {
     siginfo_t tsk_pending_siginfo[MAX_SIGNALS];
     ucontext_t tsk_pending_ucontext[MAX_SIGNALS];
     struct task_data *tsk_data; // malloc()ed from tsk_ar
+    struct task_relocations tsk_relocs; // oh my god
 };
 
 struct thread {
@@ -1813,12 +1825,6 @@ static struct task *taskalloc_common()
     t->tsk_linker = ulinker_create((void *)t);
     if (!t->tsk_linker)
         goto out;
-
-    t->tsk_data = rmem_arena_alloc(t->tsk_ar, sizeof(*t->tsk_data));
-    if (!t->tsk_data)
-        goto out;
-    memset(t->tsk_data, 0, sizeof(*t->tsk_data));
-    t->tsk_data->optind = 1;
 
     if (pthread_mutex_init(&t->tsk_lock, NULL) != 0) {
         goto out;
@@ -7717,7 +7723,7 @@ static int tvm_pwd(int argc, char **argv)
 
 static int tvm_env(int argc, char **argv)
 {
-    char **p = current->tsk_data->__environ;
+    char **p = *current->tsk_relocs.__environ;
     if (argc > 1)
         p = environ;
     for (; p && *p; p++)
@@ -7759,7 +7765,7 @@ static int tvm_sorunner(int argc, char **argv)
     int callerr = emulator_call(&ret, (uint64_t)sym,
                   (uint64_t)(argc - 1),
                   (uint64_t)(argv + 1),
-                  (uint64_t)current->tsk_data->__environ,
+                  (uint64_t)*current->tsk_relocs.__environ,
                 0, 0, 0);
     if (callerr)
         printf("sorunner emulator_call failed!\n");
@@ -8079,6 +8085,21 @@ void tvm_init(const char *init_comm)
     current->tsk_pid = __gettid();
     current->tsk_sid = current->tsk_pgid = current->tsk_pid;
 
+    current->tsk_data = rmem_arena_alloc(current->tsk_ar, sizeof(*current->tsk_data));
+    if (!current->tsk_data)
+        panic("tsk_data");
+    memset(current->tsk_data, 0, sizeof(*current->tsk_data));
+    
+    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0) ?: &current->tsk_data->__environ;
+    current->tsk_relocs.optind = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optind", 0) ?: &current->tsk_data->optind;
+    current->tsk_relocs.opterr = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "opterr", 0) ?: &current->tsk_data->opterr;
+    current->tsk_relocs.optopt = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optopt", 0) ?: &current->tsk_data->optopt;
+    current->tsk_relocs.optarg = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optarg", 0) ?: &current->tsk_data->optarg;
+    
+    *current->tsk_relocs.optind = 1;
+    *current->tsk_relocs.opterr = 1;
+    current->tsk_data->optreset = 0;
+
     // dup 0,1,2 fds
     for (int i = 0; i < 3; i++) {
         int rfd = CALL_FUNC(dup, i);
@@ -8118,8 +8139,8 @@ void tvm_init(const char *init_comm)
         VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
     }
 
-    current->tsk_data->__environ = copyenv(current->tsk_ar, environ);
-    if (!current->tsk_data->__environ)
+    *current->tsk_relocs.__environ = copyenv(current->tsk_ar, environ);
+    if (!*current->tsk_relocs.__environ)
         panic("tvm_init::copyenv");
 
     current_thread = threadalloc(current);
@@ -8197,7 +8218,7 @@ char ***_tvm_environ()
     if (!main_task)
         return &environ;
     
-    return &current->tsk_data->__environ;
+    return &*current->tsk_relocs.__environ;
 }
 
 void tvm_log(const char *function, const char *msg, ...)
@@ -10443,6 +10464,10 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     arg->tsk->tsk_data = arg->parent->tsk_data;
     if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_data, (void *)&arg->parent->tsk_data, sizeof(arg->tsk->tsk_data), 1))
         goto fail;
+    // relocations
+    memcpy(&arg->tsk->tsk_relocs, &arg->parent->tsk_relocs, sizeof(arg->tsk->tsk_relocs));
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_relocs, (void *)&arg->parent->tsk_relocs, sizeof(arg->tsk->tsk_relocs), 1))
+        goto fail;
 
     if (0 != ulinker_duplicate(arg->parent->tsk_linker, arg->tsk->tsk_linker, (void (*)(void *arg, void *old_map, void *new_map, size_t size, int))fork_dup_linker_cb, (void *)arg))
         goto fail;
@@ -11242,8 +11267,8 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
     char **env = NULL;
-    if (current->tsk_data->__environ)
-        env = findenv(current->tsk_data->__environ, name, strlen(name));
+    if (*current->tsk_relocs.__environ)
+        env = findenv(*current->tsk_relocs.__environ, name, strlen(name));
 
     if (!env)
         return NULL;
@@ -11268,23 +11293,23 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
     }
     
     char **env = NULL;
-    if (current->tsk_data->__environ)
-        env = findenv(current->tsk_data->__environ, string, klen);
+    if (*current->tsk_relocs.__environ)
+        env = findenv(*current->tsk_relocs.__environ, string, klen);
     
     if (env) {
         *env = string;
         return 0;
     }
 
-    char **new_environ = addenv(current->tsk_data->__environ, string);
+    char **new_environ = addenv(*current->tsk_relocs.__environ, string);
     if (!new_environ) {
         errno = ENOMEM;
         return -1;
     }
 
     // TODO not sure if this is a good idea
-    //free(current->tsk_data->__environ);
-    current->tsk_data->__environ = new_environ;
+    //free(*current->tsk_relocs.__environ);
+    *current->tsk_relocs.__environ = new_environ;
     return 0;
 }
 
@@ -11301,8 +11326,8 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
     memcpy(string + name_len + 1, value, value_len);
 
     char **env = NULL;
-    if (current->tsk_data->__environ)
-        env = findenv(current->tsk_data->__environ, name, strlen(name));
+    if (*current->tsk_relocs.__environ)
+        env = findenv(*current->tsk_relocs.__environ, name, strlen(name));
     
     if (env) {
         if (overwrite)
@@ -11312,7 +11337,7 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
         return 0;    
     }
 
-    char **new_environ = addenv(current->tsk_data->__environ, string);
+    char **new_environ = addenv(*current->tsk_relocs.__environ, string);
     if (!new_environ) {
         free(string);
         errno = ENOMEM;
@@ -11320,8 +11345,8 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
     }
 
     // TODO not sure if this is a good idea
-    //free(current->tsk_data->__environ);
-    current->tsk_data->__environ = new_environ;
+    //free(*current->tsk_relocs.__environ);
+    *current->tsk_relocs.__environ = new_environ;
     return 0;
 }
 
@@ -11333,10 +11358,10 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
     }
 
     size_t len = strlen(name);
-    if (!current->tsk_data->__environ)
+    if (!*current->tsk_relocs.__environ)
         return 0;
 
-    for (char **e = current->tsk_data->__environ; *e != NULL;) {
+    for (char **e = *current->tsk_relocs.__environ; *e != NULL;) {
 	    if (!strncmp (*e, name, len) && (*e)[len] == '=') {
             for (char **e2 = e; *e2 != NULL; e2++)
                 e2[0] = e2[1];
@@ -11533,9 +11558,20 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
 
     tvm_sig_leave();
 
+    // reinitialize relocations
+
+    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0) ?: &current->tsk_data->__environ;
+    current->tsk_relocs.optind = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optind", 0) ?: &current->tsk_data->optind;
+    current->tsk_relocs.opterr = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "opterr", 0) ?: &current->tsk_data->opterr;
+    current->tsk_relocs.optopt = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optopt", 0) ?: &current->tsk_data->optopt;
+    current->tsk_relocs.optarg = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optarg", 0) ?: &current->tsk_data->optarg;
+
     // re-initialize tvm data section
-    current->tsk_data->__environ = new_envp;
-    current->tsk_data->optind = 1;
+    memset(current->tsk_data, 0, sizeof(*current->tsk_data));
+    *current->tsk_relocs.__environ = new_envp;
+    *current->tsk_relocs.optind = 1;
+    *current->tsk_relocs.opterr = 1;
+    current->tsk_data->optreset = 0;
 
     int callerr = emulator_call(&ret, (uint64_t)main_func,
                   (uint64_t)argc,
@@ -11638,7 +11674,7 @@ FUNCTION_DEFINE_VA2(int, execle, const char *, pathname, const char *, arg/*, ..
 }
 
 FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
-    return execve(pathname, argv, current->tsk_data->__environ);
+    return execve(pathname, argv, *current->tsk_relocs.__environ);
 }
 
 FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
@@ -11658,7 +11694,7 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
         file = pathname;
     }
 
-    return execve(file, argv, current->tsk_data->__environ);
+    return execve(file, argv, *current->tsk_relocs.__environ);
 }
 
 #if defined(__linux__)
@@ -12127,58 +12163,208 @@ FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, fla
     return ret;
 }
 
-// atleast I tried to get shitty API working
-static pthread_mutex_t getopt_lock = PTHREAD_MUTEX_INITIALIZER;
+static void __getopt_msg(const char *a, const char *b, const char *c, size_t l)
+{
+	FILE *f = stderr;
+// #if !defined(WIN32) && !defined(_WIN32)
+// 	flockfile(f);
+// #endif
+	fputs(a, f);
+	fwrite(b, strlen(b), 1, f);
+	fwrite(c, 1, l, f);
+	fputc('\n', f);
+// #if !defined(WIN32) && !defined(_WIN32)
+// 	funlockfile(f);
+// #endif
+}
 
 FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, optstring) {
-    tvm_sig_enter();
-    pthread_mutex_lock(&getopt_lock);
-    optarg = current->tsk_data->optarg;
-    optind = current->tsk_data->optind;
-    opterr = current->tsk_data->opterr;
-    optopt = current->tsk_data->optopt;
-    int r = CALL_FUNC(getopt, argc, argv, optstring);
-    current->tsk_data->optarg = optarg;
-    current->tsk_data->optind = optind;
-    current->tsk_data->opterr = opterr;
-    current->tsk_data->optopt = optopt;
-    pthread_mutex_unlock(&getopt_lock);
-    tvm_sig_leave();
-    return r;
+    int i, c, d;
+	int k, l;
+	char *optchar;
+
+	if (!*current->tsk_relocs.optind || current->tsk_data->optreset) {
+		current->tsk_data->optreset = 0;
+		current->tsk_data->optpos = 0;
+		*current->tsk_relocs.optind = 1;
+	}
+
+	if (*current->tsk_relocs.optind >= argc || !argv[*current->tsk_relocs.optind])
+		return -1;
+
+	if (argv[*current->tsk_relocs.optind][0] != '-') {
+		if (optstring[0] == '-') {
+			*current->tsk_relocs.optarg = argv[(*current->tsk_relocs.optind)++];
+			return 1;
+		}
+		return -1;
+	}
+
+	if (!argv[*current->tsk_relocs.optind][1])
+		return -1;
+
+	if (argv[*current->tsk_relocs.optind][1] == '-' && !argv[*current->tsk_relocs.optind][2])
+		return (*current->tsk_relocs.optind)++, -1;
+
+	if (!current->tsk_data->optpos) current->tsk_data->optpos++;
+	c = argv[*current->tsk_relocs.optind][current->tsk_data->optpos], k = 1;
+	optchar = argv[*current->tsk_relocs.optind]+current->tsk_data->optpos;
+	*current->tsk_relocs.optopt = c;
+	current->tsk_data->optpos += k;
+
+	if (!argv[*current->tsk_relocs.optind][current->tsk_data->optpos]) {
+		(*current->tsk_relocs.optind)++;
+		current->tsk_data->optpos = 0;
+	}
+
+	if (optstring[0] == '-' || optstring[0] == '+')
+		optstring++;
+
+	i = 0;
+	d = 0;
+	do {
+		d = optstring[i], l = 1;
+		if (l>0) i+=l; else i++;
+	} while (l && d != c);
+
+	if (d != c) {
+		if (optstring[0] != ':' && opterr)
+			__getopt_msg(argv[0], ": unrecognized option: ", optchar, k);
+		return '?';
+	}
+	if (optstring[i] == ':') {
+		if (optstring[i+1] == ':') *current->tsk_relocs.optarg = 0;
+		else if (*current->tsk_relocs.optind >= argc) {
+			if (optstring[0] == ':') return ':';
+			if (opterr) __getopt_msg(argv[0],
+				": option requires an argument: ",
+				optchar, k);
+			return '?';
+		}
+		if (optstring[i+1] != ':' || current->tsk_data->optpos) {
+			*current->tsk_relocs.optarg = argv[(*current->tsk_relocs.optind)++] + current->tsk_data->optpos;
+			current->tsk_data->optpos = 0;
+		}
+	}
+	return c;
+}
+
+static void permute(char *const *argv, int dest, int src)
+{
+	char **av = (char **)argv;
+	char *tmp = av[src];
+	int i;
+	for (i=src; i>dest; i--)
+		av[i] = av[i-1];
+	av[dest] = tmp;
+}
+
+static int __getopt_long_core(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx, int longonly)
+{
+	*current->tsk_relocs.optarg = 0;
+	if (longopts && argv[*current->tsk_relocs.optind][0] == '-' &&
+		((longonly && argv[*current->tsk_relocs.optind][1] && argv[*current->tsk_relocs.optind][1] != '-') ||
+		 (argv[optind][1] == '-' && argv[*current->tsk_relocs.optind][2])))
+	{
+		int colon = optstring[optstring[0]=='+'||optstring[0]=='-']==':';
+		int i, cnt, match = -1;
+		char *opt;
+		for (cnt=i=0; longopts[i].name; i++) {
+			const char *name = longopts[i].name;
+			opt = argv[*current->tsk_relocs.optind]+1;
+			if (*opt == '-') opt++;
+			for (; *name && *name == *opt; name++, opt++);
+			if (*opt && *opt != '=') continue;
+			match = i;
+			if (!*name) {
+				cnt = 1;
+				break;
+			}
+			cnt++;
+		}
+		if (cnt==1) {
+			i = match;
+			(*current->tsk_relocs.optind)++;
+			*current->tsk_relocs.optopt = longopts[i].val;
+			if (*opt == '=') {
+				if (!longopts[i].has_arg) {
+					if (colon || !opterr)
+						return '?';
+					__getopt_msg(argv[0],
+						": option does not take an argument: ",
+						longopts[i].name,
+						strlen(longopts[i].name));
+					return '?';
+				}
+				*current->tsk_relocs.optarg = opt+1;
+			} else if (longopts[i].has_arg == required_argument) {
+				if (!(*current->tsk_relocs.optarg = argv[*current->tsk_relocs.optind])) {
+					if (colon) return ':';
+					if (!opterr) return '?';
+					__getopt_msg(argv[0],
+						": option requires an argument: ",
+						longopts[i].name,
+						strlen(longopts[i].name));
+					return '?';
+				}
+				(*current->tsk_relocs.optind)++;
+			}
+			if (idx) *idx = i;
+			if (longopts[i].flag) {
+				*longopts[i].flag = longopts[i].val;
+				return 0;
+			}
+			return longopts[i].val;
+		}
+		if (argv[*current->tsk_relocs.optind][1] == '-') {
+			if (!colon && opterr)
+				__getopt_msg(argv[0], cnt ?
+					": option is ambiguous: " :
+					": unrecognized option: ",
+					argv[*current->tsk_relocs.optind]+2,
+					strlen(argv[*current->tsk_relocs.optind]+2));
+			(*current->tsk_relocs.optind)++;
+			return '?';
+		}
+	}
+	return getopt(argc, argv, optstring);
+}
+
+static int __getopt_long(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx, int longonly)
+{
+	int ret, skipped, resumed;
+	if (!*current->tsk_relocs.optind || current->tsk_data->optreset) {
+		current->tsk_data->optreset = 0;
+		current->tsk_data->optpos = 0;
+		*current->tsk_relocs.optind = 1;
+	}
+	if (*current->tsk_relocs.optind >= argc || !argv[*current->tsk_relocs.optind]) return -1;
+	skipped = *current->tsk_relocs.optind;
+	if (optstring[0] != '+' && optstring[0] != '-') {
+		int i;
+		for (i=*current->tsk_relocs.optind; ; i++) {
+			if (i >= argc || !argv[i]) return -1;
+			if (argv[i][0] == '-' && argv[i][1]) break;
+		}
+		*current->tsk_relocs.optind = i;
+	}
+	resumed = *current->tsk_relocs.optind;
+	ret = __getopt_long_core(argc, argv, optstring, longopts, idx, longonly);
+	if (resumed > skipped) {
+		int i, cnt = *current->tsk_relocs.optind-resumed;
+		for (i=0; i<cnt; i++)
+			permute(argv, skipped, *current->tsk_relocs.optind-1);
+		*current->tsk_relocs.optind = skipped + cnt;
+	}
+	return ret;
 }
 
 FUNCTION_DEFINE5(int, getopt_long, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
-    tvm_sig_enter();
-    pthread_mutex_lock(&getopt_lock);
-    optarg = current->tsk_data->optarg;
-    optind = current->tsk_data->optind;
-    opterr = current->tsk_data->opterr;
-    optopt = current->tsk_data->optopt;
-    int r = CALL_FUNC(getopt_long, argc, argv, optstring, longopts, longindex);
-    current->tsk_data->optarg = optarg;
-    current->tsk_data->optind = optind;
-    current->tsk_data->opterr = opterr;
-    current->tsk_data->optopt = optopt;
-    pthread_mutex_unlock(&getopt_lock);
-    tvm_sig_leave();
-    return r;
+    return __getopt_long(argc, argv, optstring, longopts, longindex, 0);
 }
 
 FUNCTION_DEFINE5(int, getopt_long_only, int, argc, char * const *, argv, const char *, optstring, const struct option *, longopts, int *, longindex) {
-    tvm_sig_enter();
-    pthread_mutex_lock(&getopt_lock);
-    optarg = current->tsk_data->optarg;
-    optind = current->tsk_data->optind;
-    opterr = current->tsk_data->opterr;
-    optopt = current->tsk_data->optopt;
-    int r = CALL_FUNC(getopt_long_only, argc, argv, optstring, longopts, longindex);
-    current->tsk_data->optarg = optarg;
-    current->tsk_data->optind = optind;
-    current->tsk_data->opterr = opterr;
-    current->tsk_data->optopt = optopt;
-    pthread_mutex_unlock(&getopt_lock);
-    tvm_sig_leave();
-    return r;
+    return __getopt_long(argc, argv, optstring, longopts, longindex, 1);
 }
 
 FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_name)
@@ -12356,7 +12542,7 @@ FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * 
 }
 
 FUNCTION_DEFINE0(int, clearenv) {
-    current->tsk_data->__environ = NULL;
+    *current->tsk_relocs.__environ = NULL;
     return 0;
 }
 
