@@ -68,6 +68,7 @@
 // 4. waitpid signal delivery
 // 5. race for signal delivery before blocking IO operation
 // 6. external signal delivery may be received in TVM threads, needs to be handled outside
+// 7. support co-existing with external sigaction handlers
 
 // LOCK ORDERING
 
@@ -2187,6 +2188,8 @@ static int task_kill_locked(struct task *t, int signum) {
     // blocking syscall (read/write/poll/…) gets interrupted with EINTR.
     // signal_handler will see tvm_sig_blocked and defer the signal; it
     // gets drained on the next tvm_sig_leave().
+    if (!fallback)
+        panic("fallback thread NULL");
     return pthread_kill(fallback->thr_pthread, signum);
 }
 
@@ -2281,10 +2284,16 @@ static void terminate_current_locked(int result)
 
         task_unlock(current);
     }
+    // Block OS-level signals before clearing current: the signal handler
+    // panics if any signal arrives on this thread while current is NULL.
+    sigset_t all_sigs, old_sigs;
+    sigfillset(&all_sigs);
+    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
+
     current = NULL;
 
-    if (notify_parent && 0 != task_kill_locked(parent, SIGCHLD))
-        panic("terminate_current_locked notify parent failed (%d)", errno);
+    if (notify_parent)
+        task_kill_locked(parent, SIGCHLD);  // best-effort; parent may have already exited
 
     // parent may be blocked on waitpid but no more pids, wake him up!
     if (parent) {
@@ -3162,7 +3171,7 @@ static inline void tvm_sig_leave(void)
 static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
     if (!current)
-        panic("signal %d on pthread_exit", signum);
+        return;  // thread is exiting or not yet initialized — ignore
 
     if (signum < 1 || signum >= MAX_SIGNALS)
         return;
@@ -10357,6 +10366,13 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
     current->tsk_threads_cnt++;
 
+    // Unblock OS signals now that current/current_thread are set.
+    // The parent blocked all signals before pthread_create so we inherited
+    // a fully-blocked signal mask.
+    sigset_t empty_sigs;
+    sigemptyset(&empty_sigs);
+    pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
+
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
     // the error number is set to thread's errno
@@ -10672,11 +10688,22 @@ pid_t fork(void) {
 
     jmpbuf_demangle(&arg->jmpbuf_parent);
 
+    // Block OS signals before creating the child thread so it inherits a
+    // blocked signal mask.  The child unblocks after setting current/current_thread
+    // in tvm_proc_entry — without this, a signal arriving on the new thread
+    // before those thread-locals are set causes a panic (current == NULL).
+    sigset_t all_sigs, old_sigs;
+    sigfillset(&all_sigs);
+    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
+
     pthread_t pth;
     if ((r = CALL_FUNC(pthread_create, &pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg))) {
+        pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
         errno = r;
         goto out;
     }
+
+    pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
 
     // failure no longer allowed on parent
 
@@ -10737,6 +10764,12 @@ out:
     return ret;
 }
 
+// vfork() is used by toybox (xargs, etc.) — redirect to TVM's fork()
+// since TVM's fork already uses pthreads with COW semantics.
+pid_t vfork(void) {
+    return fork();
+}
+
 typedef void *(*start_routine_fn)(void *);
 struct pthread_create_arg
 {
@@ -10753,6 +10786,11 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
 
     current_thread->thr_pthread = pthread_self();
     current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
+
+    // Unblock OS signals now that current/current_thread are set.
+    sigset_t empty_sigs;
+    sigemptyset(&empty_sigs);
+    pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
 
     task_lock(current);
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
@@ -10801,7 +10839,15 @@ FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t 
 
     arg->tsk = current;
 
+    // Block OS signals so child thread inherits blocked mask and won't
+    // receive signals before current/current_thread are set.
+    sigset_t all_sigs, old_sigs;
+    sigfillset(&all_sigs);
+    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
+
     ret = CALL_FUNC(pthread_create, thread, attr, (start_routine_fn)tvm_thread_entry, (void *)arg);
+
+    pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
 
     if (!ret) {
         arg = NULL;
@@ -10881,7 +10927,7 @@ FUNCTION_DEFINE_NORET1(_exit, int, status) {
     tvm_sig_enter();
     if (current == main_task)
         CALL_FUNC(_exit, status);
-    
+
     pthread_mutex_lock(&tasks_lock);
     task_lock(current);
 
@@ -11027,7 +11073,7 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
 
     task_lock(zombiet);
     pthread_mutex_unlock(&tasks_lock);
-    
+
     if (list_empty(&zombiet->tsk_threads))
         panic("waitpid tsk_pthreads empty");
     struct thread *thr = list_entry(zombiet->tsk_threads.next, struct thread, thr_list);
@@ -11478,8 +11524,9 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     // deep-copy argv and envp onto the stack — the originals may point
     // into the caller's emulator stack which we're about to unload with emulator_context_destroy()
     int envc = 0;
-    for (char * const *e = envp; *e; e++)
-        envc++;
+    if (envp)
+        for (char * const *e = envp; *e; e++)
+            envc++;
 
     char **new_argv = alloca(sizeof(char *) * (argc + 1));
     for (int i = 0; i < argc; i++) {
