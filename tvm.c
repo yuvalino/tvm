@@ -6562,6 +6562,8 @@ out:
 
 int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
+    // TODO: do NOT mark emulation on calls from native loaded libraries
+
     // mark new handler
     struct sigaction act2;
     if (act) {
@@ -6580,9 +6582,9 @@ int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction
 
     // unmark old handler
     if (oldact) {
-        void **handler_func = (void **)&act->sa_handler;
-        if (act->sa_flags & SA_SIGINFO)
-            handler_func = (void **)&act->sa_sigaction;
+        void **handler_func = (void **)&oldact->sa_handler;
+        if (oldact->sa_flags & SA_SIGINFO)
+            handler_func = (void **)&oldact->sa_sigaction;
 
         if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
             *handler_func = EMUFUNC_UNMARK(*handler_func);
