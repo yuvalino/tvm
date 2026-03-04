@@ -72,14 +72,16 @@
 
 // LOCK ORDERING
 
+// tasks
 // tty | vfs_node
+// timers
 // task
 // file
 // file_stream
 // vfs_file
 
 /////////////
-// Macros
+// MARK: Macros
 /////////////
 
 /**
@@ -152,7 +154,7 @@ static int g_outfd = STDOUT_FILENO;
 #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
 
 /////////////
-// List
+// MARK: List
 /////////////
 
 /**
@@ -235,7 +237,7 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
 	     pos = list_next_entry(pos, member))
 
 /////////////
-// Functions
+// MARK: Functions
 /////////////
 
 /**
@@ -422,6 +424,14 @@ DECL_FUNC(signal);
 DECL_FUNC(sigaction);
 DECL_FUNC(raise);
 DECL_FUNC(kill);
+DECL_FUNC(sigprocmask);
+DECL_FUNC(pthread_sigmask);
+DECL_FUNC(sigpending);
+DECL_FUNC(sigsuspend);
+DECL_FUNC(pause);
+DECL_FUNC(sigwait);
+DECL_FUNC(sigwaitinfo);
+DECL_FUNC(sigtimedwait);
 
 DECL_FUNC(getenv);
 DECL_FUNC(putenv);
@@ -484,7 +494,12 @@ DECL_FUNC(bsearch);
 DECL_FUNC(qsort);
 
 extern int tputs(const char *, int, int (*)(int));
-DECL_FUNC(tputs);
+DECL_FUNC_OPT(tputs);
+DECL_FUNC_OPT(timer_create);
+DECL_FUNC_OPT(timer_settime);
+DECL_FUNC_OPT(timer_gettime);
+DECL_FUNC_OPT(timer_delete);
+DECL_FUNC_OPT(timer_getoverrun);
 
 #if defined(__linux__)
 DECL_FUNC(mknod);
@@ -494,7 +509,6 @@ DECL_FUNC(execvpe);
 DECL_FUNC(epoll_create);
 DECL_FUNC(epoll_create1);
 DECL_FUNC(timerfd_create);
-DECL_FUNC(timer_create);
 DECL_FUNC(pipe2);
 DECL_FUNC(fstatfs);
 DECL_FUNC(fstatfs64);
@@ -529,7 +543,7 @@ static void format_time_init(void) {
 }
 
 /////////////
-// Declarations
+// MARK: Declarations
 /////////////
 
 /**
@@ -565,8 +579,11 @@ void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1,
 static inline void tvm_sig_enter(void);
 static inline void tvm_sig_leave(void);
 
+static pthread_mutex_t vtimers_lock = PTHREAD_MUTEX_INITIALIZER;
+static void vtimer_destroy_locked(int global_idx);
+
 /////////////
-// Helpers
+// MARK: Helpers
 /////////////
 
 static pid_t __gettid()
@@ -825,7 +842,7 @@ static void *read_all(int fd, size_t *out_size) {
 
 
 /////////////
-// CPIO
+// MARK: CPIO
 /////////////
 
 typedef struct {
@@ -921,7 +938,7 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
 }
 
 /////////////
-// Jmpbuf manipulation
+// MARK: Jmpbuf
 /////////////
 
 /**
@@ -1101,7 +1118,7 @@ static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
 }
 
 /////////////
-// Environment
+// MARK: Environment
 /////////////
 
 /**
@@ -1204,7 +1221,7 @@ static char **findenv(char **env, const char *name, size_t name_len)
 }
 
 /////////////
-// File
+// MARK: File
 /////////////
 
 /**
@@ -1575,7 +1592,7 @@ ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
 }
 
 /////////////
-// Task Data
+// MARK: Task Data
 /////////////
 
 /**
@@ -1600,7 +1617,7 @@ struct task_relocations {
 };
 
 /////////////
-// Task
+// MARK: Task
 /////////////
 
 /**
@@ -1625,6 +1642,8 @@ struct task_relocations {
 
 #define MAX_FILES 1024
 #define MAX_SIGNALS 32
+#define MAX_TIMERS_PER_TASK 8
+#define MAX_VIRTUAL_TIMERS 256
 
 #define TS_ZOMBIE  0x1
 #define TS_CTTY    0x2
@@ -1658,6 +1677,7 @@ struct task {
     ucontext_t tsk_pending_ucontext[MAX_SIGNALS];
     struct task_data *tsk_data; // malloc()ed from tsk_ar
     struct task_relocations tsk_relocs; // oh my god
+    int tsk_timers[MAX_TIMERS_PER_TASK]; // indices into vtimers[], -1 = unused
 };
 
 struct thread {
@@ -1672,6 +1692,7 @@ struct thread {
     uint32_t thr_pending_sigs;  // thread-directed deferred signals (atomic via __atomic builtins)
     siginfo_t thr_pending_siginfo[MAX_SIGNALS];
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
+    sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
 };
 
 static Dl_info main_dlinfo = {0};
@@ -1687,6 +1708,7 @@ static __thread int tvm_sig_interrupted = 0;
 static __thread int tvm_sig_depth = 0;
 static __thread int tvm_sig_synchronous_depth = 0;
 static __thread int tvm_in_emu = 0;
+
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
 #define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
@@ -1820,6 +1842,9 @@ static struct task *taskalloc_common()
     
     memset(t, 0, sizeof(*t));
 
+    for (int i = 0; i < MAX_TIMERS_PER_TASK; i++)
+        t->tsk_timers[i] = -1;
+
     INIT_LIST_HEAD(&t->tsk_list);
     INIT_LIST_HEAD(&t->tsk_threads);
     INIT_LIST_HEAD(&t->tsk_filestreams);
@@ -1883,8 +1908,17 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
     if (dolocktasks)
         pthread_mutex_lock(&tasks_lock);
 
+    pthread_mutex_lock(&vtimers_lock);
+    for (int i = 0; i < MAX_TIMERS_PER_TASK; i++) {
+        if (t->tsk_timers[i] >= 0) {
+            vtimer_destroy_locked(t->tsk_timers[i]);
+            t->tsk_timers[i] = -1;
+        }
+    }
+    pthread_mutex_unlock(&vtimers_lock);
+
     task_filestreamdealloc_list(t, &t->tsk_filestreams);
-    
+
     for (int i = 0; i < 3; i++)
         t->tsk_io_filestreams[i] = NULL;
 
@@ -2295,7 +2329,7 @@ static void terminate_current_locked(int result)
     // panics if any signal arrives on this thread while current is NULL.
     sigset_t all_sigs, old_sigs;
     sigfillset(&all_sigs);
-    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
 
     current = NULL;
 
@@ -2504,7 +2538,162 @@ out:
 }
 
 /////////////
-// Allocator
+// MARK: VTimers
+/////////////
+
+struct virtual_timer {
+    int vt_active;
+    struct task *vt_task;
+    int vt_signo;           // signal to deliver to TVM task
+    union sigval vt_sigval; // caller's si_value
+    int vt_notify;          // SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_NONE
+    int vt_task_slot;       // index in task's tsk_timers[]
+    int vt_clockid;                // CLOCK_MONOTONIC or CLOCK_REALTIME
+    struct timespec vt_deadline;   // absolute next-fire time (CLOCK_MONOTONIC)
+    struct itimerspec vt_interval; // original interval (for repeating)
+};
+
+static struct virtual_timer vtimers[MAX_VIRTUAL_TIMERS];
+static pthread_cond_t vtimers_cond;
+
+static void vtimer_destroy_locked(int global_idx)
+{
+    struct virtual_timer *vt = &vtimers[global_idx];
+    if (vt->vt_active) {
+        vt->vt_active = 0;
+        vt->vt_task = NULL;
+        memset(&vt->vt_deadline, 0, sizeof(vt->vt_deadline));
+        pthread_cond_signal(&vtimers_cond);
+    }
+}
+
+static inline int ts_is_zero(const struct timespec *ts)
+{
+    return ts->tv_sec == 0 && ts->tv_nsec == 0;
+}
+
+static inline int ts_le(const struct timespec *a, const struct timespec *b)
+{
+    if (a->tv_sec != b->tv_sec) return a->tv_sec < b->tv_sec;
+    return a->tv_nsec <= b->tv_nsec;
+}
+
+static inline struct timespec ts_add(const struct timespec *a, const struct timespec *b)
+{
+    struct timespec r;
+    r.tv_sec = a->tv_sec + b->tv_sec;
+    r.tv_nsec = a->tv_nsec + b->tv_nsec;
+    if (r.tv_nsec >= 1000000000L) {
+        r.tv_sec++;
+        r.tv_nsec -= 1000000000L;
+    }
+    return r;
+}
+
+static void *vtimer_thread(void *arg)
+{
+    (void)arg;
+
+    // block all signals — manager thread must not receive TVM signals
+    sigset_t all;
+    sigfillset(&all);
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &all, NULL);
+
+    pthread_mutex_lock(&vtimers_lock);
+
+    for (;;) {
+        // find earliest deadline among active timers
+        struct timespec earliest = {0, 0};
+        int have_deadline = 0;
+        for (int i = 0; i < MAX_VIRTUAL_TIMERS; i++) {
+            struct virtual_timer *vt = &vtimers[i];
+            if (vt->vt_active && !ts_is_zero(&vt->vt_deadline)) {
+                if (!have_deadline || ts_le(&vt->vt_deadline, &earliest)) {
+                    earliest = vt->vt_deadline;
+                    have_deadline = 1;
+                }
+            }
+        }
+
+        if (!have_deadline) {
+            pthread_cond_wait(&vtimers_cond, &vtimers_lock);
+            continue;
+        }
+
+        pthread_cond_timedwait(&vtimers_cond, &vtimers_lock, &earliest);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        // collect fired timers
+        for (int i = 0; i < MAX_VIRTUAL_TIMERS; i++) {
+            struct virtual_timer *vt = &vtimers[i];
+            if (!vt->vt_active || ts_is_zero(&vt->vt_deadline))
+                continue;
+            if (!ts_le(&vt->vt_deadline, &now))
+                continue;
+
+            // timer fired — update deadline
+            if (!ts_is_zero(&vt->vt_interval.it_interval)) {
+                // repeating: advance deadline past now
+                while (ts_le(&vt->vt_deadline, &now))
+                    vt->vt_deadline = ts_add(&vt->vt_deadline, &vt->vt_interval.it_interval);
+            } else {
+                memset(&vt->vt_deadline, 0, sizeof(vt->vt_deadline));
+            }
+
+            // save delivery info
+            struct task *target = vt->vt_task;
+            int signo = vt->vt_signo;
+            int notify = vt->vt_notify;
+
+            // unlock vtimers, acquire tasks_lock (lock ordering: tasks -> vtimers_lock -> task)
+            pthread_mutex_unlock(&vtimers_lock);
+
+            if (target && notify != SIGEV_NONE) {
+                pthread_mutex_lock(&tasks_lock);
+                // re-validate under both locks
+                pthread_mutex_lock(&vtimers_lock);
+                int still_valid = vt->vt_active && vt->vt_task == target;
+                pthread_mutex_unlock(&vtimers_lock);
+
+                if (still_valid) {
+                    task_lock(target);
+                    task_kill_locked(target, signo);
+                    task_unlock(target);
+                }
+                pthread_mutex_unlock(&tasks_lock);
+            }
+
+            pthread_mutex_lock(&vtimers_lock);
+        }
+    }
+
+    return NULL;
+}
+
+static void vtimer_init(void)
+{
+    memset(vtimers, 0, sizeof(vtimers));
+
+    // init condvar with CLOCK_MONOTONIC so timedwait uses monotonic clock
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    pthread_cond_init(&vtimers_cond, &cattr);
+    pthread_condattr_destroy(&cattr);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t thr;
+    if (0 != CALL_FUNC(pthread_create, &thr, &attr, vtimer_thread, NULL))
+        panic("vtimer_init: pthread_create failed");
+    pthread_attr_destroy(&attr);
+}
+
+/////////////
+// MARK: Allocator
 /////////////
 
 static struct rmem_arena *arena_for_task(struct task *task)
@@ -2538,7 +2727,7 @@ char *kstrdup(const char *s)
 }
 
 /////////////
-// File Streams
+// MARK: File Streams
 /////////////
 
 /**
@@ -2856,7 +3045,7 @@ static struct file *file_for_task_fp(struct task *t, FILE *fp)
 }
 
 /////////////
-// Signals
+// MARK: Signals
 /////////////
 
 /**
@@ -3132,20 +3321,40 @@ static void tvm_sig_drain(void)
     struct thread *thr = current_thread;
     if (thr) {
         while ((pending = __atomic_exchange_n(&thr->thr_pending_sigs, 0, __ATOMIC_ACQ_REL)) != 0) {
+            uint32_t reblock = 0;
             for (int sig = 1; sig < MAX_SIGNALS; sig++) {
-                if (pending & (1u << sig))
-                    signal_dispatch(sig, &thr->thr_pending_siginfo[sig], &thr->thr_pending_ucontext[sig]);
+                if (!(pending & (1u << sig)))
+                    continue;
+                if (sigismember(&current_thread->thr_sigmask, sig)) {
+                    reblock |= (1u << sig);
+                    continue;
+                }
+                signal_dispatch(sig, &thr->thr_pending_siginfo[sig], &thr->thr_pending_ucontext[sig]);
             }
+            if (reblock)
+                __atomic_fetch_or(&thr->thr_pending_sigs, reblock, __ATOMIC_RELEASE);
+            if (reblock && !(pending & ~reblock))
+                break; // only blocked signals remain
         }
     }
 
     // Drain process-directed pending signals
     struct task *t = current;
     while ((pending = __atomic_exchange_n(&t->tsk_pending_sigs, 0, __ATOMIC_ACQ_REL)) != 0) {
+        uint32_t reblock = 0;
         for (int sig = 1; sig < MAX_SIGNALS; sig++) {
-            if (pending & (1u << sig))
-                signal_dispatch(sig, &t->tsk_pending_siginfo[sig], &t->tsk_pending_ucontext[sig]);
+            if (!(pending & (1u << sig)))
+                continue;
+            if (sigismember(&current_thread->thr_sigmask, sig)) {
+                reblock |= (1u << sig);
+                continue;
+            }
+            signal_dispatch(sig, &t->tsk_pending_siginfo[sig], &t->tsk_pending_ucontext[sig]);
         }
+        if (reblock)
+            __atomic_fetch_or(&t->tsk_pending_sigs, reblock, __ATOMIC_RELEASE);
+        if (reblock && !(pending & ~reblock))
+            break; // only blocked signals remain
     }
 
     tvm_sig_draining = 0;
@@ -3209,10 +3418,10 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         panic("crash in signal handler (signum %s)", signum);
     }
 
-    if (tvm_sig_blocked) {
+    if (tvm_sig_blocked || sigismember(&current_thread->thr_sigmask, signum)) {
         // Real hardware fault while in critical section = bug in our implementation
         // si_code > 0 distinguishes kernel-generated (real fault) from user-sent (kill/sigqueue)
-        if (siginfo->si_code > 0 &&
+        if (tvm_sig_blocked && siginfo->si_code > 0 &&
             (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE))
             panic("hardware fault %d (si_code=%d) while signals blocked", signum, siginfo->si_code);
 
@@ -3230,7 +3439,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 }
 
 /////////////
-// PTY/TTY
+// MARK: PTY/TTY
 /////////////
 
 /**
@@ -4597,7 +4806,7 @@ static int tty_slavename_locked(struct tty *tt, char *buf, size_t buflen)
 }
 
 /////////////
-// VFS
+// MARK: VFS
 /////////////
 
 #define VFS_NAME_MAX 256
@@ -5472,7 +5681,7 @@ static int vfs_load_cpio(struct vfs_node *vn, const void *buf, size_t len) {
 }
 
 /////////////
-// Copy-On-Write (COW)
+// MARK: Copy-On-Write (COW)
 /////////////
 
 /**
@@ -5634,7 +5843,7 @@ static void cow_fixup_process(struct cow_fixup_context *dctx)
 }
 
 /////////////
-// Exec
+// MARK: Exec
 /////////////
 
 /**
@@ -5719,7 +5928,7 @@ static const char *find_program_pathname(const char *file)
 }
 
 /////////////
-// Emulator
+// MARK: Emulator
 /////////////
 
 struct emulator_map_entry {
@@ -7072,7 +7281,7 @@ out:
 }
 
 /////////////
-// Hooks API
+// MARK: Hooks API
 /////////////
 
 struct tvm_call {
@@ -7364,7 +7573,7 @@ void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 #define FUNCTION_DEFINE_NORET_VA6(_name, ...) __FUNCTION_DEFINE_NORET_VAx(6, _name, __VA_ARGS__)
 
 /////////////
-// TVM builtins
+// MARK: TVM builtins
 /////////////
 
 #define CCAL_LEFT  0
@@ -7976,7 +8185,7 @@ static int tvm_main(int argc, char **argv)
 }
 
 /////////////
-// API functions
+// MARK: API functions
 /////////////
 
 /**
@@ -8221,7 +8430,9 @@ void tvm_init(const char *init_comm)
     strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
 
     cow_run_init_funcs(); // initialize copy-on-write vars with init statements
-    
+
+    vtimer_init(); // must be before signal handler installation
+
     struct sigaction act = {
         .sa_sigaction = signal_handler,
         .sa_flags = SA_SIGINFO,
@@ -8328,7 +8539,7 @@ static void __panic(const char *msg, const char *file, int line)
 }
 
 /////////////
-// Hooks
+// MARK: Hooks
 /////////////
 
 
@@ -10443,12 +10654,15 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
     current->tsk_threads_cnt++;
 
+    // Inherit the parent's virtual signal mask.
+    current_thread->thr_sigmask = arg->parent_thr->thr_sigmask;
+
     // Unblock OS signals now that current/current_thread are set.
     // The parent blocked all signals before pthread_create so we inherited
     // a fully-blocked signal mask.
     sigset_t empty_sigs;
     sigemptyset(&empty_sigs);
-    pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
 
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
@@ -10771,16 +10985,16 @@ pid_t fork(void) {
     // before those thread-locals are set causes a panic (current == NULL).
     sigset_t all_sigs, old_sigs;
     sigfillset(&all_sigs);
-    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
 
     pthread_t pth;
     if ((r = CALL_FUNC(pthread_create, &pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg))) {
-        pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
         errno = r;
         goto out;
     }
 
-    pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
 
     // failure no longer allowed on parent
 
@@ -10854,6 +11068,7 @@ struct pthread_create_arg
     void *start_arg;
     struct task *tsk;
     struct thread *thr;
+    sigset_t parent_sigmask; // snapshot of creating thread's mask
 };
 
 static void *tvm_thread_entry(struct pthread_create_arg *arg)
@@ -10864,10 +11079,13 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
     current_thread->thr_pthread = pthread_self();
     current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
 
+    // Inherit the creating thread's virtual signal mask.
+    current_thread->thr_sigmask = arg->parent_sigmask;
+
     // Unblock OS signals now that current/current_thread are set.
     sigset_t empty_sigs;
     sigemptyset(&empty_sigs);
-    pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
 
     task_lock(current);
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
@@ -10915,16 +11133,17 @@ FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t 
     arg->thr = thr;
 
     arg->tsk = current;
+    arg->parent_sigmask = current_thread->thr_sigmask;
 
     // Block OS signals so child thread inherits blocked mask and won't
     // receive signals before current/current_thread are set.
     sigset_t all_sigs, old_sigs;
     sigfillset(&all_sigs);
-    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
 
     ret = CALL_FUNC(pthread_create, thread, attr, (start_routine_fn)tvm_thread_entry, (void *)arg);
 
-    pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
 
     if (!ret) {
         arg = NULL;
@@ -11394,6 +11613,218 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
     return (kills_confirmed ? 0 : -1);
 }
 
+static int tvm_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
+    if (oldset)
+        *oldset = current_thread->thr_sigmask;
+
+    if (set) {
+        switch (how) {
+        case SIG_BLOCK:
+            for (int i = 1; i < MAX_SIGNALS; i++)
+                if (sigismember(set, i))
+                    sigaddset(&current_thread->thr_sigmask, i);
+            break;
+        case SIG_UNBLOCK:
+            for (int i = 1; i < MAX_SIGNALS; i++)
+                if (sigismember(set, i))
+                    sigdelset(&current_thread->thr_sigmask, i);
+            break;
+        case SIG_SETMASK:
+            current_thread->thr_sigmask = *set;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+        }
+        // SIGKILL and SIGSTOP can never be blocked
+        sigdelset(&current_thread->thr_sigmask, SIGKILL);
+        sigdelset(&current_thread->thr_sigmask, SIGSTOP);
+
+        // Drain any pending signals that are now unblocked
+        if (how == SIG_UNBLOCK || how == SIG_SETMASK)
+            tvm_sig_drain();
+    }
+
+    return 0;
+}
+
+FUNCTION_DEFINE3(int, sigprocmask, int, how, const sigset_t *, set, sigset_t *, oldset) {
+    return tvm_sigprocmask(how, set, oldset);
+}
+
+FUNCTION_DEFINE3(int, pthread_sigmask, int, how, const sigset_t *, set, sigset_t *, oldset) {
+    return tvm_sigprocmask(how, set, oldset);
+}
+
+FUNCTION_DEFINE1(int, sigpending, sigset_t *, set) {
+    if (!set) {
+        errno = EFAULT;
+        return -1;
+    }
+    sigemptyset(set);
+    uint32_t pending = 0;
+    if (current_thread)
+        pending |= __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
+    pending |= __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE);
+
+    for (int sig = 1; sig < MAX_SIGNALS; sig++) {
+        if ((pending & (1u << sig)) && sigismember(&current_thread->thr_sigmask, sig))
+            sigaddset(set, sig);
+    }
+    return 0;
+}
+
+FUNCTION_DEFINE1(int, sigsuspend, const sigset_t *, mask) {
+    sigset_t old = current_thread->thr_sigmask;
+    current_thread->thr_sigmask = *mask;
+    sigdelset(&current_thread->thr_sigmask, SIGKILL);
+    sigdelset(&current_thread->thr_sigmask, SIGSTOP);
+
+    // Drain any pending signals that are now unblocked by the temporary mask
+    tvm_sig_interrupted = 0;
+    tvm_sig_drain();
+
+    while (!tvm_sig_interrupted) {
+        // Sleep until an OS signal arrives. TVM's signal_handler will fire,
+        // either dispatching (if unblocked) or deferring (if blocked).
+        sigset_t empty;
+        sigemptyset(&empty);
+        CALL_FUNC(sigsuspend, &empty);
+        // Drain again — the handler may have deferred a now-unblocked signal
+        tvm_sig_drain();
+    }
+
+    current_thread->thr_sigmask = old;
+    errno = EINTR;
+    return -1;
+}
+
+FUNCTION_DEFINE0(int, pause) {
+    tvm_sig_interrupted = 0;
+    tvm_sig_drain();
+
+    while (!tvm_sig_interrupted) {
+        sigset_t empty;
+        sigemptyset(&empty);
+        CALL_FUNC(sigsuspend, &empty);
+        tvm_sig_drain();
+    }
+
+    errno = EINTR;
+    return -1;
+}
+
+// Helper: consume one pending signal from the given set.
+// Returns signal number or 0 if none found.
+static int tvm_consume_pending(const sigset_t *set, siginfo_t *info) {
+    // Check thread-directed first
+    if (current_thread) {
+        uint32_t pending = __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
+        for (int sig = 1; sig < MAX_SIGNALS; sig++) {
+            if ((pending & (1u << sig)) && sigismember(set, sig)) {
+                __atomic_fetch_and(&current_thread->thr_pending_sigs, ~(1u << sig), __ATOMIC_ACQ_REL);
+                if (info)
+                    *info = current_thread->thr_pending_siginfo[sig];
+                return sig;
+            }
+        }
+    }
+    // Check task-directed
+    uint32_t pending = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE);
+    for (int sig = 1; sig < MAX_SIGNALS; sig++) {
+        if ((pending & (1u << sig)) && sigismember(set, sig)) {
+            __atomic_fetch_and(&current->tsk_pending_sigs, ~(1u << sig), __ATOMIC_ACQ_REL);
+            if (info)
+                *info = current->tsk_pending_siginfo[sig];
+            return sig;
+        }
+    }
+    return 0;
+}
+
+FUNCTION_DEFINE2(int, sigwait, const sigset_t *, set, int *, sig) {
+    int s;
+    while (!(s = tvm_consume_pending(set, NULL))) {
+        sigset_t empty;
+        sigemptyset(&empty);
+        CALL_FUNC(sigsuspend, &empty);
+    }
+    *sig = s;
+    return 0;
+}
+
+FUNCTION_DEFINE2(int, sigwaitinfo, const sigset_t *, set, siginfo_t *, info) {
+    siginfo_t local_info;
+    int s;
+    while (!(s = tvm_consume_pending(set, &local_info))) {
+        sigset_t empty;
+        sigemptyset(&empty);
+        CALL_FUNC(sigsuspend, &empty);
+    }
+    if (info)
+        *info = local_info;
+    return s;
+}
+
+FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, const struct timespec *, timeout) {
+    siginfo_t local_info;
+    int s;
+
+    // Check immediately
+    if ((s = tvm_consume_pending(set, &local_info))) {
+        if (info)
+            *info = local_info;
+        return s;
+    }
+
+    if (timeout && timeout->tv_sec == 0 && timeout->tv_nsec == 0) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    if (timeout) {
+        deadline.tv_sec += timeout->tv_sec;
+        deadline.tv_nsec += timeout->tv_nsec;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+
+    while (!(s = tvm_consume_pending(set, &local_info))) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (timeout) {
+            if (now.tv_sec > deadline.tv_sec ||
+                (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+                errno = EAGAIN;
+                return -1;
+            }
+        }
+        // Sleep until a signal arrives or remaining time elapses
+        struct timespec remaining;
+        if (timeout) {
+            remaining.tv_sec = deadline.tv_sec - now.tv_sec;
+            remaining.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+            if (remaining.tv_nsec < 0) {
+                remaining.tv_sec--;
+                remaining.tv_nsec += 1000000000L;
+            }
+        } else {
+            remaining.tv_sec = 3600;
+            remaining.tv_nsec = 0;
+        }
+        sigset_t empty;
+        sigemptyset(&empty);
+        ppoll(NULL, 0, &remaining, &empty);
+    }
+    if (info)
+        *info = local_info;
+    return s;
+}
+
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
     char **env = NULL;
     if (*current->tsk_relocs.__environ)
@@ -11531,6 +11962,10 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         return -1;
     }
 
+    // Skip file inspection for registered programs (they don't exist on disk).
+    if (find_program(pathname))
+        goto do_exec;
+
     // Open the file and inspect magic bytes before entering the signal-critical section.
     // If it's a #! script, rewrite pathname/argv to point at the interpreter.
     char hdr[256];
@@ -11601,6 +12036,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         argc = i;
     }
 
+do_exec:
     // Deep-copy argv and envp onto the stack — the originals may point into the
     // caller's emulator stack or shebang_buf which we're about to destroy.
     int envc = 0;
@@ -11747,7 +12183,10 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         if (0 != sigaction(i, &act, NULL))
             panic("sigaction(%d)", i);
     }
-    
+
+    // POSIX: execve clears the signal mask
+    sigemptyset(&current_thread->thr_sigmask);
+
     // TODO if 0, 1, 2 are closed we can be nice and open /dev/full, /dev/null and /dev/null for the program
 
     // TODO purge rmem heap + mmaps
@@ -12712,10 +13151,242 @@ FUNCTION_DEFINE3(int, tputs, const char *, str, int, affcnt, tputs_putc_t, putc_
     return ret;
 }
 
+FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp, timer_t *, timerid) {
+    tvm_sig_enter();
+    pthread_mutex_lock(&vtimers_lock);
+    task_lock(current);
+
+    int notify = sevp ? sevp->sigev_notify : SIGEV_SIGNAL;
+    int signo = SIGALRM;
+    union sigval user_val = {0};
+
+    if (sevp) {
+        if (notify == SIGEV_SIGNAL || notify == SIGEV_THREAD_ID)
+            signo = sevp->sigev_signo;
+        user_val = sevp->sigev_value;
+    }
+
+    // treat SIGEV_THREAD as SIGEV_SIGNAL (delivers signal to TVM task)
+    if (notify == SIGEV_THREAD)
+        notify = SIGEV_SIGNAL;
+
+    // find free task slot
+    int task_slot = -1;
+    for (int i = 0; i < MAX_TIMERS_PER_TASK; i++) {
+        if (current->tsk_timers[i] < 0) {
+            task_slot = i;
+            break;
+        }
+    }
+    if (task_slot < 0) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        tvm_sig_leave();
+        errno = EAGAIN;
+        return -1;
+    }
+
+    // find free global slot
+    int global_idx = -1;
+    for (int i = 0; i < MAX_VIRTUAL_TIMERS; i++) {
+        if (!vtimers[i].vt_active) {
+            global_idx = i;
+            break;
+        }
+    }
+    if (global_idx < 0) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        tvm_sig_leave();
+        errno = EAGAIN;
+        return -1;
+    }
+
+    struct virtual_timer *vt = &vtimers[global_idx];
+    memset(vt, 0, sizeof(*vt));
+
+    vt->vt_active = 1;
+    vt->vt_task = current;
+    vt->vt_clockid = clockid;
+    vt->vt_signo = signo;
+    vt->vt_sigval = user_val;
+    vt->vt_notify = notify;
+    vt->vt_task_slot = task_slot;
+    // vt_deadline left at zero (not armed until timer_settime)
+
+    current->tsk_timers[task_slot] = global_idx;
+    pthread_cond_signal(&vtimers_cond);
+
+    task_unlock(current);
+    pthread_mutex_unlock(&vtimers_lock);
+    tvm_sig_leave();
+
+    // return task slot index as the timer_t
+    *timerid = (timer_t)(intptr_t)task_slot;
+    return 0;
+}
+
+FUNCTION_DEFINE4(int, timer_settime, timer_t, tmr, int, flags,
+                 const struct itimerspec *, new_value,
+                 struct itimerspec *, old_value) {
+    tvm_sig_enter();
+    pthread_mutex_lock(&vtimers_lock);
+    task_lock(current);
+
+    int slot = (int)(intptr_t)tmr;
+    if (slot < 0 || slot >= MAX_TIMERS_PER_TASK || current->tsk_timers[slot] < 0) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        tvm_sig_leave();
+        errno = EINVAL;
+        return -1;
+    }
+
+    int global_idx = current->tsk_timers[slot];
+    struct virtual_timer *vt = &vtimers[global_idx];
+    if (!vt->vt_active || vt->vt_task != current) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        tvm_sig_leave();
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    // return old value if requested
+    if (old_value) {
+        if (ts_is_zero(&vt->vt_deadline)) {
+            memset(old_value, 0, sizeof(*old_value));
+        } else {
+            // remaining = deadline - now (clamp to 0 if past)
+            if (ts_le(&vt->vt_deadline, &now)) {
+                old_value->it_value.tv_sec = 0;
+                old_value->it_value.tv_nsec = 0;
+            } else {
+                old_value->it_value.tv_sec = vt->vt_deadline.tv_sec - now.tv_sec;
+                old_value->it_value.tv_nsec = vt->vt_deadline.tv_nsec - now.tv_nsec;
+                if (old_value->it_value.tv_nsec < 0) {
+                    old_value->it_value.tv_sec--;
+                    old_value->it_value.tv_nsec += 1000000000L;
+                }
+            }
+            old_value->it_interval = vt->vt_interval.it_interval;
+        }
+    }
+
+    // set new value
+    if (new_value->it_value.tv_sec == 0 && new_value->it_value.tv_nsec == 0) {
+        // disarm
+        memset(&vt->vt_deadline, 0, sizeof(vt->vt_deadline));
+        memset(&vt->vt_interval, 0, sizeof(vt->vt_interval));
+    } else {
+        if (flags & TIMER_ABSTIME) {
+            // absolute time — convert to monotonic if needed
+            vt->vt_deadline = new_value->it_value;
+        } else {
+            // relative time — add to now
+            vt->vt_deadline = ts_add(&now, &new_value->it_value);
+        }
+        vt->vt_interval.it_interval = new_value->it_interval;
+    }
+
+    pthread_cond_signal(&vtimers_cond);
+
+    task_unlock(current);
+    pthread_mutex_unlock(&vtimers_lock);
+    tvm_sig_leave();
+
+    return 0;
+}
+
+FUNCTION_DEFINE2(int, timer_gettime, timer_t, tmr, struct itimerspec *, curr_value) {
+    tvm_sig_enter();
+    pthread_mutex_lock(&vtimers_lock);
+    task_lock(current);
+
+    int slot = (int)(intptr_t)tmr;
+    if (slot < 0 || slot >= MAX_TIMERS_PER_TASK || current->tsk_timers[slot] < 0) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        tvm_sig_leave();
+        errno = EINVAL;
+        return -1;
+    }
+
+    int global_idx = current->tsk_timers[slot];
+    struct virtual_timer *vt = &vtimers[global_idx];
+    if (!vt->vt_active || vt->vt_task != current) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        tvm_sig_leave();
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (ts_is_zero(&vt->vt_deadline)) {
+        memset(curr_value, 0, sizeof(*curr_value));
+    } else {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (ts_le(&vt->vt_deadline, &now)) {
+            curr_value->it_value.tv_sec = 0;
+            curr_value->it_value.tv_nsec = 0;
+        } else {
+            curr_value->it_value.tv_sec = vt->vt_deadline.tv_sec - now.tv_sec;
+            curr_value->it_value.tv_nsec = vt->vt_deadline.tv_nsec - now.tv_nsec;
+            if (curr_value->it_value.tv_nsec < 0) {
+                curr_value->it_value.tv_sec--;
+                curr_value->it_value.tv_nsec += 1000000000L;
+            }
+        }
+        curr_value->it_interval = vt->vt_interval.it_interval;
+    }
+
+    task_unlock(current);
+    pthread_mutex_unlock(&vtimers_lock);
+    tvm_sig_leave();
+
+    return 0;
+}
+
+FUNCTION_DEFINE1(int, timer_delete, timer_t, tmr) {
+
+    tvm_sig_enter();
+    pthread_mutex_lock(&vtimers_lock);
+    task_lock(current);
+
+    int slot = (int)(intptr_t)tmr;
+    if (slot < 0 || slot >= MAX_TIMERS_PER_TASK || current->tsk_timers[slot] < 0) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        tvm_sig_leave();
+        errno = EINVAL;
+        return -1;
+    }
+
+    int global_idx = current->tsk_timers[slot];
+    current->tsk_timers[slot] = -1;
+    vtimer_destroy_locked(global_idx);
+
+    task_unlock(current);
+    pthread_mutex_unlock(&vtimers_lock);
+
+    tvm_sig_leave();
+
+    return 0;
+}
+
+FUNCTION_DEFINE1(int, timer_getoverrun, timer_t, tmr) {
+    (void)tmr;
+    return 0; // we don't track overruns
+}
+
 #if defined(__linux__)
 
 /////////////
-// Linux-specific hooks
+// MARK: Linux-specific hooks
 /////////////
 
 FUNCTION_DEFINE3(int, mknod, const char *, pathname, mode_t, mode, dev_t, dev) {
@@ -12822,18 +13493,6 @@ FUNCTION_DEFINE2(int, timerfd_create, int, clockid, int, flags) {
     return f;
 }
 
-FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp, timer_t *, timerid) {
-#ifndef ENABLE_RWX
-    // SIGEV_THREAD creates a real OS thread that calls a function pointer
-    // in the emulated binary — can't work in emulator mode.
-    if (sevp && sevp->sigev_notify == SIGEV_THREAD) {
-        errno = ENOSYS;
-        return -1;
-    }
-#endif
-    return CALL_FUNC(timer_create, clockid, sevp, timerid);
-}
-
 FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
     int r[2], f[2];
 
@@ -12916,6 +13575,10 @@ FUNCTION_DEFINE0(char *, get_current_dir_name) {
 }
 
 #elif defined(__APPLE__)
+
+/////////////
+// MARK: Apple-specific hooks
+/////////////
 
 static __thread CFDictionaryApplierFunction CFDictionaryApplyFunction_function = NULL;
 
