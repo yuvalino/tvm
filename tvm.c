@@ -579,6 +579,8 @@ void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1,
 static inline void tvm_sig_enter(void);
 static inline void tvm_sig_leave(void);
 
+typedef void *(*start_routine_fn)(void *);
+
 static pthread_mutex_t vtimers_lock = PTHREAD_MUTEX_INITIALIZER;
 static void vtimer_destroy_locked(int global_idx);
 
@@ -2551,6 +2553,8 @@ struct virtual_timer {
     int vt_clockid;                // CLOCK_MONOTONIC or CLOCK_REALTIME
     struct timespec vt_deadline;   // absolute next-fire time (CLOCK_MONOTONIC)
     struct itimerspec vt_interval; // original interval (for repeating)
+    start_routine_fn vt_thread_func;           // SIGEV_THREAD: pre-wrapped start routine
+    void (*vt_notify_function)(union sigval);  // original sigev_notify_function
 };
 
 static struct virtual_timer vtimers[MAX_VIRTUAL_TIMERS];
@@ -2589,6 +2593,16 @@ static inline struct timespec ts_add(const struct timespec *a, const struct time
     }
     return r;
 }
+
+static int task_create_thread_locked(struct task *tsk, start_routine_fn start_fn, void *arg,
+                              pthread_t *out_thread, const pthread_attr_t *attr,
+                              const sigset_t *sigmask);
+
+// SIGEV_THREAD arg: allocated from tsk_ar by vtimer manager, freed inside thread.
+struct vtimer_thread_arg {
+    void (*func)(union sigval);
+    union sigval val;
+};
 
 static void *vtimer_thread(void *arg)
 {
@@ -2646,13 +2660,45 @@ static void *vtimer_thread(void *arg)
             struct task *target = vt->vt_task;
             int signo = vt->vt_signo;
             int notify = vt->vt_notify;
+            start_routine_fn thread_func = vt->vt_thread_func;
+            void (*notify_function)(union sigval) = vt->vt_notify_function;
+            union sigval sigval = vt->vt_sigval;
 
             // unlock vtimers, acquire tasks_lock (lock ordering: tasks -> vtimers_lock -> task)
             pthread_mutex_unlock(&vtimers_lock);
 
-            if (target && notify != SIGEV_NONE) {
+            if (target && notify == SIGEV_THREAD && thread_func) {
+                // SIGEV_THREAD: spawn callback thread
                 pthread_mutex_lock(&tasks_lock);
-                // re-validate under both locks
+                pthread_mutex_lock(&vtimers_lock);
+                int still_valid = vt->vt_active && vt->vt_task == target;
+                pthread_mutex_unlock(&vtimers_lock);
+
+                if (still_valid) {
+                    // allocate arg from task's arena (freed by wrapper via kfree)
+                    struct vtimer_thread_arg *a = rmem_arena_alloc(target->tsk_ar, sizeof(*a));
+                    VERIFY(a);
+
+                    task_lock(target);
+
+                    a->func = notify_function;
+                    a->val = sigval;
+
+                    pthread_t thr;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+                    VERIFY(0 == task_create_thread_locked(target, thread_func, a, &thr, &attr, NULL));
+
+                    pthread_attr_destroy(&attr);
+
+                    task_unlock(target);
+                }
+                pthread_mutex_unlock(&tasks_lock);
+            } else if (target && notify != SIGEV_NONE) {
+                // SIGEV_SIGNAL: deliver signal
+                pthread_mutex_lock(&tasks_lock);
                 pthread_mutex_lock(&vtimers_lock);
                 int still_valid = vt->vt_active && vt->vt_task == target;
                 pthread_mutex_unlock(&vtimers_lock);
@@ -10878,10 +10924,8 @@ fail:
 // so do not use wrapper
 //FUNCTION_DEFINE0(pid_t, fork) {
 pid_t fork(void) {
-    if (!can_enter_tvm(__builtin_return_address(0))) {
-        INFO("fork() BYPASSING TVM: lr=%p", __builtin_return_address(0));
+    if (!can_enter_tvm(__builtin_return_address(0)))
         return CALL_FUNC(fork);
-    }
     
     struct task *tsk = NULL;
     struct thread *thr = NULL;
@@ -11061,18 +11105,23 @@ pid_t vfork(void) {
     return fork();
 }
 
-typedef void *(*start_routine_fn)(void *);
 struct pthread_create_arg
 {
     start_routine_fn start_fn;
     void *start_arg;
     struct task *tsk;
     struct thread *thr;
-    sigset_t parent_sigmask; // snapshot of creating thread's mask
+    sigset_t sigmask; // snapshot of creating thread's mask
+
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+    int done; // -1 means not done, 0 - success, >0 error
 };
 
 static void *tvm_thread_entry(struct pthread_create_arg *arg)
 {
+    pthread_mutex_lock(&arg->mtx);
+
     current = arg->tsk;
     current_thread = arg->thr;
 
@@ -11080,96 +11129,122 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
     current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
 
     // Inherit the creating thread's virtual signal mask.
-    current_thread->thr_sigmask = arg->parent_sigmask;
+    current_thread->thr_sigmask = arg->sigmask;
 
-    // Unblock OS signals now that current/current_thread are set.
+    // current is locked by the creating thread
+    list_add_tail(&current_thread->thr_list, &current->tsk_threads);
+    current->tsk_threads_cnt++;
+
+    start_routine_fn start_fn = arg->start_fn;
+    void *start_arg = arg->start_arg;
+
+    arg->done = 0;
+    pthread_cond_broadcast(&arg->cond);
+    pthread_mutex_unlock(&arg->mtx);
+
+    // unblock OS signals now that we're safe with locks
     sigset_t empty_sigs;
     sigemptyset(&empty_sigs);
     CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
 
-    task_lock(current);
-    list_add_tail(&current_thread->thr_list, &current->tsk_threads);
-    current->tsk_threads_cnt++;
-    task_unlock(current);
-
-    start_routine_fn start_fn = arg->start_fn;
-    void *start_arg = arg->start_arg;
-    kfree(arg);
-
     pthread_exit(start_fn(start_arg));
 }
 
-FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t *, attr, start_routine_fn, start_routine, void *, _arg) {
-    tvm_sig_enter();
+// Create a thread within a locked task.  The new thread gets the full TVM lifecycle
+// (thread list, signal mask, refcount, emulator context, pthread_exit teardown).
+//
+// If parent_attr is non-NULL it is copied to the thread's pthread_attr.
+// If parent_sigmask is non-NULL the thread inherits it; otherwise starts empty.
+static int task_create_thread_locked(struct task *tsk, start_routine_fn start_fn, void *arg,
+                              pthread_t *out_thread, const pthread_attr_t *attr,
+                              const sigset_t *sigmask)
+{
+    int ret = ENOMEM;
+    tsk->tsk_refcount++;
 
-    int ret = EINVAL;
-    struct pthread_create_arg *arg = NULL;
-    struct thread *thr = NULL;
-
-    task_lock(current);
-    current->tsk_refcount++;
-    task_unlock(current);
-
-    thr = threadalloc(current);
-    if (!thr) {
-        ret = ENOMEM;
-        goto out;
-    }
+    struct thread *thr = threadalloc(tsk);
+    if (!thr)
+        goto fail_refcount;
 
     if (attr) {
-        if (0 != (ret = copy_pthread_attr(attr, &thr->thr_pthread_attr)))
-            goto out;
-        ret = EINVAL;
+        ret = copy_pthread_attr(attr, &thr->thr_pthread_attr);
+        if (ret)
+            goto fail_thr;
     }
 
-    arg = kalloc(sizeof(struct pthread_create_arg));
-    if (!arg) {
-        ret = ENOMEM;
-        goto out;
+    struct pthread_create_arg *a = kalloc(sizeof(*a));
+    if (!a)
+        goto fail_thr;
+
+    a->start_fn = start_fn;
+    a->start_arg = arg;
+    a->tsk = tsk;
+    a->thr = thr;
+    if (sigmask)
+        a->sigmask = *sigmask;
+    else
+        memset(&a->sigmask, 0, sizeof(a->sigmask));
+
+    if ((ret = pthread_mutex_init(&a->mtx, NULL))) {
+        errno = ret;
+        goto fail_arg;
     }
 
-    arg->start_fn = start_routine;
-    arg->start_arg = _arg;
-    arg->thr = thr;
-
-    arg->tsk = current;
-    arg->parent_sigmask = current_thread->thr_sigmask;
-
-    // Block OS signals so child thread inherits blocked mask and won't
-    // receive signals before current/current_thread are set.
-    sigset_t all_sigs, old_sigs;
-    sigfillset(&all_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
-
-    ret = CALL_FUNC(pthread_create, thread, attr, (start_routine_fn)tvm_thread_entry, (void *)arg);
-
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
-
-    if (!ret) {
-        arg = NULL;
-        thr = NULL;
+    if ((ret = pthread_cond_init(&a->cond, NULL))) {
+        errno = ret;
+        goto fail_arg;
     }
 
-    // TODO condition variable wait for child to succeed
+    a->done = -1;
 
-out:
+    // NOTE: for the entire duration of pthread_create, current is locked by the creating thread!
+    // the new thread signals the creating thread when it finished initializing.
+
+    pthread_mutex_lock(&a->mtx);
+
+    sigset_t all, old;
+    sigfillset(&all);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &old);
+
+    ret = CALL_FUNC(pthread_create, out_thread, attr, (start_routine_fn)tvm_thread_entry, a);
+
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old, NULL);
+
     if (ret) {
-
-        if (arg) {
-            kfree(arg);
-            arg = NULL;
-        }
-
-        if (thr) {
-            threaddealloc(thr);
-            thr = NULL;
-        }
-
-        task_lock(current);
-        current->tsk_refcount--;
-        task_unlock(current);
+        pthread_mutex_unlock(&a->mtx);
+        goto fail_arg;
     }
 
+    while (a->done == -1)
+        pthread_cond_wait(&a->cond, &a->mtx);
+
+    // currently, the child always succeeds!!
+    VERIFY(a->done == 0);
+    ret = a->done;
+
+    pthread_mutex_unlock(&a->mtx);
+
+    pthread_cond_destroy(&a->cond);
+    pthread_mutex_destroy(&a->mtx);
+    kfree(a);
+
+    return 0;
+fail_arg:
+    pthread_cond_destroy(&a->cond);
+    pthread_mutex_destroy(&a->mtx);
+    kfree(a);
+fail_thr:
+    threaddealloc(thr);
+fail_refcount:
+    tsk->tsk_refcount--;
+    return ret;
+}
+
+FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t *, attr, start_routine_fn, start_routine, void *, arg) {
+    tvm_sig_enter();
+    task_lock(current);
+    int ret = task_create_thread_locked(current, start_routine, arg, thread, attr, &current_thread->thr_sigmask);
+    task_unlock(current);
     tvm_sig_leave();
     return ret;
 }
@@ -13151,6 +13226,31 @@ FUNCTION_DEFINE3(int, tputs, const char *, str, int, affcnt, tputs_putc_t, putc_
     return ret;
 }
 
+// SIGEV_THREAD entry points: selected at timer_create time based on whether
+// the callback is a host function or an emulated binary function.
+static void *vtimer_thread_entry(void *_arg)
+{
+    struct vtimer_thread_arg *a = _arg;
+    void (*func)(union sigval) = a->func;
+    union sigval val = a->val;
+    free(a); // current is set → intercepted free → tsk_ar
+    func(val);
+    return NULL;
+}
+
+#ifndef ENABLE_RWX
+static void *vtimer_thread_entry_emu(void *_arg)
+{
+    struct vtimer_thread_arg *a = _arg;
+    uint64_t pc = (uint64_t)(uintptr_t)a->func;
+    uint64_t sigval_bits = 0;
+    memcpy(&sigval_bits, &a->val, sizeof(a->val));
+    free(a); // current is set → intercepted free → tsk_ar
+    emulator_call(NULL, pc, sigval_bits, 0, 0, 0, 0, 0);
+    return NULL;
+}
+#endif
+
 FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp, timer_t *, timerid) {
     tvm_sig_enter();
     pthread_mutex_lock(&vtimers_lock);
@@ -13159,16 +13259,29 @@ FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp,
     int notify = sevp ? sevp->sigev_notify : SIGEV_SIGNAL;
     int signo = SIGALRM;
     union sigval user_val = {0};
+    start_routine_fn thread_func = NULL;
 
     if (sevp) {
         if (notify == SIGEV_SIGNAL || notify == SIGEV_THREAD_ID)
             signo = sevp->sigev_signo;
         user_val = sevp->sigev_value;
+        if (notify == SIGEV_THREAD && sevp->sigev_notify_function) {
+            // Wrap the callback at creation time so the vtimer manager
+            // can spawn threads without knowing about emulator dispatch.
+#ifdef ENABLE_RWX
+            thread_func = vtimer_thread_entry;
+#else
+            {
+                struct emulator_context *ec = current_thread->thr_emulator;
+                struct ulinker_dladdr_info dlinfo;
+                if (ec && 0 == emulator_find_dl(ec, (uint64_t)(uintptr_t)sevp->sigev_notify_function, &dlinfo))
+                    thread_func = vtimer_thread_entry_emu;
+                else
+                    thread_func = vtimer_thread_entry;
+            }
+#endif
+        }
     }
-
-    // treat SIGEV_THREAD as SIGEV_SIGNAL (delivers signal to TVM task)
-    if (notify == SIGEV_THREAD)
-        notify = SIGEV_SIGNAL;
 
     // find free task slot
     int task_slot = -1;
@@ -13212,6 +13325,8 @@ FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp,
     vt->vt_sigval = user_val;
     vt->vt_notify = notify;
     vt->vt_task_slot = task_slot;
+    vt->vt_thread_func = thread_func;
+    vt->vt_notify_function = (notify == SIGEV_THREAD && sevp) ? sevp->sigev_notify_function : NULL;
     // vt_deadline left at zero (not armed until timer_settime)
 
     current->tsk_timers[task_slot] = global_idx;
