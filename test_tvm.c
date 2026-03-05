@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -1140,10 +1141,6 @@ static void sig_multi_handler(int sig) {
     sig_multi_count++;
     char c = '!';
     write(sig_multi_pipe, &c, 1);
-}
-
-TEST(tmp) {
-    sleep(10);
 }
 
 TEST(SignalMultiDeliver) {
@@ -2893,6 +2890,17 @@ TEST(ThreadPidShared) {
 static COW_IMPL_INIT(volatile int, vtimer_sig_count, 0);
 static void vtimer_handler(int sig) { vtimer_sig_count++; }
 
+// shared state for SIGEV_THREAD callback tests (heap-allocated, not TLS)
+struct vtimer_thread_state {
+    volatile int called;
+    volatile int magic;
+};
+static void vtimer_thread_func(union sigval sv) {
+    struct vtimer_thread_state *st = sv.sival_ptr;
+    st->magic = 0x42;
+    __atomic_fetch_add(&st->called, 1, __ATOMIC_SEQ_CST);
+}
+
 TEST(TimerCreateDelete) {
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
@@ -3359,6 +3367,89 @@ TEST(TimerCustomSignal) {
 
         if (vtimer_sig_count < 1) _exit(3);
         timer_delete(tid);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(TimerSIGEV_THREAD_Callback) {
+    // SIGEV_THREAD should call sigev_notify_function, not deliver a signal
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        vtimer_sig_count = 0;
+        struct vtimer_thread_state *st = mmap(NULL, sizeof(*st),
+            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        st->called = 0;
+        st->magic = 0;
+
+        // install SIGALRM handler to detect if signal is delivered instead
+        struct sigaction sa = { .sa_handler = vtimer_handler };
+        sigaction(SIGALRM, &sa, NULL);
+
+        timer_t tid;
+        struct sigevent sev = {
+            .sigev_notify = SIGEV_THREAD,
+            .sigev_notify_function = vtimer_thread_func,
+            .sigev_value.sival_ptr = st,
+        };
+        if (timer_create(CLOCK_MONOTONIC, &sev, &tid) != 0) _exit(1);
+
+        struct itimerspec its = {
+            .it_value = { .tv_sec = 0, .tv_nsec = 10000000 }, // 10ms
+        };
+        if (timer_settime(tid, 0, &its, NULL) != 0) _exit(2);
+
+        // wait for callback
+        for (int i = 0; i < 50 && !st->called; i++)
+            usleep(10000);
+
+        if (!st->called) _exit(3);          // callback was not invoked
+        if (st->magic != 0x42) _exit(4);    // wrong sigval
+        timer_delete(tid);
+        munmap(st, sizeof(*st));
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(TimerSIGEV_THREAD_Repeating) {
+    // SIGEV_THREAD with repeating interval should call function multiple times
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct vtimer_thread_state *st = mmap(NULL, sizeof(*st),
+            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        st->called = 0;
+        st->magic = 0;
+
+        timer_t tid;
+        struct sigevent sev = {
+            .sigev_notify = SIGEV_THREAD,
+            .sigev_notify_function = vtimer_thread_func,
+            .sigev_value.sival_ptr = st,
+        };
+        if (timer_create(CLOCK_MONOTONIC, &sev, &tid) != 0) _exit(1);
+
+        struct itimerspec its = {
+            .it_value    = { .tv_sec = 0, .tv_nsec = 20000000 }, // 20ms initial
+            .it_interval = { .tv_sec = 0, .tv_nsec = 20000000 }, // 20ms repeat
+        };
+        if (timer_settime(tid, 0, &its, NULL) != 0) _exit(2);
+
+        // wait long enough for multiple callbacks
+        for (int i = 0; i < 50 && st->called < 2; i++)
+            usleep(20000);
+
+        if (st->called < 2) _exit(3);
+        timer_delete(tid);
+        munmap(st, sizeof(*st));
         _exit(0);
     }
     int s;
