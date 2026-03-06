@@ -444,6 +444,7 @@ DECL_FUNC(execlp);
 DECL_FUNC(execle);
 DECL_FUNC(execv);
 DECL_FUNC(execvp);
+DECL_FUNC(system);
 
 DECL_FUNC(openpty);
 
@@ -8194,6 +8195,31 @@ int tvm_info(int argc, char **argv) {
     printf("rwx        %d\n", rwx);
 }
 
+static int tvm_shell(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "USAGE: tvm shell COMMAND [ARGS..]\n");
+        return 1;
+    }
+
+    // join all args into a single command string
+    size_t len = 0;
+    for (int i = 1; i < argc; i++)
+        len += strlen(argv[i]) + 1; // +1 for space or NUL
+
+    char *cmd = alloca(len);
+    char *p = cmd;
+    for (int i = 1; i < argc; i++) {
+        size_t n = strlen(argv[i]);
+        memcpy(p, argv[i], n);
+        p += n;
+        *p++ = (i < argc - 1) ? ' ' : '\0';
+    }
+
+    int r = system(cmd);
+    return WIFEXITED(r) ? WEXITSTATUS(r) : 128 + WTERMSIG(r);
+}
+
 static int tvm_main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -8212,6 +8238,7 @@ static int tvm_main(int argc, char **argv)
         printf("  sorunner       run shared object\n");
         printf("  cpio           CPIO archive reader\n");
         printf("  mount          VFS mount\n");
+        printf("  shell          execute command via system()\n");
         printf("\n");
         return 0;
     }
@@ -8224,7 +8251,8 @@ static int tvm_main(int argc, char **argv)
     if (0 == strcmp(argv[1], "cpio")) return tvm_cpio(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "mount")) return tvm_mount(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "info")) return tvm_info(argc - 1, argv + 1);
-    
+    if (0 == strcmp(argv[1], "shell")) return tvm_shell(argc - 1, argv + 1);
+
     fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
     fprintf(stderr, "Try 'tvm -h' for more information.\n");
     return 1;
@@ -12409,6 +12437,58 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
     }
 
     return execve(file, argv, *current->tsk_relocs.__environ);
+}
+
+FUNCTION_DEFINE1(int, system, const char *, command) {
+    if (!command)
+        return 1; // shell is available
+
+    const char *sh = CALL_FUNC(getenv, "TVM_SHELL");
+    if (!sh || !*sh)
+        sh = "/bin/sh";
+
+    // POSIX: ignore SIGINT/SIGQUIT, block SIGCHLD during system()
+    struct sigaction ign = { .sa_handler = SIG_IGN };
+    struct sigaction old_int, old_quit;
+    sigaction(SIGINT, &ign, &old_int);
+    sigaction(SIGQUIT, &ign, &old_quit);
+
+    sigset_t chld, old_mask;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &chld, &old_mask);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        sigaction(SIGINT, &old_int, NULL);
+        sigaction(SIGQUIT, &old_quit, NULL);
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        return -1;
+    }
+
+    if (pid == 0) {
+        // child: restore signals before exec
+        sigaction(SIGINT, &old_int, NULL);
+        sigaction(SIGQUIT, &old_quit, NULL);
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        execl(sh, "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+
+    // parent: wait for child
+    int status;
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+            status = -1;
+            break;
+        }
+    }
+
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGQUIT, &old_quit, NULL);
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+    return status;
 }
 
 #if defined(__linux__)
