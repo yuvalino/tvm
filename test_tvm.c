@@ -933,6 +933,164 @@ TEST(ExecArgs) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+// Mock shell for system() tests: handles "sh -c <command>"
+static int mock_sh(int argc, char **argv)
+{
+    // Validate: sh -c <command>
+    if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+        const char *cmd = argv[2];
+        if (strcmp(cmd, "exit 0") == 0) return 0;
+        if (strcmp(cmd, "exit 42") == 0) return 42;
+        if (strcmp(cmd, "true") == 0) return 0;
+        if (strcmp(cmd, "false") == 0) return 1;
+        // echo test: just succeed
+        if (strncmp(cmd, "echo ", 5) == 0) return 0;
+        // unknown command
+        return 127;
+    }
+    return 1;
+}
+
+static void register_mock_sh(void)
+{
+    tvm_register_program("/bin/sh", (main_func_t)mock_sh);
+}
+
+TEST(SystemNull) {
+    // system(NULL) returns non-zero when shell is available
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int r = system(NULL);
+        _exit(r != 0 ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SystemExitZero) {
+    register_mock_sh();
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int r = system("exit 0");
+        // system() returns waitpid status; extract exit code
+        _exit(WIFEXITED(r) && WEXITSTATUS(r) == 0 ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SystemExitNonZero) {
+    register_mock_sh();
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int r = system("exit 42");
+        _exit(WIFEXITED(r) && WEXITSTATUS(r) == 42 ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SystemTrue) {
+    register_mock_sh();
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int r = system("true");
+        _exit(WIFEXITED(r) && WEXITSTATUS(r) == 0 ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SystemFalse) {
+    register_mock_sh();
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int r = system("false");
+        _exit(WIFEXITED(r) && WEXITSTATUS(r) == 1 ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SystemMultiple) {
+    // Multiple system() calls in sequence
+    register_mock_sh();
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int r1 = system("exit 0");
+        int r2 = system("exit 42");
+        int r3 = system("true");
+        if (!WIFEXITED(r1) || WEXITSTATUS(r1) != 0) _exit(1);
+        if (!WIFEXITED(r2) || WEXITSTATUS(r2) != 42) _exit(2);
+        if (!WIFEXITED(r3) || WEXITSTATUS(r3) != 0) _exit(3);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SystemSigmaskPreserved) {
+    // system() must restore the original signal mask
+    register_mock_sh();
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t before, after;
+        sigemptyset(&before);
+        sigaddset(&before, SIGUSR1);
+        sigprocmask(SIG_SETMASK, &before, NULL);
+
+        system("true");
+
+        sigprocmask(SIG_SETMASK, NULL, &after);
+        // SIGUSR1 should still be blocked
+        _exit(sigismember(&after, SIGUSR1) ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SystemSignalHandlersPreserved) {
+    // system() must restore SIGINT/SIGQUIT handlers
+    register_mock_sh();
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct sigaction sa = { .sa_handler = SIG_DFL };
+        sigaction(SIGINT, &sa, NULL);
+
+        system("true");
+
+        struct sigaction cur;
+        sigaction(SIGINT, NULL, &cur);
+        _exit(cur.sa_handler == SIG_DFL ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
 char *ptsname(int fd);
 
 TEST(TTYBasic) {
