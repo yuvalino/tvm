@@ -20,13 +20,14 @@ static void (*print_cb)(char *, int) = NULL;
     else { write(1, _msg, _len); } \
 } while (0)
 
-static __thread char msgbuf[4096] = {0};
 #define PRINT(MSG, ...) do { \
-    int __len = snprintf(msgbuf, sizeof(msgbuf), "%s:%d %s: " MSG "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
-    PRINT0(msgbuf, __len); \
+    char __msgbuf[4096]; \
+    int __len = snprintf(__msgbuf, sizeof(__msgbuf), "%s:%d %s: " MSG "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
+    PRINT0(__msgbuf, __len); \
 } while (0)
 
-static __thread char errormsg[4096] = {0};
+// not thread-safe (same as POSIX dlerror)
+static char errormsg[4096] = {0};
 #define ERROR(_msg, ...) do { snprintf(errormsg, sizeof(errormsg), (_msg), ##__VA_ARGS__); PRINT("%s", errormsg); } while (0)
 
 static void (*event_cb)(int, void *);
@@ -2067,6 +2068,10 @@ struct dlinfo_elf64 {
     size_t      dle64_rela_size;
     size_t      dle64_rela_ent;
 
+    void       *dle64_init_array;
+    size_t      dle64_init_array_size;
+    void       *dle64_init_func;
+
     void       *dle64_shsymtab_map;
     size_t      dle64_shsymtab_map_size;
     Elf64_Sym  *dle64_shsymtab;
@@ -3068,6 +3073,18 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
             case DT_RELAENT:
                 dl->dle64_rela_ent = d->d_un.d_val;
                 break;
+
+            case DT_INIT:
+                dl->dle64_init_func = (void *)(dl->dle64_load_bias + d->d_un.d_ptr);
+                break;
+
+            case DT_INIT_ARRAY:
+                dl->dle64_init_array = (void *)(dl->dle64_load_bias + d->d_un.d_ptr);
+                break;
+
+            case DT_INIT_ARRAYSZ:
+                dl->dle64_init_array_size = d->d_un.d_val;
+                break;
         }
     }
 
@@ -3773,7 +3790,7 @@ static struct dlinfo *load_library_internal(struct ulinker *ulinker, const char 
 
     dl->dl_next = ulinker->ul_dlinfo;
     ulinker->ul_dlinfo = dl;
-    
+
     dl->dl_linker = ulinker;
     dl->dl_refcnt++;
     
@@ -3829,6 +3846,21 @@ static void call_macho64_constructors(struct dlinfo_macho64 *dl) {
     }
 }
 
+static void call_elf64_constructors(struct dlinfo_elf64 *dl)
+{
+    if (dl->dle64_init_func)
+        uo.uo_call(DLPRIVATE(dl), dl->dle64_init_func);
+
+    if (dl->dle64_init_array && dl->dle64_init_array_size) {
+        size_t count = dl->dle64_init_array_size / sizeof(void *);
+        void **funcs = (void **)dl->dle64_init_array;
+        for (size_t i = 0; i < count; i++) {
+            if (funcs[i])
+                uo.uo_call(DLPRIVATE(dl), funcs[i]);
+        }
+    }
+}
+
 static void call_constructors(struct dlinfo *dl) {
     if (dl->dl_constructors_called)
         return;
@@ -3840,7 +3872,9 @@ static void call_constructors(struct dlinfo *dl) {
 
     // TODO call children ctors here
 
-    if (dl->dl_type == DLT_MACHO64)
+    if (dl->dl_type == DLT_ELF64)
+        call_elf64_constructors((struct dlinfo_elf64 *)dl);
+    else if (dl->dl_type == DLT_MACHO64)
         call_macho64_constructors((struct dlinfo_macho64 *)dl);
 }
 
