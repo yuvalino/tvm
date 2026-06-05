@@ -34,7 +34,7 @@ tvm: unicorn
 	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c main.c -o tvm -L . -lz -lpthread -lutil -lunicorn -lm $(LDFLAGS)
 
 test_tvm:
-	$(CC) $(CFLAGS) -g -I. test_tvm.c -o test_tvm -lpthread -lutil -Wl,--unresolved-symbols=ignore-in-object-files $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -I. test_tvm.c -o test_tvm -lpthread -lutil $(LDFLAGS)
 
 test_rmem: rmem.c test_rmem.c
 	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c test_rmem.c -o test_rmem -lpthread $(LDFLAGS)
