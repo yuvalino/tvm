@@ -14,7 +14,6 @@
 
 /* -------------------- Helpers -------------------- */
 
-static __thread char msgbuf[4096];
 static void (*print_cb)(char *, int) = NULL;
 
 
@@ -25,14 +24,16 @@ static void (*print_cb)(char *, int) = NULL;
 
 
 #define PRINT(MSG, ...) do { \
-    int __len = snprintf(msgbuf, sizeof(msgbuf), "%s:%d %s: " MSG "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
-    PRINT0(msgbuf, __len); \
+    char __msgbuf[4096]; \
+    int __len = snprintf(__msgbuf, sizeof(__msgbuf), "%s:%d %s: " MSG "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
+    PRINT0(__msgbuf, __len); \
 } while (0)
 
 
 #define ABORT(MSG, ...) do { \
-    int __len = snprintf(msgbuf, sizeof(msgbuf), "ABORT! %s:%d %s: " MSG "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
-    PRINT0(msgbuf, __len); \
+    char __msgbuf[4096]; \
+    int __len = snprintf(__msgbuf, sizeof(__msgbuf), "ABORT! %s:%d %s: " MSG "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
+    PRINT0(__msgbuf, __len); \
     abort(); \
 } while (0)
 

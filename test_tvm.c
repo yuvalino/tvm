@@ -25,6 +25,8 @@
 
 //////////
 //// API
+static const char *self_exe;
+
 //////////
 
 #define __S(X) #X
@@ -37,25 +39,29 @@ void _add_test(const char *n, void (*f)());
 #define ASSERT_EQ(X, Y) do { __auto_type __X = (X); __auto_type __Y = (Y); if (__X != __Y) FAIL("    ASSERT_EQ(" #X ", " #Y ");\n    ----\n    %lld != %lld", (long long) __X, (long long)__Y); } while (0)
 #define ASSERT_NEQ(X, Y) do { __auto_type __X = (X); __auto_type __Y = (Y); if (__X == __Y) FAIL("    ASSERT_NEQ(" #X ", " #Y ");\n    ----\n    %lld == %lld", (long long) __X, (long long)__Y); } while (0)
 
-// Assuming these are shared between all tvm tasks
-static pthread_mutex_t test_phase_lock  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  test_phase_cond  = PTHREAD_COND_INITIALIZER;
-static int             test_phase_value = 0;
+// Phase counter lives in MAP_SHARED memory so it stays shared across TVM
+// fork (each forked task otherwise gets its own COW copy of static data).
+static volatile int *test_phase_value;
+
+static void phase_reset(void) {
+    if (test_phase_value)
+        munmap((void *)test_phase_value, sizeof(int));
+    test_phase_value = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *test_phase_value = 0;
+}
+
 #define PHASE_WAIT(Phase) do { \
-        pthread_mutex_lock(&test_phase_lock); \
-        while (test_phase_value < (Phase)) \
-            pthread_cond_wait(&test_phase_cond, &test_phase_lock); \
-        pthread_mutex_unlock(&test_phase_lock); \
+        while (*test_phase_value < (Phase)) \
+            usleep(500); \
     } while(0)
 #define PHASE_SET(Phase) do { \
-        pthread_mutex_lock(&test_phase_lock); \
-        test_phase_value = (Phase); \
-        pthread_cond_broadcast(&test_phase_cond); \
-        pthread_mutex_unlock(&test_phase_lock); \
+        if (*test_phase_value < (Phase)) \
+            *test_phase_value = (Phase); \
     } while (0)
-#define PHASE test_phase_value
+#define PHASE (*test_phase_value)
 
-#define PHASE_INC() PHASE_SET(test_phase_value+1)
+#define PHASE_INC() PHASE_SET((*test_phase_value)+1)
 
 //////////
 //// Tests
@@ -99,6 +105,7 @@ TEST(ProcExit) {
 }
 
 TEST(ProcWNOHANG) {
+    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -117,6 +124,7 @@ TEST(ProcWNOHANG) {
 }
 
 TEST(ProcWaitPgrp) {
+    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -152,6 +160,7 @@ TEST(ProcRaise) {
 }
 
 TEST(ProcKill) {
+    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -171,6 +180,7 @@ TEST(ProcKill) {
 }
 
 TEST(ProcParent) {
+    phase_reset();
     int pip[2];
     int pip2[2];
     ASSERT_EQ(pipe(pip), 0);
@@ -251,6 +261,7 @@ TEST(ProcParent) {
 }
 
 TEST(ProcSid) {
+    phase_reset();
     ASSERT_EQ(getpid(), getsid(0));
     ASSERT_EQ(-1, setsid());
     ASSERT_EQ(EPERM, errno);
@@ -285,6 +296,7 @@ TEST(ProcSid) {
 }
 
 TEST(ProcPgid) {
+    phase_reset();
     ASSERT_EQ(getpid(), getpgrp());
     ASSERT_EQ(-1, setpgrp());
     ASSERT_EQ(EPERM, errno);
@@ -320,6 +332,7 @@ TEST(ProcPgid) {
 }
 
 TEST(ProcPgidSet) {
+    phase_reset();
     pid_t p1 = fork();
     ASSERT_NEQ(p1, -1);
     if (!p1) {
@@ -357,7 +370,7 @@ TEST(ProcPgidSet) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
-static __thread int sigged = 0;
+static int sigged = 0;
 void my_handler(int signo, siginfo_t *si, void * ctx) {
     sigged = 1;
 }
@@ -394,6 +407,7 @@ static void testhandler(int signo) {
 }
 
 TEST(SignalsSIGCHLD) {
+    phase_reset();
 
     /////
     // SIGCHLD set to SIG_IGN
@@ -473,6 +487,7 @@ TEST(SignalsSIGCHLD) {
 }
 
 TEST(SignalsPgrp) {
+    phase_reset();
     pid_t p1 = fork();
     ASSERT_NEQ(p1, -1);
     if (!p1) {
@@ -517,6 +532,7 @@ TEST(FDsInit) {
 }
 
 TEST(FDsPoll) {
+    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -574,6 +590,7 @@ TEST(FDsPoll) {
 }
 
 TEST(FDsFcntl) {
+    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -632,9 +649,10 @@ TEST(FDsCloseOnExit) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
-static COW_IMPL(int, cow_int);
+static int cow_int;
 
 TEST(COWSingleThreaded) {
+    phase_reset();
     cow_int = 69;
 
     pid_t p = fork();
@@ -667,12 +685,13 @@ TEST(COWSingleThreaded) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
-static COW_IMPL(struct {
+static struct {
     int val;
-    char *ptr;  
-}, cow_deep);
+    char *ptr;
+} cow_deep;
 
 TEST(COWDeepCopy) {
+    phase_reset();
     cow_deep.val = 69;
     cow_deep.ptr = malloc(0x69);
     ASSERT_NEQ(NULL, cow_deep.ptr);
@@ -712,6 +731,7 @@ TEST(COWDeepCopy) {
 
 TEST(COWDeepCopyMidBufferUnaligned)
 {
+    phase_reset();
     char *ptr = malloc(0x69);
     ASSERT_NEQ(NULL, ptr);
 
@@ -749,6 +769,7 @@ TEST(COWDeepCopyMidBufferUnaligned)
 
 TEST(COWDeepCopyInStack)
 {
+    phase_reset();
     char *ptr = malloc(0x69);
     int i;
     for (i = 0; i < 10; i++)
@@ -820,6 +841,7 @@ TEST(EnvBasic) {
 }
 
 TEST(EnvFork) {
+    phase_reset();
     ASSERT_EQ(NULL, getenv("kd85n2lk2"));
     ASSERT_EQ(0, putenv("kd85n2lk2=1"));
     ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "1"));
@@ -835,10 +857,10 @@ TEST(EnvFork) {
 
         ASSERT_EQ(0, setenv("kd85n2lk2", "2", 1));
         ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "2"));
-        
+
         PHASE_SET(1);
         PHASE_WAIT(2);
-        
+
         ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "2"));
 
         _exit(0);
@@ -885,12 +907,12 @@ TEST(ExecBasic) {
     ASSERT_EQ(-1, execl("/aaa", "/aaa", NULL));
     ASSERT_EQ(ENOENT, errno);
 
-    tvm_register_program("/basic_prog", (main_func_t)my_basic_prog);
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
     if (!p) {
-        execl("/basic_prog", "/basic_prog", NULL);
+        setenv("TVM_TEST_PROG", "basic", 1);
+        execl(self_exe, self_exe, NULL);
         _exit(1);
     }
 
@@ -918,12 +940,12 @@ static int my_args_prog(int argc, char **argv)
 }
 
 TEST(ExecArgs) {
-    tvm_register_program("/args_prog", (main_func_t)my_args_prog);
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
     if (!p) {
-        execl("/args_prog", "arg0", "arg1", NULL);
+        setenv("TVM_TEST_PROG", "args", 1);
+        execl(self_exe, "arg0", "arg1", NULL);
         _exit(1);
     }
 
@@ -933,7 +955,7 @@ TEST(ExecArgs) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
-// Mock shell for system() tests: handles "sh -c <command>"
+// Mock shell for test_system() tests: handles "sh -c <command>"
 static int mock_sh(int argc, char **argv)
 {
     // Validate: sh -c <command>
@@ -951,17 +973,26 @@ static int mock_sh(int argc, char **argv)
     return 1;
 }
 
-static void register_mock_sh(void)
+static int test_system(const char *command)
 {
-    tvm_register_program("/bin/sh", (main_func_t)mock_sh);
+    pid_t p = fork();
+    if (p == -1) return -1;
+    if (p == 0) {
+        setenv("TVM_TEST_PROG", "sh", 1);
+        execl(self_exe, "sh", "-c", command, NULL);
+        _exit(127);
+    }
+    int s;
+    if (waitpid(p, &s, 0) == -1) return -1;
+    return s;
 }
 
 TEST(SystemNull) {
-    // system(NULL) returns non-zero when shell is available
+    // test_system(NULL) returns non-zero when shell is available
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        int r = system(NULL);
+        int r = test_system(NULL);
         _exit(r != 0 ? 0 : 1);
     }
     int s;
@@ -971,12 +1002,12 @@ TEST(SystemNull) {
 }
 
 TEST(SystemExitZero) {
-    register_mock_sh();
+    
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        int r = system("exit 0");
-        // system() returns waitpid status; extract exit code
+        int r = test_system("exit 0");
+        // test_system() returns waitpid status; extract exit code
         _exit(WIFEXITED(r) && WEXITSTATUS(r) == 0 ? 0 : 1);
     }
     int s;
@@ -986,11 +1017,11 @@ TEST(SystemExitZero) {
 }
 
 TEST(SystemExitNonZero) {
-    register_mock_sh();
+    
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        int r = system("exit 42");
+        int r = test_system("exit 42");
         _exit(WIFEXITED(r) && WEXITSTATUS(r) == 42 ? 0 : 1);
     }
     int s;
@@ -1000,11 +1031,11 @@ TEST(SystemExitNonZero) {
 }
 
 TEST(SystemTrue) {
-    register_mock_sh();
+    
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        int r = system("true");
+        int r = test_system("true");
         _exit(WIFEXITED(r) && WEXITSTATUS(r) == 0 ? 0 : 1);
     }
     int s;
@@ -1014,11 +1045,11 @@ TEST(SystemTrue) {
 }
 
 TEST(SystemFalse) {
-    register_mock_sh();
+    
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        int r = system("false");
+        int r = test_system("false");
         _exit(WIFEXITED(r) && WEXITSTATUS(r) == 1 ? 0 : 1);
     }
     int s;
@@ -1028,14 +1059,14 @@ TEST(SystemFalse) {
 }
 
 TEST(SystemMultiple) {
-    // Multiple system() calls in sequence
-    register_mock_sh();
+    // Multiple test_system() calls in sequence
+    
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        int r1 = system("exit 0");
-        int r2 = system("exit 42");
-        int r3 = system("true");
+        int r1 = test_system("exit 0");
+        int r2 = test_system("exit 42");
+        int r3 = test_system("true");
         if (!WIFEXITED(r1) || WEXITSTATUS(r1) != 0) _exit(1);
         if (!WIFEXITED(r2) || WEXITSTATUS(r2) != 42) _exit(2);
         if (!WIFEXITED(r3) || WEXITSTATUS(r3) != 0) _exit(3);
@@ -1048,8 +1079,8 @@ TEST(SystemMultiple) {
 }
 
 TEST(SystemSigmaskPreserved) {
-    // system() must restore the original signal mask
-    register_mock_sh();
+    // test_system() must restore the original signal mask
+    
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
@@ -1058,7 +1089,7 @@ TEST(SystemSigmaskPreserved) {
         sigaddset(&before, SIGUSR1);
         sigprocmask(SIG_SETMASK, &before, NULL);
 
-        system("true");
+        test_system("true");
 
         sigprocmask(SIG_SETMASK, NULL, &after);
         // SIGUSR1 should still be blocked
@@ -1071,15 +1102,15 @@ TEST(SystemSigmaskPreserved) {
 }
 
 TEST(SystemSignalHandlersPreserved) {
-    // system() must restore SIGINT/SIGQUIT handlers
-    register_mock_sh();
+    // test_system() must restore SIGINT/SIGQUIT handlers
+    
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
         struct sigaction sa = { .sa_handler = SIG_DFL };
         sigaction(SIGINT, &sa, NULL);
 
-        system("true");
+        test_system("true");
 
         struct sigaction cur;
         sigaction(SIGINT, NULL, &cur);
@@ -1154,12 +1185,13 @@ TEST(TTYCloseSlave) {
     ASSERT_NEQ(-1, open(ptsname(master), O_RDWR | O_NOCTTY));
 }
 
-static COW_IMPL_INIT(int, got_sig, 0);
+static int got_sig = 0;
 static void sighup_handler(int signo) {
     got_sig++;
 }
 
 TEST(TTYDetachCloseMaster) {
+    phase_reset();
     int master, slave;
 	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
 
@@ -1192,6 +1224,7 @@ TEST(TTYDetachCloseMaster) {
 }
 
 TEST(TTYDetachTIOCNOTTY) {
+    phase_reset();
     int master, slave;
 	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
 
@@ -1294,7 +1327,7 @@ TEST(SignalIgnFork) {
 
 // Pipe written from signal handler to confirm each delivery (write is async-signal-safe)
 static int sig_multi_pipe = -1;
-static COW_IMPL_INIT(int, sig_multi_count, 0);
+static int sig_multi_count = 0;
 static void sig_multi_handler(int sig) {
     sig_multi_count++;
     char c = '!';
@@ -1348,7 +1381,7 @@ TEST(SignalMultiDeliver) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
-static COW_IMPL_INIT(int, sig_intr_count, 0);
+static int sig_intr_count = 0;
 static void sig_intr_handler(int sig) { sig_intr_count++; }
 
 TEST(SignalInterruptRead) {
@@ -1441,10 +1474,11 @@ TEST(SignalGrandchild) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
-static COW_IMPL_INIT(int, sig_pgrp_count, 0);
+static int sig_pgrp_count = 0;
 static void sig_pgrp_handler(int sig) { sig_pgrp_count++; }
 
 TEST(SignalKillZero) {
+    phase_reset();
     sig_pgrp_count = 0;
     struct sigaction act = { .sa_handler = sig_pgrp_handler };
     ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
@@ -1485,7 +1519,7 @@ TEST(SignalKillZero) {
     ASSERT_EQ(p, wait(&s));
 }
 
-static COW_IMPL_INIT(int, sig_fork_count, 0);
+static int sig_fork_count = 0;
 static void sig_fork_handler(int sig) { sig_fork_count++; }
 
 TEST(SignalWhileFork) {
@@ -1544,6 +1578,7 @@ TEST(StressForkExit) {
 }
 
 TEST(TTYSighupRace) {
+    phase_reset();
     int master, slave;
     ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
 
@@ -1577,7 +1612,7 @@ TEST(TTYSighupRace) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
-static COW_IMPL_INIT(int, cc_count, 0);
+static int cc_count = 0;
 static void cc_handler(int sig) { cc_count++; }
 
 TEST(ConcurrentKills) {
@@ -1637,7 +1672,7 @@ TEST(ConcurrentKills) {
 
 // --- sigprocmask / pthread_sigmask ---
 
-static COW_IMPL_INIT(volatile int, spm_got, 0);
+static volatile int spm_got = 0;
 static void spm_handler(int sig) { spm_got = 1; }
 
 TEST(SigprocmaskBlock) {
@@ -1695,7 +1730,7 @@ TEST(SigprocmaskInheritFork) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
-static COW_IMPL_INIT(volatile int, ptm_got, 0);
+static volatile int ptm_got = 0;
 static void ptm_handler(int sig) { ptm_got = 1; }
 
 TEST(PthreadSigmaskBlock) {
@@ -1778,7 +1813,7 @@ TEST(Sigpending) {
 
 // --- sigsuspend ---
 
-static COW_IMPL_INIT(volatile int, susp_got, 0);
+static volatile int susp_got = 0;
 static void susp_handler(int sig) { susp_got = 1; }
 
 TEST(SigsuspendBasic) {
@@ -1925,7 +1960,7 @@ TEST(SigwaitBasic) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
-static COW_IMPL_INIT(volatile int, swh_called, 0);
+static volatile int swh_called = 0;
 static void swh_handler(int sig) { swh_called = 1; }
 
 TEST(SigwaitDoesNotInvokeHandler) {
@@ -2090,7 +2125,7 @@ TEST(PthreadKillZeroProbe) {
         FAIL("pthread_kill on dead thread returned %d", r);
 }
 
-static COW_IMPL_INIT(volatile int, ptkill_cross_got, 0);
+static volatile int ptkill_cross_got = 0;
 static void ptkill_cross_handler(int sig) { ptkill_cross_got = 1; }
 
 TEST(PthreadKillCrossProcess) {
@@ -2114,7 +2149,7 @@ TEST(PthreadKillCrossProcess) {
 
 // --- Combined: block + wait + deliver across fork ---
 
-static COW_IMPL_INIT(volatile int, smb_count, 0);
+static volatile int smb_count = 0;
 static void smb_handler(int sig) { smb_count++; }
 
 TEST(SigmaskBlockMultiple) {
@@ -2148,8 +2183,8 @@ TEST(SigmaskBlockMultiple) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
-static COW_IMPL_INIT(volatile int, ssu_got1, 0);
-static COW_IMPL_INIT(volatile int, ssu_got2, 0);
+static volatile int ssu_got1 = 0;
+static volatile int ssu_got2 = 0;
 static void ssu_handler1(int sig) { ssu_got1 = 1; }
 static void ssu_handler2(int sig) { ssu_got2 = 1; }
 
@@ -2227,7 +2262,7 @@ TEST(SigprocmaskNoBlockKill) {
 
 // --- sigprocmask: SIG_UNBLOCK drains pending signals ---
 
-static COW_IMPL_INIT(volatile int, drain_got, 0);
+static volatile int drain_got = 0;
 static void drain_handler(int sig) { drain_got = 1; }
 
 TEST(SigprocmaskUnblockDrains) {
@@ -2369,7 +2404,7 @@ TEST(SigpendingEmpty) {
 
 // --- sigpending: unblocking clears pending ---
 
-static COW_IMPL_INIT(volatile int, pclr_got, 0);
+static volatile int pclr_got = 0;
 static void pclr_handler(int sig) { pclr_got = 1; }
 
 TEST(SigpendingClearsOnDelivery) {
@@ -2409,8 +2444,8 @@ TEST(SigpendingClearsOnDelivery) {
 
 // --- sigsuspend: blocks signals in the temporary mask ---
 
-static COW_IMPL_INIT(volatile int, sblk_usr1, 0);
-static COW_IMPL_INIT(volatile int, sblk_usr2, 0);
+static volatile int sblk_usr1 = 0;
+static volatile int sblk_usr2 = 0;
 static void sblk_handler(int sig) {
     if (sig == SIGUSR1) sblk_usr1 = 1;
     if (sig == SIGUSR2) sblk_usr2 = 1;
@@ -2579,7 +2614,7 @@ TEST(SigtimedwaitSignalArrives) {
 
 // --- Signal mask isolation between forked tasks ---
 
-static COW_IMPL_INIT(volatile int, iso_parent_got, 0);
+static volatile int iso_parent_got = 0;
 static void iso_handler(int sig) { iso_parent_got = 1; }
 
 TEST(SigmaskForkIsolation) {
@@ -2786,7 +2821,7 @@ TEST(SigIgnBlockedDiscard) {
 
 // --- Rapid block/unblock/raise stress test ---
 
-static COW_IMPL_INIT(volatile int, stress_count, 0);
+static volatile int stress_count = 0;
 static void stress_handler(int sig) { stress_count++; }
 
 TEST(SigmaskStressBlockUnblock) {
@@ -2892,7 +2927,7 @@ TEST(SigwaitPicksFromSet) {
 
 // --- kill(pid, sig) across tasks with blocked mask ---
 
-static COW_IMPL_INIT(volatile int, xkill_got, 0);
+static volatile int xkill_got = 0;
 static void xkill_handler(int sig) { xkill_got = 1; }
 
 TEST(KillBlockedThenUnblock) {
@@ -3045,7 +3080,7 @@ TEST(ThreadPidShared) {
 
 // --- Virtual timer tests ---
 
-static COW_IMPL_INIT(volatile int, vtimer_sig_count, 0);
+static volatile int vtimer_sig_count = 0;
 static void vtimer_handler(int sig) { vtimer_sig_count++; }
 
 // shared state for SIGEV_THREAD callback tests (heap-allocated, not TLS)
@@ -3684,7 +3719,6 @@ void _add_test(const char *n, void (*f)())
 
 static int runtest_gdb(struct testinfo_t *testinfo, int verbose)
 {
-    tvm_init(testinfo->n);
     testinfo->f();
     return 0;
 }
@@ -3770,12 +3804,8 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
         close(outp[1]);
         close(errp[1]);
 
-        if (getpid() != setsid()) {
-            perror("test_tvm: set sid");
-            exit(1);
-        }
+        setsid(); // best-effort session isolation
 
-        tvm_init(testinfo->n);
         testinfo->f();
         exit(0);
     }
@@ -3790,7 +3820,7 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     while (1) {
-        if (-1 == usleep(2000)) {
+        if (-1 == usleep(2000) && errno != EINTR) {
             perror("test_tvm: usleep");
             abort();
         }
@@ -3962,6 +3992,16 @@ int gdb(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+    self_exe = argv[0];
+    char *prog_mode = getenv("TVM_TEST_PROG");
+    if (prog_mode) {
+        unsetenv("TVM_TEST_PROG");
+        if (strcmp(prog_mode, "basic") == 0) return my_basic_prog();
+        if (strcmp(prog_mode, "args") == 0) return my_args_prog(argc, argv);
+        if (strcmp(prog_mode, "sh") == 0) return mock_sh(argc, argv);
+        return 127;
+    }
+
     setbuf(stdout, NULL);
     
     int test_names_s = 0;
