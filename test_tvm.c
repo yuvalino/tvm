@@ -21,8 +21,6 @@
 #include <util.h>
 #endif
 
-#include "tvm.h"
-
 //////////
 //// API
 static const char *self_exe;
@@ -34,6 +32,13 @@ static const char *self_exe;
 
 void _add_test(const char *n, void (*f)());
 #define TEST(Name) void _test_ ## Name (); __attribute__((constructor)) void _c_ ## Name () { _add_test(#Name , _test_ ## Name); } void _test_ ## Name ()
+
+// PROG(Name) registers a mock program, looked up by main() when this binary is
+// re-exec'd as one (TVM_TEST_PROG=Name). Every program has the same signature;
+// dispatch is by name, so adding one needs no edits to main().
+typedef int (*prog_fn)(int argc, char **argv);
+void _add_prog(const char *n, prog_fn f);
+#define PROG(Name) static int _prog_ ## Name (int argc, char **argv); __attribute__((constructor)) static void _cp_ ## Name () { _add_prog(#Name , _prog_ ## Name); } static int _prog_ ## Name (int argc, char **argv)
 
 #define FAIL(Msg, ...) do { fprintf(stderr, "FAIL (errno %d):\n  File \"" __FILE__ "\", line " _S(__LINE__) ", in ", errno); (strncmp("_test_", __FUNCTION__, 6)?fputs(__FUNCTION__, stderr):fprintf(stderr, "TEST(%s)", __FUNCTION__+6)); fprintf(stderr, "\n" Msg "\n", ##__VA_ARGS__); fflush(stderr); exit(1); } while (0)
 #define ASSERT_EQ(X, Y) do { __auto_type __X = (X); __auto_type __Y = (Y); if (__X != __Y) FAIL("    ASSERT_EQ(" #X ", " #Y ");\n    ----\n    %lld != %lld", (long long) __X, (long long)__Y); } while (0)
@@ -807,18 +812,16 @@ TEST(COWDeepCopyInStack)
 extern char **environ;
 
 TEST(EnvBasic) {
-    for (char **e = environ, **te = tvm_environ; *e != NULL; e++, te++) {
-        ASSERT_NEQ(NULL, *te);
-        ASSERT_EQ(0, strcmp(*e, *te));
-    }
+    for (char **e = environ; *e != NULL; e++)
+        ASSERT_NEQ(NULL, *e);
 
     ASSERT_EQ(NULL, getenv("kd85n2lk2"));
     ASSERT_EQ(0, putenv("kd85n2lk2=1"));
     ASSERT_NEQ(NULL, getenv("kd85n2lk2"));
     ASSERT_EQ(0, strcmp("1", getenv("kd85n2lk2")));
-    
+
     char **e;
-    for (e = tvm_environ; *(e+1) != NULL; e++) { }
+    for (e = environ; *(e+1) != NULL; e++) { }
     ASSERT_EQ(0, strcmp(*e, "kd85n2lk2=1"));
 
     ASSERT_EQ(0, unsetenv("kd85n2lk2"));
@@ -837,7 +840,7 @@ TEST(EnvBasic) {
     ASSERT_NEQ(NULL, getenv("kd85n2lk2"));
     ASSERT_EQ(0, strcmp("3", getenv("kd85n2lk2")));
 
-    ASSERT_NEQ(NULL, tvm_environ[0]);
+    ASSERT_NEQ(NULL, environ[0]);
 }
 
 TEST(EnvFork) {
@@ -850,7 +853,7 @@ TEST(EnvFork) {
     ASSERT_NEQ(p, -1);
 
     if (!p) {
-        tvm_environ[0] = "lol";
+        environ[0] = "lol";
 
         ASSERT_NEQ(NULL, getenv("kd85n2lk2"));
         ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "1"));
@@ -870,7 +873,7 @@ TEST(EnvFork) {
 
     ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "1"));
     ASSERT_EQ(0, setenv("kd85n2lk2", "3", 1));
-    ASSERT_NEQ(0, strcmp(tvm_environ[0], "lol"));
+    ASSERT_NEQ(0, strcmp(environ[0], "lol"));
 
     PHASE_SET(2);
 
@@ -884,22 +887,23 @@ TEST(EnvNULL) {
     ASSERT_NEQ(NULL, getenv("PATH"));
 #if defined(__linux__)
     ASSERT_EQ(0, clearenv());
-    ASSERT_EQ(tvm_environ, NULL);
+    ASSERT_EQ(environ, NULL);
 #else
-    tvm_environ = NULL;
+    environ = NULL;
 #endif
     ASSERT_EQ(NULL, getenv("PATH"));
     ASSERT_EQ(0, unsetenv("PATH"));
-    ASSERT_EQ(tvm_environ, NULL);
+    ASSERT_EQ(environ, NULL);
 
     ASSERT_EQ(0, putenv("hello=world"));
     ASSERT_NEQ(NULL, getenv("hello"));
     ASSERT_EQ(0, strcmp(getenv("hello"), "world"));
-    ASSERT_NEQ(tvm_environ, NULL);
+    ASSERT_NEQ(environ, NULL);
 }
 
-static int my_basic_prog()
+PROG(basic)
 {
+    (void)argc; (void)argv;
     return 69;
 }
 
@@ -922,7 +926,7 @@ TEST(ExecBasic) {
     ASSERT_EQ(WEXITSTATUS(s), 69);
 }
 
-static int my_args_prog(int argc, char **argv)
+PROG(args)
 {
     if (argc != 2)
         return 2;
@@ -956,7 +960,7 @@ TEST(ExecArgs) {
 }
 
 // Mock shell for test_system() tests: handles "sh -c <command>"
-static int mock_sh(int argc, char **argv)
+PROG(sh)
 {
     // Validate: sh -c <command>
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
@@ -3717,6 +3721,35 @@ void _add_test(const char *n, void (*f)())
     tests[idx].n = n;
 }
 
+#define MAX_PROGS 32
+static struct proginfo_t {
+    const char *n;
+    prog_fn f;
+} progs[MAX_PROGS + 1] = {0};
+
+void _add_prog(const char *n, prog_fn f)
+{
+    int idx;
+    for (idx = 0; idx < MAX_PROGS && progs[idx].f; idx++)
+        ;
+    if (idx == MAX_PROGS) {
+        fprintf(stderr, "too many progs for %s", n);
+        abort();
+    }
+    progs[idx].f = f;
+    progs[idx].n = n;
+}
+
+// Run the registered program named `name`; returns its exit code, or 127 if no
+// such program (shell convention for "command not found").
+static int run_prog_mode(const char *name, int argc, char **argv)
+{
+    for (int i = 0; progs[i].f; i++)
+        if (strcmp(progs[i].n, name) == 0)
+            return progs[i].f(argc, argv);
+    return 127;
+}
+
 static int runtest_gdb(struct testinfo_t *testinfo, int verbose)
 {
     testinfo->f();
@@ -3996,10 +4029,7 @@ int main(int argc, char **argv)
     char *prog_mode = getenv("TVM_TEST_PROG");
     if (prog_mode) {
         unsetenv("TVM_TEST_PROG");
-        if (strcmp(prog_mode, "basic") == 0) return my_basic_prog();
-        if (strcmp(prog_mode, "args") == 0) return my_args_prog(argc, argv);
-        if (strcmp(prog_mode, "sh") == 0) return mock_sh(argc, argv);
-        return 127;
+        return run_prog_mode(prog_mode, argc, argv);
     }
 
     setbuf(stdout, NULL);
