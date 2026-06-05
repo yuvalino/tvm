@@ -107,8 +107,6 @@ static void __panic(const char *m, const char *f, int l);
         const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
         (type *)((char *)__mptr - offsetof(type,member));})
 
-static __thread char msgbuf[0x1000];
-
 static long g_tz_offset; // seconds east of UTC, cached at startup
 
 static void format_time(char *buf, size_t buflen)
@@ -147,8 +145,9 @@ static int g_outfd = STDOUT_FILENO;
 #define INFO(Msg, ...) do { \
     char __ts[32]; \
     format_time(__ts, sizeof(__ts)); \
-    int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
-    CALL_FUNC(write, g_outfd, msgbuf, __num); \
+    char __msgbuf[0x1000]; \
+    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
+    CALL_FUNC(write, g_outfd, __msgbuf, __num); \
 } while (0)
 
 #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
@@ -1189,19 +1188,22 @@ out:
     return r;
 }
 
-static char **addenv(char **env, char *string)
+static char **addenv(struct rmem_arena *ar, char **env, char *string)
 {
     int sz = envsize(env);
-    char **newenv = malloc(sizeof(char *) * (sz+2));
+    // Allocate from the task arena (not host malloc) so the environ array is
+    // part of the cow-tracked memory and gets duplicated + pointer-fixed-up on
+    // fork. Otherwise putenv/setenv entries are lost in forked children.
+    char **newenv = rmem_arena_alloc(ar, sizeof(char *) * (sz+2));
     if (!newenv)
         return NULL;
-    
+
     newenv[sz] = string;
     newenv[sz + 1] = 0;
 
     if (env)
         memcpy(newenv, env, sizeof(char *) * sz);
-    
+
     return newenv;
 }
 
@@ -1667,6 +1669,7 @@ struct task {
     pthread_cond_t tsk_wait_cond;
     struct sigaction tsk_sighandlers[MAX_SIGNALS];
     unsigned tsk_threads_cnt;
+    unsigned tsk_sigev_inflight;   // SIGEV_THREAD timer callbacks currently running
     struct list_head tsk_threads;  // thread
     pid_t tsk_sid;
     pid_t tsk_pgid;
@@ -1702,15 +1705,71 @@ static Dl_info main_dlinfo = {0};
 static struct rmem_arena *global_arena = NULL;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
-static __thread struct task *current;
-static __thread struct thread *current_thread;
-static __thread int thread_tvm_disallow = 0;
-static __thread int tvm_sig_blocked = 0;
-static __thread int tvm_sig_draining = 0;
-static __thread int tvm_sig_interrupted = 0;
-static __thread int tvm_sig_depth = 0;
-static __thread int tvm_sig_synchronous_depth = 0;
-static __thread int tvm_in_emu = 0;
+struct tvm_call;
+typedef int (*compar_t)(const void *, const void *);
+typedef int (*tputs_putc_t)(int);
+
+struct tvm_tls {
+    struct task *tls_current;
+    struct thread *tls_current_thread;
+
+    int tls_thread_tvm_disallow;
+    int tls_tvm_sig_blocked;
+    int tls_tvm_sig_draining;
+    int tls_tvm_sig_interrupted;
+    int tls_tvm_sig_depth;
+    int tls_tvm_sig_synchronous_depth;
+    int tls_tvm_in_emu;
+    int tls_sigshutup;
+    int tls_tasks_lock_held; // set during task teardown when tasks_lock is held
+
+    struct tvm_call *tls_call;
+
+    compar_t tls_bsearch_compar;
+    compar_t tls_qsort_compar;
+    tputs_putc_t tls_tputs_putc;
+#if defined(__APPLE__)
+    CFDictionaryApplierFunction tls_CFDictionaryApplyFunction_function;
+#endif
+
+    char tls_tty_name[PATH_MAX];
+    char tls_pts_name[PATH_MAX];
+};
+
+static pthread_key_t tls_key;
+
+__attribute__((constructor))
+static void tls_key_init(void) {
+    pthread_key_create(&tls_key, NULL);
+}
+
+static struct tvm_tls _tls_bootstrap;
+
+static inline struct tvm_tls *tvm_tls(void) {
+    struct tvm_tls *t = pthread_getspecific(tls_key);
+    return t ? t : &_tls_bootstrap;
+}
+
+#define current                     (tvm_tls()->tls_current)
+#define current_thread              (tvm_tls()->tls_current_thread)
+#define thread_tvm_disallow         (tvm_tls()->tls_thread_tvm_disallow)
+#define tvm_sig_blocked             (tvm_tls()->tls_tvm_sig_blocked)
+#define tvm_sig_draining            (tvm_tls()->tls_tvm_sig_draining)
+#define tvm_sig_interrupted         (tvm_tls()->tls_tvm_sig_interrupted)
+#define tvm_sig_depth               (tvm_tls()->tls_tvm_sig_depth)
+#define tvm_sig_synchronous_depth   (tvm_tls()->tls_tvm_sig_synchronous_depth)
+#define tvm_in_emu                  (tvm_tls()->tls_tvm_in_emu)
+#define tasks_lock_held             (tvm_tls()->tls_tasks_lock_held)
+#define sigshutup                   (tvm_tls()->tls_sigshutup)
+#define call                        (tvm_tls()->tls_call)
+#define bsearch_compar              (tvm_tls()->tls_bsearch_compar)
+#define qsort_compar                (tvm_tls()->tls_qsort_compar)
+#define tputs_putc                  (tvm_tls()->tls_tputs_putc)
+#if defined(__APPLE__)
+#define CFDictionaryApplyFunction_function (tvm_tls()->tls_CFDictionaryApplyFunction_function)
+#endif
+#define tty_name                    (tvm_tls()->tls_tty_name)
+#define pts_name                    (tvm_tls()->tls_pts_name)
 
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
@@ -1911,6 +1970,12 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
     if (dolocktasks)
         pthread_mutex_lock(&tasks_lock);
 
+    // tasks_lock is held for the whole body (either we locked it or the caller
+    // did). Closing this task's files below can reach ttyop_close, which would
+    // otherwise re-acquire tasks_lock (directly or via kill()) and self-deadlock.
+    int prev_tasks_lock_held = tasks_lock_held;
+    tasks_lock_held = 1;
+
     pthread_mutex_lock(&vtimers_lock);
     for (int i = 0; i < MAX_TIMERS_PER_TASK; i++) {
         if (t->tsk_timers[i] >= 0) {
@@ -1946,7 +2011,9 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
         list_del(&t->tsk_list);
         taskdealloc(t);
     }
-    
+
+    tasks_lock_held = prev_tasks_lock_held;
+
     if (dolocktasks)
         pthread_mutex_unlock(&tasks_lock);
 }
@@ -2280,9 +2347,30 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
-    // TODO kill all threads, make sure tsk_threads_cnt==1
-    if (current->tsk_threads_cnt != 1)
-        panic("_exit tsk_threads_cnt");
+    // POSIX: _exit terminates every thread of the process. SIGEV_THREAD timer
+    // callbacks run as detached task threads, so one may still be draining when
+    // we get here. Destroy this task's timers first (so the vtimer manager
+    // spawns no new callbacks), then wait for any in-flight callback threads to
+    // finish before requiring tsk_threads_cnt == 1.
+    pthread_mutex_lock(&vtimers_lock);
+    for (int i = 0; i < MAX_TIMERS_PER_TASK; i++) {
+        if (current->tsk_timers[i] >= 0) {
+            vtimer_destroy_locked(current->tsk_timers[i]);
+            current->tsk_timers[i] = -1;
+        }
+    }
+    pthread_mutex_unlock(&vtimers_lock);
+
+    // Drain sibling threads. Release both locks so a callback thread can take
+    // task_lock(current) to decrement the count (and call into the kernel if it
+    // needs to). With the timers gone, no new callbacks can appear.
+    while (current->tsk_threads_cnt != 1) {
+        task_unlock(current);
+        pthread_mutex_unlock(&tasks_lock);
+        usleep(500);
+        pthread_mutex_lock(&tasks_lock);
+        task_lock(current);
+    }
     --current->tsk_refcount;
     --current->tsk_threads_cnt;
 
@@ -2690,6 +2778,9 @@ static void *vtimer_thread(void *arg)
                     pthread_attr_init(&attr);
                     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
+                    // Track this callback as in-flight so timer_delete() can wait
+                    // for it to finish before the caller frees state it may touch.
+                    target->tsk_sigev_inflight++;
                     VERIFY(0 == task_create_thread_locked(target, thread_func, a, &thr, &attr, NULL));
 
                     pthread_attr_destroy(&attr);
@@ -3174,8 +3265,6 @@ static const int default_signal_actions[MAX_SIGNALS] = {
 #endif
 };
 
-static __thread int sigshutup = 0;
-
 struct safeio_ctx
 {
     int p[2];
@@ -3362,6 +3451,7 @@ static void tvm_sig_drain(void)
         return;
     tvm_sig_draining = 1;
 
+
     uint32_t pending;
 
     // Drain thread-directed pending signals
@@ -3545,9 +3635,6 @@ struct tty {
 
 LIST_HEAD(ttys);
 pthread_mutex_t ttys_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static COW_IMPL(char[PATH_MAX], tty_name);
-static COW_IMPL(char[PATH_MAX], pts_name);
 
 static cc_t ttydefchars[NCCS] = {
 	[VEOF]=CEOF,
@@ -4642,6 +4729,28 @@ static ssize_t ttyop_write(struct file *file, const void *buf, size_t count, int
     return ret;
 }
 
+// Send sig to a target the way kill() does (pid>0: that pid; pid<0: process
+// group -pid), but assuming tasks_lock is already held by the caller. Used from
+// the tty-close path during task teardown, where re-entering kill() (which
+// locks tasks_lock) would self-deadlock.
+static void kill_target_tasks_locked(pid_t pid, int sig) {
+    struct task *t;
+    if ((main_task->tsk_pid == pid || main_task->tsk_pgid == -pid) && main_task != current) {
+        task_lock(main_task);
+        if (!(main_task->tsk_state & TS_ZOMBIE))
+            task_kill_locked(main_task, sig);
+        task_unlock(main_task);
+    }
+    list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
+        if ((t->tsk_pid == pid || t->tsk_pgid == -pid) && t != current) {
+            task_lock(t);
+            if (!(t->tsk_state & TS_ZOMBIE))
+                task_kill_locked(t, sig);
+            task_unlock(t);
+        }
+    }
+}
+
 static void ttyop_close(struct file *file) {
     int ttymode;
     struct tty *tt = tty_for_file_locked(file, &ttymode);
@@ -4667,18 +4776,30 @@ static void ttyop_close(struct file *file) {
         file_unlock(file, 0);
 
         if (tty_sid != -1) {
-            pthread_mutex_lock(&tasks_lock);
+            int held = tasks_lock_held;
+            if (!held)
+                pthread_mutex_lock(&tasks_lock);
             struct task *t;
             list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
-                task_lock(t);
+                // In teardown current's task_lock is already held by us — don't
+                // re-lock it (recursive task_lock would self-deadlock).
+                int self_held = (held && t == current);
+                if (!self_held)
+                    task_lock(t);
                 if (t->tsk_sid == tty_sid)
                     t->tsk_state &= ~TS_CTTY;
-                task_unlock(t);
+                if (!self_held)
+                    task_unlock(t);
             }
-            pthread_mutex_unlock(&tasks_lock);
-
-            kill(-tty_pgid, SIGHUP);
-            kill(-tty_pgid, SIGCONT);
+            if (held) {
+                // teardown path: tasks_lock already held, signal without re-locking
+                kill_target_tasks_locked(-tty_pgid, SIGHUP);
+                kill_target_tasks_locked(-tty_pgid, SIGCONT);
+            } else {
+                pthread_mutex_unlock(&tasks_lock);
+                kill(-tty_pgid, SIGHUP);
+                kill(-tty_pgid, SIGCONT);
+            }
         }
 
         file_lock(file, 0);
@@ -4694,16 +4815,24 @@ static void ttyop_close(struct file *file) {
 
     // Disassociate the entire session
 
+    int held = tasks_lock_held;
     if (master_closed && tty_sid != -1) {
-        pthread_mutex_lock(&tasks_lock);
+        if (!held)
+            pthread_mutex_lock(&tasks_lock);
         struct task *t;
         list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
-            task_lock(t);
+            // In teardown current's task_lock is already held by us — don't
+            // re-lock it (recursive task_lock would self-deadlock).
+            int self_held = (held && t == current);
+            if (!self_held)
+                task_lock(t);
             if (t->tsk_sid == tty_sid)
                 t->tsk_state &= ~TS_CTTY;
-            task_unlock(t);
+            if (!self_held)
+                task_unlock(t);
         }
-        pthread_mutex_unlock(&tasks_lock);
+        if (!held)
+            pthread_mutex_unlock(&tasks_lock);
     }
 
     pthread_mutex_lock(&ttys_lock);
@@ -4715,8 +4844,14 @@ static void ttyop_close(struct file *file) {
     // Signal after all locks released: session leader may be current task,
     // and signal_handler acquires tasks_lock.
     if (master_closed && tty_sid != -1) {
-        kill(tty_sid, SIGHUP);
-        kill(tty_sid, SIGCONT);
+        if (held) {
+            // teardown path: tasks_lock already held, signal without re-locking
+            kill_target_tasks_locked(tty_sid, SIGHUP);
+            kill_target_tasks_locked(tty_sid, SIGCONT);
+        } else {
+            kill(tty_sid, SIGHUP);
+            kill(tty_sid, SIGCONT);
+        }
     }
 
     file_lock(file, 0);
@@ -5728,67 +5863,8 @@ static int vfs_load_cpio(struct vfs_node *vn, const void *buf, size_t len) {
 }
 
 /////////////
-// MARK: Copy-On-Write (COW)
+// MARK: Copy-On-Write (COW) Fixup
 /////////////
-
-/**
- * Idea here is to let each task feel like it has COW memory with its parent,
- * but in reality we deep-copy every relevant buffer.
- * 
- * The major downside here is that EVERY global must be declared/defined with COW_DECL()/COW_IMPL() macros.
- * 
- * How it works:
- * 1. We register all global variables to a global list (with sizes)
- * 2. We mark every `malloc()` buffer so we could identify it
- * 3. On fork(), get all global variable pointers from parent
- * 4. On fork(), memcpy() all parent global variables to the child
- * 5. On fork(), iterate every global variable and recursively deep-copy malloc'd buffer pointers
- * 6. On fork(), iterate copied stack frame (see `Forkless API` section) and deep-copy malloc'd pointers as-well
- * 
- * We also use a "deep-copy" cache (struct cow_deepcopy_ctx) so we properly handled pointers that appear twice while deep-copying.
- * 
- * TODO:
- * - Find a way to NOT mark every global variable with COW_IMPL().
- * - Support multi-threading, we can force dynamic tlsmodel and override _get_tls_data() resolve function.
- */
-
-#define COW_FIXUP 0x1
-
-struct cow_data_variable_t {
-    struct list_head list;
-    void *(*getptr_fn)();
-    void (*init_fn)();
-    char *name; // for debugging purposes
-    size_t size;
-    int flags;
-};
-static LIST_HEAD(cow_data_variables);
-
-void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)(), int deepcopy, char *name)
-{
-    struct cow_data_variable_t *cow_data_var;
-    if (NULL == (cow_data_var = CALL_FUNC(malloc, sizeof(*cow_data_var))))
-        panic("cow_data_var");
-    
-    list_add_tail(&cow_data_var->list, &cow_data_variables);
-    cow_data_var->getptr_fn = getptr_fn;
-    cow_data_var->init_fn = init_fn;
-    cow_data_var->name = name;
-    cow_data_var->size = size;
-    if (deepcopy) 
-        cow_data_var->flags |= COW_FIXUP;
-}
-
-static void cow_run_init_funcs()
-{
-    struct cow_data_variable_t *cow;
-    list_for_each_entry(cow, &cow_data_variables, list) {
-        if (cow->init_fn)
-            cow->init_fn();
-        else
-            memset(cow->getptr_fn(), 0, cow->size);
-    }
-}
 
 struct cow_fixup_context {
     struct {
@@ -5799,47 +5875,6 @@ struct cow_fixup_context {
     } *ptrs;
     size_t count;
 };
-
-static int cow_fixup_load_data_variables(struct cow_fixup_context *ctx, int new)
-{
-    size_t data_variable_count = 0;
-    struct cow_data_variable_t *cow;
-
-    list_for_each_entry(cow, &cow_data_variables, list)
-        data_variable_count++;
-    
-    if (ctx->count == 0) {
-        ctx->ptrs = kalloc(data_variable_count * sizeof(*ctx->ptrs));
-        if (!ctx->ptrs) {
-            errno = ENOMEM;
-            return -1;
-        }
-        ctx->count = data_variable_count;
-    }
-    else if (ctx->count != data_variable_count)
-        panic("data variable count mismatch (%zu != %zu)", data_variable_count, ctx->count);
-    
-    int i = 0;
-    list_for_each_entry(cow, &cow_data_variables, list) {
-        if (i >= (data_variable_count))
-            panic("data variable count mismatch in iteration (%d !+ %zu)", (i+1), data_variable_count);
-
-        ctx->ptrs[i].size = cow->size;
-        void *p = cow->getptr_fn();
-        if (new)
-            ctx->ptrs[i].new = cow->getptr_fn();
-        else
-            ctx->ptrs[i].old = cow->getptr_fn();
-        ctx->ptrs[i].fixup = 1;
-
-        i++;
-    }
-
-    if (i != (data_variable_count))
-        panic("data variable coumt mismatch after iteration (%d != %zu)", i, data_variable_count);
-    
-    return 0;
-}
 
 static int cow_fixup_ctx_add(struct cow_fixup_context *dctx, void *new, void *old, size_t size, int fixup)
 {
@@ -6708,9 +6743,18 @@ int emulator_step(struct emulator_context *ec)
     uint64_t pc = emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC);
  
     if (ec->ec_curr_engine->ee_refresh) {
-        if (0 != emulator_engine_reset(ec->ec_curr_engine))
+        // Creating/resetting a Unicorn engine is not async-signal-safe (it
+        // allocates host memory).  If a signal arrives mid-allocation, its
+        // handler is dispatched through the emulator, which resets the engine
+        // again and re-enters the allocator — deadlocking on the malloc lock.
+        // Defer signals across the reset.
+        tvm_sig_enter();
+        int reset_err = emulator_engine_reset(ec->ec_curr_engine);
+        if (0 == reset_err)
+            ec->ec_curr_engine->ee_refresh = 0;
+        tvm_sig_leave();
+        if (0 != reset_err)
             goto out;
-        ec->ec_curr_engine->ee_refresh = 0;
     }
 
     if (0 != emulator_saved_state_to_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc))
@@ -7011,7 +7055,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
     struct ulinker_dladdr_info local_pcinfo;
     if (!pcinfo) {
         if (0 != emulator_find_dl(ec, params->pc, &local_pcinfo)) {
-            INFO("emulator_find_dl(pc=%p) failed", (void *)params->pc);
+            INFO("emulator_call_ex: emulator_find_dl(pc=%p) failed", (void *)params->pc);
             return 1;
         }
         pcinfo = &local_pcinfo;
@@ -7089,7 +7133,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
     while (1) {
         if (0 != emulator_step(ec))
             goto out;
-        
+
         if (ess->ess_intr == ESS_INTR_MEM) {
             if (ess->ess_intr_memtype != UC_MEM_FETCH_PROT && ess->ess_intr_memtype != UC_MEM_FETCH_UNMAPPED) {
                 INFO("ess->ess_intr_memtype %d != UC_MEM_FETCH_PROT/UNMAPPED at %p", ess->ess_intr_memtype, (void *)ess->ess_intr_addr);
@@ -7105,7 +7149,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
                 goto out;
             }
 
-            // perhaps we need to page in executable memory
+            // perhaps we need to page in memory
             uint64_t fault_range_start = 0;
             uint64_t fault_range_size  = 0;
             struct ulinker_dladdr_info fault_info;
@@ -7119,14 +7163,10 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
                     struct emulator_call_params fault_params;
                     emulator_call_params_from_saved_state(&fault_params, ess);
 
-                    // INFO("emulator_call_ex subcall: %p ( %p, %p )", (void *)fault_params.pc, (void *)fault_params.arg[0], (void *)fault_params.arg[1]);
-
                     // call with parameters and save ret
                     uint64_t fault_ret;
                     if (0 != emulator_call_ex(&fault_info, &fault_params, &fault_ret))
                         goto out;
-
-                    // INFO("emulator_call_ex subcall ret: %p", (void *)fault_ret);
 
                     // NOTE! It is possible `fork()` was called!
                     // Update local variables from thread state
@@ -7335,7 +7375,6 @@ struct tvm_call {
     struct tvm_call *prev;
     void *lr;
 };
-static __thread struct tvm_call *call = NULL;
 
 #if defined(__linux__)
 extern char etext;
@@ -7446,8 +7485,9 @@ int can_enter_tvm(void *lr) {
     if (!main_task)
         return 0;
 
-    if (thread_tvm_disallow)
+    if (thread_tvm_disallow) {
         return 0;
+    }
 
     if (!lr) {
         if (!call)
@@ -8269,15 +8309,17 @@ static int tvm_main(int argc, char **argv)
 static void rmem_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
-    int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
-    CALL_FUNC(write, g_outfd, msgbuf, __num);
+    char __msgbuf[0x1000];
+    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
+    CALL_FUNC(write, g_outfd, __msgbuf, __num);
 }
 
 static void ulinker_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
-    int __num = snprintf(msgbuf, sizeof(msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
-    CALL_FUNC(write, g_outfd, msgbuf, __num);
+    char __msgbuf[0x1000];
+    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
+    CALL_FUNC(write, g_outfd, __msgbuf, __num);
 }
 
 void *rmem_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
@@ -8411,6 +8453,12 @@ void tvm_init(const char *init_comm)
     if (!global_arena)
         panic("couldn't create global arena");
 
+    struct tvm_tls *t = kalloc(sizeof(struct tvm_tls));
+    if (!t)
+        panic("tvm_tls alloc");
+    memset(t, 0, sizeof(struct tvm_tls));
+    pthread_setspecific(tls_key, t);
+
     ulinker_setopt(ULINKER_PRINT_CB, (void *)ulinker_print_cb);
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
@@ -8503,7 +8551,7 @@ void tvm_init(const char *init_comm)
 
     strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
 
-    cow_run_init_funcs(); // initialize copy-on-write vars with init statements
+
 
     vtimer_init(); // must be before signal handler installation
 
@@ -8566,7 +8614,9 @@ char ***_tvm_environ()
 
 void tvm_log(const char *function, const char *msg, ...)
 {
-    int n = snprintf(msgbuf, sizeof(msgbuf), "%s(%d): %s: ", (current ? current->tsk_comm : "<null>"), __gettid(), function);
+    char msgbuf[0x1000];
+    struct tvm_tls *t = tvm_tls();
+    int n = snprintf(msgbuf, sizeof(msgbuf), "%s(%d): %s: ", (t && t->tls_current ? t->tls_current->tsk_comm : "<null>"), __gettid(), function);
 
     va_list ap;
     va_start(ap, msg);
@@ -10656,6 +10706,7 @@ struct fork_arg {
     struct task *tsk;
     struct thread *thr;
     struct thread *parent_thr;
+    struct tvm_tls *parent_tls;
 
     struct cow_fixup_context fixup;
     void *tmp_stack;
@@ -10707,8 +10758,50 @@ static void fork_dup_heap_cb(struct fork_arg *arg, void *old_slab, void *new_sla
 
 static void fork_done_heap_cb(struct fork_arg *arg)
 {
-    if (arg->duplicate_errors == 0)
+    if (arg->duplicate_errors == 0) {
+        // strip EMUFUNC_MARK from sighandler pointers so fixup can translate them
+        for (int i = 0; i < MAX_SIGNALS; i++) {
+            struct sigaction *sa = &arg->tsk->tsk_sighandlers[i];
+            if (sa->sa_flags & SA_SIGINFO) {
+                if (EMUFUNC_MARKED(sa->sa_sigaction))
+                    sa->sa_sigaction = EMUFUNC_UNMARK(sa->sa_sigaction);
+            } else {
+                if (EMUFUNC_MARKED(sa->sa_handler))
+                    sa->sa_handler = EMUFUNC_UNMARK(sa->sa_handler);
+            }
+        }
+
+        // Snapshot the parent's live environ pointer before fixup. TVM's
+        // putenv/setenv write the environ array pointer directly through
+        // tsk_relocs.__environ (into the guest's __environ symbol), but the
+        // fork duplication source for that symbol does not reflect those
+        // host-side writes — the child inherits a stale (pre-putenv) value.
+        // We restore it from the parent's live value after fixup below.
+        char **parent_environ = *arg->parent->tsk_relocs.__environ;
+
         cow_fixup_process(&arg->fixup);
+
+        // cow_fixup_process may wrongly translate tsk_parent (it should
+        // point to the PARENT's task, not the child's arena copy)
+        arg->tsk->tsk_parent = arg->parent;
+
+        // Restore the child's environ pointer from the parent's live value
+        // (translated into the child's address space), working around the
+        // stale-duplication issue described above.
+        *arg->tsk->tsk_relocs.__environ = cow_fixup_translate(&arg->fixup, parent_environ);
+
+        // re-mark translated sighandler pointers
+        for (int i = 0; i < MAX_SIGNALS; i++) {
+            struct sigaction *sa = &arg->tsk->tsk_sighandlers[i];
+            if (sa->sa_flags & SA_SIGINFO) {
+                if (sa->sa_sigaction && sa->sa_sigaction != (void *)SIG_DFL && sa->sa_sigaction != (void *)SIG_IGN)
+                    sa->sa_sigaction = EMUFUNC_MARK(sa->sa_sigaction);
+            } else {
+                if (sa->sa_handler && sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN)
+                    sa->sa_handler = EMUFUNC_MARK(sa->sa_handler);
+            }
+        }
+    }
 }
 
 static void tvm_proc_entry_cont(struct fork_arg *arg);
@@ -10718,6 +10811,12 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     // save fp before modifying
     uintptr_t curr_fp = (uintptr_t)__builtin_frame_address(0);
     arg->thread_fp = curr_fp;
+
+    struct tvm_tls *child_tls = kalloc(sizeof(struct tvm_tls));
+    if (!child_tls)
+        panic("tvm_proc_entry: tvm_tls alloc");
+    memset(child_tls, 0, sizeof(struct tvm_tls));
+    pthread_setspecific(tls_key, child_tls);
 
     // set thread-local current/current_thread early so ulinker callbacks
     // (which VERIFY(arg == current)) work during ulinker_duplicate
@@ -10835,12 +10934,17 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // *(uintptr_t *)(child_fp) = 0xDEADBEEF46464646;
     // *(uintptr_t *)(child_fp + 8) = 0xDEADBEEF42424242;
 
-    // load and copy all data vars
-    if (0 != cow_fixup_load_data_variables(&arg->fixup, 1))
-        goto fail;
-
-    for (int i = 0; i < arg->fixup.count; i++)
-        memcpy(arg->fixup.ptrs[i].new, arg->fixup.ptrs[i].old, arg->fixup.ptrs[i].size);
+    // copy tvm_tls from parent to child
+    {
+        struct tvm_tls *child_tls = tvm_tls();
+        struct tvm_tls *parent_tls = arg->parent_tls;
+        memcpy(child_tls, parent_tls, sizeof(struct tvm_tls));
+        if (0 != cow_fixup_ctx_add(&arg->fixup, child_tls, parent_tls, sizeof(struct tvm_tls), 1))
+            goto fail;
+        current = arg->tsk;
+        current_thread = arg->thr;
+        tvm_sig_blocked = 0;
+    }
 
     // include prologue (fp + lr) when adjusting jmpbuf context regs (important for fixing up pointers to rbp)
     // INFO("STACK %p %p %p", (void *)parent_sp, (void *)child_sp, (void *)(parent_fp - parent_sp + 2 * sizeof(uintptr_t)));
@@ -10854,6 +10958,9 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // relocations
     memcpy(&arg->tsk->tsk_relocs, &arg->parent->tsk_relocs, sizeof(arg->tsk->tsk_relocs));
     if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&arg->tsk->tsk_relocs, (void *)&arg->parent->tsk_relocs, sizeof(arg->tsk->tsk_relocs), 1))
+        goto fail;
+    // signal handlers contain function pointers that need translation
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_sighandlers, (void *)arg->parent->tsk_sighandlers, sizeof(arg->tsk->tsk_sighandlers), 1))
         goto fail;
 
     if (0 != ulinker_duplicate(arg->parent->tsk_linker, arg->tsk->tsk_linker, (void (*)(void *arg, void *old_map, void *new_map, size_t size, int))fork_dup_linker_cb, (void *)arg))
@@ -11024,10 +11131,7 @@ pid_t fork(void) {
         goto out;
     }
 
-    if (0 != cow_fixup_load_data_variables(&arg->fixup, 0)) {
-        // HANDLE??
-        goto out;
-    }
+    arg->parent_tls = tvm_tls();
 
     if (0 != setjmp(arg->jmpbuf_parent)) {
 
@@ -11148,6 +11252,12 @@ struct pthread_create_arg
 
 static void *tvm_thread_entry(struct pthread_create_arg *arg)
 {
+    struct tvm_tls *t = kalloc(sizeof(struct tvm_tls));
+    if (!t)
+        panic("tvm_thread_entry: tvm_tls alloc");
+    memset(t, 0, sizeof(struct tvm_tls));
+    pthread_setspecific(tls_key, t);
+
     pthread_mutex_lock(&arg->mtx);
 
     current = arg->tsk;
@@ -11520,7 +11630,7 @@ FUNCTION_DEFINE1(pid_t, getsid, pid_t, pid) {
 
     if (!pid)
         pid = current->tsk_pid;
-    
+
     struct task *t = task_for_pid(pid, 1);
     if (!t) {
         tvm_sig_leave();
@@ -11964,7 +12074,7 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
         return 0;
     }
 
-    char **new_environ = addenv(*current->tsk_relocs.__environ, string);
+    char **new_environ = addenv(current->tsk_ar, *current->tsk_relocs.__environ, string);
     if (!new_environ) {
         errno = ENOMEM;
         return -1;
@@ -11979,7 +12089,8 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
 FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, overwrite) {
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
-    char *string = malloc(name_len + value_len + 2);
+    // Arena-allocate (not host malloc) so the string survives fork — see addenv().
+    char *string = rmem_arena_alloc(current->tsk_ar, name_len + value_len + 2);
     if (!string) {
         errno = ENOMEM;
         return -1;
@@ -11991,18 +12102,18 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
     char **env = NULL;
     if (*current->tsk_relocs.__environ)
         env = findenv(*current->tsk_relocs.__environ, name, strlen(name));
-    
+
     if (env) {
         if (overwrite)
             *env = string;
         else
-            free(string);
-        return 0;    
+            rmem_arena_free(current->tsk_ar, string);
+        return 0;
     }
 
-    char **new_environ = addenv(*current->tsk_relocs.__environ, string);
+    char **new_environ = addenv(current->tsk_ar, *current->tsk_relocs.__environ, string);
     if (!new_environ) {
-        free(string);
+        rmem_arena_free(current->tsk_ar, string);
         errno = ENOMEM;
         return -1;
     }
@@ -12175,7 +12286,6 @@ do_exec:
         tvm_sig_leave();
         return -1;
     }
-
     // destroy old emulator context (with stale engine/map entries) and
     // create a fresh one so the new executable starts clean
     struct emulator_context *new_emulator = emulator_context_create(new_linker);
@@ -12294,11 +12404,16 @@ do_exec:
 
     // TODO purge rmem heap + mmaps
 
-    cow_run_init_funcs(); // re-initialize copy-on-write vars with init statements
+    memset(tvm_tls()->tls_tty_name, 0, sizeof(tvm_tls()->tls_tty_name));
+    memset(tvm_tls()->tls_pts_name, 0, sizeof(tvm_tls()->tls_pts_name));
 
     uint64_t ret;
 
     tvm_sig_leave();
+
+    // Reset signal depth — the exec path accumulates nested tvm_sig_enter
+    // calls from file I/O during setup that don't fully unwind
+    tvm_sig_blocked = 0;
 
     // reinitialize relocations
 
@@ -13251,10 +13366,6 @@ FUNCTION_DEFINE1(char *, getwd, char *, buf) {
     return getcwd(buf, PATH_MAX);
 }
 
-typedef int (*compar_t) (const void *, const void *);
-
-static __thread compar_t bsearch_compar = NULL;
-
 static int bsearch_compar_emulator(const void *a, const void *b)
 {
     uint64_t ret;
@@ -13271,8 +13382,6 @@ FUNCTION_DEFINE5(void *, bsearch, const void *, key, const void *, base, size_t,
     return ret;
 }
 
-static __thread compar_t qsort_compar = NULL;
-
 static int qsort_compar_emulator(const void *a, const void *b)
 {
     uint64_t ret;
@@ -13287,9 +13396,6 @@ FUNCTION_DEFINE_VOID4(qsort, void *, base, size_t, nel, size_t, width, compar_t,
     CALL_FUNC(qsort, base, nel, width, qsort_compar_emulator);
     qsort_compar = NULL;
 }
-
-typedef int (*tputs_putc_t)(int);
-static __thread tputs_putc_t tputs_putc = NULL;
 
 static int tputs_putc_emulator(int c)
 {
@@ -13308,6 +13414,16 @@ FUNCTION_DEFINE3(int, tputs, const char *, str, int, affcnt, tputs_putc_t, putc_
 
 // SIGEV_THREAD entry points: selected at timer_create time based on whether
 // the callback is a host function or an emulated binary function.
+static void vtimer_cb_done(void)
+{
+    // Mark this SIGEV_THREAD callback as finished so a waiting timer_delete()
+    // can proceed. See tsk_sigev_inflight.
+    task_lock(current);
+    if (current->tsk_sigev_inflight > 0)
+        current->tsk_sigev_inflight--;
+    task_unlock(current);
+}
+
 static void *vtimer_thread_entry(void *_arg)
 {
     struct vtimer_thread_arg *a = _arg;
@@ -13315,6 +13431,7 @@ static void *vtimer_thread_entry(void *_arg)
     union sigval val = a->val;
     free(a); // current is set → intercepted free → tsk_ar
     func(val);
+    vtimer_cb_done();
     return NULL;
 }
 
@@ -13327,6 +13444,7 @@ static void *vtimer_thread_entry_emu(void *_arg)
     memcpy(&sigval_bits, &a->val, sizeof(a->val));
     free(a); // current is set → intercepted free → tsk_ar
     emulator_call(NULL, pc, sigval_bits, 0, 0, 0, 0, 0);
+    vtimer_cb_done();
     return NULL;
 }
 #endif
@@ -13565,6 +13683,19 @@ FUNCTION_DEFINE1(int, timer_delete, timer_t, tmr) {
     current->tsk_timers[slot] = -1;
     vtimer_destroy_locked(global_idx);
 
+    // Wait for any in-flight SIGEV_THREAD callback to finish before returning.
+    // The timer is now destroyed so the manager spawns no new callbacks; an
+    // already-running one may still be touching caller-owned state (e.g. the
+    // sival_ptr buffer), which the caller is free to release once we return.
+    // Bounded so an unrelated busy timer can't make us spin forever.
+    for (int spins = 0; current->tsk_sigev_inflight > 0 && spins < 4000; spins++) {
+        task_unlock(current);
+        pthread_mutex_unlock(&vtimers_lock);
+        usleep(500);
+        pthread_mutex_lock(&vtimers_lock);
+        task_lock(current);
+    }
+
     task_unlock(current);
     pthread_mutex_unlock(&vtimers_lock);
 
@@ -13774,8 +13905,6 @@ FUNCTION_DEFINE0(char *, get_current_dir_name) {
 /////////////
 // MARK: Apple-specific hooks
 /////////////
-
-static __thread CFDictionaryApplierFunction CFDictionaryApplyFunction_function = NULL;
 
 static void CFDictionaryApplyFunction_emulator(const void *key, const void *value, void *context)
 {
