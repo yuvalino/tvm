@@ -3849,14 +3849,14 @@ static void call_macho64_constructors(struct dlinfo_macho64 *dl) {
 static void call_elf64_constructors(struct dlinfo_elf64 *dl)
 {
     if (dl->dle64_init_func)
-        uo.uo_call(DLPRIVATE(dl), dl->dle64_init_func);
+        call_function(DLBASE(dl)->dl_linker, (struct dlinfo *)dl, (void *)dl->dle64_init_func);
 
     if (dl->dle64_init_array && dl->dle64_init_array_size) {
         size_t count = dl->dle64_init_array_size / sizeof(void *);
         void **funcs = (void **)dl->dle64_init_array;
         for (size_t i = 0; i < count; i++) {
             if (funcs[i])
-                uo.uo_call(DLPRIVATE(dl), funcs[i]);
+                call_function(DLBASE(dl)->dl_linker, (struct dlinfo *)dl, funcs[i]);
         }
     }
 }
