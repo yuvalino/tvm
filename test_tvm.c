@@ -23,9 +23,9 @@
 
 //////////
 //// API
-static const char *self_exe;
-
 //////////
+
+static const char *self_exe;
 
 #define __S(X) #X
 #define _S(X) __S(X)
@@ -110,7 +110,6 @@ TEST(ProcExit) {
 }
 
 TEST(ProcWNOHANG) {
-    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -129,7 +128,6 @@ TEST(ProcWNOHANG) {
 }
 
 TEST(ProcWaitPgrp) {
-    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -165,7 +163,6 @@ TEST(ProcRaise) {
 }
 
 TEST(ProcKill) {
-    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -185,7 +182,6 @@ TEST(ProcKill) {
 }
 
 TEST(ProcParent) {
-    phase_reset();
     int pip[2];
     int pip2[2];
     ASSERT_EQ(pipe(pip), 0);
@@ -266,7 +262,6 @@ TEST(ProcParent) {
 }
 
 TEST(ProcSid) {
-    phase_reset();
     ASSERT_EQ(getpid(), getsid(0));
     ASSERT_EQ(-1, setsid());
     ASSERT_EQ(EPERM, errno);
@@ -301,7 +296,6 @@ TEST(ProcSid) {
 }
 
 TEST(ProcPgid) {
-    phase_reset();
     ASSERT_EQ(getpid(), getpgrp());
     ASSERT_EQ(-1, setpgrp());
     ASSERT_EQ(EPERM, errno);
@@ -337,7 +331,6 @@ TEST(ProcPgid) {
 }
 
 TEST(ProcPgidSet) {
-    phase_reset();
     pid_t p1 = fork();
     ASSERT_NEQ(p1, -1);
     if (!p1) {
@@ -412,7 +405,6 @@ static void testhandler(int signo) {
 }
 
 TEST(SignalsSIGCHLD) {
-    phase_reset();
 
     /////
     // SIGCHLD set to SIG_IGN
@@ -492,7 +484,6 @@ TEST(SignalsSIGCHLD) {
 }
 
 TEST(SignalsPgrp) {
-    phase_reset();
     pid_t p1 = fork();
     ASSERT_NEQ(p1, -1);
     if (!p1) {
@@ -537,7 +528,6 @@ TEST(FDsInit) {
 }
 
 TEST(FDsPoll) {
-    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -595,7 +585,6 @@ TEST(FDsPoll) {
 }
 
 TEST(FDsFcntl) {
-    phase_reset();
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
 
@@ -657,7 +646,6 @@ TEST(FDsCloseOnExit) {
 static int cow_int;
 
 TEST(COWSingleThreaded) {
-    phase_reset();
     cow_int = 69;
 
     pid_t p = fork();
@@ -696,7 +684,6 @@ static struct {
 } cow_deep;
 
 TEST(COWDeepCopy) {
-    phase_reset();
     cow_deep.val = 69;
     cow_deep.ptr = malloc(0x69);
     ASSERT_NEQ(NULL, cow_deep.ptr);
@@ -736,7 +723,6 @@ TEST(COWDeepCopy) {
 
 TEST(COWDeepCopyMidBufferUnaligned)
 {
-    phase_reset();
     char *ptr = malloc(0x69);
     ASSERT_NEQ(NULL, ptr);
 
@@ -774,7 +760,6 @@ TEST(COWDeepCopyMidBufferUnaligned)
 
 TEST(COWDeepCopyInStack)
 {
-    phase_reset();
     char *ptr = malloc(0x69);
     int i;
     for (i = 0; i < 10; i++)
@@ -844,7 +829,6 @@ TEST(EnvBasic) {
 }
 
 TEST(EnvFork) {
-    phase_reset();
     ASSERT_EQ(NULL, getenv("kd85n2lk2"));
     ASSERT_EQ(0, putenv("kd85n2lk2=1"));
     ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "1"));
@@ -1195,7 +1179,6 @@ static void sighup_handler(int signo) {
 }
 
 TEST(TTYDetachCloseMaster) {
-    phase_reset();
     int master, slave;
 	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
 
@@ -1228,7 +1211,6 @@ TEST(TTYDetachCloseMaster) {
 }
 
 TEST(TTYDetachTIOCNOTTY) {
-    phase_reset();
     int master, slave;
 	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
 
@@ -1482,7 +1464,6 @@ static int sig_pgrp_count = 0;
 static void sig_pgrp_handler(int sig) { sig_pgrp_count++; }
 
 TEST(SignalKillZero) {
-    phase_reset();
     sig_pgrp_count = 0;
     struct sigaction act = { .sa_handler = sig_pgrp_handler };
     ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
@@ -1582,7 +1563,6 @@ TEST(StressForkExit) {
 }
 
 TEST(TTYSighupRace) {
-    phase_reset();
     int master, slave;
     ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
 
@@ -3752,6 +3732,7 @@ static int run_prog_mode(const char *name, int argc, char **argv)
 
 static int runtest_gdb(struct testinfo_t *testinfo, int verbose)
 {
+    phase_reset();
     testinfo->f();
     return 0;
 }
@@ -3822,6 +3803,8 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
         perror("test_tvm: sigaction");
         abort();
     }
+
+    phase_reset();
 
     pid_t p = fork();
     if (p == -1) {
