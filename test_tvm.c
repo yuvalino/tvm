@@ -3818,7 +3818,10 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
         close(outp[1]);
         close(errp[1]);
 
-        setsid(); // best-effort session isolation
+        if (getpid() != setsid()) {
+            perror("test_tvm: setsid");
+            exit(1);
+        }
 
         testinfo->f();
         exit(0);
