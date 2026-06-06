@@ -3421,6 +3421,8 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
         return;
     }
 
+    tvm_sig_interrupted = signum;
+
     if ((act->sa_flags & SA_SIGINFO) == 0) {
         task_unlock(current);
         tvm_sig_depth--;
@@ -3528,8 +3530,6 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 
     if (signum < 1 || signum >= MAX_SIGNALS)
         return;
-
-    tvm_sig_interrupted = signum;
 
     int hardware_fault = siginfo->si_code > 0 && (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE);
 
@@ -11786,7 +11786,7 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
             ntasks++;
             task_lock(main_task);
             if (main_task->tsk_state & TS_ZOMBIE)
-                errno = ESRCH;
+                kills_confirmed++;
             else if (0 == task_kill_locked(main_task, sig))
                 kills_confirmed++;
             task_unlock(main_task);
@@ -11802,7 +11802,7 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
             ntasks++;
             task_lock(t);
             if (t->tsk_state & TS_ZOMBIE)
-                errno = ESRCH;
+                kills_confirmed++;
             else if (0 == task_kill_locked(t, sig))
                 kills_confirmed++;
             task_unlock(t);
