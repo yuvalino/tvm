@@ -243,12 +243,11 @@ TEST(ProcParent) {
     PHASE_SET(3);
 
     ASSERT_EQ(0, read(pip[0], &p2, sizeof(p2))); // ensure child is zombie
-    ASSERT_EQ(-1, kill(p1, 0)); // kill zombie should fail
-    ASSERT_EQ(ESRCH, errno);
+    ASSERT_EQ(0, kill(p1, 0)); // POSIX: zombie is still a process
 
     ASSERT_EQ(p1, waitpid(p1, NULL, 0));
 
-    // we can't check this because the system may have re-used this PID
+    // after reaping, kill should fail (but PID may have been reused)
     //ASSERT_EQ(-1, kill(p1, 0));
     //ASSERT_EQ(ESRCH, errno);
 
@@ -1277,9 +1276,8 @@ TEST(SignalZombie) {
     read(pip[0], &c, 1);
     close(pip[0]);
 
-    // Zombie: any real signal should fail with ESRCH
-    ASSERT_EQ(-1, kill(p, SIGUSR1));
-    ASSERT_EQ(ESRCH, errno);
+    // POSIX: zombie is still a process, kill should succeed
+    ASSERT_EQ(0, kill(p, SIGUSR1));
 
     int s;
     ASSERT_EQ(p, wait(&s));
