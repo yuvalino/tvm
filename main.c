@@ -70,7 +70,24 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    tvm_init("tvm");
+    int verbose = 0;
+    for (int j = 1; j < argc; j++) {
+        if (strcmp(argv[j], "--verbose") == 0) {
+            verbose = 1;
+            break;
+        }
+    }
+
+    if (verbose)
+        tvm_init("tvm");
+    else {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull == -1) {
+            perror("/dev/null");
+            return 1;
+        }
+        tvm_init_with_outfd("tvm", devnull);
+    }
 
     int i = 1;
 
@@ -80,8 +97,11 @@ int main(int argc, char **argv)
             printf("Run programs in TVM (Thread Virtual Machine)\n\n");
             printf("Options:\n");
             printf("  -h             display this help and exit\n");
+            printf("  --verbose      enable kernel log output\n");
             printf("  -v PATH:CPIO   mount CPIO archive at PATH (repeatable)\n");
             return 0;
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            i++;
         } else if (strcmp(argv[i], "-v") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s: -v requires argument PATH:CPIO\n", argv[0]);
