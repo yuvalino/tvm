@@ -1188,13 +1188,10 @@ out:
     return r;
 }
 
-static char **addenv(struct rmem_arena *ar, char **env, char *string)
+static char **addenv(char **env, char *string)
 {
     int sz = envsize(env);
-    // Allocate from the task arena (not host malloc) so the environ array is
-    // part of the cow-tracked memory and gets duplicated + pointer-fixed-up on
-    // fork. Otherwise putenv/setenv entries are lost in forked children.
-    char **newenv = rmem_arena_alloc(ar, sizeof(char *) * (sz+2));
+    char **newenv = malloc(sizeof(char *) * (sz+2));
     if (!newenv)
         return NULL;
 
@@ -12074,7 +12071,7 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
         return 0;
     }
 
-    char **new_environ = addenv(current->tsk_ar, *current->tsk_relocs.__environ, string);
+    char **new_environ = addenv(*current->tsk_relocs.__environ, string);
     if (!new_environ) {
         errno = ENOMEM;
         return -1;
@@ -12089,8 +12086,7 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
 FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, overwrite) {
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
-    // Arena-allocate (not host malloc) so the string survives fork — see addenv().
-    char *string = rmem_arena_alloc(current->tsk_ar, name_len + value_len + 2);
+    char *string = malloc(name_len + value_len + 2);
     if (!string) {
         errno = ENOMEM;
         return -1;
@@ -12107,13 +12103,13 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
         if (overwrite)
             *env = string;
         else
-            rmem_arena_free(current->tsk_ar, string);
+            free(string);
         return 0;
     }
 
-    char **new_environ = addenv(current->tsk_ar, *current->tsk_relocs.__environ, string);
+    char **new_environ = addenv(*current->tsk_relocs.__environ, string);
     if (!new_environ) {
-        rmem_arena_free(current->tsk_ar, string);
+        free(string);
         errno = ENOMEM;
         return -1;
     }
