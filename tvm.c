@@ -1734,15 +1734,12 @@ struct tvm_tls {
 };
 
 static pthread_key_t tls_key;
-
-__attribute__((constructor))
-static void tls_key_init(void) {
-    pthread_key_create(&tls_key, NULL);
-}
-
+static int tls_initialized = 0;
 static struct tvm_tls _tls_bootstrap;
 
 static inline struct tvm_tls *tvm_tls(void) {
+    if (!tls_initialized)
+        return &_tls_bootstrap;
     struct tvm_tls *t = pthread_getspecific(tls_key);
     return t ? t : &_tls_bootstrap;
 }
@@ -7146,7 +7143,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
                 goto out;
             }
 
-            // perhaps we need to page in memory
+            // perhaps we need to page in executable memory
             uint64_t fault_range_start = 0;
             uint64_t fault_range_size  = 0;
             struct ulinker_dladdr_info fault_info;
@@ -8449,6 +8446,9 @@ void tvm_init(const char *init_comm)
     global_arena = rmem_arena_create(NULL);
     if (!global_arena)
         panic("couldn't create global arena");
+
+    pthread_key_create(&tls_key, NULL);
+    tls_initialized = 1;
 
     struct tvm_tls *t = kalloc(sizeof(struct tvm_tls));
     if (!t)
@@ -10703,7 +10703,6 @@ struct fork_arg {
     struct task *tsk;
     struct thread *thr;
     struct thread *parent_thr;
-    struct tvm_tls *parent_tls;
 
     struct cow_fixup_context fixup;
     void *tmp_stack;
@@ -10757,46 +10756,33 @@ static void fork_done_heap_cb(struct fork_arg *arg)
 {
     if (arg->duplicate_errors == 0) {
         // strip EMUFUNC_MARK from sighandler pointers so fixup can translate them
+        uint32_t emu_marked = 0;
         for (int i = 0; i < MAX_SIGNALS; i++) {
             struct sigaction *sa = &arg->tsk->tsk_sighandlers[i];
             if (sa->sa_flags & SA_SIGINFO) {
-                if (EMUFUNC_MARKED(sa->sa_sigaction))
+                if (EMUFUNC_MARKED(sa->sa_sigaction)) {
+                    emu_marked |= (1u << i);
                     sa->sa_sigaction = EMUFUNC_UNMARK(sa->sa_sigaction);
+                }
             } else {
-                if (EMUFUNC_MARKED(sa->sa_handler))
+                if (EMUFUNC_MARKED(sa->sa_handler)) {
+                    emu_marked |= (1u << i);
                     sa->sa_handler = EMUFUNC_UNMARK(sa->sa_handler);
+                }
             }
         }
 
-        // Snapshot the parent's live environ pointer before fixup. TVM's
-        // putenv/setenv write the environ array pointer directly through
-        // tsk_relocs.__environ (into the guest's __environ symbol), but the
-        // fork duplication source for that symbol does not reflect those
-        // host-side writes — the child inherits a stale (pre-putenv) value.
-        // We restore it from the parent's live value after fixup below.
-        char **parent_environ = *arg->parent->tsk_relocs.__environ;
-
         cow_fixup_process(&arg->fixup);
 
-        // cow_fixup_process may wrongly translate tsk_parent (it should
-        // point to the PARENT's task, not the child's arena copy)
-        arg->tsk->tsk_parent = arg->parent;
-
-        // Restore the child's environ pointer from the parent's live value
-        // (translated into the child's address space), working around the
-        // stale-duplication issue described above.
-        *arg->tsk->tsk_relocs.__environ = cow_fixup_translate(&arg->fixup, parent_environ);
-
-        // re-mark translated sighandler pointers
+        // re-mark only handlers that were originally marked
         for (int i = 0; i < MAX_SIGNALS; i++) {
+            if (!(emu_marked & (1u << i)))
+                continue;
             struct sigaction *sa = &arg->tsk->tsk_sighandlers[i];
-            if (sa->sa_flags & SA_SIGINFO) {
-                if (sa->sa_sigaction && sa->sa_sigaction != (void *)SIG_DFL && sa->sa_sigaction != (void *)SIG_IGN)
-                    sa->sa_sigaction = EMUFUNC_MARK(sa->sa_sigaction);
-            } else {
-                if (sa->sa_handler && sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN)
-                    sa->sa_handler = EMUFUNC_MARK(sa->sa_handler);
-            }
+            if (sa->sa_flags & SA_SIGINFO)
+                sa->sa_sigaction = EMUFUNC_MARK(sa->sa_sigaction);
+            else
+                sa->sa_handler = EMUFUNC_MARK(sa->sa_handler);
         }
     }
 }
@@ -10930,18 +10916,6 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // for debugging when unwinder crashes
     // *(uintptr_t *)(child_fp) = 0xDEADBEEF46464646;
     // *(uintptr_t *)(child_fp + 8) = 0xDEADBEEF42424242;
-
-    // copy tvm_tls from parent to child
-    {
-        struct tvm_tls *child_tls = tvm_tls();
-        struct tvm_tls *parent_tls = arg->parent_tls;
-        memcpy(child_tls, parent_tls, sizeof(struct tvm_tls));
-        if (0 != cow_fixup_ctx_add(&arg->fixup, child_tls, parent_tls, sizeof(struct tvm_tls), 1))
-            goto fail;
-        current = arg->tsk;
-        current_thread = arg->thr;
-        tvm_sig_blocked = 0;
-    }
 
     // include prologue (fp + lr) when adjusting jmpbuf context regs (important for fixing up pointers to rbp)
     // INFO("STACK %p %p %p", (void *)parent_sp, (void *)child_sp, (void *)(parent_fp - parent_sp + 2 * sizeof(uintptr_t)));
@@ -11127,8 +11101,6 @@ pid_t fork(void) {
         errno = r;
         goto out;
     }
-
-    arg->parent_tls = tvm_tls();
 
     if (0 != setjmp(arg->jmpbuf_parent)) {
 
