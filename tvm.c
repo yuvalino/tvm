@@ -1666,7 +1666,6 @@ struct task {
     pthread_cond_t tsk_wait_cond;
     struct sigaction tsk_sighandlers[MAX_SIGNALS];
     unsigned tsk_threads_cnt;
-    unsigned tsk_sigev_inflight;   // SIGEV_THREAD timer callbacks currently running
     struct list_head tsk_threads;  // thread
     pid_t tsk_sid;
     pid_t tsk_pgid;
@@ -2341,11 +2340,9 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
-    // POSIX: _exit terminates every thread of the process. SIGEV_THREAD timer
-    // callbacks run as detached task threads, so one may still be draining when
-    // we get here. Destroy this task's timers first (so the vtimer manager
-    // spawns no new callbacks), then wait for any in-flight callback threads to
-    // finish before requiring tsk_threads_cnt == 1.
+    // Destroy this task's timers so the vtimer manager spawns no new callbacks.
+    // Any already-running SIGEV_THREAD callbacks are regular task threads and
+    // will be drained by the tsk_threads_cnt loop below.
     pthread_mutex_lock(&vtimers_lock);
     for (int i = 0; i < MAX_TIMERS_PER_TASK; i++) {
         if (current->tsk_timers[i] >= 0) {
@@ -2772,9 +2769,6 @@ static void *vtimer_thread(void *arg)
                     pthread_attr_init(&attr);
                     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-                    // Track this callback as in-flight so timer_delete() can wait
-                    // for it to finish before the caller frees state it may touch.
-                    target->tsk_sigev_inflight++;
                     VERIFY(0 == task_create_thread_locked(target, thread_func, a, &thr, &attr, NULL));
 
                     pthread_attr_destroy(&attr);
@@ -13382,16 +13376,6 @@ FUNCTION_DEFINE3(int, tputs, const char *, str, int, affcnt, tputs_putc_t, putc_
 
 // SIGEV_THREAD entry points: selected at timer_create time based on whether
 // the callback is a host function or an emulated binary function.
-static void vtimer_cb_done(void)
-{
-    // Mark this SIGEV_THREAD callback as finished so a waiting timer_delete()
-    // can proceed. See tsk_sigev_inflight.
-    task_lock(current);
-    if (current->tsk_sigev_inflight > 0)
-        current->tsk_sigev_inflight--;
-    task_unlock(current);
-}
-
 static void *vtimer_thread_entry(void *_arg)
 {
     struct vtimer_thread_arg *a = _arg;
@@ -13399,7 +13383,6 @@ static void *vtimer_thread_entry(void *_arg)
     union sigval val = a->val;
     free(a); // current is set → intercepted free → tsk_ar
     func(val);
-    vtimer_cb_done();
     return NULL;
 }
 
@@ -13412,7 +13395,6 @@ static void *vtimer_thread_entry_emu(void *_arg)
     memcpy(&sigval_bits, &a->val, sizeof(a->val));
     free(a); // current is set → intercepted free → tsk_ar
     emulator_call(NULL, pc, sigval_bits, 0, 0, 0, 0, 0);
-    vtimer_cb_done();
     return NULL;
 }
 #endif
@@ -13650,19 +13632,6 @@ FUNCTION_DEFINE1(int, timer_delete, timer_t, tmr) {
     int global_idx = current->tsk_timers[slot];
     current->tsk_timers[slot] = -1;
     vtimer_destroy_locked(global_idx);
-
-    // Wait for any in-flight SIGEV_THREAD callback to finish before returning.
-    // The timer is now destroyed so the manager spawns no new callbacks; an
-    // already-running one may still be touching caller-owned state (e.g. the
-    // sival_ptr buffer), which the caller is free to release once we return.
-    // Bounded so an unrelated busy timer can't make us spin forever.
-    for (int spins = 0; current->tsk_sigev_inflight > 0 && spins < 4000; spins++) {
-        task_unlock(current);
-        pthread_mutex_unlock(&vtimers_lock);
-        usleep(500);
-        pthread_mutex_lock(&vtimers_lock);
-        task_lock(current);
-    }
 
     task_unlock(current);
     pthread_mutex_unlock(&vtimers_lock);
