@@ -2946,8 +2946,6 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
             }
         }
 
-        if (ulinker->ul_cb_mmap)
-            ulinker->ul_cb_mmap(ulinker, DLBASE(dl)->dl_base, DLBASE(dl)->dl_size, (void *)seg_page_start, seg_page_end - seg_page_start, PFLAGS_TO_PROT(curr_phdr->p_flags));
     }
 
     // find phdr as it appears in the loaded segments
@@ -3418,8 +3416,6 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             }
         }
 
-        if (ulinker->ul_cb_mmap)
-            ulinker->ul_cb_mmap(ulinker, DLBASE(dl)->dl_base, DLBASE(dl)->dl_size, (void *)seg_page_start, seg_page_end - seg_page_start, VMPROT_TO_PROT(curr_sc->initprot));
     }
 
     // find phdr as it appears in the loaded segments
@@ -3878,17 +3874,59 @@ static void call_constructors(struct dlinfo *dl) {
         call_macho64_constructors((struct dlinfo_macho64 *)dl);
 }
 
+static void notify_loaded_segments(struct ulinker *ulinker, struct dlinfo *dl)
+{
+    if (!ulinker->ul_cb_mmap)
+        return;
+
+    if (dl->dl_type == DLT_ELF64) {
+        struct dlinfo_elf64 *dl64 = (struct dlinfo_elf64 *)dl;
+        for (size_t i = 0; i < dl64->dle64_phdr_count; i++) {
+            const Elf64_Phdr *phdr = &dl64->dle64_phdr[i];
+            if (phdr->p_type != PT_LOAD)
+                continue;
+            uintptr_t seg_start = phdr->p_vaddr + dl64->dle64_load_bias;
+            uintptr_t seg_page_start = page_start(seg_start);
+            uintptr_t seg_page_end = page_end(seg_start + phdr->p_memsz);
+            ulinker->ul_cb_mmap(ulinker, dl->dl_base, dl->dl_size,
+                (void *)seg_page_start, seg_page_end - seg_page_start,
+                PFLAGS_TO_PROT(phdr->p_flags));
+        }
+    } else if (dl->dl_type == DLT_MACHO64) {
+        struct dlinfo_macho64 *dlm = (struct dlinfo_macho64 *)dl;
+        const struct load_command *lc = dlm->dlm64_lc;
+        for (size_t i = 0; i < dlm->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+            if (lc->cmd != LC_SEGMENT_64)
+                continue;
+            const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+            // skip zeropage
+            if (sc->initprot == 0 && sc->maxprot == 0 && sc->vmaddr == 0)
+                continue;
+            uintptr_t seg_start = sc->vmaddr + dlm->dlm64_load_bias;
+            uintptr_t seg_page_start = page_start(seg_start);
+            uintptr_t seg_page_end = page_end(seg_start + sc->vmsize);
+            ulinker->ul_cb_mmap(ulinker, dl->dl_base, dl->dl_size,
+                (void *)seg_page_start, seg_page_end - seg_page_start,
+                VMPROT_TO_PROT(sc->initprot));
+        }
+    }
+}
+
 static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename) {
     struct dlinfo *ret = NULL;
     struct dlinfo *dl = NULL;
 
     if (!(dl = load_library_internal(ulinker, filename)))
         goto out;
-    
+
     if (link_library(dl))
         goto out;
 
     call_constructors(dl);
+
+    // calls mmap_cb, load event is reported right at mmap time.
+    // this is purely for post-processing memory after initialization is done.
+    notify_loaded_segments(ulinker, dl);
 
     ret = dl;
 
