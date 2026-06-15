@@ -2,4 +2,8 @@
 - ulinker switch emulator / native with env
 - ulinker support code signed binaries
 - ulinker support dwarf5 (only supports dwarf4)
+- ulinker support dSYM (Mach-O)
+- ulinker support TLS iOS
+- ulinker support Android
+- ulinker support dependencies
 - call matrix
