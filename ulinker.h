@@ -10,6 +10,7 @@ enum {
     ULINKER_ADD_EXTERNAL_DLINFO,
     ULINKER_PRINT_CB,
     ULINKER_EVENT_CB,
+    ULINKER_NOEMU, // disable emu mode globally (allow PROT_EXEC mapping)
 };
 
 enum {
@@ -29,6 +30,8 @@ struct ulinker_load_event {
 #ifndef RTLD_DEFAULT
 # define RTLD_DEFAULT	((void *) 0)
 #endif
+
+#define RTLD_NOEMU 0x40000000  // allow PROT_EXEC mappings
 
 struct ulinker_ops {
     void *(*uo_malloc)(void *, size_t);
@@ -81,6 +84,7 @@ struct ulinker_dladdr_info {
     size_t      udli_fsize;
     int         udli_farch;
     int         udli_fabi;
+    int         udli_femu;  // != 0 means no PROT_EXEC mappings, made to run under emulator
 };
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
 

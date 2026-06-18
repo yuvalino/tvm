@@ -574,7 +574,7 @@ struct emulator_context;
 struct emulator_context *emulator_context_create(struct ulinker *ulinker);
 void                     emulator_context_destroy(struct emulator_context *ec);
 
-void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
+void call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
 
 static inline void tvm_sig_enter(void);
 static inline void tvm_sig_leave(void);
@@ -1736,6 +1736,20 @@ static pthread_key_t tls_key;
 static int tls_initialized = 0;
 static struct tvm_tls _tls_bootstrap;
 
+static void taskdealloc(struct task *t);
+void threaddealloc(struct thread *thr);
+
+static void tvm_thread_destructor(void *arg) {
+    struct tvm_tls *tls = arg;
+    if (tls == &_tls_bootstrap)
+        return;
+    if (tls->tls_current_thread)
+        threaddealloc(tls->tls_current_thread);
+    if (tls->tls_current)
+        taskdealloc(tls->tls_current);
+    kfree(tls);
+}
+
 static inline struct tvm_tls *tvm_tls(void) {
     if (!tls_initialized)
         return &_tls_bootstrap;
@@ -2392,14 +2406,15 @@ static void terminate_current_locked(int result)
     }
 
     if (auto_reap) {
-        taskfreelastref(current, 0, 1);
+        taskfreelastref(current, 0, 0);
+        list_del(&current->tsk_list);
         pthread_detach(pthread_self());
     }
     else {
         if (!parent)
             panic("auto_reap=0 but parent is NULL");
-        
-        
+
+
         taskfreelastref(current, 0, 0);
 
         current->tsk_state |= TS_ZOMBIE;
@@ -2407,13 +2422,21 @@ static void terminate_current_locked(int result)
 
         task_unlock(current);
     }
+
     // Block OS-level signals before clearing current: the signal handler
     // panics if any signal arrives on this thread while current is NULL.
     sigset_t all_sigs, old_sigs;
     sigfillset(&all_sigs);
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
 
-    current = NULL;
+    // zombie: clear current/current_thread so tvm_thread_destructor skips
+    //         teardown — parent's waitpid handles it via taskfreelastref.
+    // auto_reap: leave them set so tvm_thread_destructor calls
+    //            threaddealloc + taskdealloc after stack unwind.
+    if (!auto_reap) {
+        current_thread = NULL;
+        current = NULL;
+    }
 
     if (notify_parent)
         task_kill_locked(parent, SIGCHLD);  // best-effort; parent may have already exited
@@ -3414,13 +3437,13 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
     if ((act->sa_flags & SA_SIGINFO) == 0) {
         task_unlock(current);
         tvm_sig_depth--;
-        emulator_call_sighandler((uint64_t)act->sa_handler, signum, 0, 0);
+        call_sighandler((uint64_t)act->sa_handler, signum, 0, 0);
         return;
     }
 
     task_unlock(current);
     tvm_sig_depth--;
-    emulator_call_sighandler((uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
+    call_sighandler((uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
     return;
 }
 
@@ -6493,6 +6516,15 @@ int emulator_find_dl(struct emulator_context *ec, uint64_t pc, struct ulinker_dl
     // return 1;
 }
 
+int emulated_pc(struct emulator_context *ec, uint64_t pc)
+{
+    struct ulinker_dladdr_info dli;
+    if (0 != emulator_find_dl(ec, pc, &dli))
+        return 0;
+
+    return dli.udli_femu;
+}
+
 bool emulator_hook_cb(uc_engine *uc, uc_mem_type type,
                                  uint64_t address, int size, int64_t value,
                                  struct emulator_context *ec)
@@ -6902,8 +6934,6 @@ out:
 
 int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
-    // TODO: do NOT mark emulation on calls from native loaded libraries
-
     // mark new handler
     struct sigaction act2;
     if (act) {
@@ -6914,18 +6944,19 @@ int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction
         if (act->sa_flags & SA_SIGINFO)
             handler_func = (void **)&act->sa_sigaction;
 
-        if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
+        if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN && emulated_pc(current_thread->thr_emulator, (uint64_t)*handler_func))
             *handler_func = EMUFUNC_MARK(*handler_func);
     }
 
     int ret = sigaction(signum, act, oldact);
 
     // unmark old handler
-    if (oldact) {
+    if (0 == ret && oldact) {
         void **handler_func = (void **)&oldact->sa_handler;
         if (oldact->sa_flags & SA_SIGINFO)
             handler_func = (void **)&oldact->sa_sigaction;
 
+        // its okay to always strip emulator marker even if not emulated pc, its no-op in that case
         if (*handler_func && *handler_func != SIG_DFL && *handler_func != SIG_IGN)
             *handler_func = EMUFUNC_UNMARK(*handler_func);
     }
@@ -6934,17 +6965,19 @@ int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction
 }
 
 #if defined(__linux__)
-sighandler_t emulator_signal(int signum, sighandler_t handler) {
+sighandler_t emulator_signal(int signum, sighandler_t handler)
 #elif defined(__APPLE__)
-sig_t emulator_signal(int signum, sig_t handler) {
+sig_t emulator_signal(int signum, sig_t handler)
 #endif
+{
     // mark new handler
-    if (handler && handler != SIG_DFL && handler != SIG_IGN)
+    if (handler && handler != SIG_DFL && handler != SIG_IGN && emulated_pc(current_thread->thr_emulator, (uint64_t)handler))
         handler = EMUFUNC_MARK(handler);
     
     handler = signal(signum, handler);
 
-    // unmark old handler
+    // unmark old handler (NOTE: must check SIG_ERR)
+    // its okay to always strip emulator marker even if not emulated pc, its no-op in that case
     if (handler && handler != SIG_DFL && handler != SIG_IGN && handler != SIG_ERR)
         handler = EMUFUNC_UNMARK(handler);
     
@@ -6954,6 +6987,10 @@ sig_t emulator_signal(int signum, sig_t handler) {
 int emulator_setjmp(jmp_buf env) {
     uc_err err;
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
+
+    // if no saved state no emulator, so call native
+    if (!ess)
+        return setjmp(env);
 
     uint64_t *envarr = (uint64_t *)env;
 
@@ -6993,6 +7030,13 @@ int emulator_setjmp(jmp_buf env) {
 int emulator_longjmp(jmp_buf env, int val) {
     uc_err err;
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
+
+    // if no saved state no emulator, so call native
+    if (!ess) {
+        longjmp(env, val);
+        __builtin_unreachable();
+    }
+
     uint64_t *envarr = (uint64_t *)env;
 
     if (!val) val = 1;
@@ -7052,11 +7096,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
     prevtvm = TVM_OFF;
 
     // fast path: upcall to host
-#ifdef ENABLE_RWX
-    if (1) {
-#else
-    if (pcinfo->udli_farch == ULARCH_NONE) {
-#endif
+    if (!pcinfo->udli_femu) {
         TVM_ON;
         uint64_t ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
@@ -7142,7 +7182,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
             uint64_t fault_range_size  = 0;
             struct ulinker_dladdr_info fault_info;
             if (0 == emulator_find_dl(ec, ess->ess_intr_addr, &fault_info)) {
-                if (fault_info.udli_farch != ess->ess_arch) {
+                if (fault_info.udli_farch != ess->ess_arch || !fault_info.udli_femu) {
 
                     // read lr before call so stack is adjusted for emulator_call_params_from_saved_state()
                     if (0 != emulator_saved_state_exit_call(ess, &ess->ess_fault_lr))
@@ -7217,14 +7257,10 @@ int emulator_call(uint64_t *out_ret, uint64_t pc, uint64_t arg0, uint64_t arg1, 
     return emulator_call_ex(NULL, &params, out_ret);
 }
 
-void emulator_call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+void call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
 
     // handler is not in emulator
-#ifdef ENABLE_RWX
-    if (1) {
-#else
     if (!EMUFUNC_MARKED(handler_pc)) {
-#endif
         ((void (*)(uint64_t, uint64_t, uint64_t))handler_pc)(arg0, arg1, arg2);
         return;
     }
@@ -7253,6 +7289,10 @@ void *tvm_emulator_thread_entry(struct emulator_pthread_create_arg *arg) {
 
 int emulator_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *_arg)
 {
+    // short-circuit for non-emulated PC addresses
+    if (!emulated_pc(current_thread->thr_emulator, (uint64_t)start_routine))
+        return pthread_create(thread, attr, start_routine, _arg);
+
     struct emulator_pthread_create_arg *arg = kalloc(sizeof(*arg));
     if (!arg) {
         return ENOMEM;
@@ -8216,11 +8256,8 @@ static int tvm_mount(int argc, char **argv)
 }
 
 int tvm_info(int argc, char **argv) {
-    int rwx = 0;
-#ifdef ENABLE_RWX
-    rwx = 1;
-#endif
-    printf("rwx        %d\n", rwx);
+    printf("tvm\n");
+    return 0;
 }
 
 static int tvm_shell(int argc, char **argv)
@@ -8378,7 +8415,6 @@ static struct ulinker_ops ulinker_ops = {
 
 static void *ulinker_external_dlsym(void *arg, const char *s)
 {
-#ifndef ENABLE_RWX
     if (0 == strcmp(s, "sigaction"))    return &emulator_sigaction;
     if (0 == strcmp(s, "signal"))       return &emulator_signal;
     if (0 == strcmp(s, "_setjmp"))      return &emulator_setjmp;
@@ -8390,7 +8426,6 @@ static void *ulinker_external_dlsym(void *arg, const char *s)
     if (0 == strcmp(s, "siglongjmp"))   return &emulator_longjmp;
 
     if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
-#endif
 
     if (0 == strcmp(s, "optarg"))   return &current->tsk_data->optarg;
     if (0 == strcmp(s, "optind"))   return &current->tsk_data->optind;
@@ -8441,7 +8476,7 @@ void tvm_init(const char *init_comm)
     if (!global_arena)
         panic("couldn't create global arena");
 
-    pthread_key_create(&tls_key, NULL);
+    pthread_key_create(&tls_key, tvm_thread_destructor);
     tls_initialized = 1;
 
     struct tvm_tls *t = kalloc(sizeof(struct tvm_tls));
@@ -8454,6 +8489,11 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
+    ulinker_setopt(ULINKER_NOEMU, (void *)(long)(getenv("TVM_NOEMU") != NULL));
+
+
+    // FROM HERE ON WE ENTER TVM ON CURRENT THREAD
+
 
     // we dont bother lockin current
 
@@ -11358,18 +11398,18 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
         task_unlock(current);
         exit((int) ((long) retval));
     }
-    
+
     list_del(&current_thread->thr_list);
     current->tsk_threads_cnt--;
     current->tsk_refcount--;
-
-    if (current_thread->thr_refcount == 1) {
-        threaddealloc(current_thread);
-    }
-
-    current_thread = NULL;
-
     task_unlock(current);
+
+    sigset_t all_sigs;
+    sigfillset(&all_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, NULL);
+
+    // current_thread left set → tvm_thread_destructor calls threaddealloc
+    current = NULL;
 
     CALL_FUNC(pthread_exit, retval);
     __builtin_unreachable();
@@ -13374,20 +13414,7 @@ FUNCTION_DEFINE3(int, tputs, const char *, str, int, affcnt, tputs_putc_t, putc_
     return ret;
 }
 
-// SIGEV_THREAD entry points: selected at timer_create time based on whether
-// the callback is a host function or an emulated binary function.
 static void *vtimer_thread_entry(void *_arg)
-{
-    struct vtimer_thread_arg *a = _arg;
-    void (*func)(union sigval) = a->func;
-    union sigval val = a->val;
-    free(a); // current is set → intercepted free → tsk_ar
-    func(val);
-    return NULL;
-}
-
-#ifndef ENABLE_RWX
-static void *vtimer_thread_entry_emu(void *_arg)
 {
     struct vtimer_thread_arg *a = _arg;
     uint64_t pc = (uint64_t)(uintptr_t)a->func;
@@ -13397,7 +13424,6 @@ static void *vtimer_thread_entry_emu(void *_arg)
     emulator_call(NULL, pc, sigval_bits, 0, 0, 0, 0, 0);
     return NULL;
 }
-#endif
 
 FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp, timer_t *, timerid) {
     tvm_sig_enter();
@@ -13413,22 +13439,8 @@ FUNCTION_DEFINE3(int, timer_create, clockid_t, clockid, struct sigevent *, sevp,
         if (notify == SIGEV_SIGNAL || notify == SIGEV_THREAD_ID)
             signo = sevp->sigev_signo;
         user_val = sevp->sigev_value;
-        if (notify == SIGEV_THREAD && sevp->sigev_notify_function) {
-            // Wrap the callback at creation time so the vtimer manager
-            // can spawn threads without knowing about emulator dispatch.
-#ifdef ENABLE_RWX
+        if (notify == SIGEV_THREAD && sevp->sigev_notify_function)
             thread_func = vtimer_thread_entry;
-#else
-            {
-                struct emulator_context *ec = current_thread->thr_emulator;
-                struct ulinker_dladdr_info dlinfo;
-                if (ec && 0 == emulator_find_dl(ec, (uint64_t)(uintptr_t)sevp->sigev_notify_function, &dlinfo))
-                    thread_func = vtimer_thread_entry_emu;
-                else
-                    thread_func = vtimer_thread_entry;
-            }
-#endif
-        }
     }
 
     // find free task slot
