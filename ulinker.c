@@ -32,6 +32,8 @@ static char errormsg[4096] = {0};
 
 static void (*event_cb)(int, void *);
 
+static int noemu = 0; // disable emu mode globally (allow PROT_EXEC mapping)
+
 #define ULINKER_EVENT(_event, _arg) do { if (event_cb) event_cb((_event), (void *)(_arg)); } while (0)
 
 #define ULINKER_EVENT_LOAD(_event, _dl) do {    \
@@ -278,15 +280,9 @@ typedef struct
 #define PF_MASKPROC	0xf0000000	/* Processor-specific */
 
 #define MAYBE_MAP_FLAG(x, from, to)  (((x) & (from)) ? (to) : 0)
-#ifdef ENABLE_RWX
 #define PFLAGS_TO_PROT(x)            (MAYBE_MAP_FLAG((x), PF_R, PROT_READ) | \
                                       MAYBE_MAP_FLAG((x), PF_W, PROT_WRITE) | \
                                       MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC))
-#else
-#define PFLAGS_TO_PROT(x)            (MAYBE_MAP_FLAG((x), PF_R, PROT_READ) | \
-                                      MAYBE_MAP_FLAG((x), PF_W, PROT_WRITE))
-                                    //MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC) |   <- no need, emulated
-#endif
 
 /* Dynamic section entry.  */
 
@@ -1361,15 +1357,9 @@ typedef int             vm_prot_t;
 #define VM_PROT_WRITE   ((vm_prot_t) 0x02)      /* write permission */
 #define VM_PROT_EXECUTE ((vm_prot_t) 0x04)      /* execute permission */
 
-#ifdef ENABLE_RWX
 #define VMPROT_TO_PROT(x)            (MAYBE_MAP_FLAG((x), VM_PROT_READ, PROT_READ) | \
                                       MAYBE_MAP_FLAG((x), VM_PROT_WRITE, PROT_WRITE) | \
                                       MAYBE_MAP_FLAG((x), VM_PROT_EXECUTE, PROT_EXEC))
-#else
-#define VMPROT_TO_PROT(x)            (MAYBE_MAP_FLAG((x), VM_PROT_READ, PROT_READ) | \
-                                      MAYBE_MAP_FLAG((x), VM_PROT_WRITE, PROT_WRITE))
-                                    //MAYBE_MAP_FLAG((x), VM_PROT_EXECUTE, PROT_EXEC) |   <- no need, emulated
-#endif
 
 /*
  * Dynamically linked shared libraries are identified by two things.  The
@@ -2031,6 +2021,8 @@ struct dlinfo {
     size_t dl_size;
     int dl_linked;
     int dl_constructors_called;
+    int dl_flags;  // flags as passed by dlopen()
+    int dl_emu;  // != 0 means no PROT_EXEC mappings, made to run under emulator
 };
 
 #define DLBASE(_ptr) ((struct dlinfo *)_ptr)
@@ -2112,7 +2104,7 @@ struct dlinfo_macho64 {
 
 struct dlinfo_external {
     struct dlinfo dlext_base;
-    void *(*dlext_dlsym)(void *, const char *s);
+    void *(*dlext_dlsym)(void *, const char *);
 };
 
 static pthread_mutex_t g_external_dlinfos_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -2768,7 +2760,7 @@ static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *s
     return NULL;
 }
 
-static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size, unsigned char *ident)
+static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size, unsigned char *ident, int flags)
 {
     struct dlinfo *ret = NULL;
     struct dlinfo_elf64 *dl = NULL;
@@ -2784,6 +2776,8 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
 
     memset(dl, 0, sizeof(*dl));
     DLBASE(dl)->dl_type = DLT_ELF64;
+    DLBASE(dl)->dl_flags = flags;
+    DLBASE(dl)->dl_emu = !(flags & RTLD_NOEMU) && !noemu;
     strncpy(DLBASE(dl)->dl_pathname, filename, sizeof(DLBASE(dl)->dl_pathname)-1);
     DLPRIVATE(dl) = ulinker->ul_private;
 
@@ -2911,7 +2905,7 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
         if (file_length != 0) {
             void* seg_addr = uo.uo_mmap(ulinker->ul_private, (void *)seg_page_start,
                                 file_length,
-                                PFLAGS_TO_PROT(curr_phdr->p_flags),
+                                PFLAGS_TO_PROT(curr_phdr->p_flags) & ~(DLBASE(dl)->dl_emu ? PROT_EXEC : 0), // strip away PROT_EXEC if run on emulator
                                 MAP_FIXED|MAP_PRIVATE,
                                 fd,
                                 file_page_start);
@@ -2936,7 +2930,7 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
         if (seg_page_end > seg_file_end) {
             void* zeromap = uo.uo_mmap(ulinker->ul_private, (void *)seg_file_end,
                                 seg_page_end - seg_file_end,
-                                PFLAGS_TO_PROT(curr_phdr->p_flags),
+                                PFLAGS_TO_PROT(curr_phdr->p_flags) & ~(DLBASE(dl)->dl_emu ? PROT_EXEC : 0), // strip away PROT_EXEC if run on emulator
                                 MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE,
                                 -1,
                                 0);
@@ -3174,7 +3168,7 @@ out:
     return ret;
 }
 
-static struct dlinfo *load_elf_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size)
+static struct dlinfo *load_elf_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size, int flags)
 {
     struct dlinfo *ret = NULL;
     unsigned char ident[EI_NIDENT] = {ELFMAG0, ELFMAG1, ELFMAG2, ELFMAG3};
@@ -3185,7 +3179,7 @@ static struct dlinfo *load_elf_library(struct ulinker *ulinker, const char *file
     }
 
     if (ident[EI_CLASS] == ELFCLASS64) {
-        ret = load_elf64_library(ulinker, filename, fd, file_size, ident);
+        ret = load_elf64_library(ulinker, filename, fd, file_size, ident, flags);
     }
     else {
         ERROR("failed to load \"%s\": unsupported ELFCLASS %hhu", filename, ident[EI_CLASS]);
@@ -3230,7 +3224,7 @@ static uintptr_t vaddr_macho64(struct dlinfo_macho64 *dl, uint32_t fileoff)
     return 0;
 }
 
-static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size)
+static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *filename, int fd, ssize_t file_size, int flags)
 {
     struct dlinfo *ret = NULL;
     struct dlinfo_macho64 *dl = NULL;
@@ -3244,6 +3238,8 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
 
     memset(dl, 0, sizeof(*dl));
     DLBASE(dl)->dl_type = DLT_MACHO64;
+    DLBASE(dl)->dl_flags = flags;
+    DLBASE(dl)->dl_emu = !(flags & RTLD_NOEMU) && !noemu;
     strncpy(DLBASE(dl)->dl_pathname, filename, sizeof(DLBASE(dl)->dl_pathname)-1);
     DLPRIVATE(dl) = ulinker->ul_private;
 
@@ -3381,7 +3377,7 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         if (file_length != 0) {
             void* seg_addr = uo.uo_mmap(ulinker->ul_private, (void *)seg_page_start,
                                 file_length,
-                                VMPROT_TO_PROT(curr_sc->initprot),
+                                VMPROT_TO_PROT(curr_sc->initprot) & ~(DLBASE(dl)->dl_emu ? PROT_EXEC : 0), // strip away PROT_EXEC if run on emulator,
                                 MAP_FIXED|MAP_PRIVATE,
                                 fd,
                                 file_page_start);
@@ -3406,7 +3402,7 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         if (seg_page_end > seg_file_end) {
             void* zeromap = uo.uo_mmap(ulinker->ul_private, (void *)seg_file_end,
                                 seg_page_end - seg_file_end,
-                                VMPROT_TO_PROT(curr_sc->initprot),
+                                VMPROT_TO_PROT(curr_sc->initprot) & ~(DLBASE(dl)->dl_emu ? PROT_EXEC : 0), // strip away PROT_EXEC if run on emulator
                                 MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE,
                                 -1,
                                 0);
@@ -3723,7 +3719,7 @@ static int link_library(struct dlinfo *dl)
     return 1;
 }
 
-static struct dlinfo *load_library_internal(struct ulinker *ulinker, const char *filename)
+static struct dlinfo *load_library_internal(struct ulinker *ulinker, const char *filename, int flags)
 {
     struct dlinfo *ret = NULL;
     struct dlinfo *dl = NULL;
@@ -3753,10 +3749,10 @@ static struct dlinfo *load_library_internal(struct ulinker *ulinker, const char 
     }
 
     if (magic == *(uint32_t *)elf_magic) {  // \x7fELF
-        dl = load_elf_library(ulinker, filename, fd, file_size);
+        dl = load_elf_library(ulinker, filename, fd, file_size, flags);
     }
     else if (magic == MH_MAGIC_64) { // 0xfeedfacf
-        dl = load_macho64_library(ulinker, filename, fd, file_size);
+        dl = load_macho64_library(ulinker, filename, fd, file_size, flags);
     }
     else {
         ERROR("failed to load \"%s\": unknown magic %hhx,%hhx,%hhx,%hhx", filename, (magic) & 0xff, (magic >> 8) & 0xff, (magic >> 16) & 0xff, (magic >> 24) & 0xff);
@@ -3890,7 +3886,7 @@ static void notify_loaded_segments(struct ulinker *ulinker, struct dlinfo *dl)
             uintptr_t seg_page_end = page_end(seg_start + phdr->p_memsz);
             ulinker->ul_cb_mmap(ulinker, dl->dl_base, dl->dl_size,
                 (void *)seg_page_start, seg_page_end - seg_page_start,
-                PFLAGS_TO_PROT(phdr->p_flags));
+                PFLAGS_TO_PROT(phdr->p_flags) & ~(DLBASE(dl)->dl_emu ? PROT_EXEC : 0));  // strip away PROT_EXEC if run on emulator
         }
     } else if (dl->dl_type == DLT_MACHO64) {
         struct dlinfo_macho64 *dlm = (struct dlinfo_macho64 *)dl;
@@ -3907,16 +3903,16 @@ static void notify_loaded_segments(struct ulinker *ulinker, struct dlinfo *dl)
             uintptr_t seg_page_end = page_end(seg_start + sc->vmsize);
             ulinker->ul_cb_mmap(ulinker, dl->dl_base, dl->dl_size,
                 (void *)seg_page_start, seg_page_end - seg_page_start,
-                VMPROT_TO_PROT(sc->initprot));
+                VMPROT_TO_PROT(sc->initprot) & ~(DLBASE(dl)->dl_emu ? PROT_EXEC : 0));  // strip away PROT_EXEC if run on emulator
         }
     }
 }
 
-static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename) {
+static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename, int flags) {
     struct dlinfo *ret = NULL;
     struct dlinfo *dl = NULL;
 
-    if (!(dl = load_library_internal(ulinker, filename)))
+    if (!(dl = load_library_internal(ulinker, filename, flags)))
         goto out;
 
     if (link_library(dl))
@@ -3992,6 +3988,10 @@ int ulinker_setopt(int opt, void *val)
         event_cb = (void (*)(int, void *))val;
         return 0;
     }
+    if (opt == ULINKER_NOEMU) {
+        noemu = (int)(long)val;
+        return 0;
+    }
 
     return 1;
 }
@@ -4046,7 +4046,7 @@ void ulinker_destroy(struct ulinker *ulinker) {
 }
 
 void *ulinker_dlopen(struct ulinker *ulinker, const char *filename, int flags) {
-    return (void *)load_library(ulinker, filename);
+    return (void *)load_library(ulinker, filename, flags);
 }
 
 int ulinker_dlclose(void *handle)
@@ -4116,6 +4116,7 @@ int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dla
     info->udli_fsize = dl->dl_size;
     info->udli_farch = dl->dl_arch;
     info->udli_fabi  = dl->dl_abi;
+    info->udli_femu  = dl->dl_emu;
     return 1;
 }
 
@@ -4158,7 +4159,7 @@ int ulinker_duplicate(struct ulinker *old, struct ulinker *new, void (*segment_c
         };
 
         new->ul_cb_arg = (void *)&dup_arg;
-        if (!load_library(new, dl->dl_pathname))
+        if (!load_library(new, dl->dl_pathname, dl->dl_flags))
             goto out;
     }
 

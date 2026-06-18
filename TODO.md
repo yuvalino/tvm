@@ -1,5 +1,4 @@
 - TLS + Android
-- ulinker switch emulator / native with env
 - ulinker support code signed binaries
 - ulinker support dwarf5 (only supports dwarf4)
 - ulinker support dSYM (Mach-O)
