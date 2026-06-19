@@ -3065,11 +3065,13 @@ TEST(ThreadPidShared) {
 static volatile int vtimer_sig_count = 0;
 static void vtimer_handler(int sig) { vtimer_sig_count++; }
 
-// shared state for SIGEV_THREAD callback tests (heap-allocated, not TLS)
+// shared state for SIGEV_THREAD callback tests (static so it lives in BSS,
+// which is always mapped in every Unicorn emulator engine)
 struct vtimer_thread_state {
     volatile int called;
     volatile int magic;
 };
+static struct vtimer_thread_state vtimer_thread_st;
 static void vtimer_thread_func(union sigval sv) {
     struct vtimer_thread_state *st = sv.sival_ptr;
     st->magic = 0x42;
@@ -3556,8 +3558,7 @@ TEST(TimerSIGEV_THREAD_Callback) {
     ASSERT_NEQ(p, -1);
     if (!p) {
         vtimer_sig_count = 0;
-        struct vtimer_thread_state *st = mmap(NULL, sizeof(*st),
-            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        struct vtimer_thread_state *st = &vtimer_thread_st;
         st->called = 0;
         st->magic = 0;
 
@@ -3585,7 +3586,6 @@ TEST(TimerSIGEV_THREAD_Callback) {
         if (!st->called) _exit(3);          // callback was not invoked
         if (st->magic != 0x42) _exit(4);    // wrong sigval
         timer_delete(tid);
-        munmap(st, sizeof(*st));
         _exit(0);
     }
     int s;
@@ -3599,8 +3599,7 @@ TEST(TimerSIGEV_THREAD_Repeating) {
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        struct vtimer_thread_state *st = mmap(NULL, sizeof(*st),
-            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        struct vtimer_thread_state *st = &vtimer_thread_st;
         st->called = 0;
         st->magic = 0;
 
@@ -3624,7 +3623,6 @@ TEST(TimerSIGEV_THREAD_Repeating) {
 
         if (st->called < 2) _exit(3);
         timer_delete(tid);
-        munmap(st, sizeof(*st));
         _exit(0);
     }
     int s;
