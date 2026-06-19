@@ -1,14 +1,10 @@
 .vscode/
 *.a
 *.o
-tvm
-test_tvm
-test_rmem
 __pycache__
 *.dSYM/
 .DS_Store
 __.SYM*
-snake
-stopit
-hello_jmpbuf
 .forkless_history
+output/
+compile_commands.json
