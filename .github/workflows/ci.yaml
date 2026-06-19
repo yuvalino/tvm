@@ -19,4 +19,4 @@ jobs:
     - name: test_tvm
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
     - name: test_rmem
-      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_rmem
+      run: ./output/linux-x64/bin/test_rmem
