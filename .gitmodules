@@ -1,3 +1,15 @@
 [submodule "unicorn"]
 	path = third_party/unicorn
 	url = git@github.com:yuvalino/unicorn-forkless.git
+[submodule "third_party/dropbear"]
+	path = third_party/dropbear
+	url = git@github.com:yuvalino/dropbear-forkless.git
+[submodule "third_party/mksh"]
+	path = third_party/mksh
+	url = git@github.com:yuvalino/mksh-forkless.git
+[submodule "third_party/toybox"]
+	path = third_party/toybox
+	url = git@github.com:yuvalino/toybox-forkless.git
+[submodule "third_party/vim"]
+	path = third_party/vim
+	url = https://github.com/vim/vim.git
