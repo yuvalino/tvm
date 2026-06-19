@@ -16,14 +16,14 @@ What started as a small project to statically compile [dropbear](https://github.
 
 **macOS:** You need gnu-sed (to build toybox), just run `$ brew install gnu-sed`.
 
-To build, just run `$ make`.
+To build, just run `$ python3 build.py`.
 
 To run, `$ ./forkless sshd` and an SSH server at port 2222 will start running with user:password `user:alpine`.
 
 #### Tests
 
-- **tvm tests**: for testing the vm specifically, build and run with `$ make test && ./test_tvm`.
-- **forkless tests**: for testing `dropbear`+`mksh`+`toybox` over the tvm with **pytest**. You need to `$ pip install pytest pexpect` and then run `$ make && pytest test_forkless.py`.
+- **tvm tests**: for testing the vm specifically, build and run with `$ python3 build.py -t test_tvm && ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm`.
+- **forkless tests**: for testing `dropbear`+`mksh`+`toybox` over the tvm with **pytest**. You need to `$ pip install pytest pexpect` and then run `$ python3 build.py && pytest test_forkless.py`.
 
 ## Current Features
 
@@ -81,13 +81,13 @@ Notice `mksh_main` and `scp_main` are the main functions of each program.
 
 TembleOS is a fully-fledged OS-layer abstraction that creates a `fork(2)`/`exec(2)`-enabled environment without ever using these functions, with the most minimal source code modifications.
 
-The entire code is implemented in `tvm.c` (with a small API in `tvm.h`), and must be statically compiled with the rest of the program (dropbear and mksh in our case).
+The entire code is implemented in `tvm/tvm.c` (with a small API in `tvm/tvm.h`), and must be statically compiled with the rest of the program (dropbear and mksh in our case).
 
 One basic concept is the "task". A task is essentially a tvm-process. It is a group of threads that together act like a POSIX-compliant process with `getpid(2)`, `getppid(2)` and other process-wide attributes being the same.
 
 ## Tests
 
-Custom testing framework was developed, compiled with `$ make test`.
+Custom testing framework was developed, compiled with `$ python3 build.py -t test_tvm`.
 
 It has a similar API to pytest:
 
@@ -110,7 +110,7 @@ TembleOS is a play on a few things. First and foremost a tribute to Terry A. Dav
 ## Commands
 
 iOS compilation:
-CC="$(xcrun --sdk iphoneos --find clang)" CFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" LDFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" CONFFLAGS="--host=arm-apple-darwin --build=arm64-apple-darwin" CMAKE_FLAGS="-DCMAKE_SYSTEM_NAME=iOS" make libtvm && cp libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm
+python3 build.py -a ios-arm64 -t libtvm && cp output/ios-arm64/lib/libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm
 
 iOS compile and run:
-CC="$(xcrun --sdk iphoneos --find clang)" CFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" LDFLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path)" CONFFLAGS="--host=arm-apple-darwin --build=arm64-apple-darwin" CMAKE_FLAGS="-DCMAKE_SYSTEM_NAME=iOS" make libtvm && cp libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm && (cd ../devtool && xcodebuild -scheme devtool -destination "name=fulg3ns" -derivedDataPath output/ && xcrun devicectl device install app --device fulg3ns ./output/Build/Products/Debug-iphoneos/devtool.app && xcrun devicectl device process launch --device fulg3ns com.yuvalino.devtool)
+python3 build.py -a ios-arm64 -t libtvm && cp output/ios-arm64/lib/libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm && (cd ../devtool && xcodebuild -scheme devtool -destination "name=fulg3ns" -derivedDataPath output/ && xcrun devicectl device install app --device fulg3ns ./output/Build/Products/Debug-iphoneos/devtool.app && xcrun devicectl device process launch --device fulg3ns com.yuvalino.devtool)
