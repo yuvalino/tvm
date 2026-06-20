@@ -142,6 +142,8 @@ static void format_time(char *buf, size_t buflen)
 
 static int g_outfd = STDOUT_FILENO;
 static const char *noemu_list = NULL;
+static int noemu_global = 0;
+static int is_noemu_binary(const char *pathname);
 
 #define INFO(Msg, ...) do { \
     char __ts[32]; \
@@ -6989,9 +6991,8 @@ int emulator_setjmp(jmp_buf env) {
     uc_err err;
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
 
-    // if no saved state no emulator, so call native
     if (!ess)
-        return setjmp(env);
+        panic("emulator_setjmp called without emulator saved state");
 
     uint64_t *envarr = (uint64_t *)env;
 
@@ -7032,11 +7033,8 @@ int emulator_longjmp(jmp_buf env, int val) {
     uc_err err;
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
 
-    // if no saved state no emulator, so call native
-    if (!ess) {
-        longjmp(env, val);
-        __builtin_unreachable();
-    }
+    if (!ess)
+        panic("emulator_longjmp called without emulator saved state");
 
     uint64_t *envarr = (uint64_t *)env;
 
@@ -8123,7 +8121,8 @@ static int tvm_sorunner(int argc, char **argv)
         return 1;
     }
 
-    void *handle = ulinker_dlopen(current->tsk_linker, pathname_abs, 0);
+    int dlflags = RTLD_NOW | (is_noemu_binary(pathname_abs) ? RTLD_NOEMU : 0);
+    void *handle = ulinker_dlopen(current->tsk_linker, pathname_abs, dlflags);
     if (!handle) {
         fprintf(stderr, "failed to exec \"%s\": %s\n", pathname_abs, ulinker_dlerror());
         return 1;
@@ -8419,6 +8418,10 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(s, "sigaction"))    return &emulator_sigaction;
     if (0 == strcmp(s, "signal"))       return &emulator_signal;
 
+    // only intercept setjmp/longjmp for emulated binaries — in NOEMU mode
+    // emulator_setjmp calls real _setjmp which saves the host stack frame,
+    // but longjmp back into that frame corrupts the stack canary (the frame
+    // was reused by guest code in between), triggering __stack_chk_fail/SIGABRT
     if (emu) {
         if (0 == strcmp(s, "_setjmp"))      return &emulator_setjmp;
         if (0 == strcmp(s, "setjmp"))       return &emulator_setjmp;
@@ -8719,8 +8722,9 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
     const char *noemu_env = getenv("TVM_NOEMU");
     if (noemu_env) {
-        ulinker_setopt(ULINKER_NOEMU, (void *)1L);
-        if (strcmp(noemu_env, "1") != 0)
+        if (strcmp(noemu_env, "1") == 0)
+            noemu_global = 1;
+        else
             noemu_list = strdup(noemu_env);
     }
 
@@ -8839,8 +8843,9 @@ void tvm_init(const char *init_comm)
 
     const char *noemu_env2 = getenv("TVM_NOEMU");
     if (noemu_env2) {
-        ulinker_setopt(ULINKER_NOEMU, (void *)1L);
-        if (strcmp(noemu_env2, "1") != 0)
+        if (strcmp(noemu_env2, "1") == 0)
+            noemu_global = 1;
+        else
             noemu_list = strdup(noemu_env2);
     }
 }
@@ -12392,10 +12397,15 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 
 static int is_noemu_binary(const char *pathname)
 {
+    if (noemu_global)
+        return 1;
+
     if (!noemu_list) {
         const char *env = getenv("TVM_NOEMU");
-        if (env && strcmp(env, "1") == 0)
+        if (env && strcmp(env, "1") == 0) {
+            noemu_global = 1;
             return 1;
+        }
         if (env)
             noemu_list = strdup(env);
     }
@@ -12601,7 +12611,7 @@ do_exec:
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
 
-        int dlflags = is_noemu_binary(pathname) ? RTLD_NOEMU : 0;
+        int dlflags = RTLD_NOW | (is_noemu_binary(pathname) ? RTLD_NOEMU : 0);
         void *handle = ulinker_dlopen(new_linker, pathname, dlflags);
         if (!handle) {
             current->tsk_linker = old_linker;

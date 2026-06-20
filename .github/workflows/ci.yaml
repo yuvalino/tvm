@@ -7,7 +7,7 @@ on:
       branches: [ main ]
 
 jobs:
-  tvm-test:
+  build:
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -16,11 +16,57 @@ jobs:
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: build
       run: python3 build.py -t tvm test_tvm test_rmem initrd
+    - uses: actions/upload-artifact@v4
+      with:
+        name: build-output
+        path: output/
+
+  test_tvm:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'true'
+        token: ${{ secrets.SUBMODULE_TOKEN }}
+    - uses: actions/download-artifact@v4
+      with:
+        name: build-output
+        path: output/
+    - run: chmod +x output/linux-x64/bin/*
     - name: test_tvm
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
+
+  test_rmem:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'true'
+        token: ${{ secrets.SUBMODULE_TOKEN }}
+    - uses: actions/download-artifact@v4
+      with:
+        name: build-output
+        path: output/
+    - run: chmod +x output/linux-x64/bin/*
     - name: test_rmem
       run: ./output/linux-x64/bin/test_rmem
+
+  test_integration:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'true'
+        token: ${{ secrets.SUBMODULE_TOKEN }}
+    - uses: actions/download-artifact@v4
+      with:
+        name: build-output
+        path: output/
+    - run: chmod +x output/linux-x64/bin/*
     - name: pip
-      run: pip install -r requirements.txt
+      run: pip install -r python_requirements.txt
     - name: test_integration
       run: TVM_NOEMU=1 pytest tests/test_integration.py -v

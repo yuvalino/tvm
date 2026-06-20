@@ -32,7 +32,7 @@ static char errormsg[4096] = {0};
 
 static void (*event_cb)(int, void *);
 
-static int noemu = 0; // disable emu mode globally (allow PROT_EXEC mapping)
+static int noemu = 0; // deprecated — kept for ULINKER_NOEMU compat
 
 #define ULINKER_EVENT(_event, _arg) do { if (event_cb) event_cb((_event), (void *)(_arg)); } while (0)
 

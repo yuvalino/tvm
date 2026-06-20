@@ -10,7 +10,7 @@ enum {
     ULINKER_ADD_EXTERNAL_DLINFO,
     ULINKER_PRINT_CB,
     ULINKER_EVENT_CB,
-    ULINKER_NOEMU, // disable emu mode globally (allow PROT_EXEC mapping)
+    ULINKER_NOEMU, // deprecated — use RTLD_NOEMU per-dlopen instead
 };
 
 enum {
