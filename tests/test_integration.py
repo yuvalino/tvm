@@ -14,6 +14,7 @@ from typing import Iterator
 PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 TVM_BIN = os.environ.get("TVM_BIN", "./output/linux-x64/bin/tvm")
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim"
 
 def clean_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[>=<]', '', text)
@@ -34,7 +35,9 @@ def forkless() -> Iterator[Forkless]:
     cmd = f"{TVM_BIN} /tvm/bin/sshd -R -e -F -E -p {port}"
     logpath = tempfile.mktemp(prefix="tvm_", suffix=".log")
     logfile = open(logpath, "w+")
-    proc = subprocess.Popen(cmd.split(), stdout=logfile, stderr=subprocess.STDOUT)
+    env = dict(os.environ)
+    env.setdefault("TVM_NOEMU", TVM_NOEMU_DEFAULT)
+    proc = subprocess.Popen(cmd.split(), stdout=logfile, stderr=subprocess.STDOUT, env=env)
 
     ready = f"Not backgrounding, port {port}"
     deadline = time.monotonic() + 5.0

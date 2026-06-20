@@ -8718,10 +8718,11 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
     const char *noemu_env = getenv("TVM_NOEMU");
-    if (noemu_env && strcmp(noemu_env, "1") == 0)
+    if (noemu_env) {
         ulinker_setopt(ULINKER_NOEMU, (void *)1L);
-    else if (noemu_env)
-        noemu_list = strdup(noemu_env);
+        if (strcmp(noemu_env, "1") != 0)
+            noemu_list = strdup(noemu_env);
+    }
 
 
     // FROM HERE ON WE ENTER TVM ON CURRENT THREAD
@@ -8837,10 +8838,11 @@ void tvm_init(const char *init_comm)
     tvm_load_initrc();
 
     const char *noemu_env2 = getenv("TVM_NOEMU");
-    if (noemu_env2 && strcmp(noemu_env2, "1") == 0)
+    if (noemu_env2) {
         ulinker_setopt(ULINKER_NOEMU, (void *)1L);
-    else if (noemu_env2)
-        noemu_list = strdup(noemu_env2);
+        if (strcmp(noemu_env2, "1") != 0)
+            noemu_list = strdup(noemu_env2);
+    }
 }
 
 int tvm_setopt(int opt, void *val) {
@@ -12390,6 +12392,13 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 
 static int is_noemu_binary(const char *pathname)
 {
+    if (!noemu_list) {
+        const char *env = getenv("TVM_NOEMU");
+        if (env && strcmp(env, "1") == 0)
+            return 1;
+        if (env)
+            noemu_list = strdup(env);
+    }
     if (!noemu_list)
         return 0;
 
