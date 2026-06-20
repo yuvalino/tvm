@@ -141,6 +141,7 @@ static void format_time(char *buf, size_t buflen)
 }
 
 static int g_outfd = STDOUT_FILENO;
+static const char *noemu_list = NULL;
 
 #define INFO(Msg, ...) do { \
     char __ts[32]; \
@@ -8707,7 +8708,11 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
-    ulinker_setopt(ULINKER_NOEMU, (void *)(long)(getenv("TVM_NOEMU") != NULL));
+    const char *noemu_env = getenv("TVM_NOEMU");
+    if (noemu_env && strcmp(noemu_env, "1") == 0)
+        ulinker_setopt(ULINKER_NOEMU, (void *)1L);
+    else if (noemu_env)
+        noemu_list = noemu_env;
 
 
     // FROM HERE ON WE ENTER TVM ON CURRENT THREAD
@@ -12368,6 +12373,52 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
     return 0;
 }
 
+static int is_noemu_binary(const char *pathname)
+{
+    if (!noemu_list)
+        return 0;
+
+    char resolved[PATH_MAX];
+    strncpy(resolved, pathname, PATH_MAX - 1);
+    resolved[PATH_MAX - 1] = 0;
+
+    char link[PATH_MAX];
+    ssize_t n;
+    while ((n = readlink(resolved, link, sizeof(link) - 1)) > 0) {
+        link[n] = 0;
+        if (link[0] == '/') {
+            strncpy(resolved, link, PATH_MAX - 1);
+            resolved[PATH_MAX - 1] = 0;
+        } else {
+            char *slash = strrchr(resolved, '/');
+            if (slash) {
+                snprintf(slash + 1, PATH_MAX - (slash + 1 - resolved), "%s", link);
+            } else {
+                strncpy(resolved, link, PATH_MAX - 1);
+                resolved[PATH_MAX - 1] = 0;
+            }
+        }
+    }
+
+    const char *basename = strrchr(resolved, '/');
+    basename = basename ? basename + 1 : resolved;
+
+    const char *p = noemu_list;
+    while (*p) {
+        const char *end = strchr(p, ':');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+
+        if ((len == strlen(resolved) && strncmp(p, resolved, len) == 0) ||
+            (len == strlen(basename) && strncmp(p, basename, len) == 0)) {
+            return 1;
+        }
+
+        p += len;
+        if (*p == ':') p++;
+    }
+    return 0;
+}
+
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
@@ -12526,7 +12577,8 @@ do_exec:
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
 
-        void *handle = ulinker_dlopen(new_linker, pathname, 0);
+        int dlflags = is_noemu_binary(pathname) ? RTLD_NOEMU : 0;
+        void *handle = ulinker_dlopen(new_linker, pathname, dlflags);
         if (!handle) {
             current->tsk_linker = old_linker;
             current_thread->thr_emulator = old_emulator;
