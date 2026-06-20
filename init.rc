@@ -6,5 +6,6 @@ mount output/linux-x64/initrd.cpio:/tvm
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/sh
 setenv PATH=/tvm/bin:$PATH
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim
 
 echo TVM initialized

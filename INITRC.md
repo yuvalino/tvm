@@ -54,17 +54,25 @@ mount $HOME/extra.cpio:/opt
 
 ### setenv
 
-Set an environment variable.
+Set an environment variable (always overwrites).
 
 ```
 setenv <name>=<value>
+```
+
+### setenv?
+
+Set an environment variable only if not already set.
+
+```
+setenv? <name>=<value>
 ```
 
 Example:
 ```
 setenv PATH=/tvm/bin:$PATH
 setenv TVM_SHELL=/tvm/bin/sh
-setenv HOME=$HOME
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh
 ```
 
 ### echo
@@ -89,6 +97,7 @@ mount initrd.cpio:/tvm
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/sh
 setenv PATH=/tvm/bin:$PATH
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim
 
 echo TVM initialized
 ```
