@@ -12,6 +12,51 @@
 
 #include "tvm.h"
 
+static int mount_cpio(const char *target, const char *cpio_path)
+{
+    int fd = open(cpio_path, O_RDONLY);
+    if (fd == -1) {
+        perror(cpio_path);
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+        perror(cpio_path);
+        close(fd);
+        return -1;
+    }
+
+    void *buf = malloc(st.st_size);
+    if (!buf) {
+        perror("malloc");
+        close(fd);
+        return -1;
+    }
+
+    size_t total = 0;
+    while (total < (size_t)st.st_size) {
+        ssize_t n = read(fd, (char *)buf + total, st.st_size - total);
+        if (n <= 0) {
+            perror("read");
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        total += n;
+    }
+    close(fd);
+
+    if (tvm_mount_cpio(target, buf, total) != 0) {
+        fprintf(stderr, "tvm_mount_cpio: failed to mount %s at %s\n", cpio_path, target);
+        free(buf);
+        return -1;
+    }
+
+    free(buf);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char cwd[PATH_MAX];
@@ -96,27 +141,8 @@ int main(int argc, char **argv)
                 return 1;
             }
             *sep = '\0';
-            const char *target = argv[j];
-            const char *cpio_path = sep + 1;
-
-            int fd = open(cpio_path, O_RDONLY);
-            if (fd == -1) { perror(cpio_path); return 1; }
-            struct stat st;
-            if (fstat(fd, &st) == -1) { perror(cpio_path); close(fd); return 1; }
-            void *buf = malloc(st.st_size);
-            if (!buf) { perror("malloc"); close(fd); return 1; }
-            size_t total = 0;
-            while (total < (size_t)st.st_size) {
-                ssize_t n = read(fd, (char *)buf + total, st.st_size - total);
-                if (n <= 0) { perror("read"); free(buf); close(fd); return 1; }
-                total += n;
-            }
-            close(fd);
-            if (tvm_mount_cpio(target, buf, total) != 0) {
-                fprintf(stderr, "tvm_mount_cpio: failed to mount %s at %s\n", cpio_path, target);
-                free(buf); return 1;
-            }
-            free(buf);
+            if (mount_cpio(argv[j], sep + 1) != 0)
+                return 1;
         }
         j++;
     }
