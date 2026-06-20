@@ -8413,17 +8413,20 @@ static struct ulinker_ops ulinker_ops = {
     .uo_call = ulinker_call,
 };
 
-static void *ulinker_external_dlsym(void *arg, const char *s)
+static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
 {
     if (0 == strcmp(s, "sigaction"))    return &emulator_sigaction;
     if (0 == strcmp(s, "signal"))       return &emulator_signal;
-    if (0 == strcmp(s, "_setjmp"))      return &emulator_setjmp;
-    if (0 == strcmp(s, "setjmp"))       return &emulator_setjmp;
-    if (0 == strcmp(s, "__sigsetjmp"))  return &emulator_setjmp;
-    if (0 == strcmp(s, "sigsetjmp"))    return &emulator_setjmp;
-    if (0 == strcmp(s, "longjmp"))      return &emulator_longjmp;
-    if (0 == strcmp(s, "_longjmp"))     return &emulator_longjmp;
-    if (0 == strcmp(s, "siglongjmp"))   return &emulator_longjmp;
+
+    if (emu) {
+        if (0 == strcmp(s, "_setjmp"))      return &emulator_setjmp;
+        if (0 == strcmp(s, "setjmp"))       return &emulator_setjmp;
+        if (0 == strcmp(s, "__sigsetjmp"))  return &emulator_setjmp;
+        if (0 == strcmp(s, "sigsetjmp"))    return &emulator_setjmp;
+        if (0 == strcmp(s, "longjmp"))      return &emulator_longjmp;
+        if (0 == strcmp(s, "_longjmp"))     return &emulator_longjmp;
+        if (0 == strcmp(s, "siglongjmp"))   return &emulator_longjmp;
+    }
 
     if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
 
@@ -8451,6 +8454,188 @@ static void ulinker_event_cb(int event, void *arg)
     }
     else if (event == ULEVENT_UNLOAD) {
         remove_ulinker_loaded_range(ule);
+    }
+}
+
+static int initrc_expand_vars(const char *input, char *output, size_t output_size)
+{
+    const char *p = input;
+    char *out = output;
+    char *end = output + output_size - 1;
+
+    while (*p && out < end) {
+        if (*p == '$') {
+            p++;
+            const char *var_start;
+            size_t var_len;
+            int braced = 0;
+            if (*p == '{') {
+                braced = 1;
+                p++;
+                var_start = p;
+                while (*p && *p != '}') p++;
+                var_len = p - var_start;
+                if (*p == '}') p++;
+            } else {
+                var_start = p;
+                while (*p && ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_'))
+                    p++;
+                var_len = p - var_start;
+            }
+            if (var_len > 0) {
+                char name[256];
+                if (var_len >= sizeof(name)) var_len = sizeof(name) - 1;
+                memcpy(name, var_start, var_len);
+                name[var_len] = 0;
+                const char *val = getenv(name);
+                if (val) {
+                    while (*val && out < end)
+                        *out++ = *val++;
+                }
+            }
+        } else {
+            *out++ = *p++;
+        }
+    }
+    *out = 0;
+    return 0;
+}
+
+static void initrc_cmd_mount(const char *arg)
+{
+    char expanded[PATH_MAX * 2];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+
+    char *colon = strchr(expanded, ':');
+    if (!colon) {
+        INFO("initrc: mount: expected hostpath:guestpath, got '%s'", expanded);
+        return;
+    }
+    *colon = 0;
+    const char *hostpath = expanded;
+    const char *guestpath = colon + 1;
+
+    int fd = open(hostpath, O_RDONLY);
+    if (fd == -1) {
+        INFO("initrc: mount: cannot open '%s': %s", hostpath, strerror(errno));
+        return;
+    }
+
+    size_t size;
+    void *buf = read_all(fd, &size);
+    close(fd);
+    if (!buf) {
+        INFO("initrc: mount: cannot read '%s'", hostpath);
+        return;
+    }
+
+    if (tvm_mount_cpio(guestpath, buf, size) != 0)
+        INFO("initrc: mount: failed to mount '%s' at '%s'", hostpath, guestpath);
+    else
+        INFO("initrc: mounted '%s' at '%s'", hostpath, guestpath);
+
+    free(buf);
+}
+
+static void initrc_cmd_setenv(const char *arg)
+{
+    char expanded[4096];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+
+    char *eq = strchr(expanded, '=');
+    if (!eq) {
+        INFO("initrc: setenv: expected name=value, got '%s'", expanded);
+        return;
+    }
+    *eq = 0;
+    setenv(expanded, eq + 1, 1);
+    INFO("initrc: setenv %s=%s", expanded, eq + 1);
+}
+
+static void initrc_cmd_echo(const char *arg)
+{
+    char expanded[4096];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+    INFO("initrc: %s", expanded);
+}
+
+static struct {
+    const char *name;
+    void (*handler)(const char *arg);
+} initrc_cmds[] = {
+    { "mount",  initrc_cmd_mount },
+    { "setenv", initrc_cmd_setenv },
+    { "echo",   initrc_cmd_echo },
+    { NULL, NULL }
+};
+
+static void tvm_exec_initrc(const char *path, int must_exist)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        if (must_exist)
+            INFO("initrc: cannot open '%s': %s", path, strerror(errno));
+        return;
+    }
+
+    size_t size;
+    void *buf = read_all(fd, &size);
+    close(fd);
+    if (!buf) {
+        INFO("initrc: cannot read '%s'", path);
+        return;
+    }
+
+    INFO("initrc: loading '%s'", path);
+
+    char *data = (char *)buf;
+    char *line = data;
+    for (size_t i = 0; i <= size; i++) {
+        if (i == size || data[i] == '\n') {
+            if (i < size) data[i] = 0;
+
+            while (*line == ' ' || *line == '\t') line++;
+
+            if (*line && *line != '#') {
+                const char *cmd = line;
+                char *sp = line;
+                while (*sp && *sp != ' ' && *sp != '\t') sp++;
+                const char *arg = "";
+                if (*sp) {
+                    *sp = 0;
+                    arg = sp + 1;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                }
+
+                int found = 0;
+                for (int j = 0; initrc_cmds[j].name; j++) {
+                    if (strcmp(cmd, initrc_cmds[j].name) == 0) {
+                        initrc_cmds[j].handler(arg);
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found)
+                    INFO("initrc: unknown command '%s'", cmd);
+            }
+
+            line = data + i + 1;
+        }
+    }
+
+    free(buf);
+}
+
+static void tvm_load_initrc(void)
+{
+    if (getenv("TVM_NOINITRC"))
+        return;
+
+    const char *path = getenv("TVM_INITRC");
+    if (path) {
+        tvm_exec_initrc(path, 1);
+    } else {
+        tvm_exec_initrc("init.rc", 0);
     }
 }
 
@@ -8601,6 +8786,8 @@ void tvm_init(const char *init_comm)
     }
 
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
+
+    tvm_load_initrc();
 }
 
 int tvm_setopt(int opt, void *val) {
