@@ -141,9 +141,6 @@ static void format_time(char *buf, size_t buflen)
 }
 
 static int g_outfd = STDOUT_FILENO;
-static const char *noemu_list = NULL;
-static int noemu_global = 0;
-static int is_noemu_binary(const char *pathname);
 
 #define INFO(Msg, ...) do { \
     char __ts[32]; \
@@ -8108,6 +8105,7 @@ static int tvm_env(int argc, char **argv)
     return 0;
 }
 
+static int is_noemu_binary(const char *pathname);
 static int tvm_sorunner(int argc, char **argv)
 {
     if (argc < 2) {
@@ -8461,6 +8459,20 @@ static void ulinker_event_cb(int event, void *arg)
     }
 }
 
+/* ==================== initrc ==================== */
+
+static const char *noemu_list = NULL;
+static int noemu_global = 0;
+
+static const char *initrc_getenv(const char *name)
+{
+    if (current && current->tsk_relocs.__environ && *current->tsk_relocs.__environ) {
+        char **e = findenv(*current->tsk_relocs.__environ, name, strlen(name));
+        if (e) return strchr(*e, '=') + 1;
+    }
+    return getenv(name);
+}
+
 static int initrc_expand_vars(const char *input, char *output, size_t output_size)
 {
     const char *p = input;
@@ -8472,9 +8484,7 @@ static int initrc_expand_vars(const char *input, char *output, size_t output_siz
             p++;
             const char *var_start;
             size_t var_len;
-            int braced = 0;
             if (*p == '{') {
-                braced = 1;
                 p++;
                 var_start = p;
                 while (*p && *p != '}') p++;
@@ -8491,12 +8501,7 @@ static int initrc_expand_vars(const char *input, char *output, size_t output_siz
                 if (var_len >= sizeof(name)) var_len = sizeof(name) - 1;
                 memcpy(name, var_start, var_len);
                 name[var_len] = 0;
-                const char *val = NULL;
-                if (current && current->tsk_relocs.__environ && *current->tsk_relocs.__environ) {
-                    char **e = findenv(*current->tsk_relocs.__environ, name, var_len);
-                    if (e) val = strchr(*e, '=') + 1;
-                }
-                if (!val) val = getenv(name);
+                const char *val = initrc_getenv(name);
                 if (val) {
                     while (*val && out < end)
                         *out++ = *val++;
@@ -8560,35 +8565,34 @@ static void initrc_setenv_internal(const char *arg, int overwrite)
     const char *name = expanded;
     const char *value = eq + 1;
 
-    if (!overwrite && getenv(name)) {
+    if (!overwrite && initrc_getenv(name)) {
         INFO("initrc: setenv %s already set, skipping", name);
         return;
     }
 
-    CALL_FUNC(setenv, name, value, 1);
+    if (!current || !current->tsk_relocs.__environ)
+        return;
 
-    if (current && current->tsk_relocs.__environ) {
-        size_t name_len = strlen(name);
-        size_t value_len = strlen(value);
-        char *string = malloc(name_len + value_len + 2);
-        if (string) {
-            memcpy(string, name, name_len);
-            string[name_len] = '=';
-            memcpy(string + name_len + 1, value, value_len + 1);
+    size_t name_len = strlen(name);
+    size_t value_len = strlen(value);
+    char *string = malloc(name_len + value_len + 2);
+    if (!string)
+        return;
+    memcpy(string, name, name_len);
+    string[name_len] = '=';
+    memcpy(string + name_len + 1, value, value_len + 1);
 
-            char **env = *current->tsk_relocs.__environ
-                ? findenv(*current->tsk_relocs.__environ, name, name_len)
-                : NULL;
-            if (env) {
-                *env = string;
-            } else {
-                char **new_environ = addenv(*current->tsk_relocs.__environ, string);
-                if (new_environ)
-                    *current->tsk_relocs.__environ = new_environ;
-                else
-                    free(string);
-            }
-        }
+    char **env = *current->tsk_relocs.__environ
+        ? findenv(*current->tsk_relocs.__environ, name, name_len)
+        : NULL;
+    if (env) {
+        *env = string;
+    } else {
+        char **new_environ = addenv(*current->tsk_relocs.__environ, string);
+        if (new_environ)
+            *current->tsk_relocs.__environ = new_environ;
+        else
+            free(string);
     }
 
     INFO("initrc: setenv %s=%s", name, value);
@@ -8674,16 +8678,77 @@ static void tvm_exec_initrc(const char *path, int must_exist)
 
 static void tvm_load_initrc(void)
 {
-    if (getenv("TVM_NOINITRC"))
+    if (initrc_getenv("TVM_NOINITRC"))
         return;
 
-    const char *path = getenv("TVM_INITRC");
+    const char *path = initrc_getenv("TVM_INITRC");
     if (path) {
         tvm_exec_initrc(path, 1);
     } else {
         tvm_exec_initrc("init.rc", 0);
     }
 }
+
+static void tvm_parse_noemu(void)
+{
+    const char *env = initrc_getenv("TVM_NOEMU");
+    if (!env)
+        return;
+    if (strcmp(env, "1") == 0)
+        noemu_global = 1;
+    else
+        noemu_list = strdup(env);
+}
+
+static int is_noemu_binary(const char *pathname)
+{
+    if (noemu_global)
+        return 1;
+    if (!noemu_list)
+        return 0;
+
+    char resolved[PATH_MAX];
+    strncpy(resolved, pathname, PATH_MAX - 1);
+    resolved[PATH_MAX - 1] = 0;
+
+    char link[PATH_MAX];
+    ssize_t n;
+    while ((n = readlink(resolved, link, sizeof(link) - 1)) > 0) {
+        link[n] = 0;
+        if (link[0] == '/') {
+            strncpy(resolved, link, PATH_MAX - 1);
+            resolved[PATH_MAX - 1] = 0;
+        } else {
+            char *slash = strrchr(resolved, '/');
+            if (slash) {
+                snprintf(slash + 1, PATH_MAX - (slash + 1 - resolved), "%s", link);
+            } else {
+                strncpy(resolved, link, PATH_MAX - 1);
+                resolved[PATH_MAX - 1] = 0;
+            }
+        }
+    }
+
+    const char *basename = strrchr(resolved, '/');
+    basename = basename ? basename + 1 : resolved;
+
+    const char *p = noemu_list;
+    while (*p) {
+        const char *end = strchr(p, ':');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+
+        if ((len == strlen(resolved) && strncmp(p, resolved, len) == 0) ||
+            (len == strlen(basename) && strncmp(p, basename, len) == 0)) {
+            return 1;
+        }
+
+        p += len;
+        if (*p == ':') p++;
+    }
+    return 0;
+}
+
+/* ==================== end initrc ==================== */
 
 void tvm_init_with_outfd(const char *init_comm, int outfd)
 {
@@ -8720,13 +8785,6 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
-    const char *noemu_env = getenv("TVM_NOEMU");
-    if (noemu_env) {
-        if (strcmp(noemu_env, "1") == 0)
-            noemu_global = 1;
-        else
-            noemu_list = strdup(noemu_env);
-    }
 
 
     // FROM HERE ON WE ENTER TVM ON CURRENT THREAD
@@ -8841,13 +8899,7 @@ void tvm_init(const char *init_comm)
 
     tvm_load_initrc();
 
-    const char *noemu_env2 = getenv("TVM_NOEMU");
-    if (noemu_env2) {
-        if (strcmp(noemu_env2, "1") == 0)
-            noemu_global = 1;
-        else
-            noemu_list = strdup(noemu_env2);
-    }
+    tvm_parse_noemu();
 }
 
 int tvm_setopt(int opt, void *val) {
@@ -12395,63 +12447,6 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
     return 0;
 }
 
-static int is_noemu_binary(const char *pathname)
-{
-    if (noemu_global)
-        return 1;
-
-    if (!noemu_list) {
-        const char *env = getenv("TVM_NOEMU");
-        if (env && strcmp(env, "1") == 0) {
-            noemu_global = 1;
-            return 1;
-        }
-        if (env)
-            noemu_list = strdup(env);
-    }
-    if (!noemu_list)
-        return 0;
-
-    char resolved[PATH_MAX];
-    strncpy(resolved, pathname, PATH_MAX - 1);
-    resolved[PATH_MAX - 1] = 0;
-
-    char link[PATH_MAX];
-    ssize_t n;
-    while ((n = readlink(resolved, link, sizeof(link) - 1)) > 0) {
-        link[n] = 0;
-        if (link[0] == '/') {
-            strncpy(resolved, link, PATH_MAX - 1);
-            resolved[PATH_MAX - 1] = 0;
-        } else {
-            char *slash = strrchr(resolved, '/');
-            if (slash) {
-                snprintf(slash + 1, PATH_MAX - (slash + 1 - resolved), "%s", link);
-            } else {
-                strncpy(resolved, link, PATH_MAX - 1);
-                resolved[PATH_MAX - 1] = 0;
-            }
-        }
-    }
-
-    const char *basename = strrchr(resolved, '/');
-    basename = basename ? basename + 1 : resolved;
-
-    const char *p = noemu_list;
-    while (*p) {
-        const char *end = strchr(p, ':');
-        size_t len = end ? (size_t)(end - p) : strlen(p);
-
-        if ((len == strlen(resolved) && strncmp(p, resolved, len) == 0) ||
-            (len == strlen(basename) && strncmp(p, basename, len) == 0)) {
-            return 1;
-        }
-
-        p += len;
-        if (*p == ':') p++;
-    }
-    return 0;
-}
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     char pathname_abs[PATH_MAX];
@@ -12866,7 +12861,7 @@ FUNCTION_DEFINE1(int, system, const char *, command) {
     if (!command)
         return 1; // shell is available
 
-    const char *sh = CALL_FUNC(getenv, "TVM_SHELL");
+    const char *sh = getenv("TVM_SHELL");
     if (!sh || !*sh)
         sh = "/bin/sh";
 
