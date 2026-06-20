@@ -53,7 +53,7 @@ struct ulinker_ops {
 struct ulinker_external_dlinfo_args {
     void *ue_private;
     const char *ue_name;
-    void *(*ue_dlsym)(void *, const char *);
+    void *(*ue_dlsym)(void *, const char *, int emu);
 };
 
 int ulinker_setopt(int opt, void *val);

@@ -2104,7 +2104,7 @@ struct dlinfo_macho64 {
 
 struct dlinfo_external {
     struct dlinfo dlext_base;
-    void *(*dlext_dlsym)(void *, const char *);
+    void *(*dlext_dlsym)(void *, const char *, int);
 };
 
 static pthread_mutex_t g_external_dlinfos_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -2604,9 +2604,9 @@ static char *string_elf64(struct dlinfo_elf64 *dl, Elf64_Word idx)
     return dl->dle64_strtab + idx;
 }
 
-static void *lookup_symbol_external(struct dlinfo_external *dl, const char *s)
+static void *lookup_symbol_external(struct dlinfo_external *dl, const char *s, struct dlinfo *caller)
 {
-    return dl->dlext_dlsym(DLPRIVATE(dl), s);
+    return dl->dlext_dlsym(DLPRIVATE(dl), s, caller ? caller->dl_emu : 0);
 }
 
 static void *lookup_symbol_elf64_dyn(struct dlinfo_elf64 *dl, const char *s)
@@ -2702,10 +2702,10 @@ static void *lookup_symbol_macho64(struct dlinfo_macho64 *dl, const char *s)
     return NULL;
 }
 
-static void *lookup_symbol(struct dlinfo *dl, const char *s, int all)
+static void *lookup_symbol(struct dlinfo *dl, const char *s, int all, struct dlinfo *caller)
 {
-    if (dl->dl_type == DLT_EXTERNAL) 
-        return lookup_symbol_external((struct dlinfo_external *)dl, s);
+    if (dl->dl_type == DLT_EXTERNAL)
+        return lookup_symbol_external((struct dlinfo_external *)dl, s, caller);
     if (dl->dl_type == DLT_ELF64)
         return lookup_symbol_elf64((struct dlinfo_elf64 *)dl, s, all);
     if (dl->dl_type == DLT_MACHO64)
@@ -2733,7 +2733,7 @@ static struct dlinfo *library_for_address_locked(struct ulinker *ulinker, const 
     return NULL;
 }
 
-static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *symbol, void *lr, int external, int all)
+static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *symbol, void *lr, int external, int all, struct dlinfo *caller)
 {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = (struct dlinfo *)handle;
@@ -2749,7 +2749,7 @@ static void *dlsym_internal(struct ulinker *ulinker, void *handle, const char *s
     while (dl) {
         if (!external && dl->dl_type == DLT_EXTERNAL)
             break;
-        void *a = lookup_symbol(dl, symbol, all);
+        void *a = lookup_symbol(dl, symbol, all, caller);
         if (a) {
             DLINFO_UNLOCK(ulinker);
             return a;
@@ -3545,10 +3545,10 @@ static int link_library_elf64_relocate(struct dlinfo_elf64 *dl, void *rel_opaque
             // For COPY relocations, skip the current library to avoid
             // resolving the symbol to its own copy target.
             if (type == R_X86_64_COPY || type == R_AARCH64_COPY) {
-                sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, (void *)DLBASE(dl)->dl_next, sym_name, NULL, 1, 0);
+                sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, (void *)DLBASE(dl)->dl_next, sym_name, NULL, 1, 0, DLBASE(dl));
             } else {
                 // lookup symbol with external libraries as this is for internal use
-                sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1, 0);
+                sym_addr = (Elf64_Addr)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, sym_name, NULL, 1, 0, DLBASE(dl));
             }
             if (!sym_addr) {
                 if (ELF64_ST_BIND(dl->dle64_symtab[sym].st_info) != STB_WEAK) {
@@ -3679,7 +3679,7 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                             struct dyld_chained_import *import = &imports[p.ptr_64_bind->ordinal];
                             // skip the leading underscore
                             const char *s = dl->dlm64_chainedfixups_strtab + import->name_offset + 1;
-                            uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1, 0);
+                            uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1, 0, DLBASE(dl));
                             if (!sym_addr && import->weak_import) {
                                 ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
                                 return 1;
@@ -4096,7 +4096,7 @@ int ulinker_dlclose(void *handle)
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all) {
     void *lr = __builtin_return_address(0);
     // do NOT search in external for API calls
-    return dlsym_internal(ulinker, handle, symbol, lr, 0, all);
+    return dlsym_internal(ulinker, handle, symbol, lr, 0, all, NULL);
 }
 
 char *ulinker_dlerror(void) {

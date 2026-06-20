@@ -1,0 +1,10 @@
+# TVM init.rc
+
+# Mount rootfs
+mount output/linux-x64/initrd.cpio:/tvm
+
+# Environment setup
+setenv TVM_SHELL=/tvm/bin/sh
+setenv PATH=/tvm/bin:$PATH
+
+echo TVM initialized

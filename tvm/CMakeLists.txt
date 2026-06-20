@@ -10,8 +10,8 @@ target_link_libraries(tvm_objects PRIVATE unicorn)
 
 # tvm executable
 add_executable(tvm $<TARGET_OBJECTS:tvm_objects>)
-target_link_libraries(tvm PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS})
-target_link_options(tvm PRIVATE -rdynamic)
+target_link_libraries(tvm PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt ncurses)
+target_link_options(tvm PRIVATE -rdynamic -Wl,--no-as-needed)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(tvm PRIVATE -pie)
 endif()

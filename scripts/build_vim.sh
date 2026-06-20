@@ -14,6 +14,7 @@ if [ ! -f auto/config.mk ]; then
         --disable-selinux \
         --disable-smack \
         --with-tlib=ncurses \
+        --without-wayland \
         CFLAGS="-g -gdwarf-4"
 fi
 make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4" MAKEOVERRIDES=
