@@ -1,0 +1,6 @@
+// TVM native library linkage.
+// Uncomment and adjust TVM_ROOT once TVM libraries are built for iOS.
+// TVM_ROOT=$(PROJECT_DIR)/../tvm
+// HEADER_SEARCH_PATHS=$(inherited) $(TVM_ROOT)/include $(PROJECT_DIR)/../native
+// LIBRARY_SEARCH_PATHS=$(inherited) $(TVM_ROOT)/lib/ios
+// OTHER_LDFLAGS=$(inherited) -ltvm -ldropbear -lmksh -ltoybox -lminivim -lunicorn -lz

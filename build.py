@@ -39,6 +39,7 @@ TARGET_MAP = {
     "hello_jmpbuf":  "example_hello_jmpbuf",
     "gdb_backtrace": "example_gdb_backtrace",
     "examples":      "examples",
+    "flutter":       "flutter",
 }
 
 
@@ -81,25 +82,38 @@ def configure(platform):
         cc_link.symlink_to(cc_json)
 
 
-def build(platform, targets, verbose=False):
-    bd = build_dir(platform)
-    if not (bd / "build.ninja").exists():
-        configure(platform)
+def build_flutter(platform):
+    run([
+        "sh",
+        str(project_root() / "scripts" / "build_flutter.sh"),
+        str(project_root() / "flutter"),
+        str(output_dir(platform)),
+    ])
 
+
+def build(platform, targets, verbose=False):
     cmake_targets = []
     for t in targets:
         if t not in TARGET_MAP:
             print(f"error: unknown target '{t}'", file=sys.stderr)
             print(f"available targets: {', '.join(sorted(TARGET_MAP))}", file=sys.stderr)
             sys.exit(1)
-        cmake_targets.append(TARGET_MAP[t])
+        if t == "flutter":
+            build_flutter(platform)
+        else:
+            cmake_targets.append(TARGET_MAP[t])
 
-    ninja_args = ["ninja", "-C", str(bd)]
-    if verbose:
-        ninja_args.append("-v")
-    ninja_args.extend(cmake_targets)
+    if cmake_targets:
+        bd = build_dir(platform)
+        if not (bd / "build.ninja").exists():
+            configure(platform)
 
-    run(ninja_args)
+        ninja_args = ["ninja", "-C", str(bd)]
+        if verbose:
+            ninja_args.append("-v")
+        ninja_args.extend(cmake_targets)
+
+        run(ninja_args)
 
 
 def clean(platform):
