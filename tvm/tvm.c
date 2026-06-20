@@ -8487,7 +8487,12 @@ static int initrc_expand_vars(const char *input, char *output, size_t output_siz
                 if (var_len >= sizeof(name)) var_len = sizeof(name) - 1;
                 memcpy(name, var_start, var_len);
                 name[var_len] = 0;
-                const char *val = getenv(name);
+                const char *val = NULL;
+                if (current && current->tsk_relocs.__environ && *current->tsk_relocs.__environ) {
+                    char **e = findenv(*current->tsk_relocs.__environ, name, var_len);
+                    if (e) val = strchr(*e, '=') + 1;
+                }
+                if (!val) val = getenv(name);
                 if (val) {
                     while (*val && out < end)
                         *out++ = *val++;
@@ -8548,8 +8553,36 @@ static void initrc_cmd_setenv(const char *arg)
         return;
     }
     *eq = 0;
-    setenv(expanded, eq + 1, 1);
-    INFO("initrc: setenv %s=%s", expanded, eq + 1);
+    const char *name = expanded;
+    const char *value = eq + 1;
+
+    CALL_FUNC(setenv, name, value, 1);
+
+    if (current && current->tsk_relocs.__environ) {
+        size_t name_len = strlen(name);
+        size_t value_len = strlen(value);
+        char *string = malloc(name_len + value_len + 2);
+        if (string) {
+            memcpy(string, name, name_len);
+            string[name_len] = '=';
+            memcpy(string + name_len + 1, value, value_len + 1);
+
+            char **env = *current->tsk_relocs.__environ
+                ? findenv(*current->tsk_relocs.__environ, name, name_len)
+                : NULL;
+            if (env) {
+                *env = string;
+            } else {
+                char **new_environ = addenv(*current->tsk_relocs.__environ, string);
+                if (new_environ)
+                    *current->tsk_relocs.__environ = new_environ;
+                else
+                    free(string);
+            }
+        }
+    }
+
+    INFO("initrc: setenv %s=%s", name, value);
 }
 
 static void initrc_cmd_echo(const char *arg)
