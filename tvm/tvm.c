@@ -8543,7 +8543,7 @@ static void initrc_cmd_mount(const char *arg)
     free(buf);
 }
 
-static void initrc_cmd_setenv(const char *arg)
+static void initrc_setenv_internal(const char *arg, int overwrite)
 {
     char expanded[4096];
     initrc_expand_vars(arg, expanded, sizeof(expanded));
@@ -8556,6 +8556,11 @@ static void initrc_cmd_setenv(const char *arg)
     *eq = 0;
     const char *name = expanded;
     const char *value = eq + 1;
+
+    if (!overwrite && getenv(name)) {
+        INFO("initrc: setenv %s already set, skipping", name);
+        return;
+    }
 
     CALL_FUNC(setenv, name, value, 1);
 
@@ -8586,6 +8591,9 @@ static void initrc_cmd_setenv(const char *arg)
     INFO("initrc: setenv %s=%s", name, value);
 }
 
+static void initrc_cmd_setenv(const char *arg) { initrc_setenv_internal(arg, 1); }
+static void initrc_cmd_setenv_default(const char *arg) { initrc_setenv_internal(arg, 0); }
+
 static void initrc_cmd_echo(const char *arg)
 {
     char expanded[4096];
@@ -8597,9 +8605,10 @@ static struct {
     const char *name;
     void (*handler)(const char *arg);
 } initrc_cmds[] = {
-    { "mount",  initrc_cmd_mount },
-    { "setenv", initrc_cmd_setenv },
-    { "echo",   initrc_cmd_echo },
+    { "mount",   initrc_cmd_mount },
+    { "setenv",  initrc_cmd_setenv },
+    { "setenv?", initrc_cmd_setenv_default },
+    { "echo",    initrc_cmd_echo },
     { NULL, NULL }
 };
 
@@ -8712,7 +8721,7 @@ void tvm_init(const char *init_comm)
     if (noemu_env && strcmp(noemu_env, "1") == 0)
         ulinker_setopt(ULINKER_NOEMU, (void *)1L);
     else if (noemu_env)
-        noemu_list = noemu_env;
+        noemu_list = strdup(noemu_env);
 
 
     // FROM HERE ON WE ENTER TVM ON CURRENT THREAD
@@ -8826,6 +8835,12 @@ void tvm_init(const char *init_comm)
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
 
     tvm_load_initrc();
+
+    const char *noemu_env2 = getenv("TVM_NOEMU");
+    if (noemu_env2 && strcmp(noemu_env2, "1") == 0)
+        ulinker_setopt(ULINKER_NOEMU, (void *)1L);
+    else if (noemu_env2)
+        noemu_list = strdup(noemu_env2);
 }
 
 int tvm_setopt(int opt, void *val) {
