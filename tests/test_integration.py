@@ -563,7 +563,7 @@ def test_vim_opens_and_quits(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("echo 'hello vim' > /tmp/vt1.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt1.txt")
+        p.sendline("vim -n /tmp/vt1.txt")
         time.sleep(1)
         p.expect(["hello vim", TIMEOUT], timeout=3)
         p.send("\x1b")
@@ -574,7 +574,7 @@ def test_vim_opens_and_quits(forkless: Forkless):
 def test_vim_insert_mode(forkless: Forkless):
     """Insert text in vim using insert mode, save and verify."""
     with ssh_interactive(forkless.port) as p:
-        p.sendline("vim /tmp/vt2.txt")
+        p.sendline("vim -n /tmp/vt2.txt")
         time.sleep(1.5)
         p.send("i")
         time.sleep(0.3)
@@ -592,7 +592,7 @@ def test_vim_insert_mode_indicator(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("echo 'test' > /tmp/vt_ind.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt_ind.txt")
+        p.sendline("vim -n /tmp/vt_ind.txt")
         time.sleep(1.5)
         p.send("i")
         idx = p.expect(["INSERT", TIMEOUT], timeout=3)
@@ -607,7 +607,7 @@ def test_vim_arrow_keys_insert(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("echo 'abcdef' > /tmp/vt_arrow.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt_arrow.txt")
+        p.sendline("vim -n /tmp/vt_arrow.txt")
         time.sleep(1.5)
         p.send("i")
         time.sleep(0.3)
@@ -630,7 +630,7 @@ def test_vim_normal_mode_navigation(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("printf 'line1\\nline2\\nline3\\nline4\\n' > /tmp/vt3.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt3.txt")
+        p.sendline("vim -n /tmp/vt3.txt")
         time.sleep(1.5)
         p.send("j")
         time.sleep(0.2)
@@ -652,7 +652,7 @@ def test_vim_visual_line_yank(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("printf 'alpha\\nbeta\\ngamma\\ndelta\\n' > /tmp/vt4.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt4.txt")
+        p.sendline("vim -n /tmp/vt4.txt")
         time.sleep(1.5)
         p.send("j")
         time.sleep(0.2)
@@ -683,7 +683,7 @@ def test_vim_vimrc(forkless: Forkless):
         p.expect(r'\$\s*$')
         p.sendline("printf 'aaa\\nbbb\\nccc\\n' > /tmp/vt5.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt5.txt")
+        p.sendline("vim -n /tmp/vt5.txt")
         time.sleep(2)
         p.sendline(":set number?")
         time.sleep(0.5)
@@ -700,12 +700,12 @@ def test_vim_multi_session(forkless: Forkless):
     """Two concurrent SSH sessions each running vim."""
     with ssh_interactive(forkless.port) as p1:
         with ssh_interactive(forkless.port) as p2:
-            p1.sendline("vim -u NONE /tmp/vt6a.txt")
+            p1.sendline("vim -n -u NONE /tmp/vt6a.txt")
             time.sleep(1)
             p1.send("iSession1Text")
             time.sleep(0.3)
 
-            p2.sendline("vim -u NONE /tmp/vt6b.txt")
+            p2.sendline("vim -n -u NONE /tmp/vt6b.txt")
             time.sleep(1)
             p2.send("iSession2Text")
             time.sleep(0.3)
@@ -731,7 +731,7 @@ def test_vim_ex_search_replace(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("printf 'foo bar\\nfoo baz\\nfoo qux\\n' > /tmp/vt7.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt7.txt")
+        p.sendline("vim -n /tmp/vt7.txt")
         time.sleep(1.5)
         p.sendline(":%s/foo/replaced/g")
         time.sleep(0.5)
@@ -745,7 +745,7 @@ def test_vim_undo(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("echo 'original' > /tmp/vt8.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt8.txt")
+        p.sendline("vim -n /tmp/vt8.txt")
         time.sleep(1.5)
         p.send("dd")
         time.sleep(0.3)
@@ -776,7 +776,7 @@ def test_vim_open_newline(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("printf 'first\\nlast\\n' > /tmp/vt10.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt10.txt")
+        p.sendline("vim -n -u NONE -N /tmp/vt10.txt")
         time.sleep(1.5)
         p.send("o")
         time.sleep(0.2)
@@ -800,7 +800,7 @@ def test_vim_search(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("printf 'apple\\nbanana\\ncherry\\n' > /tmp/vt11.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt11.txt")
+        p.sendline("vim -n /tmp/vt11.txt")
         time.sleep(1.5)
         p.sendline("/cherry")
         time.sleep(0.5)
@@ -820,7 +820,7 @@ def test_vim_no_error_on_startup(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("echo 'test' > /tmp/vt12.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt12.txt")
+        p.sendline("vim -n /tmp/vt12.txt")
         time.sleep(2)
         idx = p.expect(["Press ENTER", "E[0-9]+:", TIMEOUT], timeout=2)
         p.send("\x1b")
@@ -834,7 +834,7 @@ def test_vim_backspace(forkless: Forkless):
     with ssh_interactive(forkless.port) as p:
         p.sendline("echo 'xyz' > /tmp/vt_bs.txt")
         p.expect(r'\$\s*$')
-        p.sendline("vim /tmp/vt_bs.txt")
+        p.sendline("vim -n /tmp/vt_bs.txt")
         time.sleep(1.5)
         p.send("A")  # append at end of line
         time.sleep(0.3)
