@@ -1,116 +1,131 @@
-# Forkless TembleOS Virtual Machine
+# TVM - Thread Virtual Machine
 
 ![TembleOS](./rsc/logo.jpg)
 
-## Background
+Thread-based process virtualization framework. Lets sandboxed applications with no `fork()` permissions run POSIX-compliant programs by implementing processes as thread groups.
 
-iOS does not allow `fork(2)` semantics.
+`fork()` creates a new thread group (task) that shares resources like file descriptors and signal handlers. Memory ranges are duplicated with pointer fixup to imitate copy-on-write. A dedicated heap (`rmem.c`) and linker (`ulinker.c`) optimize this to be as fast as possible.
 
-Applications and daemons cannot create processes themselves and may not use the `system(3)` function. Instead, only `launchd` (equivalent to Linux' `init`) may create processes using `posix_spawn(3)`.
+Unsigned code execution is supported via the [Unicorn](https://www.unicorn-engine.org/) CPU emulator. When the emulator hits a signed region, it traps and lets the real CPU take over. The `TVM_NOEMU` environment variable controls which programs skip emulation.
 
-But what if we wanted to do it anyway? Maybe even run an `sshd` server with an interactive shell?
+## Building
 
-What started as a small project to statically compile [dropbear](https://github.com/mkj/dropbear) SSH and [mksh](https://github.com/MirBSD/mksh), glue them together and refactor the `fork(2)`s to `pthread_create(3)`s, ended up writing an entire POSIX abstraction!
+Requirements: CMake 3.16+, Ninja, Python 3, a C compiler.
 
-## Build and run
+```sh
+# Build TVM executable (default)
+python3 build.py
 
-**macOS:** You need gnu-sed (to build toybox), just run `$ brew install gnu-sed`.
+# Build specific targets
+python3 build.py -t dropbear mksh toybox vim
 
-To build, just run `$ python3 build.py`.
+# Build the initrd (rootfs CPIO archive with all third-party programs)
+python3 build.py -t initrd
 
-To run, `$ ./forkless sshd` and an SSH server at port 2222 will start running with user:password `user:alpine`.
+# Build tests
+python3 build.py -t tests
 
-#### Tests
+# Build examples
+python3 build.py -t examples
 
-- **tvm tests**: for testing the vm specifically, build and run with `$ python3 build.py -t test_tvm && ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm`.
-- **forkless tests**: for testing `dropbear`+`mksh`+`toybox` over the tvm with **pytest**. You need to `$ pip install pytest pexpect` and then run `$ python3 build.py && pytest test_forkless.py`.
-
-## Current Features
-
-### Programs
-
-- `ssh` - dropbear
-- `scp` - dropbear
-- `sh` - MirBSD Korn Shell
-  - builtins (`echo`, `export`, `cd`, etc..)
-- `toybox` - `ls`, `cat`, `id`, `grep` etc
-- `tvm` - tvm diagnostics
-  - `tvm ps` - internal process list
-  - `tvm lsof` - internal file-descriptor tables
-
-### Platforms
-
-- Linux x86-64
-- XNU arm64
-
-### TVM
-
-- `fork()` creates a new task.
-- Each task has its own file-descriptor table (with `0`, `1`, `2` pointing to task-specific files under the hood)
-- All I/O operations (`read(2)` / `fwrite(3)` / `perror(3)` / `printf` / `getc`) operate on the task-specific file-descriptors / streams.
-- Calls to `sigaction(2)` change the signal disposition only for the calling task.
-- Full `kill(2)` / `waitpid(2)` support.
-- Copy-on-write for each task.
-- `execve(2)` and `exec(3)` with pre-registered programs.
-- Userspace device drivers framework
-  - TTY device (no real pty/tty is opened in host OS).
-- Task-specific environment.
-- Task-specific `getopt(3)` support.
-
-Soon:
-- `pthread_create(3)` with shared globals and private TLS (coming soon).
-
-## Adding custom programs
-
-As you can see in `main.c`, adding a new program is easy:
-
-```c
-int main(int argc, char **argv)
-{
-    tvm_init("forkless");
-    tvm_register_program("/bin/sh", (main_func_t) mksh_main);
-    tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
-
-    // ...
-}
+# Clean and rebuild
+python3 build.py --clean
 ```
 
-Notice `mksh_main` and `scp_main` are the main functions of each program.
+Output goes to `output/linux-x64/bin/`.
 
-## Overview
+## Running
 
-TembleOS is a fully-fledged OS-layer abstraction that creates a `fork(2)`/`exec(2)`-enabled environment without ever using these functions, with the most minimal source code modifications.
+```sh
+# Run a program in TVM
+./output/linux-x64/bin/tvm <program> [args...]
 
-The entire code is implemented in `tvm/tvm.c` (with a small API in `tvm/tvm.h`), and must be statically compiled with the rest of the program (dropbear and mksh in our case).
+# Run with kernel log output
+./output/linux-x64/bin/tvm --verbose <program>
 
-One basic concept is the "task". A task is essentially a tvm-process. It is a group of threads that together act like a POSIX-compliant process with `getpid(2)`, `getppid(2)` and other process-wide attributes being the same.
+# Custom initrc
+./output/linux-x64/bin/tvm -i path/to/init.rc <program>
+
+# Skip initrc
+./output/linux-x64/bin/tvm -n <program>
+
+# Mount a CPIO archive
+./output/linux-x64/bin/tvm -v /tvm:path/to/initrd.cpio <program>
+```
+
+## Programs
+
+### Builtin
+
+`tvm` - diagnostics tool (registered at `/usr/bin/tvm`):
+- `tvm ps` - task list
+- `tvm lsof` - file descriptor tables
+- `tvm pwd` - working directory
+- `tvm env` - environment variables
+- `tvm sorunner` - run shared object
+- `tvm cpio` - CPIO archive reader
+- `tvm mount` - VFS mount
+- `tvm shell` - execute command via `system()`
+
+### Third-party (`third_party/`)
+
+| Program | Description |
+|---|---|
+| [dropbear](https://github.com/mkj/dropbear) | SSH server and `scp` |
+| [mksh](https://github.com/MirBSD/mksh) | MirBSD Korn Shell |
+| [toybox](http://landley.net/toybox/) | Unix utilities (`ls`, `cat`, `grep`, `id`, etc.) |
+| [vim](https://github.com/vim/vim) | Text editor |
+
+### Examples (`examples/`)
+
+Small test programs: `fork`, `snake`, `stopit`, `hello_jmpbuf`, `gdb_backtrace`.
+
+Build with `python3 build.py -t examples`.
+
+## initrc
+
+TVM runs an init script during `tvm_init()` before the main program starts. By default it looks for `./init.rc` in the current directory.
+
+| Environment variable | Behavior |
+|---|---|
+| (neither set) | Try `./init.rc`, silently skip if not found |
+| `TVM_INITRC=<path>` | Load from given path, error if not found |
+| `TVM_NOINITRC=1` | Skip initrc entirely |
+
+Commands:
+
+```sh
+mount <hostpath>:<guestpath>   # Mount a CPIO archive into the VFS
+setenv <name>=<value>          # Set environment variable (overwrites)
+setenv? <name>=<value>         # Set only if not already set
+echo <message>                 # Print to kernel log
+```
+
+All arguments support variable expansion (`$VAR` or `${VAR}`).
+
+See [INITRC.md](INITRC.md) for the full specification.
 
 ## Tests
 
-Custom testing framework was developed, compiled with `$ python3 build.py -t test_tvm`.
+```sh
+# Unit tests (rmem + tvm)
+python3 build.py -t tests
+./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
+./output/linux-x64/bin/test_rmem
 
-It has a similar API to pytest:
-
+# Integration tests (pytest)
+pip install pytest pexpect
+python3 build.py
+pytest tests/test_integration.py
 ```
-$ ./test_forkless -h
-USAGE: ./test_forkless [OPTION]...
-Run tests
 
-  -l             print test list and exit
-  -k=TEST        only run TEST (can be passed multiple times)
-  -v             verbose output
-  -g             debug with gdb
-  -h             display this help and exit
-```
+Test runner flags: `-l` list tests, `-k=TEST` filter, `-v` verbose, `-g` debug with gdb.
+
+## Platforms
+
+- Linux x86-64
+- XNU arm64 (as a static library, `python3 build.py -t libtvm`)
 
 ## Etymology
 
-TembleOS is a play on a few things. First and foremost a tribute to Terry A. Davis, the developer of [TempleOS](https://simple.wikipedia.org/wiki/TempleOS). Temble is hebrew for "dummy", which also is a name of an Israeli [hat](https://en.wikipedia.org/wiki/Tembel_hat) popular in mid-20th century.
-
-## Commands
-
-iOS compilation:
-python3 build.py -a ios-arm64 -t libtvm && cp output/ios-arm64/lib/libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm
-
-iOS compile and run:
-python3 build.py -a ios-arm64 -t libtvm && cp output/ios-arm64/lib/libtvm.a libtoybox.a libmksh.a libdropbear.a libunicorn.a libminivim.a ../devtool/tvm && (cd ../devtool && xcodebuild -scheme devtool -destination "name=fulg3ns" -derivedDataPath output/ && xcrun devicectl device install app --device fulg3ns ./output/Build/Products/Debug-iphoneos/devtool.app && xcrun devicectl device process launch --device fulg3ns com.yuvalino.devtool)
+TembleOS is a tribute to Terry A. Davis' [TempleOS](https://simple.wikipedia.org/wiki/TempleOS). Temble is Hebrew for "dummy", also the name of an Israeli [hat](https://en.wikipedia.org/wiki/Tembel_hat) popular in mid-20th century.

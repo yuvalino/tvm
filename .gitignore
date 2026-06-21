@@ -8,3 +8,6 @@ __.SYM*
 .forkless_history
 output/
 compile_commands.json
+.cache/
+test_rmem
+test_tvm
