@@ -19,7 +19,7 @@ TARGET_MAP = {
     "dropbear":      "dropbear",
     "mksh":          "mksh",
     "toybox":        "toybox",
-    "vim":           "vim_prog",
+    "vim":           "vim",
     "initrd":        "initrd",
     "snake":         "example_snake",
     "fork":          "example_fork",

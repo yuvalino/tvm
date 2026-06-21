@@ -8322,6 +8322,229 @@ static int tvm_main(int argc, char **argv)
 }
 
 /////////////
+// MARK: Initrc
+/////////////
+
+static int initrc_expand_vars(const char *input, char *output, size_t output_size)
+{
+    const char *p = input;
+    char *out = output;
+    char *end = output + output_size - 1;
+
+    while (*p && out < end) {
+        if (*p == '$') {
+            p++;
+            const char *var_start;
+            size_t var_len;
+            if (*p == '{') {
+                p++;
+                var_start = p;
+                while (*p && *p != '}') p++;
+                var_len = p - var_start;
+                if (*p == '}') p++;
+            } else {
+                var_start = p;
+                while (*p && ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_'))
+                    p++;
+                var_len = p - var_start;
+            }
+            if (var_len > 0) {
+                char name[256];
+                if (var_len >= sizeof(name)) var_len = sizeof(name) - 1;
+                memcpy(name, var_start, var_len);
+                name[var_len] = 0;
+                const char *val = getenv(name);
+                if (val) {
+                    while (*val && out < end)
+                        *out++ = *val++;
+                }
+            }
+        } else {
+            *out++ = *p++;
+        }
+    }
+    *out = 0;
+    return 0;
+}
+
+static void initrc_cmd_mount(const char *arg)
+{
+    char expanded[PATH_MAX * 2];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+
+    char *colon = strchr(expanded, ':');
+    if (!colon) {
+        INFO("initrc: mount: expected hostpath:guestpath, got '%s'", expanded);
+        return;
+    }
+    *colon = 0;
+    const char *hostpath = expanded;
+    const char *guestpath = colon + 1;
+
+    int fd = open(hostpath, O_RDONLY);
+    if (fd == -1) {
+        INFO("initrc: mount: cannot open '%s': %s", hostpath, strerror(errno));
+        return;
+    }
+
+    size_t size;
+    void *buf = read_all(fd, &size);
+    close(fd);
+    if (!buf) {
+        INFO("initrc: mount: cannot read '%s'", hostpath);
+        return;
+    }
+
+    if (tvm_mount_cpio(guestpath, buf, size) != 0)
+        INFO("initrc: mount: failed to mount '%s' at '%s'", hostpath, guestpath);
+    else
+        INFO("initrc: mounted '%s' at '%s'", hostpath, guestpath);
+
+    free(buf);
+}
+
+static void initrc_setenv_internal(const char *arg, int overwrite)
+{
+    char expanded[4096];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+
+    char *eq = strchr(expanded, '=');
+    if (!eq) {
+        INFO("initrc: setenv: expected name=value, got '%s'", expanded);
+        return;
+    }
+    *eq = 0;
+    const char *name = expanded;
+    const char *value = eq + 1;
+
+    if (!overwrite && getenv(name)) {
+        INFO("initrc: setenv %s already set, skipping", name);
+        return;
+    }
+
+    if (!current || !current->tsk_relocs.__environ)
+        return;
+
+    size_t name_len = strlen(name);
+    size_t value_len = strlen(value);
+    char *string = malloc(name_len + value_len + 2);
+    if (!string)
+        return;
+    memcpy(string, name, name_len);
+    string[name_len] = '=';
+    memcpy(string + name_len + 1, value, value_len + 1);
+
+    char **env = *current->tsk_relocs.__environ
+        ? findenv(*current->tsk_relocs.__environ, name, name_len)
+        : NULL;
+    if (env) {
+        free(*env);
+        *env = string;
+    } else {
+        char **old_environ = *current->tsk_relocs.__environ;
+        char **new_environ = addenv(old_environ, string);
+        if (new_environ) {
+            *current->tsk_relocs.__environ = new_environ;
+            free(old_environ);
+        } else
+            free(string);
+    }
+
+    INFO("initrc: setenv %s=%s", name, value);
+}
+
+static void initrc_cmd_setenv(const char *arg) { initrc_setenv_internal(arg, 1); }
+static void initrc_cmd_setenv_default(const char *arg) { initrc_setenv_internal(arg, 0); }
+
+static void initrc_cmd_echo(const char *arg)
+{
+    char expanded[4096];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+    INFO("initrc: %s", expanded);
+}
+
+static struct {
+    const char *name;
+    void (*handler)(const char *arg);
+} initrc_cmds[] = {
+    { "mount",   initrc_cmd_mount },
+    { "setenv",  initrc_cmd_setenv },
+    { "setenv?", initrc_cmd_setenv_default },
+    { "echo",    initrc_cmd_echo },
+    { NULL, NULL }
+};
+
+static void tvm_exec_initrc(const char *path, int must_exist)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        if (must_exist)
+            INFO("initrc: cannot open '%s': %s", path, strerror(errno));
+        return;
+    }
+
+    size_t size;
+    void *buf = read_all(fd, &size);
+    close(fd);
+    if (!buf) {
+        INFO("initrc: cannot read '%s'", path);
+        return;
+    }
+
+    INFO("initrc: loading '%s'", path);
+
+    char *data = (char *)buf;
+    char *line = data;
+    for (size_t i = 0; i <= size; i++) {
+        if (i == size || data[i] == '\n') {
+            data[i] = 0;
+
+            while (*line == ' ' || *line == '\t') line++;
+
+            if (*line && *line != '#') {
+                const char *cmd = line;
+                char *sp = line;
+                while (*sp && *sp != ' ' && *sp != '\t') sp++;
+                const char *arg = "";
+                if (*sp) {
+                    *sp = 0;
+                    arg = sp + 1;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                }
+
+                int found = 0;
+                for (int j = 0; initrc_cmds[j].name; j++) {
+                    if (strcmp(cmd, initrc_cmds[j].name) == 0) {
+                        initrc_cmds[j].handler(arg);
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found)
+                    INFO("initrc: unknown command '%s'", cmd);
+            }
+
+            line = data + i + 1;
+        }
+    }
+
+    free(buf);
+}
+
+static void tvm_load_initrc(void)
+{
+    if (getenv("TVM_NOINITRC"))
+        return;
+
+    const char *path = getenv("TVM_INITRC");
+    if (path) {
+        tvm_exec_initrc(path, 1);
+    } else {
+        tvm_exec_initrc("init.rc", 0);
+    }
+}
+
+/////////////
 // MARK: API functions
 /////////////
 
@@ -8459,239 +8682,12 @@ static void ulinker_event_cb(int event, void *arg)
     }
 }
 
-/* ==================== initrc ==================== */
-
 static const char *noemu_list = NULL;
 static int noemu_global = 0;
 
-static const char *initrc_getenv(const char *name)
-{
-    if (current && current->tsk_relocs.__environ && *current->tsk_relocs.__environ) {
-        char **e = findenv(*current->tsk_relocs.__environ, name, strlen(name));
-        if (e) return strchr(*e, '=') + 1;
-    }
-    return getenv(name);
-}
-
-static int initrc_expand_vars(const char *input, char *output, size_t output_size)
-{
-    const char *p = input;
-    char *out = output;
-    char *end = output + output_size - 1;
-
-    while (*p && out < end) {
-        if (*p == '$') {
-            p++;
-            const char *var_start;
-            size_t var_len;
-            if (*p == '{') {
-                p++;
-                var_start = p;
-                while (*p && *p != '}') p++;
-                var_len = p - var_start;
-                if (*p == '}') p++;
-            } else {
-                var_start = p;
-                while (*p && ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_'))
-                    p++;
-                var_len = p - var_start;
-            }
-            if (var_len > 0) {
-                char name[256];
-                if (var_len >= sizeof(name)) var_len = sizeof(name) - 1;
-                memcpy(name, var_start, var_len);
-                name[var_len] = 0;
-                const char *val = initrc_getenv(name);
-                if (val) {
-                    while (*val && out < end)
-                        *out++ = *val++;
-                }
-            }
-        } else {
-            *out++ = *p++;
-        }
-    }
-    *out = 0;
-    return 0;
-}
-
-static void initrc_cmd_mount(const char *arg)
-{
-    char expanded[PATH_MAX * 2];
-    initrc_expand_vars(arg, expanded, sizeof(expanded));
-
-    char *colon = strchr(expanded, ':');
-    if (!colon) {
-        INFO("initrc: mount: expected hostpath:guestpath, got '%s'", expanded);
-        return;
-    }
-    *colon = 0;
-    const char *hostpath = expanded;
-    const char *guestpath = colon + 1;
-
-    int fd = open(hostpath, O_RDONLY);
-    if (fd == -1) {
-        INFO("initrc: mount: cannot open '%s': %s", hostpath, strerror(errno));
-        return;
-    }
-
-    size_t size;
-    void *buf = read_all(fd, &size);
-    close(fd);
-    if (!buf) {
-        INFO("initrc: mount: cannot read '%s'", hostpath);
-        return;
-    }
-
-    if (tvm_mount_cpio(guestpath, buf, size) != 0)
-        INFO("initrc: mount: failed to mount '%s' at '%s'", hostpath, guestpath);
-    else
-        INFO("initrc: mounted '%s' at '%s'", hostpath, guestpath);
-
-    free(buf);
-}
-
-static void initrc_setenv_internal(const char *arg, int overwrite)
-{
-    char expanded[4096];
-    initrc_expand_vars(arg, expanded, sizeof(expanded));
-
-    char *eq = strchr(expanded, '=');
-    if (!eq) {
-        INFO("initrc: setenv: expected name=value, got '%s'", expanded);
-        return;
-    }
-    *eq = 0;
-    const char *name = expanded;
-    const char *value = eq + 1;
-
-    if (!overwrite && initrc_getenv(name)) {
-        INFO("initrc: setenv %s already set, skipping", name);
-        return;
-    }
-
-    if (!current || !current->tsk_relocs.__environ)
-        return;
-
-    size_t name_len = strlen(name);
-    size_t value_len = strlen(value);
-    char *string = malloc(name_len + value_len + 2);
-    if (!string)
-        return;
-    memcpy(string, name, name_len);
-    string[name_len] = '=';
-    memcpy(string + name_len + 1, value, value_len + 1);
-
-    char **env = *current->tsk_relocs.__environ
-        ? findenv(*current->tsk_relocs.__environ, name, name_len)
-        : NULL;
-    if (env) {
-        *env = string;
-    } else {
-        char **new_environ = addenv(*current->tsk_relocs.__environ, string);
-        if (new_environ)
-            *current->tsk_relocs.__environ = new_environ;
-        else
-            free(string);
-    }
-
-    INFO("initrc: setenv %s=%s", name, value);
-}
-
-static void initrc_cmd_setenv(const char *arg) { initrc_setenv_internal(arg, 1); }
-static void initrc_cmd_setenv_default(const char *arg) { initrc_setenv_internal(arg, 0); }
-
-static void initrc_cmd_echo(const char *arg)
-{
-    char expanded[4096];
-    initrc_expand_vars(arg, expanded, sizeof(expanded));
-    INFO("initrc: %s", expanded);
-}
-
-static struct {
-    const char *name;
-    void (*handler)(const char *arg);
-} initrc_cmds[] = {
-    { "mount",   initrc_cmd_mount },
-    { "setenv",  initrc_cmd_setenv },
-    { "setenv?", initrc_cmd_setenv_default },
-    { "echo",    initrc_cmd_echo },
-    { NULL, NULL }
-};
-
-static void tvm_exec_initrc(const char *path, int must_exist)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd == -1) {
-        if (must_exist)
-            INFO("initrc: cannot open '%s': %s", path, strerror(errno));
-        return;
-    }
-
-    size_t size;
-    void *buf = read_all(fd, &size);
-    close(fd);
-    if (!buf) {
-        INFO("initrc: cannot read '%s'", path);
-        return;
-    }
-
-    INFO("initrc: loading '%s'", path);
-
-    char *data = (char *)buf;
-    char *line = data;
-    for (size_t i = 0; i <= size; i++) {
-        if (i == size || data[i] == '\n') {
-            if (i < size) data[i] = 0;
-
-            while (*line == ' ' || *line == '\t') line++;
-
-            if (*line && *line != '#') {
-                const char *cmd = line;
-                char *sp = line;
-                while (*sp && *sp != ' ' && *sp != '\t') sp++;
-                const char *arg = "";
-                if (*sp) {
-                    *sp = 0;
-                    arg = sp + 1;
-                    while (*arg == ' ' || *arg == '\t') arg++;
-                }
-
-                int found = 0;
-                for (int j = 0; initrc_cmds[j].name; j++) {
-                    if (strcmp(cmd, initrc_cmds[j].name) == 0) {
-                        initrc_cmds[j].handler(arg);
-                        found = 1;
-                        break;
-                    }
-                }
-                if (!found)
-                    INFO("initrc: unknown command '%s'", cmd);
-            }
-
-            line = data + i + 1;
-        }
-    }
-
-    free(buf);
-}
-
-static void tvm_load_initrc(void)
-{
-    if (initrc_getenv("TVM_NOINITRC"))
-        return;
-
-    const char *path = initrc_getenv("TVM_INITRC");
-    if (path) {
-        tvm_exec_initrc(path, 1);
-    } else {
-        tvm_exec_initrc("init.rc", 0);
-    }
-}
-
 static void tvm_parse_noemu(void)
 {
-    const char *env = initrc_getenv("TVM_NOEMU");
+    const char *env = getenv("TVM_NOEMU");
     if (!env)
         return;
     if (strcmp(env, "1") == 0)
@@ -8748,7 +8744,6 @@ static int is_noemu_binary(const char *pathname)
     return 0;
 }
 
-/* ==================== end initrc ==================== */
 
 void tvm_init_with_outfd(const char *init_comm, int outfd)
 {

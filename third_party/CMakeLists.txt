@@ -30,8 +30,8 @@ add_custom_target(toybox
 set_target_properties(toybox PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 # vim (text editor)
-add_custom_target(vim_prog
+add_custom_target(vim
     COMMAND sh ${SCRIPTS_DIR}/build_vim.sh ${CMAKE_CURRENT_SOURCE_DIR}/vim
     COMMENT "Building vim"
 )
-set_target_properties(vim_prog PROPERTIES EXCLUDE_FROM_ALL TRUE)
+set_target_properties(vim PROPERTIES EXCLUDE_FROM_ALL TRUE)

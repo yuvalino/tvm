@@ -13,7 +13,7 @@ add_custom_target(initrd
         ${CMAKE_CURRENT_BINARY_DIR}/.rootfs
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/..
         ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS dropbear mksh toybox vim_prog
+    DEPENDS dropbear mksh toybox vim
     COMMENT "Assembling initrd.cpio"
 )
 set_target_properties(initrd PROPERTIES EXCLUDE_FROM_ALL TRUE)
