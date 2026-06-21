@@ -125,7 +125,3 @@ Test runner flags: `-l` list tests, `-k=TEST` filter, `-v` verbose, `-g` debug w
 
 - Linux x86-64
 - XNU arm64 (as a static library, `python3 build.py -t libtvm`)
-
-## Etymology
-
-TembleOS is a tribute to Terry A. Davis' [TempleOS](https://simple.wikipedia.org/wiki/TempleOS). Temble is Hebrew for "dummy", also the name of an Israeli [hat](https://en.wikipedia.org/wiki/Tembel_hat) popular in mid-20th century.
