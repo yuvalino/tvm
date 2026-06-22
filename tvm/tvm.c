@@ -9951,10 +9951,12 @@ retry:
     file_unlock(file, 1);
     tvm_sig_leave();
 
-    // restart if interrupt an SA_RESTART flag for the interrupt signal is on
-    if (ret == (size_t)-1 && errno == EINTR && tvm_sig_interrupted &&
-        current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
-        goto retry;
+    if (ret == (size_t)-1 && errno == EINTR) {
+        if (!tvm_sig_interrupted)
+            goto retry; // signal was handled internally (e.g. IGN'd), guest never sees it
+        if (current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
+            goto retry;
+    }
 
     return ret;
 }
@@ -9982,11 +9984,13 @@ retry:
 
     file_unlock(file, 1);
     tvm_sig_leave();
-    
-    // restart if interrupt an SA_RESTART flag for the interrupt signal is on
-    if (ret == (size_t)-1 && errno == EINTR && tvm_sig_interrupted &&
-        current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
-        goto retry;
+
+    if (ret == (size_t)-1 && errno == EINTR) {
+        if (!tvm_sig_interrupted)
+            goto retry;
+        if (current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
+            goto retry;
+    }
 
     return ret;
 }
