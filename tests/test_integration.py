@@ -325,7 +325,7 @@ def test_toybox_find(sshi: spawn):
 
 def test_toybox_grep(sshi: spawn):
     """grep in a pipeline — exercises stdio, pipes, and regex."""
-    sshi.sendline("echo -e 'foo\\nbar\\nbaz' | grep ba")
+    sshi.sendline("printf 'foo\\nbar\\nbaz\\n' | grep ba")
     sshi.expect("bar")
     sshi.expect("baz")
     sshi.expect(r"\$ ")
