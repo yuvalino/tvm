@@ -45,6 +45,23 @@
 #include <asm/prctl.h>
 #endif
 
+#if defined(__APPLE__)
+typedef int timer_t;
+struct itimerspec {
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+#define TIMER_ABSTIME   1
+#define SIGEV_THREAD_ID 4
+int timer_create(clockid_t, struct sigevent *restrict, timer_t *restrict);
+int timer_settime(timer_t, int, const struct itimerspec *restrict, struct itimerspec *restrict);
+int timer_gettime(timer_t, struct itimerspec *restrict);
+int timer_delete(timer_t);
+int timer_getoverrun(timer_t);
+int sigwaitinfo(const sigset_t *restrict, siginfo_t *restrict);
+int sigtimedwait(const sigset_t *restrict, siginfo_t *restrict, const struct timespec *restrict);
+#endif
+
 #include "tvm.h"
 #include "rmem.h"
 #include "ulinker.h"
@@ -429,8 +446,8 @@ DECL_FUNC(sigpending);
 DECL_FUNC(sigsuspend);
 DECL_FUNC(pause);
 DECL_FUNC(sigwait);
-DECL_FUNC(sigwaitinfo);
-DECL_FUNC(sigtimedwait);
+DECL_FUNC_OPT(sigwaitinfo);
+DECL_FUNC_OPT(sigtimedwait);
 
 DECL_FUNC(getenv);
 DECL_FUNC(putenv);
@@ -492,6 +509,9 @@ DECL_FUNC(getwd);
 
 DECL_FUNC(bsearch);
 DECL_FUNC(qsort);
+
+DECL_FUNC(setitimer);
+DECL_FUNC(getitimer);
 
 extern int tputs(const char *, int, int (*)(int));
 DECL_FUNC_OPT(tputs);
@@ -1680,6 +1700,7 @@ struct task {
     struct task_data *tsk_data; // malloc()ed from tsk_ar
     struct task_relocations tsk_relocs; // oh my god
     int tsk_timers[MAX_TIMERS_PER_TASK]; // indices into vtimers[], -1 = unused
+    int tsk_itimer_real; // tsk_timers[] index for ITIMER_REAL, -1 = unset
 };
 
 struct thread {
@@ -1913,6 +1934,7 @@ static struct task *taskalloc_common()
 
     for (int i = 0; i < MAX_TIMERS_PER_TASK; i++)
         t->tsk_timers[i] = -1;
+    t->tsk_itimer_real = -1;
 
     INIT_LIST_HEAD(&t->tsk_list);
     INIT_LIST_HEAD(&t->tsk_threads);
@@ -1990,6 +2012,7 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
             t->tsk_timers[i] = -1;
         }
     }
+    t->tsk_itimer_real = -1;
     pthread_mutex_unlock(&vtimers_lock);
 
     task_filestreamdealloc_list(t, &t->tsk_filestreams);
@@ -2737,7 +2760,20 @@ static void *vtimer_thread(void *arg)
             continue;
         }
 
-        pthread_cond_timedwait(&vtimers_cond, &vtimers_lock, &earliest);
+        {
+            struct timespec now_mono, now_real, rel, abstime;
+            clock_gettime(CLOCK_MONOTONIC, &now_mono);
+            clock_gettime(CLOCK_REALTIME, &now_real);
+            rel.tv_sec = earliest.tv_sec - now_mono.tv_sec;
+            rel.tv_nsec = earliest.tv_nsec - now_mono.tv_nsec;
+            if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000L; }
+            if (rel.tv_sec >= 0) {
+                abstime.tv_sec = now_real.tv_sec + rel.tv_sec;
+                abstime.tv_nsec = now_real.tv_nsec + rel.tv_nsec;
+                if (abstime.tv_nsec >= 1000000000L) { abstime.tv_sec++; abstime.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&vtimers_cond, &vtimers_lock, &abstime);
+            }
+        }
 
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -2825,12 +2861,7 @@ static void vtimer_init(void)
 {
     memset(vtimers, 0, sizeof(vtimers));
 
-    // init condvar with CLOCK_MONOTONIC so timedwait uses monotonic clock
-    pthread_condattr_t cattr;
-    pthread_condattr_init(&cattr);
-    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
-    pthread_cond_init(&vtimers_cond, &cattr);
-    pthread_condattr_destroy(&cattr);
+    pthread_cond_init(&vtimers_cond, NULL);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -12328,7 +12359,7 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
         }
         sigset_t empty;
         sigemptyset(&empty);
-        ppoll(NULL, 0, &remaining, &empty);
+        pselect(0, NULL, NULL, NULL, &remaining, &empty);
     }
     if (info)
         *info = local_info;
@@ -13952,6 +13983,130 @@ FUNCTION_DEFINE1(int, timer_delete, timer_t, tmr) {
 FUNCTION_DEFINE1(int, timer_getoverrun, timer_t, tmr) {
     (void)tmr;
     return 0; // we don't track overruns
+}
+
+static int itimer_real_get_remaining(struct task *t, struct itimerval *val)
+{
+    memset(val, 0, sizeof(*val));
+    if (t->tsk_itimer_real < 0)
+        return 0;
+    int global_idx = t->tsk_timers[t->tsk_itimer_real];
+    if (global_idx < 0)
+        return 0;
+    struct virtual_timer *vt = &vtimers[global_idx];
+    if (!vt->vt_active || ts_is_zero(&vt->vt_deadline))
+        return 0;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!ts_le(&vt->vt_deadline, &now)) {
+        long long usec = (vt->vt_deadline.tv_sec - now.tv_sec) * 1000000LL
+                       + (vt->vt_deadline.tv_nsec - now.tv_nsec) / 1000;
+        if (usec < 0) usec = 0;
+        val->it_value.tv_sec = usec / 1000000;
+        val->it_value.tv_usec = usec % 1000000;
+    }
+    val->it_interval.tv_sec = vt->vt_interval.it_interval.tv_sec;
+    val->it_interval.tv_usec = vt->vt_interval.it_interval.tv_nsec / 1000;
+    return 0;
+}
+
+FUNCTION_DEFINE3(int, setitimer, int, which, const struct itimerval *, new_value,
+                 struct itimerval *, old_value) {
+    if (which != ITIMER_REAL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    tvm_sig_enter();
+    pthread_mutex_lock(&vtimers_lock);
+    task_lock(current);
+
+    if (old_value)
+        itimer_real_get_remaining(current, old_value);
+
+    if (current->tsk_itimer_real < 0 &&
+        (new_value->it_value.tv_sec || new_value->it_value.tv_usec)) {
+        // allocate a vtimer slot
+        int task_slot = -1;
+        for (int i = 0; i < MAX_TIMERS_PER_TASK; i++) {
+            if (current->tsk_timers[i] < 0) {
+                task_slot = i;
+                break;
+            }
+        }
+        int global_idx = -1;
+        if (task_slot >= 0) {
+            for (int i = 0; i < MAX_VIRTUAL_TIMERS; i++) {
+                if (!vtimers[i].vt_active) {
+                    global_idx = i;
+                    break;
+                }
+            }
+        }
+        if (task_slot < 0 || global_idx < 0) {
+            task_unlock(current);
+            pthread_mutex_unlock(&vtimers_lock);
+            tvm_sig_leave();
+            errno = EAGAIN;
+            return -1;
+        }
+
+        struct virtual_timer *vt = &vtimers[global_idx];
+        memset(vt, 0, sizeof(*vt));
+        vt->vt_active = 1;
+        vt->vt_task = current;
+        vt->vt_clockid = CLOCK_MONOTONIC;
+        vt->vt_signo = SIGALRM;
+        vt->vt_notify = SIGEV_SIGNAL;
+        vt->vt_task_slot = task_slot;
+        current->tsk_timers[task_slot] = global_idx;
+        current->tsk_itimer_real = task_slot;
+    }
+
+    if (current->tsk_itimer_real >= 0) {
+        int global_idx = current->tsk_timers[current->tsk_itimer_real];
+        struct virtual_timer *vt = &vtimers[global_idx];
+
+        if (new_value->it_value.tv_sec == 0 && new_value->it_value.tv_usec == 0) {
+            memset(&vt->vt_deadline, 0, sizeof(vt->vt_deadline));
+            memset(&vt->vt_interval, 0, sizeof(vt->vt_interval));
+        } else {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            struct timespec val_ts = {
+                .tv_sec = new_value->it_value.tv_sec,
+                .tv_nsec = new_value->it_value.tv_usec * 1000L,
+            };
+            vt->vt_deadline = ts_add(&now, &val_ts);
+            vt->vt_interval.it_interval.tv_sec = new_value->it_interval.tv_sec;
+            vt->vt_interval.it_interval.tv_nsec = new_value->it_interval.tv_usec * 1000L;
+        }
+        pthread_cond_signal(&vtimers_cond);
+    }
+
+    task_unlock(current);
+    pthread_mutex_unlock(&vtimers_lock);
+    tvm_sig_leave();
+    return 0;
+}
+
+FUNCTION_DEFINE2(int, getitimer, int, which, struct itimerval *, curr_value) {
+    if (which != ITIMER_REAL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    tvm_sig_enter();
+    pthread_mutex_lock(&vtimers_lock);
+    task_lock(current);
+
+    itimer_real_get_remaining(current, curr_value);
+
+    task_unlock(current);
+    pthread_mutex_unlock(&vtimers_lock);
+    tvm_sig_leave();
+    return 0;
 }
 
 #if defined(__linux__)

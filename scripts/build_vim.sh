@@ -6,6 +6,7 @@ if [ ! -f auto/config.mk ]; then
     ./configure \
         --with-features=normal \
         --enable-gui=no \
+        --disable-darwin \
         --disable-netbeans \
         --disable-channel \
         --without-x \

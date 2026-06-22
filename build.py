@@ -3,12 +3,24 @@
 
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-PLATFORMS = {"linux-x64"}
+PLATFORMS = {"linux-x64", "macos-arm64"}
+
+
+def detect_platform():
+    s = platform.system()
+    if s == "Darwin":
+        return "macos-arm64"
+    elif s == "Linux":
+        return "linux-x64"
+    else:
+        print(f"error: unsupported platform '{s}'", file=sys.stderr)
+        sys.exit(1)
 
 TARGET_MAP = {
     "tvm":           "tvm",
@@ -99,8 +111,8 @@ def clean(platform):
 
 def main():
     parser = argparse.ArgumentParser(description="Build TVM")
-    parser.add_argument("-a", default="linux-x64", choices=sorted(PLATFORMS),
-                        help="platform (default: linux-x64)")
+    parser.add_argument("-a", default=None, choices=sorted(PLATFORMS),
+                        help="platform (default: auto-detect)")
     parser.add_argument("-t", nargs="+", default=["tvm"],
                         help="build target(s) (default: tvm)")
     parser.add_argument("--clean", action="store_true",
@@ -108,6 +120,9 @@ def main():
     parser.add_argument("--verbose", action="store_true",
                         help="show full build commands")
     args = parser.parse_args()
+
+    if args.a is None:
+        args.a = detect_platform()
 
     if args.clean:
         clean(args.a)
