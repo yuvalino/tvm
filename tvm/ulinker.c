@@ -3665,7 +3665,7 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                 struct dyld_chained_ptr_64_rebase *ptr_64_rebase;
                 struct dyld_chained_ptr_64_bind   *ptr_64_bind;
             } p;
-            p.ptr8 = (uintptr_t *)(segment_address + seg_starts->page_start[pg]);
+            p.ptr8 = (uintptr_t *)(segment_address + (uintptr_t)pg * seg_starts->page_size + seg_starts->page_start[pg]);
             
             uintptr_t *prev_ptr8 = 0;
             while (p.ptr8 != prev_ptr8) {
@@ -3680,29 +3680,14 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                             // skip the leading underscore
                             const char *s = dl->dlm64_chainedfixups_strtab + import->name_offset + 1;
                             uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1, 0, DLBASE(dl));
-                            if (!sym_addr) {
-                                // try without $DARWIN_EXTSN or $UNIX2003 suffix
-                                const char *dollar = strchr(s, '$');
-                                if (dollar) {
-                                    char base[256];
-                                    size_t blen = dollar - s;
-                                    if (blen < sizeof(base)) {
-                                        memcpy(base, s, blen);
-                                        base[blen] = 0;
-                                        sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, base, NULL, 1, 0, DLBASE(dl));
-                                    }
-                                }
-                            }
                             if (!sym_addr && !import->weak_import) {
                                 ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
                                 return 1;
                             }
-                            //PRINT("DYLD_CHAINED_PTR_64_BIND %p %p %s", p.ptr8, (void *)sym_addr, s - 1);
                             *p.ptr8 = sym_addr;
                         }
                         else {
                             next = p.ptr_64_rebase->next * 4;
-                            //PRINT("DYLD_CHAINED_PTR_64_REBASE %p %p", p.ptr8, (void *)(dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero));
                             *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero;
                         }
                         break;
