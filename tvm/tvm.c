@@ -1461,7 +1461,7 @@ struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode, 
             filedealloc_locked(file);
             return NULL;
         }
-        
+
         errno = last_errno;
     };
 
@@ -5808,7 +5808,7 @@ void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file
         return MAP_FAILED;
     }
 
-    void *ret = CALL_FUNC(mmap, hint, size, prot | PROT_WRITE, flags | MAP_ANONYMOUS, -1, 0);
+    void *ret = CALL_FUNC(mmap, hint, size, PROT_READ | PROT_WRITE, flags | MAP_ANONYMOUS, -1, 0);
     if (ret == MAP_FAILED) {
         vn_unlock(vn, 1);
         return MAP_FAILED;
@@ -5826,8 +5826,7 @@ void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file
 
     memcpy(ret, vn->vn_data + op_offset, op_size);
 
-    if (0 == (prot & PROT_WRITE)) {
-        // if this fails, its probably some new RWX mitigation
+    if (prot != (PROT_READ | PROT_WRITE)) {
         VERIFY(0 == CALL_FUNC(mprotect, ret, size, prot));
     }
 
@@ -5872,7 +5871,12 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
     if (S_ISDIR(cpio->c_mode) ||
         S_ISREG(cpio->c_mode) ||
         S_ISLNK(cpio->c_mode)) {
-        struct vfs_node *child = vfs_lookup_locked(vn, cpio->name, 1, 0, cpio->c_mode, cpio->c_uid, cpio->c_gid);
+        const char *name = cpio->name;
+        while (name[0] == '.' && name[1] == '/') name += 2;
+        while (name[0] == '/') name++;
+        if (name[0] == '.' && name[1] == '\0') return 0;
+        if (name[0] == '\0') return 0;
+        struct vfs_node *child = vfs_lookup_locked(vn, name, 1, 0, cpio->c_mode, cpio->c_uid, cpio->c_gid);
         if (!child) {
             // TODO clear all children
             return -1;
@@ -8562,10 +8566,41 @@ static void tvm_exec_initrc(const char *path, int must_exist)
     free(buf);
 }
 
+static void tvm_set_outdir(void)
+{
+    if (getenv("TVM_OUTDIR"))
+        return;
+    char self[PATH_MAX];
+#if defined(__APPLE__)
+    uint32_t size = sizeof(self);
+    if (_NSGetExecutablePath(self, &size) != 0)
+        return;
+#elif defined(__linux__)
+    ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (len <= 0)
+        return;
+    self[len] = 0;
+#else
+    return;
+#endif
+    char *resolved = realpath(self, NULL);
+    if (!resolved)
+        return;
+    // binary is at <outdir>/bin/tvm — strip "bin/tvm" to get outdir
+    char *slash = strrchr(resolved, '/');
+    if (slash) *slash = 0; // strip "/tvm"
+    slash = strrchr(resolved, '/');
+    if (slash) slash[1] = 0; // strip "bin" → keep trailing /
+    setenv("TVM_OUTDIR", resolved, 0);
+    free(resolved);
+}
+
 static void tvm_load_initrc(void)
 {
     if (getenv("TVM_NOINITRC"))
         return;
+
+    tvm_set_outdir();
 
     const char *path = getenv("TVM_INITRC");
     if (path) {

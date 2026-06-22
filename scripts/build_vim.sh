@@ -7,9 +7,11 @@ if [ ! -f auto/config.mk ]; then
         --with-features=normal \
         --enable-gui=no \
         --disable-darwin \
+        --disable-nls \
         --disable-netbeans \
         --disable-channel \
         --without-x \
+        ac_cv_header_iconv_h=no \
         --disable-xsmp \
         --disable-xattr \
         --disable-selinux \
