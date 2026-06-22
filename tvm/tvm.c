@@ -5213,6 +5213,12 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
 
     while (tok) {
         next_tok = strtok_r(NULL, "/", &saveptr);
+
+        if (strcmp(tok, ".") == 0) {
+            tok = next_tok;
+            continue;
+        }
+
         struct vfs_node *child = vfs_find_child_locked(cur, tok);
 
         if (!child) {
@@ -5914,7 +5920,8 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
             }
         }
 
-        vn_unlock(child, 1);
+        if (child != vn)
+            vn_unlock(child, 1);
     }
 
     return 0;
