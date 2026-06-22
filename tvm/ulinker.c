@@ -3680,7 +3680,7 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                             // skip the leading underscore
                             const char *s = dl->dlm64_chainedfixups_strtab + import->name_offset + 1;
                             uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1, 0, DLBASE(dl));
-                            if (!sym_addr && import->weak_import) {
+                            if (!sym_addr && !import->weak_import) {
                                 ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
                                 return 1;
                             }

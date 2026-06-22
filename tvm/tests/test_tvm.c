@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -1980,6 +1981,7 @@ TEST(SigwaitDoesNotInvokeHandler) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
+#if defined(__linux__)
 TEST(SigwaitinfoBasic) {
     // sigwaitinfo returns signal number and fills siginfo_t
     pid_t p = fork();
@@ -2059,6 +2061,7 @@ TEST(SigtimedwaitImmediate) {
     ASSERT_EQ(1, WIFEXITED(s));
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
+#endif // __linux__ (sigwaitinfo/sigtimedwait tests)
 
 // --- pthread_kill ---
 
@@ -2513,6 +2516,7 @@ TEST(SigwaitFromKill) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
+#if defined(__linux__)
 // --- sigtimedwait with siginfo ---
 
 TEST(SigtimedwaitWithInfo) {
@@ -2593,6 +2597,7 @@ TEST(SigtimedwaitSignalArrives) {
     ASSERT_EQ(1, WIFEXITED(s));
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
+#endif // __linux__ (sigtimedwait tests)
 
 // --- Signal mask isolation between forked tasks ---
 
@@ -2952,6 +2957,7 @@ TEST(KillBlockedThenUnblock) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
+#if defined(__linux__)
 // --- sigtimedwait: timeout accuracy (should not take way too long) ---
 
 TEST(SigtimedwaitTimeoutAccuracy) {
@@ -2988,6 +2994,7 @@ TEST(SigtimedwaitTimeoutAccuracy) {
 // Multi-threading tests
 // NOTE: exit() with >1 thread alive is NOT supported — always join first.
 //       SIGALRM is not supported.
+#endif // __linux__ (SigtimedwaitTimeoutAccuracy)
 // =========================================================================
 
 static void *thread_basic_fn(void *arg) {
@@ -3065,6 +3072,7 @@ TEST(ThreadPidShared) {
 static volatile int vtimer_sig_count = 0;
 static void vtimer_handler(int sig) { vtimer_sig_count++; }
 
+#if defined(__linux__)
 // shared state for SIGEV_THREAD callback tests (static so it lives in BSS,
 // which is always mapped in every Unicorn emulator engine)
 struct vtimer_thread_state {
@@ -3652,6 +3660,192 @@ TEST(TimerNullSevp) {
 
         if (vtimer_sig_count < 1) _exit(3);
         timer_delete(tid);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+#endif // __linux__ (timer_create tests)
+
+TEST(SetitimerBasic) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        vtimer_sig_count = 0;
+        struct sigaction sa = { .sa_handler = vtimer_handler };
+        sigaction(SIGALRM, &sa, NULL);
+
+        struct itimerval iv = {
+            .it_value = { .tv_sec = 0, .tv_usec = 10000 }, // 10ms
+        };
+        if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
+        usleep(100000); // 100ms
+        if (vtimer_sig_count < 1) _exit(2);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SetitimerRepeating) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        vtimer_sig_count = 0;
+        struct sigaction sa = { .sa_handler = vtimer_handler };
+        sigaction(SIGALRM, &sa, NULL);
+
+        struct itimerval iv = {
+            .it_value    = { .tv_sec = 0, .tv_usec = 50000 }, // 50ms
+            .it_interval = { .tv_sec = 0, .tv_usec = 50000 }, // 50ms repeat
+        };
+        if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
+        for (int i = 0; i < 20 && vtimer_sig_count < 3; i++)
+            usleep(50000);
+        if (vtimer_sig_count < 3) _exit(2);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SetitimerDisarm) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        vtimer_sig_count = 0;
+        struct sigaction sa = { .sa_handler = vtimer_handler };
+        sigaction(SIGALRM, &sa, NULL);
+
+        struct itimerval iv = {
+            .it_value = { .tv_sec = 0, .tv_usec = 50000 }, // 50ms
+        };
+        if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
+        struct itimerval disarm = {{0,0},{0,0}};
+        if (setitimer(ITIMER_REAL, &disarm, NULL) != 0) _exit(2);
+        usleep(200000); // 200ms
+        if (vtimer_sig_count != 0) _exit(3);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SetitimerOldValue) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct sigaction sa = { .sa_handler = vtimer_handler };
+        sigaction(SIGALRM, &sa, NULL);
+
+        struct itimerval iv = {
+            .it_value = { .tv_sec = 0, .tv_usec = 500000 }, // 500ms
+        };
+        if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
+        usleep(100000); // 100ms
+
+        struct itimerval old;
+        struct itimerval disarm = {{0,0},{0,0}};
+        if (setitimer(ITIMER_REAL, &disarm, &old) != 0) _exit(2);
+
+        long remaining_us = old.it_value.tv_sec * 1000000L + old.it_value.tv_usec;
+        if (remaining_us < 300000 || remaining_us > 500000) _exit(3);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(GetitimerBasic) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct sigaction sa = { .sa_handler = vtimer_handler };
+        sigaction(SIGALRM, &sa, NULL);
+
+        struct itimerval iv = {
+            .it_value = { .tv_sec = 0, .tv_usec = 500000 }, // 500ms
+        };
+        if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
+        usleep(100000); // 100ms
+
+        struct itimerval val;
+        if (getitimer(ITIMER_REAL, &val) != 0) _exit(2);
+        long remaining_us = val.it_value.tv_sec * 1000000L + val.it_value.tv_usec;
+        if (remaining_us < 300000 || remaining_us > 500000) _exit(3);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(GetitimerDisarmed) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct itimerval val;
+        if (getitimer(ITIMER_REAL, &val) != 0) _exit(1);
+        if (val.it_value.tv_sec != 0 || val.it_value.tv_usec != 0) _exit(2);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SetitimerInvalidWhich) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct itimerval iv = {
+            .it_value = { .tv_sec = 1 },
+        };
+        if (setitimer(ITIMER_VIRTUAL, &iv, NULL) == 0) _exit(1);
+        if (errno != EINVAL) _exit(2);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(SetitimerForkNotInherited) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct sigaction sa = { .sa_handler = vtimer_handler };
+        sigaction(SIGALRM, &sa, NULL);
+
+        struct itimerval iv = {
+            .it_value = { .tv_sec = 10 }, // 10s — won't fire
+        };
+        if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
+
+        pid_t child = fork();
+        if (child < 0) _exit(2);
+        if (child == 0) {
+            struct itimerval val;
+            if (getitimer(ITIMER_REAL, &val) != 0) _exit(10);
+            if (val.it_value.tv_sec != 0 || val.it_value.tv_usec != 0) _exit(11);
+            _exit(0);
+        }
+        int cs;
+        waitpid(child, &cs, 0);
+        if (!WIFEXITED(cs) || WEXITSTATUS(cs) != 0) _exit(3);
         _exit(0);
     }
     int s;
