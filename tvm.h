@@ -1,5 +1,12 @@
 #pragma once
 
+#if defined(__ANDROID__) && __ANDROID_MIN_SDK_VERSION__ < 28
+#include <sys/types.h>
+#include <linux/random.h>
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags);
+int getentropy(void *buf, size_t buflen);
+#endif
+
 #define __TVM_STRINGIFY(X) #X
 #define _TVM_STRINGIFY(X) __TVM_STRINGIFY(X)
 

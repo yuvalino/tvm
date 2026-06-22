@@ -28,6 +28,135 @@
 
 #include <limits.h>
 #include <termios.h>
+
+#if defined(__ANDROID__)
+/*
+ * Android/Bionic compatibility shims.
+ *
+ * Bionic's termios uses inline functions and lacks BSD tty defaults.
+ * Several POSIX functions are missing or have different signatures.
+ * The ioctl function is declared with __overloadable which breaks typeof().
+ */
+
+/* On Android, termios functions (tcgetattr etc.) are static inline in the header.
+   We cannot redefine them with FUNCTION_DEFINE, so we skip both DECL_FUNC and
+   FUNCTION_DEFINE for these on Android. The tvm tty layer uses ioctls directly
+   for local ttys and falls through to the real functions for non-local fds. */
+
+/* BSD tty default control characters (not provided by Bionic) */
+#ifndef CEOF
+#define CEOF    '\004'  /* ^D */
+#endif
+#ifndef CEOL
+#define CEOL    '\0'
+#endif
+#ifndef CERASE
+#define CERASE  '\177'  /* ^? */
+#endif
+#ifndef CWERASE
+#define CWERASE '\027'  /* ^W */
+#endif
+#ifndef CKILL
+#define CKILL   '\025'  /* ^U */
+#endif
+#ifndef CREPRINT
+#define CREPRINT '\022' /* ^R */
+#endif
+#ifndef CINTR
+#define CINTR   '\003'  /* ^C */
+#endif
+#ifndef CQUIT
+#define CQUIT   '\034'  /* ^\ */
+#endif
+#ifndef CSUSP
+#define CSUSP   '\032'  /* ^Z */
+#endif
+#ifndef CDSUSP
+#define CDSUSP  '\031'  /* ^Y */
+#endif
+#ifndef CSTART
+#define CSTART  '\021'  /* ^Q */
+#endif
+#ifndef CSTOP
+#define CSTOP   '\023'  /* ^S */
+#endif
+#ifndef CLNEXT
+#define CLNEXT  '\026'  /* ^V */
+#endif
+#ifndef CDISCARD
+#define CDISCARD '\017' /* ^O */
+#endif
+#ifndef CMIN
+#define CMIN    1
+#endif
+#ifndef CTIME
+#define CTIME   0
+#endif
+#ifndef CSTATUS
+#define CSTATUS '\024'  /* ^T */
+#endif
+
+#ifndef TTYDEF_IFLAG
+#define TTYDEF_IFLAG  (BRKINT | ICRNL | IMAXBEL | IXON | IXANY)
+#endif
+#ifndef TTYDEF_OFLAG
+#define TTYDEF_OFLAG  (OPOST | ONLCR)
+#endif
+#ifndef TTYDEF_LFLAG
+#define TTYDEF_LFLAG  (ECHO | ICANON | ISIG | IEXTEN | ECHOE | ECHOKE | ECHOCTL)
+#endif
+#ifndef TTYDEF_CFLAG
+#define TTYDEF_CFLAG  (CREAD | CS8 | HUPCL)
+#endif
+#ifndef TTYDEF_SPEED
+#define TTYDEF_SPEED  (B9600)
+#endif
+
+#ifndef CCEQ
+#define CCEQ(val, c)  ((c) == (val) && (val) != _POSIX_VDISABLE)
+#endif
+
+/* lchmod does not exist on Android */
+static inline int lchmod(const char *path, mode_t mode) {
+    return fchmodat(AT_FDCWD, path, mode, AT_SYMLINK_NOFOLLOW);
+}
+
+/* getwd is deprecated/missing on Android */
+static inline char *getwd(char *buf) {
+    return getcwd(buf, PATH_MAX);
+}
+
+/* get_current_dir_name is a GNU extension not on Android */
+static inline char *get_current_dir_name(void) {
+    return getcwd(NULL, 0);
+}
+
+/* pthread_attr_{get,set}inheritsched are not in Bionic */
+#ifndef PTHREAD_INHERIT_SCHED
+#define PTHREAD_INHERIT_SCHED 0
+#endif
+#ifndef PTHREAD_EXPLICIT_SCHED
+#define PTHREAD_EXPLICIT_SCHED 1
+#endif
+static inline int pthread_attr_getinheritsched(const pthread_attr_t *attr, int *inheritsched) {
+    (void)attr;
+    *inheritsched = PTHREAD_INHERIT_SCHED;
+    return 0;
+}
+static inline int pthread_attr_setinheritsched(pthread_attr_t *attr, int inheritsched) {
+    (void)attr;
+    (void)inheritsched;
+    return 0;
+}
+
+/* On Android, struct termios lacks c_ispeed/c_ospeed. Provide accessors instead. */
+#define ANDROID_NO_TERMIOS_SPEED 1
+
+/* Bionic declares ioctl with __overloadable, which breaks typeof().
+   Provide an unambiguous declaration for the DECL_FUNC macro. */
+typedef int (*ioctl_func_t)(int, unsigned long, ...);
+
+#endif /* __ANDROID__ */
 #include <getopt.h>
 #include <grp.h>
 #include <signal.h>
@@ -42,7 +171,9 @@
 #include <sys/vfs.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#if defined(__x86_64__)
 #include <asm/prctl.h>
+#endif
 #endif
 
 #include "tvm.h"
@@ -260,7 +391,19 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
     static void _ofc_ ## Name () { list_add_tail( & (_of_ ## Name).list, &original_functions); }
 #define DECL_FUNC(Name)     DECL_FUNC_EX(Name, 0)
 #define DECL_FUNC_OPT(Name) DECL_FUNC_EX(Name, 1)
+#if defined(__ANDROID__)
+/* On Android, libc init calls our wrappers before init_funcs runs (our
+   constructors run AFTER libc's DT_INIT). Lazy-resolve via dlsym.
+   Safe from recursion: our custom __emutls_get_address uses __emutls_malloc
+   (which calls LOCAL_SYM(malloc) directly), never going through CALL_FUNC. */
+#define CALL_FUNC(Name, ...) ({ \
+    if (__builtin_expect(!LOCAL_SYM(Name), 0)) \
+        LOCAL_SYM(Name) = dlsym(RTLD_NEXT, #Name); \
+    LOCAL_SYM(Name)(__VA_ARGS__); \
+})
+#else
 #define CALL_FUNC(Name, ...) (LOCAL_SYM(Name) (__VA_ARGS__))
+#endif
 
 struct original_func_t {
     struct list_head list;
@@ -350,7 +493,9 @@ DECL_FUNC(fstatat);
 DECL_FUNC(access);
 DECL_FUNC(faccessat);
 DECL_FUNC(chmod);
+#if !defined(__ANDROID__)
 DECL_FUNC(lchmod);
+#endif
 DECL_FUNC(fchmod);
 DECL_FUNC(fchmodat);
 DECL_FUNC(chown);
@@ -393,7 +538,14 @@ DECL_FUNC(recvfrom);
 DECL_FUNC(recvmsg);
 DECL_FUNC(shutdown);
 DECL_FUNC(socketpair);
+#if defined(__ANDROID__)
+static ioctl_func_t LOCAL_SYM(ioctl) = NULL;
+static struct original_func_t _of_ioctl = { .ptrdest = (void *)&LOCAL_SYM(ioctl), .name = "ioctl", .opt = 0 };
+__attribute__((constructor))
+static void _ofc_ioctl() { list_add_tail(&(_of_ioctl).list, &original_functions); }
+#else
 DECL_FUNC(ioctl);
+#endif
 
 DECL_FUNC(pthread_create);
 DECL_FUNC(pthread_exit);
@@ -456,12 +608,14 @@ DECL_FUNC(ttyname_r);
 DECL_FUNC(ptsname);
 DECL_FUNC(ptsname_r);
 
+#if !defined(__ANDROID__)
 DECL_FUNC(tcgetattr);
 DECL_FUNC(tcsetattr);
 DECL_FUNC(tcsendbreak);
 DECL_FUNC(tcdrain);
 DECL_FUNC(tcflush);
 DECL_FUNC(tcflow);
+#endif
 
 DECL_FUNC(strdup);
 DECL_FUNC(strndup);
@@ -489,7 +643,9 @@ DECL_FUNC(realpath);
 DECL_FUNC(chdir);
 DECL_FUNC(fchdir);
 DECL_FUNC(getcwd);
+#if !defined(__ANDROID__)
 DECL_FUNC(getwd);
+#endif
 
 DECL_FUNC(bsearch);
 DECL_FUNC(qsort);
@@ -518,12 +674,29 @@ DECL_FUNC(openat64);
 DECL_FUNC(fstatat64);
 DECL_FUNC(lseek64);
 DECL_FUNC(ftruncate64);
+#if !defined(__ANDROID__)
 DECL_FUNC(get_current_dir_name);
+#endif
 #elif defined(__APPLE__)
 DECL_FUNC_OPT(CFDictionaryApplyFunction);
 #endif
 
-__attribute__((constructor))
+static int funcs_initialized = 0;
+
+#if defined(__ANDROID__)
+/*
+ * Disable Android's heap pointer tagging. TVM uses its own memory allocator (rmem)
+ * which returns untagged pointers. When these pointers are passed to libc functions
+ * (stdio, etc.), Android's tagged-pointer checker would abort the process.
+ */
+extern int mallopt(int, int);
+__attribute__((constructor(101)))
+static void disable_heap_tagging()
+{
+    mallopt(/*M_BIONIC_SET_HEAP_TAGGING_LEVEL*/ -204, /*M_HEAP_TAGGING_LEVEL_NONE*/ 0);
+}
+#endif
+
 static void init_funcs()
 {
     struct original_func_t *curr_func;
@@ -535,7 +708,25 @@ static void init_funcs()
             *curr_func->ptrdest = (void *)0x4141DEAD;
         }
     }
+    funcs_initialized = 1;
 };
+
+#if defined(__ANDROID__)
+/* Resolve critical allocator symbols before any DT_INIT constructor runs.
+   .preinit_array runs before ALL shared library constructors, so o_malloc,
+   o_free, o_realloc are available when libc's init calls our wrappers. */
+static void __preinit_resolve_alloc(void) {
+    LOCAL_SYM(malloc)  = dlsym(RTLD_NEXT, "malloc");
+    LOCAL_SYM(free)    = dlsym(RTLD_NEXT, "free");
+    LOCAL_SYM(realloc) = dlsym(RTLD_NEXT, "realloc");
+    LOCAL_SYM(calloc)  = dlsym(RTLD_NEXT, "calloc");
+}
+__attribute__((section(".preinit_array"), used))
+static void (*__preinit_fn)(void) = __preinit_resolve_alloc;
+#endif
+
+__attribute__((constructor))
+static void __init_funcs_ctor(void) { init_funcs(); }
 
 __attribute__((constructor))
 static void format_time_init(void) {
@@ -1008,6 +1199,78 @@ static void *jmpbuf_getstack(jmp_buf *jmpbuf)
 #undef PTR_MANGLE
 #undef PTR_DEMANGLE
 
+#elif defined(__aarch64__)
+
+/*
+ * Bionic aarch64 jmp_buf layout (reverse-engineered from sigsetjmp/siglongjmp):
+ *   [0]  cookie (from TLS, sigflag in bit 0)
+ *   [1]  sigmask (unmangled)
+ *   [2]  x30/lr ^ cookie
+ *   [3]  sp ^ cookie
+ *   [4]  x28 ^ cookie
+ *   [5]  x29/fp ^ cookie
+ *   [6]  x26 ^ cookie
+ *   [7]  x27 ^ cookie
+ *   [8]  x24 ^ cookie
+ *   [9]  x25 ^ cookie
+ *   [10] x22 ^ cookie
+ *   [11] x23 ^ cookie
+ *   [12] x20 ^ cookie
+ *   [13] x21 ^ cookie
+ *   [14] (x18 & 0x3fff) ^ cookie  (TLS tag)
+ *   [15] x19 ^ cookie
+ *   [16-23] d14,d15,d12,d13,d10,d11,d8,d9  (unmangled)
+ *   [24] XOR checksum of [0..23]
+ *
+ * Cookie low bit encodes sigflag (1=setjmp, 0=_setjmp).
+ * All register slots XOR'd with cookie (low bit cleared).
+ * longjmp verifies checksum; mismatch aborts.
+ */
+
+#define JB_COOKIE     0
+#define JB_SP         3
+#define JB_FP         5
+#define JB_CHECKSUM   24
+#define JB_SAVED_COOKIE 25  /* unused slot — we stash the cookie here during demangle */
+
+static void jmpbuf_recompute_checksum(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    uintptr_t checksum = 0;
+    for (int i = 0; i < 24; i++)
+        checksum ^= jb[i];
+    jb[JB_CHECKSUM] = checksum;
+}
+
+static void jmpbuf_demangle(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    uintptr_t cookie = jb[JB_COOKIE] & ~(uintptr_t)1;
+    /* Stash cookie in an unused jmpbuf slot so jmpbuf_mangle can recover it
+       even when called from a different thread (e.g., fork child). */
+    jb[JB_SAVED_COOKIE] = cookie;
+    jb[0] ^= cookie;
+    for (int i = 2; i <= 15; i++)
+        jb[i] ^= cookie;
+}
+
+static void jmpbuf_mangle(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    uintptr_t cookie = jb[JB_SAVED_COOKIE];
+    jb[0] ^= cookie;
+    for (int i = 2; i <= 15; i++)
+        jb[i] ^= cookie;
+    jb[JB_SAVED_COOKIE] = 0; /* clear stashed cookie */
+    jmpbuf_recompute_checksum(jmpbuf);
+}
+
+static void *jmpbuf_getstack(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    return (void *) jb[JB_SP];
+}
+
 #endif
 #elif defined(__APPLE__)
 #if defined(__aarch64__)
@@ -1094,8 +1357,20 @@ static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
 {
     uintptr_t *jb = (uintptr_t*) (jmpbuf);
     uintptr_t diff = old_stack - new_stack;
- 
-    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
+
+    /*
+     * On Bionic aarch64, only slots 0-15 hold demangled register values.
+     * Slots 16-23 are unmangled floating-point regs (d8-d15) whose bit patterns
+     * could accidentally match the stack address range. Slot 24 is the checksum.
+     * Scanning those would corrupt the jmpbuf and cause longjmp to fail.
+     */
+#if defined(__ANDROID__) && defined(__aarch64__)
+    int nslots = 16;
+#else
+    int nslots = sizeof(jmp_buf) / 8;
+#endif
+
+    for (int i = 0; i < nslots; i++)
     {
         if (jb[i] >= old_stack && jb[i] < (old_stack + stack_size))
             jb[i] -= diff;
@@ -1712,9 +1987,36 @@ static __thread int tvm_sig_depth = 0;
 static __thread int tvm_sig_synchronous_depth = 0;
 static __thread int tvm_in_emu = 0;
 
+#if defined(__ANDROID__) && defined(__aarch64__)
+/* Raw TLS access via Bionic's tpidr_el0 — no emutls, zero overhead.
+   TLS_SLOT_APP (slot 2, offset +16) is available for application use on API >= 29.
+   We use it as a per-thread bit field:
+     bit 0: emutls re-entrancy guard (set during alloc wrapper __thread access)
+     bit 1: TVM disallow flag (replaces thread_tvm_disallow) */
+static inline uintptr_t __tvm_in_wrapper(void) {
+    uintptr_t tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    return *(uintptr_t *)(tp + 16);
+}
+static inline void __tvm_set_in_wrapper(uintptr_t v) {
+    uintptr_t tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    *(uintptr_t *)(tp + 16) = v;
+}
+#endif
+
+#if defined(__ANDROID__)
+#define TVM_ON  do { __tvm_set_in_wrapper(__tvm_in_wrapper() & ~2u); } while (0)
+#define TVM_OFF ({ int __val = (__tvm_in_wrapper() >> 1) & 1; __tvm_set_in_wrapper(__tvm_in_wrapper() | 2); __val; })
+#define TVM_RESTORE(_val) do { \
+    if (_val) __tvm_set_in_wrapper(__tvm_in_wrapper() | 2); \
+    else __tvm_set_in_wrapper(__tvm_in_wrapper() & ~2u); \
+} while (0)
+#else
 #define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
 #define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
 #define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
+#endif
 
 static void task_lock(struct task *t)
 {
@@ -2842,7 +3144,11 @@ void dp_setfileno(DIR *dp, int fd) {
 
 void init_file_stream_dp()
 {
+#if defined(__ANDROID__)
+    int dev = CALL_FUNC(open, "/proc/self", O_RDONLY | O_DIRECTORY);
+#else
     int dev = CALL_FUNC(open, "/", O_RDONLY | O_DIRECTORY);
+#endif
     VERIFY(dev != -1);
 
     int fd123;
@@ -3532,8 +3838,10 @@ struct tty {
 #define t_cflag  t_termios.c_cflag
 #define t_lflag  t_termios.c_lflag
 #define t_cc     t_termios.c_cc
+#if !defined(__ANDROID__)
 #define t_ispeed t_termios.c_ispeed
 #define t_ospeed t_termios.c_ospeed
+#endif
 
     int t_mfd;
     ino_t t_mfd_ino;
@@ -3609,8 +3917,13 @@ static struct tty *ttyalloc()
     tt->t_termios.c_oflag = TTYDEF_OFLAG;
     tt->t_termios.c_lflag = TTYDEF_LFLAG;
     tt->t_termios.c_cflag = TTYDEF_CFLAG;
+#if !defined(__ANDROID__)
     tt->t_termios.c_ispeed = tt->t_termios.c_ospeed = TTYDEF_SPEED;
-    
+#else
+    cfsetispeed(&tt->t_termios, TTYDEF_SPEED);
+    cfsetospeed(&tt->t_termios, TTYDEF_SPEED);
+#endif
+
     struct stat st;
     if (-1 == CALL_FUNC(fstat, tt->t_mfd, &st)) {
         goto fail;
@@ -5917,25 +6230,25 @@ void tvm_register_program(const char *pathname, main_func_t main_routine)
 {
     if (!pathname || !pathname[0])
         panic("pathname");
-    
+
     struct exec_program *prog;
     if (NULL == (prog = malloc(sizeof(*prog))))
         panic("prog");
-    
+
     prog->pathname = strdup(pathname);
     if (!prog->pathname)
         panic("strdup");
-    
+
     prog->main_routine = main_routine;
     prog->file = strrchr(prog->pathname, '/');
     if (prog->file)
         prog->file++;
     else
         prog->file = prog->pathname;
-    
+
     if (!prog->file[0])
         panic("program file \"%s\"", prog->pathname);
-    
+
     pthread_mutex_lock(&programs_lock);
     list_add_tail(&prog->list, &exec_programs);
     pthread_mutex_unlock(&programs_lock);
@@ -7446,8 +7759,13 @@ int can_enter_tvm(void *lr) {
     if (!main_task)
         return 0;
 
+#if defined(__ANDROID__)
+    if (__tvm_in_wrapper() & 2) /* bit 1 = TVM disallow */
+        return 0;
+#else
     if (thread_tvm_disallow)
         return 0;
+#endif
 
     if (!lr) {
         if (!call)
@@ -7512,11 +7830,47 @@ static void _fmc_ ## _name () { list_add_tail( & (_fm_ ## _name).fm_list, &all_f
 #define __FN_DECL(t, a)	t a
 #define __FN_ARGS(t, a)	a
 
+/*
+ * On Android, __thread uses our custom emutls (see end of file) which stores
+ * the per-thread array at tpidr_el0+24. If that slot is NULL, this thread
+ * has never accessed any __thread variable — meaning there's no `call` chain,
+ * no `current`, nothing TVM-related. Skip straight to the real libc function.
+ *
+ * This prevents the critical deadlock: scudo holds a lock → calls mmap →
+ * our wrapper → accesses __thread `call` → emutls → malloc → scudo → deadlock.
+ * With this guard, the mmap wrapper sees NULL tpidr_el0+24 and forwards to
+ * libc's mmap immediately, never touching emutls or malloc.
+ */
+static inline int __tvm_tls_ready(void) {
+    uintptr_t tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    return *(void **)(tp + 24) != NULL;
+}
+/* If TLS not ready on this thread, skip TVM — call libc directly via LOCAL_SYM.
+   This prevents the scudo deadlock: scudo holds lock → mmap → wrapper → __thread
+   → emutls → malloc → scudo re-enters → deadlock. With the guard, the mmap
+   wrapper sees no TLS → calls LOCAL_SYM(mmap) directly → no emutls → no malloc.
+   LOCAL_SYM is always resolved (set in .preinit_array before any DT_INIT). */
+#define __EMUTLS_GUARD_RET(_name, _rettype, ...) \
+    if (__builtin_expect(!__tvm_tls_ready() && LOCAL_SYM(_name), 0)) \
+        return LOCAL_SYM(_name)(__VA_ARGS__);
+#define __EMUTLS_GUARD_VOID(_name, ...) \
+    if (__builtin_expect(!__tvm_tls_ready() && LOCAL_SYM(_name), 0)) \
+        { LOCAL_SYM(_name)(__VA_ARGS__); return; }
+#define __EMUTLS_GUARD_NORET(_name, ...) \
+    if (__builtin_expect(!__tvm_tls_ready() && LOCAL_SYM(_name), 0)) \
+        { LOCAL_SYM(_name)(__VA_ARGS__); __builtin_unreachable(); }
+#define __EMUTLS_ENTER()
+#define __EMUTLS_LEAVE()
+
 #define __FUNCTION_DEFINEx(_x, _rettype, _name, ...) \
 _rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
 _rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
+    __EMUTLS_GUARD_RET(_name, _rettype, __MAP(_x, __FN_ARGS, __VA_ARGS__)) \
+    __EMUTLS_ENTER() \
     struct tvm_call __call = { call, __builtin_return_address(0) }; \
     call = &__call; \
+    __EMUTLS_LEAVE() \
     _rettype __r; \
     if (!can_enter_tvm(NULL)) { __r = CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     else { __r = __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
@@ -7529,8 +7883,11 @@ _rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
 #define __FUNCTION_DEFINE_VOIDx(_x, _name, ...) \
 void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
 void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
+    __EMUTLS_GUARD_VOID(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)) \
+    __EMUTLS_ENTER() \
     struct tvm_call __call = { call, __builtin_return_address(0) }; \
     call = &__call; \
+    __EMUTLS_LEAVE() \
     if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     else { __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     call = call->prev; \
@@ -7541,8 +7898,11 @@ void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
 #define __FUNCTION_DEFINE_NORETx(_x, _name, ...) \
 void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
 void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
+    __EMUTLS_GUARD_NORET(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)) \
+    __EMUTLS_ENTER() \
     struct tvm_call __call = { call, __builtin_return_address(0) }; \
     call = &__call; \
+    __EMUTLS_LEAVE() \
     if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     else {__tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     panic("returned"); \
@@ -7554,8 +7914,11 @@ void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
 #define __FUNCTION_DEFINE_VAx(_x, _rettype, _name, ...) \
 _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
 _rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
+    __EMUTLS_GUARD_RET(_name, _rettype, __MAP(_x, __FN_ARGS, __VA_ARGS__)) \
+    __EMUTLS_ENTER() \
     struct tvm_call __call = { call, __builtin_return_address(0) }; \
     call = &__call; \
+    __EMUTLS_LEAVE() \
     va_list __ap; \
     va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
     _rettype __r = __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
@@ -7569,8 +7932,10 @@ _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 #define __FUNCTION_DEFINE_NORET_VAx(_x, _name, ...) \
 void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
 void _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
+    __EMUTLS_ENTER() \
     struct tvm_call __call = { call, __builtin_return_address(0) }; \
     call = &__call; \
+    __EMUTLS_LEAVE() \
     va_list __ap; \
     va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
     __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
@@ -8422,6 +8787,12 @@ void tvm_init(const char *init_comm)
     if (!current)
         panic("couldn't create main task");
 
+#if defined(__ANDROID__)
+    /* On Android, setting main_task makes can_enter_tvm() return true for calls
+       from within the binary. But the fd table and task state aren't fully initialized
+       yet. Disable TVM wrappers until init completes. */
+    int __saved_disallow = TVM_OFF;
+#endif
     main_task = current;
     current->tsk_pid = __gettid();
     current->tsk_sid = current->tsk_pgid = current->tsk_pid;
@@ -8521,7 +8892,19 @@ void tvm_init(const char *init_comm)
         }
     }
 
+#if defined(__ANDROID__)
+    /* Debug: test if CALL_FUNC(malloc) works right before tvm_register_program */
+    {
+        void *_t = CALL_FUNC(malloc, 64);
+        CALL_FUNC(free, _t);
+    }
+#endif
+
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
+
+#if defined(__ANDROID__)
+    TVM_RESTORE(__saved_disallow);
+#endif
 }
 
 int tvm_setopt(int opt, void *val) {
@@ -9097,9 +9480,9 @@ FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
     tvm_sig_leave();
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, size_t, size) {
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)
 FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
 #endif
     tvm_sig_enter();
@@ -9120,7 +9503,7 @@ FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
     tvm_sig_leave();
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
     tvm_sig_enter();
 
@@ -9136,7 +9519,7 @@ FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
     file_unlock(file, 1);
     tvm_sig_leave();
 }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)
 FUNCTION_DEFINE1(int, setlinebuf, FILE *, stream) {
     tvm_sig_enter();
 
@@ -10115,6 +10498,7 @@ FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
     return ret;
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
@@ -10126,6 +10510,7 @@ FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
     tvm_sig_leave();
     return ret;
 }
+#endif
 
 FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
     tvm_sig_enter();
@@ -10610,7 +10995,25 @@ FUNCTION_DEFINE4(int, socketpair, int, domain, int, type, int, protocol, int *, 
     return 0;
 }
 
-FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
+#if defined(__ANDROID__)
+/* Bionic declares ioctl with __overloadable; we need our own non-overloaded wrapper. */
+int __tvm_ioctl_va(int fd, unsigned long request, va_list __ap);
+static int __tvm_ioctl_wrapper(int fd, unsigned long request, ...) {
+    struct tvm_call __call = { call, __builtin_return_address(0) };
+    call = &__call;
+    va_list __ap;
+    va_start(__ap, request);
+    int __r = __tvm_ioctl_va(fd, request, __ap);
+    va_end(__ap);
+    call = call->prev;
+    return __r;
+}
+FUNCTION_METADATA(ioctl, &__tvm_ioctl_wrapper);
+int __tvm_ioctl_va(int fd, unsigned long request, va_list __ap)
+#else
+FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request)
+#endif
+{
     void* arg = va_arg(__ap, void*);
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(ioctl, fd, request, arg);
@@ -10631,10 +11034,10 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     }
     else
         ret = file->f_ops->f_ioctl(file, request, arg);
-    
+
     file_unlock(file, 1);
     tvm_sig_leave();
-    
+
     return ret;
 }
 
@@ -10925,9 +11328,14 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // include prologue (fp + lr) when adjusting jmpbuf context regs
     //jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
 
-    // fix the jmpbuf
+    // fix the jmpbuf — only translate demangled register slots, not float regs or checksum
     void **jb = (void **) (&arg->jmpbuf_parent);
-    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
+#if defined(__ANDROID__) && defined(__aarch64__)
+    int jb_nslots = 16; /* slots 0-15 are demangled registers; 16+ are floats/checksum */
+#else
+    int jb_nslots = sizeof(jmp_buf) / 8;
+#endif
+    for (int i = 0; i < jb_nslots; i++)
         jb[i] = cow_fixup_translate(&arg->fixup, jb[i]);
 
     jmpbuf_mangle(&arg->jmpbuf_parent);
@@ -10952,9 +11360,11 @@ fail:
 // so do not use wrapper
 //FUNCTION_DEFINE0(pid_t, fork) {
 pid_t fork(void) {
-    if (!can_enter_tvm(__builtin_return_address(0)))
+    void *lr = __builtin_return_address(0);
+    int can = can_enter_tvm(lr);
+    if (!can)
         return CALL_FUNC(fork);
-    
+
     struct task *tsk = NULL;
     struct thread *thr = NULL;
     struct fork_arg *arg = NULL;
@@ -11060,6 +11470,7 @@ pid_t fork(void) {
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
 
     pthread_t pth;
+
     if ((r = CALL_FUNC(pthread_create, &pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg))) {
         CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
         errno = r;
@@ -11175,6 +11586,7 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
     sigemptyset(&empty_sigs);
     CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
 
+
     pthread_exit(start_fn(start_arg));
 }
 
@@ -11285,7 +11697,7 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
         task_unlock(current);
         exit((int) ((long) retval));
     }
-    
+
     list_del(&current_thread->thr_list);
     current->tsk_threads_cnt--;
     current->tsk_refcount--;
@@ -11345,14 +11757,20 @@ FUNCTION_DEFINE_NORET0(abort) {
 // atexit is implemented in the executable rather than libc
 // so we cannot really call the original one
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle) {
     return atexit((exit_t)func);
 }
 #endif
 
+#if defined(__ANDROID__)
+/* On Android, atexit is in crtbegin_dynamic.o; cannot redefine it.
+   Use a different name and register via constructor. */
+static int tvm_atexit(exit_t function) {
+#else
 //FUNCTION_DEFINE1(int, atexit, exit_t, function) {
 int atexit(exit_t function) {
+#endif
     
     if (!can_enter_tvm(NULL))
         return 0;
@@ -12670,6 +13088,8 @@ FUNCTION_DEFINE2(int, tcsetpgrp, int, fd, pid_t, pgrp) {
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TIOCSPGRP, &pgrp));
 }
 
+#if !defined(__ANDROID__)
+
 FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(tcgetattr, __rfd, termios_p));
@@ -12792,6 +13212,8 @@ FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
 #endif
 }
 
+#endif /* !__ANDROID__ - termios functions */
+
 FUNCTION_DEFINE1(void *, malloc, size_t, size) {
     return calloc(1, size);
 }
@@ -12807,7 +13229,7 @@ FUNCTION_DEFINE2(void *, calloc, size_t, nmemb, size_t, size) {
     void *p = rmem_arena_alloc(ar, nmemb * size);
     if (NULL == p)
         return NULL;
-    
+
     memset(p, 0, nmemb * size);
     return p;
 }
@@ -12817,6 +13239,14 @@ FUNCTION_DEFINE_VOID1(free, void *, ptr) {
     if (!ar)
         panic("free for task without arena %p", current);
 
+#if defined(__ANDROID__)
+    /* On Android, free may be called on pointers allocated by libc before TVM
+       was active (e.g., stdio buffers). Forward non-rmem pointers to libc. */
+    if (ptr && !rmem_arena_contains(ar, ptr)) {
+        CALL_FUNC(free, ptr);
+        return;
+    }
+#endif
     rmem_arena_free(ar, ptr);
 }
 
@@ -12825,6 +13255,10 @@ FUNCTION_DEFINE2(void *, realloc, void *, ptr, size_t, size) {
     if (!ar)
         panic("realloc for task without arena %p", current);
 
+#if defined(__ANDROID__)
+    if (ptr && !rmem_arena_contains(ar, ptr))
+        return CALL_FUNC(realloc, ptr, size);
+#endif
     return rmem_arena_realloc(ar, ptr, size);
 }
 
@@ -13247,9 +13681,11 @@ FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
     return ret;
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE1(char *, getwd, char *, buf) {
     return getcwd(buf, PATH_MAX);
 }
+#endif
 
 typedef int (*compar_t) (const void *, const void *);
 
@@ -13762,12 +14198,14 @@ FUNCTION_DEFINE2(int, ftruncate64, int, fd, off64_t, length) {
     return CURRENT_RFD(fd, CALL_FUNC(ftruncate64, __rfd, length));
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE0(char *, get_current_dir_name) {
     char *pwd = getenv("PWD");
     if (pwd)
         return strdup(pwd);
     return getcwd(NULL, 0);
 }
+#endif
 
 #elif defined(__APPLE__)
 
@@ -13790,3 +14228,175 @@ FUNCTION_DEFINE_VOID3(CFDictionaryApplyFunction, CFDictionaryRef, theDict, CFDic
 }
 
 #endif
+
+/////////////
+// MARK: Android emutls replacement
+/////////////
+
+#if defined(__ANDROID__)
+/*
+ * Custom __emutls_get_address implementation for Android.
+ *
+ * Android NDK's __thread variables use emutls (compiler-rt/lib/builtins/emutls.c)
+ * which calls malloc/realloc/free internally. Since TVM overrides malloc/free via
+ * FUNCTION_DEFINE, and those wrappers access __thread variables (triggering emutls),
+ * the original emutls creates an infinite recursion: emutls→malloc→wrapper→emutls.
+ *
+ * This replacement uses CALL_FUNC(malloc/realloc/free) to call libc's allocator
+ * directly, completely bypassing FUNCTION_DEFINE wrappers. Since __emutls_get_address
+ * is a weak symbol in the binary, our strong definition overrides compiler-rt's.
+ *
+ * Layout (matches compiler-rt exactly):
+ *   Descriptor:  { uint64_t size, align, index, void *init }
+ *   Per-thread:  stored via pthread_key, { uint64_t version, capacity; void *slots[] }
+ *   Each slot:   malloc'd block, aligned, raw ptr stashed at (aligned - 8)
+ */
+
+struct __emutls_control {
+    uint64_t size;
+    uint64_t align;
+    uint64_t index;     /* 1-based, assigned under lock, accessed with atomics */
+    void    *init;      /* NULL = zero-init */
+};
+
+struct __emutls_array {
+    uint64_t version;
+    uint64_t capacity;
+    void    *slots[];
+};
+
+/* Use atomic spinlock instead of pthread_mutex — Bionic's pthread_mutex_lock
+   may use __thread variables internally, causing recursion. */
+static int             __emutls_lock = 0;
+static pthread_key_t   __emutls_key;
+static int             __emutls_key_init = 0;
+static uint64_t        __emutls_num_objects = 0;
+
+static inline void __emutls_spin_lock(void) {
+    while (__atomic_exchange_n(&__emutls_lock, 1, __ATOMIC_ACQUIRE))
+        ;  /* spin */
+}
+static inline void __emutls_spin_unlock(void) {
+    __atomic_store_n(&__emutls_lock, 0, __ATOMIC_RELEASE);
+}
+
+/*
+ * emutls allocator: static bump heap — never calls libc malloc.
+ *
+ * Required because scudo (Android's malloc) calls mmap() while holding a lock.
+ * Our mmap FUNCTION_DEFINE wrapper accesses __thread `call` → emutls.
+ * If emutls called libc malloc here, scudo would re-enter itself → deadlock.
+ *
+ * No guard or TLS-readiness check can prevent this: the emutls array exists
+ * (TLS is "ready"), but the specific SLOT for `call` may not be allocated yet.
+ * emutls needs to malloc for it — and that malloc must not re-enter scudo.
+ *
+ * The bump heap is ~256KB. Each __thread var costs ~100 bytes per thread.
+ * With ~16 vars and ~100 threads, that's ~160KB — well within budget.
+ * Memory is never freed (threads reuse their slots until process exit).
+ */
+static char __emutls_heap[262144] __attribute__((aligned(16)));
+static size_t __emutls_heap_pos = 0;
+
+static inline void *__emutls_malloc(size_t size) {
+    size = (size + 15) & ~(size_t)15;
+    if (__emutls_heap_pos + size > sizeof(__emutls_heap))
+        return NULL;
+    void *p = &__emutls_heap[__emutls_heap_pos];
+    __emutls_heap_pos += size;
+    return p;
+}
+static inline void *__emutls_realloc(void *ptr, size_t size) {
+    void *p = __emutls_malloc(size);
+    if (p && ptr) memcpy(p, ptr, size);
+    return p;
+}
+static inline void __emutls_free(void *ptr) {
+    (void)ptr;
+}
+
+static void __emutls_key_destructor(void *ptr) {
+    struct __emutls_array *arr = ptr;
+    if (!arr) return;
+
+    /* version countdown: Bionic calls key destructors up to
+       PTHREAD_DESTRUCTOR_ITERATIONS times. Decrement version each time;
+       when it reaches 0, actually free everything. */
+    if (arr->version > 0) {
+        arr->version--;
+        pthread_setspecific(__emutls_key, arr);
+        return;
+    }
+
+    for (uint64_t i = 0; i < arr->capacity; i++) {
+        if (arr->slots[i]) {
+            /* Raw malloc pointer is stashed at (aligned_ptr - 8) */
+            void *raw = ((void **)arr->slots[i])[-1];
+            __emutls_free( raw);
+        }
+    }
+    __emutls_free( arr);
+}
+
+__attribute__((noinline)) void *__emutls_get_address(void *opaque) {
+    struct __emutls_control *desc = opaque;
+
+    uint64_t index = __atomic_load_n(&desc->index, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(index == 0, 0)) {
+        __emutls_spin_lock();
+        index = desc->index;
+        if (index == 0) {
+            index = ++__emutls_num_objects;
+            __atomic_store_n(&desc->index, index, __ATOMIC_RELEASE);
+        }
+        __emutls_spin_unlock();
+    }
+
+    /* Per-thread array in Bionic's raw TLS slot 3 (tpidr_el0 + 24) */
+    uintptr_t tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    struct __emutls_array **arr_slot = (struct __emutls_array **)(tp + 24);
+    struct __emutls_array *arr = *arr_slot;
+
+    if (!arr || index > arr->capacity) {
+        uint64_t new_cap = (index + 15) & ~(uint64_t)15;
+        if (arr) {
+            arr = __emutls_realloc(arr, sizeof(*arr) + new_cap * sizeof(void *));
+            if (!arr) syscall(SYS_exit_group, 127);
+            memset(&arr->slots[arr->capacity], 0, (new_cap - arr->capacity) * sizeof(void *));
+        } else {
+            arr = __emutls_malloc(sizeof(*arr) + new_cap * sizeof(void *));
+            if (!arr) syscall(SYS_exit_group, 127);
+            memset(arr, 0, sizeof(*arr) + new_cap * sizeof(void *));
+        }
+        arr->capacity = new_cap;
+        *arr_slot = arr;
+    }
+
+    /* Get or allocate the variable's storage */
+    void *slot = arr->slots[index - 1];
+    if (!slot) {
+        uint64_t align = desc->align;
+        if (align < 8) align = 8;
+
+        void *raw = __emutls_malloc( desc->size + align + sizeof(void *));
+        if (!raw) syscall(SYS_exit_group, 127);
+
+        /* Align: skip sizeof(void*) for the stash, then align up */
+        uintptr_t base = (uintptr_t)raw + sizeof(void *);
+        uintptr_t aligned = (base + align - 1) & ~(align - 1);
+        /* Stash the raw pointer just before the aligned area */
+        ((void **)aligned)[-1] = raw;
+
+        if (desc->init)
+            memcpy((void *)aligned, desc->init, desc->size);
+        else
+            memset((void *)aligned, 0, desc->size);
+
+        slot = (void *)aligned;
+        arr->slots[index - 1] = slot;
+    }
+
+    return slot;
+}
+#endif /* __ANDROID__ */

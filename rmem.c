@@ -572,6 +572,20 @@ void rmem_arena_free(struct rmem_arena *ar, void *p) {
     ABORT("invalid pointer %p", p);
 }
 
+int rmem_arena_contains(struct rmem_arena *ar, void *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&ar->ar_lock);
+    for (struct rmem_slab *sl = ar->ar_slabs; sl; sl = sl->sl_next) {
+        if ((uintptr_t)p >= (uintptr_t)sl->sl_base &&
+            (uintptr_t)p < ((uintptr_t)sl->sl_base + sl->sl_nobj * sl->sl_objsize)) {
+            pthread_mutex_unlock(&ar->ar_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&ar->ar_lock);
+    return 0;
+}
+
 void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
 {
     if (!p)

@@ -17,6 +17,15 @@ CFLAGS ?=
 LDFLAGS ?=
 CONFFLAGS ?=
 
+# Android/Bionic does not have libutil or libtinfo; openpty is in libc
+ifneq ($(shell uname -o 2>/dev/null),Android)
+	LUTIL = -lutil
+	LTINFO = -ltinfo
+else
+	LUTIL =
+	LTINFO =
+endif
+
 clean:
 	@rm -rf unicorn/build || true
 	@rm *.a *.o || true
@@ -31,17 +40,17 @@ libtvm: unicorn
 	ar rcs libtvm.a rmem.o ulinker.o tvm.o main.o
 
 tvm: unicorn
-	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c main.c -o tvm -L . -lz -lpthread -lutil -lunicorn -lm $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c main.c -o tvm -L . -lz -lpthread $(LUTIL) -lunicorn -lm $(LDFLAGS)
 
 test_tvm: unicorn
-	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c test_tvm.c -o test_tvm -L . -lpthread -lunicorn -lm -ltinfo $(LDFLAGS)
+	$(CC) $(CFLAGS) -g -rdynamic -I. -I./unicorn/include rmem.c ulinker.c tvm.c test_tvm.c -o test_tvm -L . -lpthread -lunicorn -lm $(LTINFO) $(LDFLAGS)
 
 test_rmem: rmem.c test_rmem.c
 	$(CC) $(CFLAGS) -g -rdynamic -I. rmem.c test_rmem.c -o test_rmem -lpthread $(LDFLAGS)
 
 unicorn:
 	mkdir -p unicorn/build
-	if [ ! -f unicorn/build/Makefile ] ; then cd unicorn/build && cmake .. $(CMAKE_FLAGS) -DCMAKE_BUILD_TYPE=Release -DUNICORN_INTERPRETER=ON -DUNICORN_ARCH="x86;aarch64" -DUNICORN_BUILD_TESTS=OFF; fi
+	if [ ! -f unicorn/build/Makefile ] ; then cd unicorn/build && cmake .. $(CMAKE_FLAGS) -DCMAKE_BUILD_TYPE=Release -DUNICORN_INTERPRETER=ON -DUNICORN_ARCH="x86;aarch64" -DUNICORN_BUILD_TESTS=OFF -DCMAKE_C_FLAGS="-DCONFIG_INT128"; fi
 	cd unicorn/build && make
 	cp unicorn/build/libunicorn.a ./libunicorn.a
 
