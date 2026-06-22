@@ -8692,6 +8692,7 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(s, "optopt"))   return &current->tsk_data->optopt;
 
     if (0 == strcmp(s, "__environ"))  return &current->tsk_data->__environ;
+    if (0 == strcmp(s, "environ"))    return &current->tsk_data->__environ;
 
     return dlsym(RTLD_DEFAULT, s);
 }
@@ -8831,7 +8832,10 @@ void tvm_init(const char *init_comm)
         panic("tsk_data");
     memset(current->tsk_data, 0, sizeof(*current->tsk_data));
     
-    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0) ?: &current->tsk_data->__environ;
+    // __environ on linux, environ on apple
+    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0)
+                                 ?: ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "environ", 0)
+                                 ?: &current->tsk_data->__environ;
     current->tsk_relocs.optind = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optind", 0) ?: &current->tsk_data->optind;
     current->tsk_relocs.opterr = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "opterr", 0) ?: &current->tsk_data->opterr;
     current->tsk_relocs.optopt = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optopt", 0) ?: &current->tsk_data->optopt;
@@ -12746,7 +12750,10 @@ do_exec:
 
     // reinitialize relocations
 
-    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0) ?: &current->tsk_data->__environ;
+    // __environ on linux, environ on apple
+    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0)
+                                 ?: ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "environ", 0)
+                                 ?: &current->tsk_data->__environ;
     current->tsk_relocs.optind = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optind", 0) ?: &current->tsk_data->optind;
     current->tsk_relocs.opterr = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "opterr", 0) ?: &current->tsk_data->opterr;
     current->tsk_relocs.optopt = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optopt", 0) ?: &current->tsk_data->optopt;
