@@ -1603,6 +1603,12 @@ TEST(ConcurrentKills) {
     struct sigaction act = { .sa_handler = cc_handler };
     ASSERT_EQ(0, sigaction(SIGUSR1, &act, NULL));
 
+    sigset_t block, empty;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    sigemptyset(&empty);
+
     // Two pipes for PID exchange
     int p1pip[2], p2pip[2];
     ASSERT_EQ(0, pipe(p1pip));
@@ -1616,8 +1622,7 @@ TEST(ConcurrentKills) {
         read(p1pip[0], &other, sizeof(other));
         close(p1pip[0]);
         kill(other, SIGUSR1);
-        // Wait for reciprocal signal
-        while (!cc_count) pause();
+        while (!cc_count) sigsuspend(&empty);
         _exit(cc_count == 1 ? 0 : 1);
     }
 
@@ -1629,7 +1634,7 @@ TEST(ConcurrentKills) {
         read(p2pip[0], &other, sizeof(other));
         close(p2pip[0]);
         kill(other, SIGUSR1);
-        while (!cc_count) pause();
+        while (!cc_count) sigsuspend(&empty);
         _exit(cc_count == 1 ? 0 : 1);
     }
 
