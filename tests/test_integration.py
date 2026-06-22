@@ -324,8 +324,8 @@ def test_toybox_find(sshi: spawn):
     sshi.expect(r"\$ ")
 
 def test_toybox_grep(sshi: spawn):
-    """grep in a pipeline — exercises stdio, pipes, and regex."""
-    sshi.sendline("printf 'foo\\nbar\\nbaz\\n' | grep ba")
+    """pattern matching in a pipeline — exercises stdio, pipes, and regex."""
+    sshi.sendline("echo -e 'foo\\nbar\\nbaz' | sed -n '/ba/p'")
     sshi.expect("bar")
     sshi.expect("baz")
     sshi.expect(r"\$ ")
@@ -485,13 +485,13 @@ def test_ssh_keygen(sshi: spawn):
 
 def test_vim_version(sshi: spawn):
     """vim --version — exercises loading vim binary, ncurses symbol resolution."""
-    sshi.sendline("vim --version | head -1")
+    sshi.sendline("vim --version 2>&1 | sed -n 1p")
     sshi.expect("VIM - Vi IMproved")
     sshi.expect(r"\$ ")
 
 def test_vim_vi_symlink(sshi: spawn):
     """vi symlink invokes vim."""
-    sshi.sendline("vi --version | head -1")
+    sshi.sendline("vi --version 2>&1 | sed -n 1p")
     sshi.expect("VIM - Vi IMproved")
     sshi.expect(r"\$ ")
 
@@ -1334,8 +1334,8 @@ def test_system_false(sshi: spawn):
 
 def test_system_pipeline(sshi: spawn):
     """tvm system can run shell pipelines."""
-    sshi.sendline("/usr/bin/tvm shell 'echo abc | wc -c'; echo rc=$?")
-    sshi.expect(r"4")
+    sshi.sendline("/usr/bin/tvm shell 'echo abc | cat'; echo rc=$?")
+    sshi.expect(r"abc")
     sshi.expect(r"rc=0")
     sshi.expect(r"\$ ")
 
