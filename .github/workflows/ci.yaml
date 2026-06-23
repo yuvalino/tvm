@@ -26,9 +26,7 @@ jobs:
       if: runner.os == 'macOS'
       run: brew install gnu-sed openssl
     - name: build
-      run: |
-        export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
-        python3 build.py -t tvm test_tvm test_rmem initrd
+      run: python3 build.py -t tvm test_tvm test_rmem initrd
     - uses: actions/upload-artifact@v4
       with:
         name: build-${{ matrix.platform }}
