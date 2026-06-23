@@ -45,6 +45,12 @@
 #include <asm/prctl.h>
 #endif
 
+#if defined(__linux__)
+#define ITIMER_WHICH_T __itimer_which_t
+#else
+#define ITIMER_WHICH_T int
+#endif
+
 #if defined(__APPLE__)
 typedef int timer_t;
 struct itimerspec {
@@ -14034,7 +14040,7 @@ static int itimer_real_get_remaining(struct task *t, struct itimerval *val)
     return 0;
 }
 
-FUNCTION_DEFINE3(int, setitimer, int, which, const struct itimerval *, new_value,
+FUNCTION_DEFINE3(int, setitimer, ITIMER_WHICH_T, which, const struct itimerval *, new_value,
                  struct itimerval *, old_value) {
     if (which != ITIMER_REAL) {
         errno = EINVAL;
@@ -14114,7 +14120,7 @@ FUNCTION_DEFINE3(int, setitimer, int, which, const struct itimerval *, new_value
     return 0;
 }
 
-FUNCTION_DEFINE2(int, getitimer, int, which, struct itimerval *, curr_value) {
+FUNCTION_DEFINE2(int, getitimer, ITIMER_WHICH_T, which, struct itimerval *, curr_value) {
     if (which != ITIMER_REAL) {
         errno = EINVAL;
         return -1;
