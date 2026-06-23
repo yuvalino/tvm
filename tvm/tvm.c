@@ -5886,6 +5886,7 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
     if (S_ISDIR(cpio->c_mode) ||
         S_ISREG(cpio->c_mode) ||
         S_ISLNK(cpio->c_mode)) {
+        // cpio names are "./bin/sh" — strip "./" so VFS paths resolve correctly
         const char *name = cpio->name;
         while (name[0] == '.' && name[1] == '/') name += 2;
         while (name[0] == '/') name++;
