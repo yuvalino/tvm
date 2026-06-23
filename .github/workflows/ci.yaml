@@ -53,7 +53,7 @@ jobs:
       with:
         name: build-${{ matrix.platform }}
         path: output/
-    - run: chmod +x output/${{ matrix.platform }}/bin/*
+    - run: chmod +x output/${{ matrix.platform }}/bin/* && if [ "$(uname)" = "Darwin" ]; then for f in output/${{ matrix.platform }}/bin/*; do codesign -f -s - "$f" 2>/dev/null || true; done; fi
     - name: test_tvm
       run: TVM_NOEMU=1 ./output/${{ matrix.platform }}/bin/tvm ./output/${{ matrix.platform }}/bin/test_tvm -t 20
 
@@ -73,7 +73,7 @@ jobs:
       with:
         name: build-${{ matrix.platform }}
         path: output/
-    - run: chmod +x output/${{ matrix.platform }}/bin/*
+    - run: chmod +x output/${{ matrix.platform }}/bin/* && if [ "$(uname)" = "Darwin" ]; then for f in output/${{ matrix.platform }}/bin/*; do codesign -f -s - "$f" 2>/dev/null || true; done; fi
     - name: test_rmem
       run: ./output/${{ matrix.platform }}/bin/test_rmem
 
@@ -98,7 +98,7 @@ jobs:
       with:
         name: build-${{ matrix.platform }}
         path: output/
-    - run: chmod +x output/${{ matrix.platform }}/bin/*
+    - run: chmod +x output/${{ matrix.platform }}/bin/* && if [ "$(uname)" = "Darwin" ]; then for f in output/${{ matrix.platform }}/bin/*; do codesign -f -s - "$f" 2>/dev/null || true; done; fi
     - name: pip
       run: pip install -r python_requirements.txt
     - name: test_integration
