@@ -6128,8 +6128,11 @@ uc_engine *uc_open_arch(int arch)
     uc_err err = UC_ERR_ARCH;
     uc_engine *engine = NULL;
 
-    if (arch == ULARCH_ARM64)
+    if (arch == ULARCH_ARM64) {
         err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &engine);
+        if (!err)
+            uc_ctl_set_cpu_model(engine, UC_CPU_ARM64_MAX);
+    }
     else if (arch == ULARCH_X86_64) {
         err = uc_open(UC_ARCH_X86, UC_MODE_64, &engine);
 #if defined(__linux__) && defined(__x86_64__)
