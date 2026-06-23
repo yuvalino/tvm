@@ -7,8 +7,15 @@ on:
       branches: [ main ]
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-22.04
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+          - platform: macos-arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -18,26 +25,19 @@ jobs:
       run: python3 build.py -t tvm test_tvm test_rmem initrd
     - uses: actions/upload-artifact@v4
       with:
-        name: build-linux
+        name: build-${{ matrix.platform }}
         path: output/
 
-  build-macos:
-    runs-on: macos-14
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    - name: build
-      run: python3 build.py -t tvm test_tvm test_rmem initrd
-    - uses: actions/upload-artifact@v4
-      with:
-        name: build-macos
-        path: output/
-
-  test_tvm-linux:
-    needs: build-linux
-    runs-on: ubuntu-22.04
+  test_tvm:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+          - platform: macos-arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -45,59 +45,41 @@ jobs:
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - uses: actions/download-artifact@v4
       with:
-        name: build-linux
+        name: build-${{ matrix.platform }}
         path: output/
-    - run: chmod +x output/linux-x64/bin/*
+    - run: chmod +x output/${{ matrix.platform }}/bin/*
     - name: test_tvm
-      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
+      run: ./output/${{ matrix.platform }}/bin/tvm ./output/${{ matrix.platform }}/bin/test_tvm -t 20
 
-  test_tvm-macos:
-    needs: build-macos
-    runs-on: macos-14
+  test_rmem:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+          - platform: macos-arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
     - uses: actions/download-artifact@v4
       with:
-        name: build-macos
+        name: build-${{ matrix.platform }}
         path: output/
-    - run: chmod +x output/macos-arm64/bin/*
-    - name: test_tvm
-      run: TVM_NOEMU=1 ./output/macos-arm64/bin/tvm ./output/macos-arm64/bin/test_tvm -t 20
-
-  test_rmem-linux:
-    needs: build-linux
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-linux
-        path: output/
-    - run: chmod +x output/linux-x64/bin/*
+    - run: chmod +x output/${{ matrix.platform }}/bin/*
     - name: test_rmem
-      run: ./output/linux-x64/bin/test_rmem
+      run: ./output/${{ matrix.platform }}/bin/test_rmem
 
-  test_rmem-macos:
-    needs: build-macos
-    runs-on: macos-14
-    steps:
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-macos
-        path: output/
-    - run: chmod +x output/macos-arm64/bin/*
-    - name: test_rmem
-      run: ./output/macos-arm64/bin/test_rmem
-
-  test_integration-linux:
-    needs: build-linux
-    runs-on: ubuntu-22.04
+  test_integration:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+          - platform: macos-arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -105,28 +87,10 @@ jobs:
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - uses: actions/download-artifact@v4
       with:
-        name: build-linux
+        name: build-${{ matrix.platform }}
         path: output/
-    - run: chmod +x output/linux-x64/bin/*
+    - run: chmod +x output/${{ matrix.platform }}/bin/*
     - name: pip
       run: pip install -r python_requirements.txt
     - name: test_integration
-      run: TVM_NOEMU=1 pytest tests/test_integration.py -v
-
-  test_integration-macos:
-    needs: build-macos
-    runs-on: macos-14
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-macos
-        path: output/
-    - run: chmod +x output/macos-arm64/bin/*
-    - name: pip
-      run: pip install -r python_requirements.txt
-    - name: test_integration
-      run: TVM_BIN=./output/macos-arm64/bin/tvm TVM_NOEMU=1 pytest tests/test_integration.py -v
+      run: pytest tests/test_integration.py -v
