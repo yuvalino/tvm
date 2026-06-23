@@ -5,11 +5,12 @@ cd "$SRCDIR/src"
 if [ ! -f auto/config.mk ]; then
     EXTRA_FLAGS=""
     if [ "$(uname)" = "Darwin" ]; then
-        EXTRA_FLAGS="--disable-darwin --disable-nls ac_cv_header_iconv_h=no"
+        EXTRA_FLAGS="--disable-darwin"
     fi
     ./configure \
         --with-features=normal \
         --enable-gui=no \
+        --disable-nls \
         --disable-netbeans \
         --disable-channel \
         --without-x \
@@ -19,6 +20,7 @@ if [ ! -f auto/config.mk ]; then
         --disable-smack \
         --with-tlib=ncurses \
         --without-wayland \
+        ac_cv_header_iconv_h=no \
         $EXTRA_FLAGS \
         CFLAGS="-g -gdwarf-4"
 fi
