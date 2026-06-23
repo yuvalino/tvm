@@ -48,4 +48,4 @@ for cmd in $(./bin/toybox); do
 done
 
 # create cpio archive
-cd "$ROOTFS" && find . | cpio -o -H newc > "$OUTDIR/initrd.cpio"
+cd "$ROOTFS" && find . | ./bin/toybox cpio -o -H newc > "$OUTDIR/initrd.cpio"
