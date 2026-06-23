@@ -2857,6 +2857,7 @@ static void terminate_current_locked(int result)
     if (auto_reap) {
         taskfreelastref(current, 0, 0);
         list_del(&current->tsk_list);
+        list_del(&current_thread->thr_list);
         pthread_detach(pthread_self());
     }
     else {
@@ -12954,6 +12955,8 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
         panic("waitpid tsk_pthreads empty");
     struct thread *thr = list_entry(zombiet->tsk_threads.next, struct thread, thr_list);
     pthread_join(thr->thr_pthread, NULL);
+    list_del(&thr->thr_list);
+    threaddealloc(thr);
 
     pid_t childpid = zombiet->tsk_pid;
     if (wstatus)
