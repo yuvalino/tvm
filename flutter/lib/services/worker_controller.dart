@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'tvm_bindings.dart';
 
+
 class WorkerController {
   WorkerController._();
   static final WorkerController instance = WorkerController._();
@@ -57,6 +58,9 @@ class WorkerController {
 
     if (!TvmBindings.instance.isAvailable) {
       _addLog('[WARN] TVM native library not loaded');
+      if (TvmBindings.instance.loadError != null) {
+        _addLog('[WARN] ${TvmBindings.instance.loadError}');
+      }
       return;
     }
 
@@ -90,5 +94,6 @@ class WorkerController {
 
   void _addLog(String line) {
     logs.value = [...logs.value, line];
+    debugPrint('[TVM] $line');
   }
 }

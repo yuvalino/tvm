@@ -11,6 +11,7 @@
 extern "C" {
 #endif
 
+TVM_EXPORT int tvm_load(const char *libtvm_path);
 TVM_EXPORT int tvm_start(int port, const char *password);
 TVM_EXPORT int tvm_poll(char *buf, int buf_size);
 TVM_EXPORT void tvm_stop(void);

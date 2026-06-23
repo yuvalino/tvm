@@ -3,6 +3,9 @@ import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
+typedef _LoadNative = Int32 Function(Pointer<Utf8> path);
+typedef _LoadDart = int Function(Pointer<Utf8> path);
+
 typedef _StartNative = Int32 Function(Int32 port, Pointer<Utf8> password);
 typedef _StartDart = int Function(int port, Pointer<Utf8> password);
 
@@ -17,19 +20,37 @@ class TvmBindings {
   static final TvmBindings instance = TvmBindings._();
 
   DynamicLibrary? _lib;
+  _LoadDart? _load;
   _StartDart? _start;
   _PollDart? _poll;
   _StopDart? _stop;
 
   bool get isAvailable => _lib != null;
 
+  String? loadError;
+
   void init() {
     try {
       _lib = _openLibrary();
+      _load = _lib!.lookupFunction<_LoadNative, _LoadDart>('tvm_load');
       _start = _lib!.lookupFunction<_StartNative, _StartDart>('tvm_start');
       _poll = _lib!.lookupFunction<_PollNative, _PollDart>('tvm_poll');
       _stop = _lib!.lookupFunction<_StopNative, _StopDart>('tvm_stop');
-    } catch (_) {
+
+      final tvmPath = _tvmLibraryPath();
+      if (tvmPath != null) {
+        final ptr = tvmPath.toNativeUtf8();
+        try {
+          if (_load!(ptr) != 0) {
+            loadError = 'tvm_load failed for $tvmPath';
+            _lib = null;
+          }
+        } finally {
+          malloc.free(ptr);
+        }
+      }
+    } catch (e) {
+      loadError = e.toString();
       _lib = null;
     }
   }
@@ -67,5 +88,16 @@ class TvmBindings {
       return DynamicLibrary.open('tvm_bridge.dll');
     }
     throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
+  }
+
+  static String? _tvmLibraryPath() {
+    if (Platform.isMacOS) {
+      final exe = Platform.resolvedExecutable;
+      final appDir = exe.substring(0, exe.lastIndexOf('/'));
+      return '$appDir/../Frameworks/libtvm.dylib';
+    }
+    // Linux/Android: libtvm.so is loaded via libtvm_bridge.so linkage
+    // iOS: statically linked
+    return null;
   }
 }

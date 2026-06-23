@@ -7577,6 +7577,11 @@ int can_enter_tvm(void *lr) {
         return 0;
     }
 
+    // threads with current_thread set are TVM-managed (e.g. forked children
+    // whose duplicated code may not be in registered address ranges)
+    if (current_thread)
+        return 1;
+
     if (!lr) {
         if (!call)
             return 0;
@@ -8729,6 +8734,11 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(s, "__environ"))  return &current->tsk_data->__environ;
     if (0 == strcmp(s, "environ"))    return &current->tsk_data->__environ;
 
+    struct function_metadata *fm;
+    list_for_each_entry(fm, &all_function_metadata, fm_list) {
+        if (0 == strcmp(fm->fm_name, s))
+            return fm->fm_ptr;
+    }
     return dlsym(RTLD_DEFAULT, s);
 }
 
@@ -11439,6 +11449,7 @@ fail:
 // for now we need strict control of how many frames we need to restore on new stack
 // so do not use wrapper
 //FUNCTION_DEFINE0(pid_t, fork) {
+FUNCTION_METADATA(fork, &fork);
 pid_t fork(void) {
     if (!can_enter_tvm(__builtin_return_address(0)))
         return CALL_FUNC(fork);

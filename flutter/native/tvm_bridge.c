@@ -11,10 +11,11 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dlfcn.h>
 #endif
 
-int tvm_main(int outfd, int port) __attribute__((weak));
-int tvm_main(int outfd, int port) { return -1; }
+typedef int (*tvm_main_fn)(int outfd, int port);
+static tvm_main_fn fn_tvm_main;
 
 static int pipe_read = -1;
 static int pipe_write = -1;
@@ -25,7 +26,7 @@ static HANDLE worker_handle = NULL;
 
 static DWORD WINAPI worker_entry(LPVOID arg) {
     int port = (int)(intptr_t)arg;
-    tvm_main(pipe_write, port);
+    fn_tvm_main(pipe_write, port);
     return 0;
 }
 #else
@@ -33,13 +34,30 @@ static pthread_t worker_thread;
 
 static void *worker_entry(void *arg) {
     int port = (int)(intptr_t)arg;
-    tvm_main(pipe_write, port);
+    fn_tvm_main(pipe_write, port);
     return NULL;
 }
 #endif
 
+TVM_EXPORT int tvm_load(const char *libtvm_path) {
+    if (fn_tvm_main) return 0;
+
+#ifdef _WIN32
+    HMODULE h = LoadLibraryA(libtvm_path);
+    if (!h) return -1;
+    fn_tvm_main = (tvm_main_fn)GetProcAddress(h, "tvm_main");
+#else
+    void *h = dlopen(libtvm_path, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) return -1;
+    fn_tvm_main = (tvm_main_fn)dlsym(h, "tvm_main");
+#endif
+
+    return fn_tvm_main ? 0 : -1;
+}
+
 TVM_EXPORT int tvm_start(int port, const char *password) {
     if (running) return -1;
+    if (!fn_tvm_main) return -1;
 
     if (password) {
 #ifdef _WIN32
@@ -69,10 +87,15 @@ TVM_EXPORT int tvm_start(int port, const char *password) {
     worker_handle = CreateThread(NULL, 0, worker_entry, (LPVOID)(intptr_t)port, 0, NULL);
     if (!worker_handle) { running = 0; return -1; }
 #else
-    if (pthread_create(&worker_thread, NULL, worker_entry, (void *)(intptr_t)port) != 0) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64 * 1024 * 1024);
+    if (pthread_create(&worker_thread, &attr, worker_entry, (void *)(intptr_t)port) != 0) {
+        pthread_attr_destroy(&attr);
         running = 0;
         return -1;
     }
+    pthread_attr_destroy(&attr);
 #endif
 
     return 0;
