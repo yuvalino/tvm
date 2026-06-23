@@ -54,7 +54,7 @@ jobs:
         path: output/
     - run: chmod +x output/${{ matrix.platform }}/bin/*
     - name: test_tvm
-      run: ./output/${{ matrix.platform }}/bin/tvm ./output/${{ matrix.platform }}/bin/test_tvm -t 20
+      run: TVM_NOEMU=1 ./output/${{ matrix.platform }}/bin/tvm ./output/${{ matrix.platform }}/bin/test_tvm -t 20
 
   test_rmem:
     needs: build
