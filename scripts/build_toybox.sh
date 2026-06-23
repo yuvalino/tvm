@@ -7,8 +7,8 @@ if [ "$(uname)" = "Darwin" ]; then
     OPENSSL_PREFIX="$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl)"
 fi
 make CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 ${OPENSSL_PREFIX:+-I$OPENSSL_PREFIX/include}" V=1 MAKEOVERRIDES=
+rm -f toybox
 if [ "$(uname)" = "Darwin" ]; then
-    rm -f toybox
     cc -g -gdwarf-4 generated/obj/*.o \
         -Wl,-dead_strip -L"$OPENSSL_PREFIX/lib" -lcrypto -lm -lresolv -lssl -lz -o toybox
 else
