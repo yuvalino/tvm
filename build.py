@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PLATFORMS = {"linux-x64", "macos-arm64", "ios-arm64"}
+PLATFORMS = {"linux-x64", "macos-arm64", "ios-arm64", "android-arm64"}
 
 
 def detect_platform():
@@ -40,6 +40,16 @@ def run(cmd, **kwargs):
     subprocess.check_call(cmd, **kwargs)
 
 
+def ndk_root():
+    env = os.environ.get("ANDROID_NDK_HOME")
+    if env:
+        return Path(env)
+    default = Path.home() / "android" / "ndk" / "android-ndk-r27c"
+    if default.exists():
+        return default
+    return None
+
+
 def configure(plat):
     bd = build_dir(plat)
     bd.mkdir(parents=True, exist_ok=True)
@@ -62,6 +72,18 @@ def configure(plat):
             "-DCMAKE_SYSTEM_NAME=iOS",
             "-DCMAKE_OSX_ARCHITECTURES=arm64",
             "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
+        ]
+
+    if plat == "android-arm64":
+        ndk = ndk_root()
+        if not ndk:
+            print("error: Android NDK not found. Set ANDROID_NDK_HOME or install to ~/android/ndk/android-ndk-r27c", file=sys.stderr)
+            sys.exit(1)
+        toolchain = ndk / "build" / "cmake" / "android.toolchain.cmake"
+        cmake_args += [
+            f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
+            "-DANDROID_ABI=arm64-v8a",
+            "-DANDROID_PLATFORM=android-21",
         ]
 
     run(cmake_args)

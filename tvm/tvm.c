@@ -41,6 +41,123 @@
 
 #include <limits.h>
 #include <termios.h>
+
+#if defined(__ANDROID__)
+/*
+ * Android/Bionic compatibility shims.
+ *
+ * Bionic's termios uses inline functions and lacks BSD tty defaults.
+ * Several POSIX functions are missing or have different signatures.
+ * The ioctl function is declared with __overloadable which breaks typeof().
+ */
+
+#ifndef CEOF
+#define CEOF    '\004'
+#endif
+#ifndef CEOL
+#define CEOL    '\0'
+#endif
+#ifndef CERASE
+#define CERASE  '\177'
+#endif
+#ifndef CWERASE
+#define CWERASE '\027'
+#endif
+#ifndef CKILL
+#define CKILL   '\025'
+#endif
+#ifndef CREPRINT
+#define CREPRINT '\022'
+#endif
+#ifndef CINTR
+#define CINTR   '\003'
+#endif
+#ifndef CQUIT
+#define CQUIT   '\034'
+#endif
+#ifndef CSUSP
+#define CSUSP   '\032'
+#endif
+#ifndef CDSUSP
+#define CDSUSP  '\031'
+#endif
+#ifndef CSTART
+#define CSTART  '\021'
+#endif
+#ifndef CSTOP
+#define CSTOP   '\023'
+#endif
+#ifndef CLNEXT
+#define CLNEXT  '\026'
+#endif
+#ifndef CDISCARD
+#define CDISCARD '\017'
+#endif
+#ifndef CMIN
+#define CMIN    1
+#endif
+#ifndef CTIME
+#define CTIME   0
+#endif
+#ifndef CSTATUS
+#define CSTATUS '\024'
+#endif
+
+#ifndef TTYDEF_IFLAG
+#define TTYDEF_IFLAG  (BRKINT | ICRNL | IMAXBEL | IXON | IXANY)
+#endif
+#ifndef TTYDEF_OFLAG
+#define TTYDEF_OFLAG  (OPOST | ONLCR)
+#endif
+#ifndef TTYDEF_LFLAG
+#define TTYDEF_LFLAG  (ECHO | ICANON | ISIG | IEXTEN | ECHOE | ECHOKE | ECHOCTL)
+#endif
+#ifndef TTYDEF_CFLAG
+#define TTYDEF_CFLAG  (CREAD | CS8 | HUPCL)
+#endif
+#ifndef TTYDEF_SPEED
+#define TTYDEF_SPEED  (B9600)
+#endif
+
+#ifndef CCEQ
+#define CCEQ(val, c)  ((c) == (val) && (val) != _POSIX_VDISABLE)
+#endif
+
+static inline int lchmod(const char *path, mode_t mode) {
+    return fchmodat(AT_FDCWD, path, mode, AT_SYMLINK_NOFOLLOW);
+}
+
+static inline char *getwd(char *buf) {
+    return getcwd(buf, PATH_MAX);
+}
+
+static inline char *get_current_dir_name(void) {
+    return getcwd(NULL, 0);
+}
+
+#ifndef PTHREAD_INHERIT_SCHED
+#define PTHREAD_INHERIT_SCHED 0
+#endif
+#ifndef PTHREAD_EXPLICIT_SCHED
+#define PTHREAD_EXPLICIT_SCHED 1
+#endif
+static inline int pthread_attr_getinheritsched(const pthread_attr_t *attr, int *inheritsched) {
+    (void)attr;
+    *inheritsched = PTHREAD_INHERIT_SCHED;
+    return 0;
+}
+static inline int pthread_attr_setinheritsched(pthread_attr_t *attr, int inheritsched) {
+    (void)attr;
+    (void)inheritsched;
+    return 0;
+}
+
+#define ANDROID_NO_TERMIOS_SPEED 1
+
+typedef int (*ioctl_func_t)(int, unsigned long, ...);
+
+#endif /* __ANDROID__ */
+
 #include <getopt.h>
 #include <grp.h>
 #include <pwd.h>
@@ -57,11 +174,13 @@
 #include <sys/vfs.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#if defined(__x86_64__)
 #include <asm/prctl.h>
 #include <link.h>
 #endif
+#endif
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 #define ITIMER_WHICH_T __itimer_which_t
 #else
 #define ITIMER_WHICH_T int
@@ -298,7 +417,15 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
     static void _ofc_ ## Name () { list_add_tail( & (_of_ ## Name).list, &original_functions); }
 #define DECL_FUNC(Name)     DECL_FUNC_EX(Name, 0)
 #define DECL_FUNC_OPT(Name) DECL_FUNC_EX(Name, 1)
+#if defined(__ANDROID__)
+#define CALL_FUNC(Name, ...) ({ \
+    if (__builtin_expect(!LOCAL_SYM(Name), 0)) \
+        LOCAL_SYM(Name) = dlsym(RTLD_NEXT, #Name); \
+    LOCAL_SYM(Name)(__VA_ARGS__); \
+})
+#else
 #define CALL_FUNC(Name, ...) (LOCAL_SYM(Name) (__VA_ARGS__))
+#endif
 
 struct original_func_t {
     struct list_head list;
@@ -392,7 +519,9 @@ DECL_FUNC(fstatat);
 DECL_FUNC(access);
 DECL_FUNC(faccessat);
 DECL_FUNC(chmod);
+#if !defined(__ANDROID__)
 DECL_FUNC(lchmod);
+#endif
 DECL_FUNC(fchmod);
 DECL_FUNC(fchmodat);
 DECL_FUNC(chown);
@@ -400,7 +529,9 @@ DECL_FUNC(lchown);
 DECL_FUNC(fchown);
 DECL_FUNC(fchownat);
 DECL_FUNC(flock);
+#if !defined(__ANDROID__)
 DECL_FUNC(lockf);
+#endif
 DECL_FUNC(readlink);
 DECL_FUNC(readlinkat);
 DECL_FUNC(symlink);
@@ -415,7 +546,9 @@ DECL_FUNC(mkdir);
 DECL_FUNC(mkdirat);
 DECL_FUNC(rmdir);
 DECL_FUNC(mkfifo);
+#if !defined(__ANDROID__)
 DECL_FUNC(mkfifoat);
+#endif
 DECL_FUNC(mkstemp);
 
 DECL_FUNC(socket);
@@ -435,7 +568,14 @@ DECL_FUNC(recvfrom);
 DECL_FUNC(recvmsg);
 DECL_FUNC(shutdown);
 DECL_FUNC(socketpair);
+#if defined(__ANDROID__)
+static ioctl_func_t LOCAL_SYM(ioctl) = NULL;
+static struct original_func_t _of_ioctl = { .ptrdest = (void *)&LOCAL_SYM(ioctl), .name = "ioctl", .opt = 0 };
+__attribute__((constructor))
+static void _ofc_ioctl() { list_add_tail(&(_of_ioctl).list, &original_functions); }
+#else
 DECL_FUNC(ioctl);
+#endif
 
 DECL_FUNC(pthread_create);
 DECL_FUNC(pthread_exit);
@@ -472,8 +612,10 @@ DECL_FUNC(sigpending);
 DECL_FUNC(sigsuspend);
 DECL_FUNC(pause);
 DECL_FUNC(sigwait);
+#if !defined(__ANDROID__)
 DECL_FUNC_OPT(sigwaitinfo);
 DECL_FUNC_OPT(sigtimedwait);
+#endif
 
 DECL_FUNC(getenv);
 DECL_FUNC(putenv);
@@ -488,7 +630,9 @@ DECL_FUNC(execv);
 DECL_FUNC(execvp);
 DECL_FUNC(system);
 
+#if !defined(__ANDROID__)
 DECL_FUNC(openpty);
+#endif
 
 DECL_FUNC(tcgetpgrp);
 DECL_FUNC(tcsetpgrp);
@@ -498,12 +642,14 @@ DECL_FUNC(ttyname_r);
 DECL_FUNC(ptsname);
 DECL_FUNC(ptsname_r);
 
+#if !defined(__ANDROID__)
 DECL_FUNC(tcgetattr);
 DECL_FUNC(tcsetattr);
 DECL_FUNC(tcsendbreak);
 DECL_FUNC(tcdrain);
 DECL_FUNC(tcflush);
 DECL_FUNC(tcflow);
+#endif
 
 DECL_FUNC(strdup);
 DECL_FUNC(strndup);
@@ -531,7 +677,9 @@ DECL_FUNC(realpath);
 DECL_FUNC(chdir);
 DECL_FUNC(fchdir);
 DECL_FUNC(getcwd);
+#if !defined(__ANDROID__)
 DECL_FUNC(getwd);
+#endif
 
 DECL_FUNC(bsearch);
 DECL_FUNC(qsort);
@@ -563,7 +711,9 @@ DECL_FUNC(openat64);
 DECL_FUNC(fstatat64);
 DECL_FUNC(lseek64);
 DECL_FUNC(ftruncate64);
+#if !defined(__ANDROID__)
 DECL_FUNC(get_current_dir_name);
+#endif
 #elif defined(__APPLE__)
 DECL_FUNC_OPT(CFDictionaryApplyFunction);
 DECL_FUNC(fileport_makeport);
@@ -582,7 +732,29 @@ DECL_FUNC(gmtime);
 DECL_FUNC(ctime);
 DECL_FUNC(strerror);
 
+static int funcs_initialized = 0;
+
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#include <malloc.h>
+__attribute__((constructor(101)))
+static void disable_heap_tagging()
+{
+    mallopt(/*M_BIONIC_SET_HEAP_TAGGING_LEVEL*/ -204, /*M_HEAP_TAGGING_LEVEL_NONE*/ 0);
+}
+#endif
+
+#if defined(__ANDROID__)
+enum { FDSAN_ERROR_LEVEL_DISABLED = 0 };
+__attribute__((weak)) int android_fdsan_set_error_level(int);
+
 __attribute__((constructor))
+static void disable_fdsan()
+{
+    if (android_fdsan_set_error_level)
+        android_fdsan_set_error_level(FDSAN_ERROR_LEVEL_DISABLED);
+}
+#endif
+
 static void init_funcs()
 {
     struct original_func_t *curr_func;
@@ -594,7 +766,22 @@ static void init_funcs()
             *curr_func->ptrdest = (void *)0x4141DEAD;
         }
     }
+    funcs_initialized = 1;
 };
+
+#if defined(__ANDROID__)
+static void __preinit_resolve_alloc(void) {
+    LOCAL_SYM(malloc)  = dlsym(RTLD_NEXT, "malloc");
+    LOCAL_SYM(free)    = dlsym(RTLD_NEXT, "free");
+    LOCAL_SYM(realloc) = dlsym(RTLD_NEXT, "realloc");
+    LOCAL_SYM(calloc)  = dlsym(RTLD_NEXT, "calloc");
+}
+__attribute__((section(".preinit_array"), used))
+static void (*__preinit_fn)(void) = __preinit_resolve_alloc;
+#endif
+
+__attribute__((constructor))
+static void __init_funcs_ctor(void) { init_funcs(); }
 
 __attribute__((constructor))
 static void format_time_init(void) {
@@ -1066,6 +1253,83 @@ static void *jmpbuf_getstack(jmp_buf *jmpbuf)
 
 #undef PTR_MANGLE
 #undef PTR_DEMANGLE
+
+#elif defined(__aarch64__)
+
+/*
+ * Bionic aarch64 jmp_buf layout (reverse-engineered from sigsetjmp/siglongjmp):
+ *   [0]  cookie (from TLS, sigflag in bit 0)
+ *   [1]  sigmask (unmangled)
+ *   [2]  x30/lr ^ cookie
+ *   [3]  sp ^ cookie
+ *   [4]  x28 ^ cookie
+ *   [5]  x29/fp ^ cookie
+ *   [6]  x26 ^ cookie
+ *   [7]  x27 ^ cookie
+ *   [8]  x24 ^ cookie
+ *   [9]  x25 ^ cookie
+ *   [10] x22 ^ cookie
+ *   [11] x23 ^ cookie
+ *   [12] x20 ^ cookie
+ *   [13] x21 ^ cookie
+ *   [14] (x18 & 0x3fff) ^ cookie  (TLS tag)
+ *   [15] x19 ^ cookie
+ *   [16-23] d14,d15,d12,d13,d10,d11,d8,d9  (unmangled)
+ *   [24] XOR checksum of [0..23]
+ *
+ * Cookie low bit encodes sigflag (1=setjmp, 0=_setjmp).
+ * All register slots XOR'd with cookie (low bit cleared).
+ * longjmp verifies checksum; mismatch aborts.
+ */
+
+#define JB_COOKIE     0
+#define JB_SP         3
+#define JB_FP         5
+#define JB_CHECKSUM   24
+#define JB_SAVED_COOKIE 25
+
+static void jmpbuf_recompute_checksum(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    uintptr_t checksum = 0;
+    for (int i = 0; i < 24; i++)
+        checksum ^= jb[i];
+    jb[JB_CHECKSUM] = checksum;
+}
+
+static void jmpbuf_demangle(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    uintptr_t cookie = jb[JB_COOKIE] & ~(uintptr_t)1;
+    jb[JB_SAVED_COOKIE] = cookie;
+    jb[0] ^= cookie;
+    for (int i = 2; i <= 15; i++)
+        jb[i] ^= cookie;
+}
+
+static uintptr_t jmpbuf_current_cookie(void)
+{
+    jmp_buf tmp;
+    _setjmp(tmp);
+    return ((uintptr_t *)tmp)[JB_COOKIE] & ~(uintptr_t)1;
+}
+
+static void jmpbuf_mangle(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    uintptr_t cookie = jmpbuf_current_cookie();
+    jb[0] ^= cookie;
+    for (int i = 2; i <= 15; i++)
+        jb[i] ^= cookie;
+    jb[JB_SAVED_COOKIE] = 0;
+    jmpbuf_recompute_checksum(jmpbuf);
+}
+
+static void *jmpbuf_getstack(jmp_buf *jmpbuf)
+{
+    uintptr_t *jb = (uintptr_t *) jmpbuf;
+    return (void *) jb[JB_SP];
+}
 
 #endif
 #elif defined(__APPLE__)
@@ -3921,8 +4185,10 @@ struct tty {
 #define t_cflag  t_termios.c_cflag
 #define t_lflag  t_termios.c_lflag
 #define t_cc     t_termios.c_cc
+#if !defined(ANDROID_NO_TERMIOS_SPEED)
 #define t_ispeed t_termios.c_ispeed
 #define t_ospeed t_termios.c_ospeed
+#endif
 
     int t_mfd;
     ino_t t_mfd_ino;
@@ -3995,7 +4261,9 @@ static struct tty *ttyalloc()
     tt->t_termios.c_oflag = TTYDEF_OFLAG;
     tt->t_termios.c_lflag = TTYDEF_LFLAG;
     tt->t_termios.c_cflag = TTYDEF_CFLAG;
+#if !defined(ANDROID_NO_TERMIOS_SPEED)
     tt->t_termios.c_ispeed = tt->t_termios.c_ospeed = TTYDEF_SPEED;
+#endif
     
     struct stat st;
     if (-1 == CALL_FUNC(fstat, tt->t_mfd, &st)) {
@@ -6382,8 +6650,14 @@ uc_engine *uc_open_arch(int arch)
         err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &engine);
         if (!err)
             uc_ctl_set_cpu_model(engine, UC_CPU_ARM64_MAX);
-    }
-    else if (arch == ULARCH_X86_64) {
+#if defined(__aarch64__)
+        if (!err) {
+            uint64_t tpidr;
+            asm("mrs %0, tpidr_el0" : "=r"(tpidr));
+            uc_reg_write(engine, UC_ARM64_REG_TPIDR_EL0, &tpidr);
+        }
+#endif
+    } else if (arch == ULARCH_X86_64) {
         err = uc_open(UC_ARCH_X86, UC_MODE_64, &engine);
 #if defined(__linux__) && defined(__x86_64__)
         uint64_t fs_base;
@@ -9999,9 +10273,9 @@ FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
     tvm_sig_leave();
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, size_t, size) {
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)
 FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
 #endif
     tvm_sig_enter();
@@ -10022,7 +10296,7 @@ FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
     tvm_sig_leave();
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
     tvm_sig_enter();
 
@@ -10038,7 +10312,7 @@ FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
     file_unlock(file, 1);
     tvm_sig_leave();
 }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)
 FUNCTION_DEFINE1(int, setlinebuf, FILE *, stream) {
     tvm_sig_enter();
 
@@ -11184,6 +11458,7 @@ FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
     return ret;
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
@@ -11195,6 +11470,7 @@ FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
     tvm_sig_leave();
     return ret;
 }
+#endif
 
 FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
     tvm_sig_enter();
@@ -11296,9 +11572,11 @@ FUNCTION_DEFINE2(int, flock, int, fd, int, operation) {
     return CURRENT_RFD(fd, CALL_FUNC(flock, __rfd, operation));
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE3(int, lockf, int, fd, int, cmd, off_t, len) {
     return CURRENT_RFD(fd, CALL_FUNC(lockf, __rfd, cmd, len));
 }
+#endif
 
 FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t, bufsiz) {
     char pathname_abs[PATH_MAX];
@@ -11526,6 +11804,7 @@ FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
     return CALL_FUNC(mkfifo, pathname, mode);
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
@@ -11536,6 +11815,7 @@ FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode
 
     return CURRENT_RFD(dirfd, CALL_FUNC(mkfifoat, __rfd, pathname, mode));
 }
+#endif
 
 FUNCTION_DEFINE1(int, mkstemp, char *, template) {
     int r, f;
@@ -11679,6 +11959,46 @@ FUNCTION_DEFINE4(int, socketpair, int, domain, int, type, int, protocol, int *, 
     return 0;
 }
 
+#if defined(__ANDROID__)
+static int __tvm_ioctl_impl(int fd, int request, void *arg) {
+    if (!can_enter_tvm(NULL))
+        return CALL_FUNC(ioctl, fd, request, arg);
+
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+
+    size_t ret;
+    if (!file->f_ops || !file->f_ops->f_ioctl) {
+        file_unlock(file, 0);
+        ret = CALL_FUNC(ioctl, file->f_rfd, request, arg);
+        file_lock(file, 0);
+    }
+    else
+        ret = file->f_ops->f_ioctl(file, request, arg);
+
+    file_unlock(file, 1);
+    tvm_sig_leave();
+
+    return ret;
+}
+int ioctl(int fd, int request, ...) {
+    struct tvm_call __call = { call, __builtin_return_address(0) };
+    call = &__call;
+    va_list ap;
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    int ret = __tvm_ioctl_impl(fd, request, arg);
+    call = call->prev;
+    return ret;
+}
+FUNCTION_METADATA(ioctl, (int(*)(int,int,...))ioctl);
+#else
 FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     void* arg = va_arg(__ap, void*);
     if (!can_enter_tvm(NULL))
@@ -11700,12 +12020,13 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     }
     else
         ret = file->f_ops->f_ioctl(file, request, arg);
-    
+
     file_unlock(file, 1);
     tvm_sig_leave();
-    
+
     return ret;
 }
+#endif
 
 /**
  * Who knew imitating `fork()` API with threads is such a hassle. Well it is.
@@ -11894,10 +12215,6 @@ static void *tvm_proc_entry(struct fork_arg *arg)
         // forge prologue so if a return occurs we can detect it
         *(uintptr_t *)(next_fp) = 0xDEADBEEF46464646;
         *(uintptr_t *)(next_fp + 8) = 0xDEADBEEF42424242;
-
-        // INFO("longjmp(arg->jmpbuf_tmp) jump curr-stack %p-%p next-stack %p-%p", curr_sp, curr_fp, next_sp, next_fp);
-        // INFO("  curr-arg = %p *%p", &arg, arg);
-        // INFO("  next-arg = %p *%p", (uintptr_t)&arg - ((uintptr_t)curr_sp - (uintptr_t)next_sp), *(uintptr_t *)((uintptr_t)&arg - ((uintptr_t)curr_sp - (uintptr_t)next_sp)));
 
         // include prologue (fp + lr) when adjusting jmpbuf context regs
         jmpbuf_setstack(&arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
@@ -12454,14 +12771,20 @@ FUNCTION_DEFINE_NORET0(abort) {
 // atexit is implemented in the executable rather than libc
 // so we cannot really call the original one
 
-#if defined(__linux__)
+#if defined(__ANDROID__)
+static int tvm_atexit(exit_t function);
+int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle) {
+    return tvm_atexit((exit_t)func);
+}
+static int tvm_atexit(exit_t function) {
+#elif defined(__linux__)
 int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle) {
     return atexit((exit_t)func);
 }
-#endif
-
-//FUNCTION_DEFINE1(int, atexit, exit_t, function) {
 int atexit(exit_t function) {
+#else
+int atexit(exit_t function) {
+#endif
     
     if (!can_enter_tvm(NULL))
         return 0;
@@ -13035,6 +13358,7 @@ FUNCTION_DEFINE2(int, sigwait, const sigset_t *, set, int *, sig) {
     return 0;
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE2(int, sigwaitinfo, const sigset_t *, set, siginfo_t *, info) {
     siginfo_t local_info;
     int s;
@@ -13121,6 +13445,7 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
         *info = local_info;
     return s;
 }
+#endif /* !__ANDROID__ */
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
     // Before any task exists (e.g. during tvm_init) there is no per-task env;
@@ -13894,7 +14219,9 @@ FUNCTION_DEFINE1(int, system, const char *, command) {
     return status;
 }
 
-#if defined(__linux__)
+#if defined(__ANDROID__)
+static int __tvm_openpty(int *amaster, int *aslave, char *name, const struct termios *termp, const struct winsize *winp) {
+#elif defined(__linux__)
 FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, const struct termios *, termp, const struct winsize *, winp) {
 #elif defined(__APPLE__)
 FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, struct termios *, termp, struct winsize *, winp) {
@@ -14073,6 +14400,7 @@ FUNCTION_DEFINE2(int, tcsetpgrp, int, fd, pid_t, pgrp) {
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TIOCSPGRP, &pgrp));
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(tcgetattr, __rfd, termios_p));
@@ -14087,13 +14415,13 @@ FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
 FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct termios *, termios_p) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(tcsetattr, __rfd, optional_actions, termios_p));
-    
+
     int request;
     switch (optional_actions) {
         default:
             errno = EINVAL;
             return -1;
-        
+
         case TCSANOW:
 #if defined(__linux__)
             request = TCSETS;
@@ -14101,7 +14429,7 @@ FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct te
             request = TIOCSETA;
 #endif
             break;
-        
+
         case TCSADRAIN:
 #if defined(__linux__)
             request = TCSETSW;
@@ -14109,7 +14437,7 @@ FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct te
             request = TIOCSETAW;
 #endif
             break;
-        
+
         case TCSAFLUSH:
 #if defined(__linux__)
             request = TCSETSF;
@@ -14125,7 +14453,7 @@ FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct te
 FUNCTION_DEFINE2(int, tcsendbreak, int, fd, int, duration) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(tcsendbreak, __rfd, duration));
-    
+
 #if defined(__linux__)
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TCSBRK, (void *)(long)duration));
 #elif defined(__APPLE__)
@@ -14145,7 +14473,7 @@ FUNCTION_DEFINE2(int, tcsendbreak, int, fd, int, duration) {
 FUNCTION_DEFINE1(int, tcdrain, int, fd) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(tcdrain, __rfd));
-    
+
 #if defined(__linux__)
     return tcsendbreak(fd, 1);
 #elif defined(__APPLE__)
@@ -14194,6 +14522,7 @@ FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
     return CURRENT_FILE(fd, ttyop_ioctl(__file, request, NULL));
 #endif
 }
+#endif /* !__ANDROID__ */
 
 FUNCTION_DEFINE1(void *, malloc, size_t, size) {
     return calloc(1, size);
@@ -14665,9 +14994,11 @@ FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
     return ret;
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE1(char *, getwd, char *, buf) {
     return getcwd(buf, PATH_MAX);
 }
+#endif
 
 static int bsearch_compar_emulator(const void *a, const void *b)
 {
@@ -15197,12 +15528,14 @@ FUNCTION_DEFINE2(int, ftruncate64, int, fd, off64_t, length) {
     return CURRENT_RFD(fd, CALL_FUNC(ftruncate64, __rfd, length));
 }
 
+#if !defined(__ANDROID__)
 FUNCTION_DEFINE0(char *, get_current_dir_name) {
     char *pwd = getenv("PWD");
     if (pwd)
         return strdup(pwd);
     return getcwd(NULL, 0);
 }
+#endif
 
 #elif defined(__APPLE__)
 
