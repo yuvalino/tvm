@@ -7337,6 +7337,8 @@ void *tvm_emulator_thread_entry(struct emulator_pthread_create_arg *arg) {
     return (void *)ret;
 }
 
+static void chkstk_nop(void) {}
+
 int emulator_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *_arg)
 {
     // short-circuit for non-emulated PC addresses
@@ -8706,6 +8708,8 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
         if (0 == strcmp(s, "_longjmp"))     return &emulator_longjmp;
         if (0 == strcmp(s, "siglongjmp"))   return &emulator_longjmp;
     }
+
+    if (0 == strcmp(s, "__chkstk_darwin")) return &chkstk_nop;
 
     if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
 
