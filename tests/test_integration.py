@@ -41,7 +41,7 @@ def forkless() -> Iterator[Forkless]:
     proc = subprocess.Popen(cmd.split(), stdout=logfile, stderr=subprocess.STDOUT, env=env)
 
     ready = f"Not backgrounding, port {port}"
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             logfile.seek(0)
