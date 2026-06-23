@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux-x64
@@ -21,8 +22,13 @@ jobs:
       with:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
+    - name: deps (macOS)
+      if: runner.os == 'macOS'
+      run: brew install gnu-sed openssl
     - name: build
-      run: python3 build.py -t tvm test_tvm test_rmem initrd
+      run: |
+        export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+        python3 build.py -t tvm test_tvm test_rmem initrd
     - uses: actions/upload-artifact@v4
       with:
         name: build-${{ matrix.platform }}
@@ -31,6 +37,7 @@ jobs:
   test_tvm:
     needs: build
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux-x64
@@ -54,6 +61,7 @@ jobs:
   test_rmem:
     needs: build
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux-x64
@@ -73,6 +81,7 @@ jobs:
   test_integration:
     needs: build
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux-x64
