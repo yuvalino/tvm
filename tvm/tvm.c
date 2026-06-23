@@ -2432,6 +2432,10 @@ static void terminate_current_locked(int result)
     
         if ((parent_act->sa_flags & SA_NOCLDWAIT) || handler == ((void *) SIG_IGN))
             auto_reap = 1;
+
+        // unlock parent before taskfreelastref — closing files (ttyop_close)
+        // iterates all tasks and would deadlock trying to re-lock parent
+        task_unlock(parent);
     }
 
     if (auto_reap) {
@@ -2451,6 +2455,10 @@ static void terminate_current_locked(int result)
 
         task_unlock(current);
     }
+
+    // re-lock parent for SIGCHLD notification and waitpid wakeup below
+    if (parent)
+        task_lock(parent);
 
     // Block OS-level signals before clearing current: the signal handler
     // panics if any signal arrives on this thread while current is NULL.
