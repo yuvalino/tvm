@@ -5,7 +5,7 @@ add_library(tvm_objects OBJECT
     main.c
 )
 target_include_directories(tvm_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_options(tvm_objects PRIVATE -g)
+target_compile_options(tvm_objects PRIVATE -g -fPIC)
 target_link_libraries(tvm_objects PRIVATE unicorn)
 
 # tvm executable

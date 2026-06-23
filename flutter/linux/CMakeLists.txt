@@ -54,18 +54,52 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
 
+# TVM project root (for pre-built objects and libraries).
+set(TVM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(TVM_OUTPUT "${TVM_ROOT}/output/linux-x64")
+set(TVM_OBJECTS_DIR "${TVM_OUTPUT}/build/tvm/CMakeFiles/tvm_objects.dir")
+
+# Embed initrd.cpio as a linkable object.
+set(INITRD_CPIO "${TVM_OUTPUT}/initrd.cpio")
+set(INITRD_OBJ "${CMAKE_CURRENT_BINARY_DIR}/initrd.cpio.o")
+add_custom_command(
+  OUTPUT "${INITRD_OBJ}"
+  COMMAND ld -r -b binary -o "${INITRD_OBJ}" initrd.cpio
+  WORKING_DIRECTORY "${TVM_OUTPUT}"
+  DEPENDS "${INITRD_CPIO}"
+  COMMENT "Embedding initrd.cpio"
+)
+add_custom_target(initrd_obj DEPENDS "${INITRD_OBJ}")
+
 # Native TVM bridge shared library.
 add_library(tvm_bridge SHARED
   "${CMAKE_CURRENT_SOURCE_DIR}/../native/tvm_bridge.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../native/devtool_main.c"
 )
 set_target_properties(tvm_bridge PROPERTIES
   OUTPUT_NAME "tvm_bridge"
   C_VISIBILITY_PRESET default
+  LINKER_LANGUAGE C
 )
 target_include_directories(tvm_bridge PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../native"
+  "${TVM_ROOT}/tvm"
 )
-target_link_libraries(tvm_bridge PRIVATE pthread)
+target_link_libraries(tvm_bridge PRIVATE
+  "${TVM_OBJECTS_DIR}/tvm.c.o"
+  "${TVM_OBJECTS_DIR}/rmem.c.o"
+  "${TVM_OBJECTS_DIR}/ulinker.c.o"
+  "${INITRD_OBJ}"
+  -Wl,--start-group
+  "${TVM_OUTPUT}/lib/libunicorn-static.a"
+  "${TVM_OUTPUT}/lib/libunicorn-common.a"
+  "${TVM_OUTPUT}/lib/libx86_64-softmmu.a"
+  "${TVM_OUTPUT}/lib/libaarch64-softmmu.a"
+  -Wl,--end-group
+  pthread util z m ${CMAKE_DL_LIBS} crypt ncurses
+)
+target_link_options(tvm_bridge PRIVATE -rdynamic -Wl,--no-as-needed -Wl,-Bsymbolic)
+add_dependencies(tvm_bridge initrd_obj)
 
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")

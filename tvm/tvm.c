@@ -5982,7 +5982,7 @@ static void cow_fixup_process(struct cow_fixup_context *dctx)
         // only used for other fixups
         if (!dctx->ptrs[i].fixup)
             continue;
-        
+
         for (
             void **p = (void **)dctx->ptrs[i].new;
             (uintptr_t)(p + 1) <= (uintptr_t)dctx->ptrs[i].new + dctx->ptrs[i].size;
@@ -7467,6 +7467,7 @@ struct tvm_call {
 extern char etext;
 extern char __executable_start;
 
+__attribute__((weak))
 void get_text(uintptr_t *out_start, uintptr_t *out_end)
 {
     *out_start = (uintptr_t)&__executable_start;
