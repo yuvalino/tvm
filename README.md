@@ -40,19 +40,19 @@ Output goes to `output/<platform>/bin/` (auto-detected: `linux-x64` or `macos-ar
 
 ```sh
 # Run a program in TVM
-./output/$PLATFORM/bin/tvm <program> [args...]
+./output/linux-x64/bin/tvm <program> [args...]
 
 # Run with kernel log output
-./output/$PLATFORM/bin/tvm --verbose <program>
+./output/macos-arm64/bin/tvm --verbose <program>
 
 # Custom initrc
-./output/$PLATFORM/bin/tvm -i path/to/init.rc <program>
+./output/linux-x64/bin/tvm -i path/to/init.rc <program>
 
 # Skip initrc
-./output/$PLATFORM/bin/tvm -n <program>
+./output/macos-arm64/bin/tvm -n <program>
 
 # Mount a CPIO archive
-./output/$PLATFORM/bin/tvm -v /tvm:path/to/initrd.cpio <program>
+./output/linux-x64/bin/tvm -v /tvm:path/to/initrd.cpio <program>
 ```
 
 ## Programs
@@ -112,12 +112,12 @@ See [INITRC.md](INITRC.md) for the full specification.
 ```sh
 # Unit tests (rmem + tvm)
 python3 build.py -t tests
-./output/$PLATFORM/bin/tvm ./output/$PLATFORM/bin/tvm ./output/$PLATFORM/bin/test_tvm
-./output/$PLATFORM/bin/test_rmem
+./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
+./output/macos-arm64/bin/test_rmem
 
 # Integration tests (pytest)
 pip install pytest pexpect
-python3 build.py
+python3 build.py -t initrd
 pytest tests/test_integration.py
 ```
 
