@@ -6,7 +6,7 @@ if [ "$(uname)" = "Darwin" ]; then
     export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
     OPENSSL_PREFIX="$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl)"
 fi
-make CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 ${OPENSSL_PREFIX:+-I$OPENSSL_PREFIX/include}" V=1 MAKEOVERRIDES=
+make CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 ${OPENSSL_PREFIX:+-I$OPENSSL_PREFIX/include}" V=1 MAKEOVERRIDES= || true
 rm -f toybox
 if [ "$(uname)" = "Darwin" ]; then
     cc -g -gdwarf-4 generated/obj/*.o \
