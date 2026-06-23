@@ -12617,7 +12617,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         argc = i;
     }
 
-do_exec: {
+do_exec:
     // Deep-copy argv and envp onto the stack — the originals may point into the
     // caller's emulator stack or shebang_buf which we're about to destroy.
     int envc = 0;
@@ -12810,7 +12810,7 @@ do_exec: {
         printf("execve emulator_call failed!\n");
 
     exit(callerr ? callerr : (int)ret);
-} }
+}
 
 FUNCTION_DEFINE_VA2(int, execl, const char *, pathname, const char *, arg/*, ... , (char *) NULL */) {
     size_t argc;
