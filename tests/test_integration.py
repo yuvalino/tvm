@@ -13,7 +13,8 @@ from typing import Iterator
 
 PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
-TVM_BIN = os.environ.get("TVM_BIN", "./output/linux-x64/bin/tvm")
+PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
+TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
 TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim"
 
 def clean_ansi(text: str) -> str:

@@ -8566,41 +8566,10 @@ static void tvm_exec_initrc(const char *path, int must_exist)
     free(buf);
 }
 
-static void tvm_set_outdir(void)
-{
-    if (getenv("TVM_OUTDIR"))
-        return;
-    char self[PATH_MAX];
-#if defined(__APPLE__)
-    uint32_t size = sizeof(self);
-    if (_NSGetExecutablePath(self, &size) != 0)
-        return;
-#elif defined(__linux__)
-    ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
-    if (len <= 0)
-        return;
-    self[len] = 0;
-#else
-    return;
-#endif
-    char *resolved = realpath(self, NULL);
-    if (!resolved)
-        return;
-    // binary is at <outdir>/bin/tvm — strip "bin/tvm" to get outdir
-    char *slash = strrchr(resolved, '/');
-    if (slash) *slash = 0; // strip "/tvm"
-    slash = strrchr(resolved, '/');
-    if (slash) slash[1] = 0; // strip "bin" → keep trailing /
-    setenv("TVM_OUTDIR", resolved, 0);
-    free(resolved);
-}
-
 static void tvm_load_initrc(void)
 {
     if (getenv("TVM_NOINITRC"))
         return;
-
-    tvm_set_outdir();
 
     const char *path = getenv("TVM_INITRC");
     if (path) {
@@ -8961,6 +8930,14 @@ void tvm_init(const char *init_comm)
     }
 
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    setenv("PLATFORM", "macos-arm64", 0);
+#elif defined(__linux__) && defined(__x86_64__)
+    setenv("PLATFORM", "linux-x64", 0);
+#elif defined(__linux__) && defined(__aarch64__)
+    setenv("PLATFORM", "linux-arm64", 0);
+#endif
 
     tvm_load_initrc();
 
