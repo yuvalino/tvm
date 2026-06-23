@@ -12,6 +12,8 @@ Unsigned code execution is supported via the [Unicorn](https://www.unicorn-engin
 
 Requirements: CMake 3.16+, Ninja, Python 3, a C compiler.
 
+On macOS, also install: `brew install gnu-sed openssl`
+
 ```sh
 # Build TVM executable (default)
 python3 build.py
@@ -32,25 +34,25 @@ python3 build.py -t examples
 python3 build.py --clean
 ```
 
-Output goes to `output/linux-x64/bin/`.
+Output goes to `output/<platform>/bin/` (auto-detected: `linux-x64` or `macos-arm64`).
 
 ## Running
 
 ```sh
 # Run a program in TVM
-./output/linux-x64/bin/tvm <program> [args...]
+./output/$PLATFORM/bin/tvm <program> [args...]
 
 # Run with kernel log output
-./output/linux-x64/bin/tvm --verbose <program>
+./output/$PLATFORM/bin/tvm --verbose <program>
 
 # Custom initrc
-./output/linux-x64/bin/tvm -i path/to/init.rc <program>
+./output/$PLATFORM/bin/tvm -i path/to/init.rc <program>
 
 # Skip initrc
-./output/linux-x64/bin/tvm -n <program>
+./output/$PLATFORM/bin/tvm -n <program>
 
 # Mount a CPIO archive
-./output/linux-x64/bin/tvm -v /tvm:path/to/initrd.cpio <program>
+./output/$PLATFORM/bin/tvm -v /tvm:path/to/initrd.cpio <program>
 ```
 
 ## Programs
@@ -110,8 +112,8 @@ See [INITRC.md](INITRC.md) for the full specification.
 ```sh
 # Unit tests (rmem + tvm)
 python3 build.py -t tests
-./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
-./output/linux-x64/bin/test_rmem
+./output/$PLATFORM/bin/tvm ./output/$PLATFORM/bin/tvm ./output/$PLATFORM/bin/test_tvm
+./output/$PLATFORM/bin/test_rmem
 
 # Integration tests (pytest)
 pip install pytest pexpect
@@ -124,4 +126,4 @@ Test runner flags: `-l` list tests, `-k=TEST` filter, `-v` verbose, `-g` debug w
 ## Platforms
 
 - Linux x86-64
-- XNU arm64 (as a static library, `python3 build.py -t libtvm`)
+- macOS arm64
