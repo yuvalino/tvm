@@ -2730,6 +2730,28 @@ static int task_create_thread_locked(struct task *tsk, start_routine_fn start_fn
                               pthread_t *out_thread, const pthread_attr_t *attr,
                               const sigset_t *sigmask);
 
+static void pthread_cond_timedwait_mono_np(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *mono_deadline)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    struct timespec rel;
+    rel.tv_sec = mono_deadline->tv_sec - now.tv_sec;
+    rel.tv_nsec = mono_deadline->tv_nsec - now.tv_nsec;
+    if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000L; }
+    if (rel.tv_sec < 0)
+        return;
+#if defined(__APPLE__)
+    pthread_cond_timedwait_relative_np(cond, mutex, &rel);
+#else
+    struct timespec abstime;
+    clock_gettime(CLOCK_REALTIME, &abstime);
+    abstime.tv_sec += rel.tv_sec;
+    abstime.tv_nsec += rel.tv_nsec;
+    if (abstime.tv_nsec >= 1000000000L) { abstime.tv_sec++; abstime.tv_nsec -= 1000000000L; }
+    pthread_cond_timedwait(cond, mutex, &abstime);
+#endif
+}
+
 // SIGEV_THREAD arg: allocated from tsk_ar by vtimer manager, freed inside thread.
 struct vtimer_thread_arg {
     void (*func)(union sigval);
@@ -2766,20 +2788,7 @@ static void *vtimer_thread(void *arg)
             continue;
         }
 
-        {
-            struct timespec now_mono, now_real, rel, abstime;
-            clock_gettime(CLOCK_MONOTONIC, &now_mono);
-            clock_gettime(CLOCK_REALTIME, &now_real);
-            rel.tv_sec = earliest.tv_sec - now_mono.tv_sec;
-            rel.tv_nsec = earliest.tv_nsec - now_mono.tv_nsec;
-            if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000L; }
-            if (rel.tv_sec >= 0) {
-                abstime.tv_sec = now_real.tv_sec + rel.tv_sec;
-                abstime.tv_nsec = now_real.tv_nsec + rel.tv_nsec;
-                if (abstime.tv_nsec >= 1000000000L) { abstime.tv_sec++; abstime.tv_nsec -= 1000000000L; }
-                pthread_cond_timedwait(&vtimers_cond, &vtimers_lock, &abstime);
-            }
-        }
+        pthread_cond_timedwait_mono_np(&vtimers_cond, &vtimers_lock, &earliest);
 
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
