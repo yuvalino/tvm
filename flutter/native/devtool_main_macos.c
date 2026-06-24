@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "tvm.h"
@@ -75,14 +76,24 @@ int tvm_main(int outfd, int port)
         outlog(outfd, "tvm_main: mkstemp initrc failed\n");
         return -1;
     }
-    char initrc[512];
+    const char *home = getenv("HOME");
+    if (!home || !home[0])
+        home = tmpdir;
+
+    char home_tmp[PATH_MAX];
+    snprintf(home_tmp, sizeof(home_tmp), "%s/tmp", home);
+    mkdir(home_tmp, 0777);
+
+    char initrc[1024];
     int n = sprintf(initrc,
         "mount %s:/tvm\n"
         "setenv TVM_SHELL=/tvm/bin/sh\n"
         "setenv PATH=/tvm/bin:$PATH\n"
+        "setenv HOME=%s\n"
+        "setenv TMPDIR=%s\n"
         "setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
         "echo TVM initialized\n",
-        initrd_path);
+        initrd_path, home, home_tmp);
     write(tmpfd, initrc, n);
     close(tmpfd);
 
@@ -93,6 +104,8 @@ int tvm_main(int outfd, int port)
 
     unlink(initrd_path);
     unlink(initrc_path);
+
+    chdir(home);
 
     outlog(outfd, "tvm_main: exec dropbear\n");
 
