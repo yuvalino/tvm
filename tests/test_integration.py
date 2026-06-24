@@ -379,7 +379,6 @@ def test_toybox_seq(sshi: spawn):
     sshi.expect("100")
     sshi.expect(r"\$ ")
 
-@pytest.mark.skipif(BACKEND == "flutter", reason="xargs hangs in flutter TVM (runtime bug)")
 def test_toybox_xargs(sshi: spawn):
     """xargs — exercises fork+exec from toybox, argv passing."""
     sshi.sendline("echo /tvm/bin/sh | xargs ls")

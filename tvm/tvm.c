@@ -11631,6 +11631,7 @@ out:
 
 // vfork() is used by toybox (xargs, etc.) — redirect to TVM's fork()
 // since TVM's fork already uses pthreads with COW semantics.
+FUNCTION_METADATA(vfork, &vfork);
 pid_t vfork(void) {
     return fork();
 }
@@ -12946,11 +12947,33 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
     }
     else {
         const char *pathname = find_program_pathname(file);
-        if (!pathname) {
-            errno = ENOENT;
-            return -1;
+        if (pathname) {
+            file = pathname;
+        } else {
+            const char *path = getenv("PATH");
+            if (!path) path = "/bin:/usr/bin";
+            int found = 0;
+            char trypath[PATH_MAX];
+            while (*path) {
+                const char *end = strchr(path, ':');
+                size_t len = end ? (size_t)(end - path) : strlen(path);
+                if (len > 0 && len + 1 + strlen(file) < PATH_MAX) {
+                    memcpy(trypath, path, len);
+                    trypath[len] = '/';
+                    strcpy(trypath + len + 1, file);
+                    if (0 == access(trypath, X_OK)) {
+                        file = trypath;
+                        found = 1;
+                        break;
+                    }
+                }
+                path = end ? end + 1 : path + strlen(path);
+            }
+            if (!found) {
+                errno = ENOENT;
+                return -1;
+            }
         }
-        file = pathname;
     }
 
     return execve(file, argv, *current->tsk_relocs.__environ);
