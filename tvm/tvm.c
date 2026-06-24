@@ -4956,6 +4956,7 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
     if (!tt)
         return -1;
 
+
     struct termios termios;
     memcpy(&termios, &tt->t_termios, sizeof(termios));
 
