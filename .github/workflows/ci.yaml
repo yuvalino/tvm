@@ -14,6 +14,8 @@ jobs:
         include:
           - platform: linux-x64
             runner: [self-hosted, linux]
+          - platform: macos-arm64
+            runner: [self-hosted, macOS]
     runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
@@ -35,6 +37,8 @@ jobs:
         include:
           - platform: linux-x64
             runner: [self-hosted, linux]
+          - platform: macos-arm64
+            runner: [self-hosted, macOS]
     runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
@@ -57,6 +61,8 @@ jobs:
         include:
           - platform: linux-x64
             runner: [self-hosted, linux]
+          - platform: macos-arm64
+            runner: [self-hosted, macOS]
     runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/download-artifact@v4
@@ -75,6 +81,8 @@ jobs:
         include:
           - platform: linux-x64
             runner: [self-hosted, linux]
+          - platform: macos-arm64
+            runner: [self-hosted, macOS]
     runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
