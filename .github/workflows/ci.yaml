@@ -95,6 +95,6 @@ jobs:
         path: output/
     - run: chmod +x output/${{ matrix.platform }}/bin/*
     - name: pip
-      run: pip install -r python_requirements.txt
+      run: pip3 install -r python_requirements.txt
     - name: test_integration
       run: pytest tests/test_integration.py -v
