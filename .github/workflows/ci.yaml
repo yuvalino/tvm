@@ -97,4 +97,10 @@ jobs:
     - name: pip
       run: pip3 install -r python_requirements.txt
     - name: test_integration
-      run: pytest tests/test_integration.py -v
+      run: pytest tests/test_integration.py -v --junitxml=report.xml
+    - name: test report
+      uses: mikepenz/action-junit-report@v5
+      if: always()
+      with:
+        report_paths: report.xml
+        check_name: test_integration (${{ matrix.platform }})
