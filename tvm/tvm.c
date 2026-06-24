@@ -10829,7 +10829,7 @@ FUNCTION_DEFINE1(int, close, int, fd) {
     if (!file) {
         task_unlock(current);
         tvm_sig_leave();
-        errno = EMFILE;
+        errno = EBADF;
         return -1;
     }
 
