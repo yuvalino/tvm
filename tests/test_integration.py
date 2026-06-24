@@ -16,6 +16,8 @@ TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
 TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim"
+FLUTTER_APP = f"./flutter/build/macos/Build/Products/Debug/tvm.app"
+BACKEND = os.environ.get("TVM_INTEG_BACKEND", "tvm")
 
 def clean_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[>=<]', '', text)
@@ -31,39 +33,64 @@ def _pick_port():
         s.bind(('', 0))
         return s.getsockname()[1]
 
-@pytest.fixture()
-def forkless() -> Iterator[Forkless]:
-    port = _pick_port()
-
+def _start_tvm_backend(port: int) -> subprocess.Popen:
     cmd = f"{TVM_BIN} /tvm/bin/sshd -R -e -F -E -p {port}"
     logpath = tempfile.mktemp(prefix="tvm_", suffix=".log")
     logfile = open(logpath, "w+")
     env = dict(os.environ)
     env.setdefault("TVM_NOEMU", TVM_NOEMU_DEFAULT)
     proc = subprocess.Popen(cmd.split(), stdout=logfile, stderr=subprocess.STDOUT, env=env)
+    proc._logfile = logfile
+    proc._logpath = logpath
+    return proc
+
+FLUTTER_DEFAULT_PORT = 2222
+
+def _start_flutter_backend() -> subprocess.Popen:
+    subprocess.run(["pkill", "-9", "-f", "tvm.app/Contents/MacOS/tvm"],
+                    capture_output=True)
+    time.sleep(1)
+    logpath = tempfile.mktemp(prefix="tvm_flutter_", suffix=".log")
+    logfile = open(logpath, "w+")
+    proc = subprocess.Popen(
+        [f"{FLUTTER_APP}/Contents/MacOS/tvm"],
+        stdout=logfile, stderr=subprocess.STDOUT,
+    )
+    proc._logfile = logfile
+    proc._logpath = logpath
+    return proc
+
+@pytest.fixture()
+def forkless() -> Iterator[Forkless]:
+    if BACKEND == "flutter":
+        port = FLUTTER_DEFAULT_PORT
+        proc = _start_flutter_backend()
+    else:
+        port = _pick_port()
+        proc = _start_tvm_backend(port)
 
     ready = f"Not backgrounding, port {port}"
-    deadline = time.monotonic() + 15.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            logfile.seek(0)
-            raise RuntimeError(f"tvm died on startup:\n{logfile.read()}")
-        logfile.seek(0)
-        if ready in logfile.read():
+            proc._logfile.seek(0)
+            raise RuntimeError(f"backend died on startup:\n{proc._logfile.read()}")
+        proc._logfile.seek(0)
+        if ready in proc._logfile.read():
             break
-        time.sleep(0.05)
+        time.sleep(0.1)
     else:
         proc.kill()
         proc.wait()
-        logfile.seek(0)
-        raise RuntimeError(f"tvm did not become ready:\n{logfile.read()}")
+        proc._logfile.seek(0)
+        raise RuntimeError(f"backend did not become ready:\n{proc._logfile.read()}")
 
     yield Forkless(proc, "localhost", port)
 
     proc.kill()
     proc.wait()
-    logfile.close()
-    os.unlink(logpath)
+    proc._logfile.close()
+    os.unlink(proc._logpath)
 
 @contextmanager
 def ssh(port: int, command: str | None = None, exe="ssh") -> Iterator[spawn]:
@@ -131,6 +158,7 @@ def test_connect_echo(forkless: Forkless):
         p.expect(EOF)
         assert 0 == p.wait()
 
+@pytest.mark.skipif(BACKEND == "flutter", reason="sandbox blocks host filesystem access")
 def test_scp(forkless: Forkless):
     f1 = tempfile.mktemp()
     f2 = tempfile.mktemp()
@@ -159,9 +187,10 @@ def test_sigint(sshi: spawn):
     sshi.expect(r"\$ ")
 
 def test_toybox(sshi: spawn):
-    sshi.sendline("echo test1234 > /tmp/1")
+    tmpdir = "/tmp" if BACKEND != "flutter" else "$HOME"
+    sshi.sendline(f"echo test1234 > {tmpdir}/toybox_test1")
     sshi.expect(r"\$ ")
-    sshi.sendline("cat /tmp/1")
+    sshi.sendline(f"cat {tmpdir}/toybox_test1")
     sshi.expect("test1234")
     sshi.expect(r"\$ ")
 
@@ -400,6 +429,7 @@ def test_concurrent_interactive(forkless: Forkless):
 
 # ── SCP extended ──────────────────────────────────────────────
 
+@pytest.mark.skipif(BACKEND == "flutter", reason="sandbox blocks host filesystem access")
 def test_scp_large_file(forkless: Forkless):
     """SCP a larger file — exercises pipe buffering and stdio with bulk data."""
     f1 = tempfile.mktemp()
