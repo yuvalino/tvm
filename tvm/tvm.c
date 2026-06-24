@@ -494,6 +494,15 @@ DECL_FUNC(perror);
 DECL_FUNC(open);
 DECL_FUNC(creat);
 DECL_FUNC(openat);
+#if defined(__ANDROID__)
+static int (*LOCAL_SYM(__open_2))(const char *, int) = NULL;
+static struct original_func_t _of___open_2 = { .ptrdest = (void *)&LOCAL_SYM(__open_2), .name = "__open_2", .opt = 0 };
+__attribute__((constructor)) static void _ofc___open_2() { list_add_tail(&_of___open_2.list, &original_functions); }
+
+static int (*LOCAL_SYM(__openat_2))(int, const char *, int) = NULL;
+static struct original_func_t _of___openat_2 = { .ptrdest = (void *)&LOCAL_SYM(__openat_2), .name = "__openat_2", .opt = 0 };
+__attribute__((constructor)) static void _ofc___openat_2() { list_add_tail(&_of___openat_2.list, &original_functions); }
+#endif
 DECL_FUNC(read);
 DECL_FUNC(write);
 DECL_FUNC(close);
@@ -641,6 +650,8 @@ DECL_FUNC(ttyname);
 DECL_FUNC(ttyname_r);
 DECL_FUNC(ptsname);
 DECL_FUNC(ptsname_r);
+DECL_FUNC(grantpt);
+DECL_FUNC(unlockpt);
 
 #if !defined(__ANDROID__)
 DECL_FUNC(tcgetattr);
@@ -2460,7 +2471,7 @@ static int task_assign_file_locked(struct task *t, struct file *file, int min_fd
 {
     if (min_fd < 0 || min_fd >= MAX_FILES)
         panic("task_assign_file_locked %d", min_fd);
-    
+
     for (int i = min_fd; i < MAX_FILES; i++) {
         if (!t->tsk_files[i]) {
             file->f_refcnt++;
@@ -4505,9 +4516,31 @@ static struct tty *tty_for_rfd(int rfd, int *out_ttymode) {
 }
 
 static struct fops *ttyops();
+static struct file *ptm_open();
 
 static int ttyop_open(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out)
 {
+    if (0 == strcmp(pathname, PTMX_FILE)) {
+        struct tty *tt = ttyalloc();
+        if (!tt)
+            return -1;
+        int mfd = CALL_FUNC(dup, tt->t_mfd);
+        if (-1 == mfd) {
+            ttydealloc(tt);
+            return -1;
+        }
+        tt->t_refcnt++;
+        tt->t_master_refcnt++;
+        out->f_rfd = mfd;
+        out->f_type = DEV_TTY;
+        out->f_data = tt;
+        out->f_ops = ttyops();
+        pthread_mutex_lock(&ttys_lock);
+        list_add_tail(&tt->t_list, &ttys);
+        pthread_mutex_unlock(&ttys_lock);
+        return 0;
+    }
+
     // tty_for_path locks stuff
     file_unlock(out, 0);
     struct tty *tt = tty_for_path(pathname);
@@ -4888,6 +4921,20 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
             ret = 0;
             break;
 #endif
+
+        case TIOCSPTLCK: {
+            // unlockpt — TVM PTYs are always unlocked
+            ret = 0;
+            break;
+        }
+
+        case TIOCGPTN: {
+            // ptsname — return the master fd as the PTY index
+            // tty_for_path matches on t_mfd to find the slave
+            *((unsigned int *)arg) = (unsigned int)tt->t_mfd;
+            ret = 0;
+            break;
+        }
 
         default:
             errno = ENOTSUP;
@@ -10654,6 +10701,15 @@ FUNCTION_DEFINE_VA2(int, open, const char *, pathname, int, flags) {
     return openat(AT_FDCWD, pathname, flags, mode);
 }
 
+#if defined(__ANDROID__)
+FUNCTION_DEFINE2(int, __open_2, const char *, pathname, int, flags) {
+    return open(pathname, flags);
+}
+FUNCTION_DEFINE3(int, __openat_2, int, dirfd, const char *, pathname, int, flags) {
+    return openat(dirfd, pathname, flags);
+}
+#endif
+
 FUNCTION_DEFINE2(int, creat, const char *, pathname, mode_t, mode) {
     return open(pathname, O_CREAT | O_WRONLY | O_TRUNC, mode);
 }
@@ -14378,6 +14434,18 @@ FUNCTION_DEFINE1(char *, ptsname, int, fd) {
     }
 
     return pts_name;
+}
+
+FUNCTION_DEFINE1(int, grantpt, int, fd) {
+    if (!islocaltty(fd))
+        return CALL_FUNC(grantpt, fd);
+    return 0;
+}
+
+FUNCTION_DEFINE1(int, unlockpt, int, fd) {
+    if (!islocaltty(fd))
+        return CALL_FUNC(unlockpt, fd);
+    return 0;
 }
 
 FUNCTION_DEFINE1(pid_t, tcgetpgrp, int, fd) {
