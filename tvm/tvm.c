@@ -5334,11 +5334,15 @@ static ssize_t ttyop_write(struct file *file, const void *buf, size_t count, int
     if (!tt)
         return -1;
 
+    INFO("ttyop_write: %s count=%zu rfd=%d", ttymode == TTM_MASTER ? "MASTER" : "SLAVE", count, file->f_rfd);
+
     ssize_t ret;
     if (ttymode == TTM_MASTER)
         ret = tty_input_buffer_locked(tt, file, buf, count);
     else
         ret = tty_output_buffer_locked(tt, file, buf, count);
+
+    INFO("ttyop_write: ret=%zd", ret);
 
     tty_unlock(tt, 1);
 
@@ -5377,6 +5381,9 @@ static void ttyop_close(struct file *file) {
     tt->t_refcnt--;
     int master_closed = (ttymode == TTM_MASTER && --tt->t_master_refcnt == 0);
     int last_file = (tt->t_refcnt == 1); // only the temp ref from tty_for_file_locked remains
+
+    if (master_closed)
+        INFO("ttyop_close: MASTER CLOSED refcnt=%d rfd=%d nfd=%d pid=%d", tt->t_refcnt, file->f_rfd, file->f_nfd, current ? current->tsk_pid : -1);
 
     if (!last_file && !master_closed) {
         tty_unlock(tt, 1);
@@ -10827,6 +10834,13 @@ FUNCTION_DEFINE1(int, close, int, fd) {
     // detach from current before closing
     // inc refcnt for locking, dec refcnt for detaching
     struct file *file = task_unassign_fd_locked(current, fd);
+    if (file && file->f_type == DEV_TTY) {
+        struct tty *_tt = (struct tty *)file->f_data;
+        struct stat _st;
+        CALL_FUNC(fstat, file->f_rfd, &_st);
+        int _is_master = (_tt->t_mfd_ino == _st.st_ino);
+        INFO("close(%d): TTY %s rfd=%d master_refcnt=%d", fd, _is_master?"MASTER":"slave", file->f_rfd, _tt->t_master_refcnt);
+    }
     if (!file) {
         task_unlock(current);
         tvm_sig_leave();
