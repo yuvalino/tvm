@@ -1,7 +1,7 @@
 import os
 import re
 import signal
-import random
+import socket
 import subprocess
 import time
 import pytest
@@ -27,7 +27,9 @@ class Forkless:
     port: int
 
 def _pick_port():
-    return random.randint(10000, 60000)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
 @pytest.fixture()
 def forkless() -> Iterator[Forkless]:
