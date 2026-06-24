@@ -10288,6 +10288,8 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
         list_for_each_entry(fsle, &current->tsk_filestreams, fsle_list) {
             if (fsle->fsle_stream->fs_type != FS_FILE)
                 continue;
+            if (fsle->fsle_stream->fs_mode[0] == 'r')
+                continue;
             ret |= CALL_FUNC(fflush, fsle->fsle_stream->fs_fp);
         }
         task_unlock(current);
