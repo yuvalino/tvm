@@ -1925,7 +1925,11 @@ ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
         errno = last_errno;
     };
 
+#if defined(__ANDROID__)
+    return syscall(SYS_readlinkat, AT_FDCWD, pathname, buf, bufsiz);
+#else
     return CALL_FUNC(readlink, pathname, buf, bufsiz);
+#endif
 }
 
 /////////////
