@@ -107,4 +107,4 @@ jobs:
       if: always()
       with:
         report_paths: report.xml
-        check_name: test_integration (${{ matrix.platform }})
+        annotate_only: true
