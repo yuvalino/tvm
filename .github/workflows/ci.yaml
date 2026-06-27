@@ -11,16 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            runner: [self-hosted, linux]
-          - platform: macos-arm64
-            runner: [self-hosted, macOS]
-    runs-on: ${{ matrix.runner }}
+  build-linux:
+    runs-on: [self-hosted, linux]
     steps:
     - uses: actions/checkout@v4
       with:
@@ -30,20 +22,26 @@ jobs:
       run: python3 build.py -t tvm test_tvm test_rmem initrd
     - uses: actions/upload-artifact@v4
       with:
-        name: build-${{ matrix.platform }}
+        name: build-linux-x64
         path: output/
 
-  test_tvm:
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            runner: [self-hosted, linux]
-          - platform: macos-arm64
-            runner: [self-hosted, macOS]
-    runs-on: ${{ matrix.runner }}
+  build-macos:
+    runs-on: [self-hosted, macOS]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'true'
+        token: ${{ secrets.SUBMODULE_TOKEN }}
+    - name: build
+      run: python3 build.py -t tvm test_tvm test_rmem initrd
+    - uses: actions/upload-artifact@v4
+      with:
+        name: build-macos-arm64
+        path: output/
+
+  test-linux:
+    needs: build-linux
+    runs-on: [self-hosted, linux]
     steps:
     - uses: actions/checkout@v4
       with:
@@ -51,53 +49,13 @@ jobs:
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - uses: actions/download-artifact@v4
       with:
-        name: build-${{ matrix.platform }}
+        name: build-linux-x64
         path: output/
-    - run: chmod +x output/${{ matrix.platform }}/bin/*
+    - run: chmod +x output/linux-x64/bin/*
     - name: test_tvm
-      run: ./output/${{ matrix.platform }}/bin/tvm ./output/${{ matrix.platform }}/bin/test_tvm
-
-  test_rmem:
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            runner: [self-hosted, linux]
-          - platform: macos-arm64
-            runner: [self-hosted, macOS]
-    runs-on: ${{ matrix.runner }}
-    steps:
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-${{ matrix.platform }}
-        path: output/
-    - run: chmod +x output/${{ matrix.platform }}/bin/*
+      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
     - name: test_rmem
-      run: ./output/${{ matrix.platform }}/bin/test_rmem
-
-  test_integration:
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            runner: [self-hosted, linux]
-          - platform: macos-arm64
-            runner: [self-hosted, macOS]
-    runs-on: ${{ matrix.runner }}
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-${{ matrix.platform }}
-        path: output/
-    - run: chmod +x output/${{ matrix.platform }}/bin/*
+      run: ./output/linux-x64/bin/test_rmem
     - name: pip
       run: pip3 install -r python_requirements.txt
     - name: test_integration
@@ -109,8 +67,36 @@ jobs:
         report_paths: report.xml
         annotate_only: true
 
-  build_flutter:
-    needs: build
+  test-macos:
+    needs: build-macos
+    runs-on: [self-hosted, macOS]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'true'
+        token: ${{ secrets.SUBMODULE_TOKEN }}
+    - uses: actions/download-artifact@v4
+      with:
+        name: build-macos-arm64
+        path: output/
+    - run: chmod +x output/macos-arm64/bin/*
+    - name: test_tvm
+      run: ./output/macos-arm64/bin/tvm ./output/macos-arm64/bin/test_tvm
+    - name: test_rmem
+      run: ./output/macos-arm64/bin/test_rmem
+    - name: pip
+      run: pip3 install -r python_requirements.txt
+    - name: test_integration
+      run: pytest tests/test_integration.py -v --junitxml=report.xml
+    - name: test report
+      uses: mikepenz/action-junit-report@v5
+      if: always()
+      with:
+        report_paths: report.xml
+        annotate_only: true
+
+  build-flutter:
+    needs: build-macos
     runs-on: [self-hosted, macOS]
     steps:
     - uses: actions/checkout@v4
@@ -129,8 +115,8 @@ jobs:
         name: flutter-macos-arm64
         path: flutter/build/macos/Build/Products/Debug/tvm.app/
 
-  test_integration_flutter:
-    needs: build_flutter
+  test-flutter:
+    needs: build-flutter
     runs-on: [self-hosted, macOS]
     steps:
     - uses: actions/checkout@v4
