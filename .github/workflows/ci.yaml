@@ -33,11 +33,15 @@ jobs:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: build
-      run: python3 build.py -t tvm test_tvm test_rmem initrd
+      run: python3 build.py -t tvm test_tvm test_rmem initrd flutter
     - uses: actions/upload-artifact@v4
       with:
         name: build-macos-arm64
         path: output/
+    - uses: actions/upload-artifact@v4
+      with:
+        name: flutter-macos-arm64
+        path: flutter/build/macos/Build/Products/Debug/tvm.app/
 
   test-linux:
     needs: build-linux
@@ -95,28 +99,8 @@ jobs:
         report_paths: report.xml
         annotate_only: true
 
-  build-flutter:
-    needs: build-macos
-    runs-on: [self-hosted, macOS]
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-macos-arm64
-        path: output/
-    - run: chmod +x output/macos-arm64/bin/*
-    - name: build flutter
-      run: python3 build.py -t flutter
-    - uses: actions/upload-artifact@v4
-      with:
-        name: flutter-macos-arm64
-        path: flutter/build/macos/Build/Products/Debug/tvm.app/
-
   test-flutter:
-    needs: build-flutter
+    needs: build-macos
     runs-on: [self-hosted, macOS]
     steps:
     - uses: actions/checkout@v4
