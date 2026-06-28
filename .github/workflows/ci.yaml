@@ -100,7 +100,7 @@ jobs:
         annotate_only: true
 
   test-flutter:
-    needs: build-macos
+    needs: test-macos
     runs-on: [self-hosted, macOS]
     steps:
     - uses: actions/checkout@v4
