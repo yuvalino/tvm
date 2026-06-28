@@ -93,13 +93,14 @@ def build_flutter(platform):
 
 def build(platform, targets, verbose=False):
     cmake_targets = []
+    has_flutter = False
     for t in targets:
         if t not in TARGET_MAP:
             print(f"error: unknown target '{t}'", file=sys.stderr)
             print(f"available targets: {', '.join(sorted(TARGET_MAP))}", file=sys.stderr)
             sys.exit(1)
         if t == "flutter":
-            build_flutter(platform)
+            has_flutter = True
         else:
             cmake_targets.append(TARGET_MAP[t])
 
@@ -114,6 +115,9 @@ def build(platform, targets, verbose=False):
         ninja_args.extend(cmake_targets)
 
         run(ninja_args)
+
+    if has_flutter:
+        build_flutter(platform)
 
 
 def clean(platform):
