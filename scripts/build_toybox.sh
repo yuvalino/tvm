@@ -19,3 +19,8 @@ fi
 make CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 $CFLAGS_EXTRA" V=1 MAKEOVERRIDES= || true
 rm -f toybox
 cc $LDFLAGS generated/obj/*.o $LIBS -o toybox
+
+# static lib
+ar rcs libtoybox.a generated/obj/*.o
+# shared lib
+cc -dynamiclib -fPIC $LDFLAGS generated/obj/*.o $LIBS -o libtoybox.dylib -install_name libtoybox.dylib 2>/dev/null || true

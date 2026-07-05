@@ -13,7 +13,7 @@ add_custom_target(initrd
         ${CMAKE_CURRENT_BINARY_DIR}/.rootfs
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/..
         ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS dropbear mksh toybox vim
+    DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe
     COMMENT "Assembling initrd.cpio"
 )
 set_target_properties(initrd PROPERTIES EXCLUDE_FROM_ALL TRUE)
@@ -23,7 +23,7 @@ add_custom_target(flutter
     COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_flutter.sh
         ${CMAKE_CURRENT_SOURCE_DIR}/flutter
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/..
-    DEPENDS tvm_dylib initrd
+    DEPENDS tvm_shared initrd
     COMMENT "Building Flutter app"
 )
 set_target_properties(flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)

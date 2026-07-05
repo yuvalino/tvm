@@ -19,7 +19,7 @@ jobs:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: build
-      run: python3 build.py -t tvm test_tvm test_rmem initrd
+      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd
     - uses: actions/upload-artifact@v4
       with:
         name: build-linux-x64
@@ -33,7 +33,7 @@ jobs:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: build
-      run: python3 build.py -t tvm test_tvm test_rmem initrd flutter
+      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd flutter
     - uses: actions/upload-artifact@v4
       with:
         name: build-macos-arm64

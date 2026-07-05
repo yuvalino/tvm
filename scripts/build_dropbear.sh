@@ -7,3 +7,8 @@ if [ ! -f Makefile ]; then
 fi
 make PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 \
     CFLAGS="-g -gdwarf-4 -DDROPBEAR_FORKLESS" MAKEOVERRIDES=
+
+# static lib
+ar rcs libdropbear.a obj/*.o
+# shared lib
+cc -dynamiclib -fPIC -o libdropbear.dylib obj/*.o libtomcrypt/libtomcrypt.a libtommath/libtommath.a -lz -install_name libdropbear.dylib 2>/dev/null || true
