@@ -1,27 +1,23 @@
-add_library(tvm_objects OBJECT
+# libtvm.a — core TVM library (no main)
+add_library(tvm_static STATIC
     rmem.c
     ulinker.c
     tvm.c
-    main.c
 )
-target_include_directories(tvm_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_options(tvm_objects PRIVATE -g -fPIC)
-target_link_libraries(tvm_objects PRIVATE unicorn)
+set_target_properties(tvm_static PROPERTIES OUTPUT_NAME tvm)
+target_include_directories(tvm_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(tvm_static PRIVATE -g -fPIC)
+target_link_libraries(tvm_static PRIVATE unicorn)
 
 # tvm executable
-add_executable(tvm $<TARGET_OBJECTS:tvm_objects>)
+add_executable(tvm main.c)
+target_link_libraries(tvm PRIVATE tvm_static)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(tvm PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt ncurses)
     target_link_options(tvm PRIVATE -rdynamic -Wl,--no-as-needed -pie)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     target_link_libraries(tvm PRIVATE unicorn z pthread m ncurses)
 endif()
-
-# libtvm.a
-add_library(tvm_static STATIC $<TARGET_OBJECTS:tvm_objects>)
-set_target_properties(tvm_static PROPERTIES OUTPUT_NAME tvm)
-target_link_libraries(tvm_static PRIVATE unicorn)
-set_target_properties(tvm_static PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 # tests
 add_executable(test_tvm tests/test_tvm.c)
@@ -48,7 +44,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(INITRD_CPIO "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../initrd.cpio")
 
     add_library(tvm_dylib SHARED
-        $<TARGET_OBJECTS:tvm_objects>
         ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native/devtool_main_macos.c
     )
     set_target_properties(tvm_dylib PROPERTIES
@@ -61,7 +56,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native
     )
-    target_link_libraries(tvm_dylib PRIVATE unicorn z pthread m ncurses)
+    target_link_libraries(tvm_dylib PRIVATE tvm_static unicorn z pthread m ncurses)
     target_link_options(tvm_dylib PRIVATE
         -Wl,-sectcreate,__DATA,__initrd,${INITRD_CPIO}
     )
