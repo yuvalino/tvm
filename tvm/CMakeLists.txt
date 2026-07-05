@@ -42,3 +42,28 @@ endif()
 set_target_properties(test_rmem PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_custom_target(tests DEPENDS test_tvm test_rmem)
+
+# libtvm.dylib — TVM runtime for Flutter app (macOS only)
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(INITRD_CPIO "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../initrd.cpio")
+
+    add_library(tvm_dylib SHARED
+        $<TARGET_OBJECTS:tvm_objects>
+        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native/devtool_main_macos.c
+    )
+    set_target_properties(tvm_dylib PROPERTIES
+        OUTPUT_NAME tvm
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/.."
+        INSTALL_NAME_DIR "@rpath"
+        C_VISIBILITY_PRESET default
+    )
+    target_include_directories(tvm_dylib PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native
+    )
+    target_link_libraries(tvm_dylib PRIVATE unicorn z pthread m ncurses)
+    target_link_options(tvm_dylib PRIVATE
+        -Wl,-sectcreate,__DATA,__initrd,${INITRD_CPIO}
+    )
+    set_target_properties(tvm_dylib PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
