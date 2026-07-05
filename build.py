@@ -2,7 +2,6 @@
 """Build script for TVM. Wraps CMake + Ninja."""
 
 import argparse
-import os
 import platform
 import shutil
 import subprocess
@@ -22,37 +21,17 @@ def detect_platform():
         print(f"error: unsupported platform '{s}'", file=sys.stderr)
         sys.exit(1)
 
-TARGET_MAP = {
-    "tvm":           "tvm",
-    "libtvm":        "tvm_static",
-    "test_tvm":      "test_tvm",
-    "test_rmem":     "test_rmem",
-    "tests":         "tests",
-    "dropbear":      "dropbear",
-    "mksh":          "mksh",
-    "toybox":        "toybox",
-    "vim":           "vim",
-    "initrd":        "initrd",
-    "snake":         "example_snake",
-    "fork":          "example_fork",
-    "stopit":        "example_stopit",
-    "hello_jmpbuf":  "example_hello_jmpbuf",
-    "gdb_backtrace": "example_gdb_backtrace",
-    "examples":      "examples",
-    "flutter":       "flutter",
-}
-
 
 def project_root():
     return Path(__file__).resolve().parent
 
 
-def output_dir(platform):
-    return project_root() / "output" / platform
+def output_dir(plat):
+    return project_root() / "output" / plat
 
 
-def build_dir(platform):
-    return output_dir(platform) / "build"
+def build_dir(plat):
+    return output_dir(plat) / "build"
 
 
 def run(cmd, **kwargs):
@@ -60,11 +39,11 @@ def run(cmd, **kwargs):
     subprocess.check_call(cmd, **kwargs)
 
 
-def configure(platform):
-    bd = build_dir(platform)
+def configure(plat):
+    bd = build_dir(plat)
     bd.mkdir(parents=True, exist_ok=True)
 
-    od = output_dir(platform)
+    od = output_dir(plat)
     run([
         "cmake",
         "-G", "Ninja",
@@ -82,46 +61,21 @@ def configure(platform):
         cc_link.symlink_to(cc_json)
 
 
-def build_flutter(platform):
-    run([
-        "sh",
-        str(project_root() / "scripts" / "build_flutter.sh"),
-        str(project_root() / "flutter"),
-        str(output_dir(platform)),
-    ])
+def build(plat, targets, verbose=False):
+    bd = build_dir(plat)
+    if not (bd / "build.ninja").exists():
+        configure(plat)
+
+    ninja_args = ["ninja", "-C", str(bd)]
+    if verbose:
+        ninja_args.append("-v")
+    ninja_args.extend(targets)
+
+    run(ninja_args)
 
 
-def build(platform, targets, verbose=False):
-    cmake_targets = []
-    has_flutter = False
-    for t in targets:
-        if t not in TARGET_MAP:
-            print(f"error: unknown target '{t}'", file=sys.stderr)
-            print(f"available targets: {', '.join(sorted(TARGET_MAP))}", file=sys.stderr)
-            sys.exit(1)
-        if t == "flutter":
-            has_flutter = True
-        else:
-            cmake_targets.append(TARGET_MAP[t])
-
-    if cmake_targets:
-        bd = build_dir(platform)
-        if not (bd / "build.ninja").exists():
-            configure(platform)
-
-        ninja_args = ["ninja", "-C", str(bd)]
-        if verbose:
-            ninja_args.append("-v")
-        ninja_args.extend(cmake_targets)
-
-        run(ninja_args)
-
-    if has_flutter:
-        build_flutter(platform)
-
-
-def clean(platform):
-    od = output_dir(platform)
+def clean(plat):
+    od = output_dir(plat)
     if od.exists():
         shutil.rmtree(od)
         print(f"removed {od}", file=sys.stderr)
@@ -132,7 +86,7 @@ def main():
     parser.add_argument("-a", default=None, choices=sorted(PLATFORMS),
                         help="platform (default: auto-detect)")
     parser.add_argument("-t", nargs="+", default=["tvm"],
-                        help="build target(s) (default: tvm)")
+                        help="cmake/ninja target(s) (default: tvm)")
     parser.add_argument("--clean", action="store_true",
                         help="remove build directory before building")
     parser.add_argument("--verbose", action="store_true",

@@ -17,3 +17,13 @@ add_custom_target(initrd
     COMMENT "Assembling initrd.cpio"
 )
 set_target_properties(initrd PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# flutter app (calls build_flutter.sh after cmake targets are built)
+add_custom_target(flutter
+    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_flutter.sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/flutter
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/..
+    DEPENDS tvm_objects initrd
+    COMMENT "Building Flutter app"
+)
+set_target_properties(flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)
