@@ -25,8 +25,3 @@ if [ ! -f auto/config.mk ]; then
         CFLAGS="-g -gdwarf-4"
 fi
 make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4" MAKEOVERRIDES=
-
-# static lib
-ar rcs libvim.a objects/*.o
-# shared lib
-cc -dynamiclib -fPIC -g -o libvim.dylib objects/*.o -lm -lncurses -install_name libvim.dylib 2>/dev/null || true
