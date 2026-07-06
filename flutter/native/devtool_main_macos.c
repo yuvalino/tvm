@@ -35,6 +35,22 @@ static const char *get_tmpdir(void)
     return "/tmp/";
 }
 
+static const char *get_frameworks_dir(void)
+{
+    static char dir[PATH_MAX];
+    Dl_info info;
+    if (dladdr((void *)_anchor, &info) && info.dli_fname) {
+        char *last_slash = strrchr(info.dli_fname, '/');
+        if (last_slash) {
+            size_t len = last_slash - info.dli_fname;
+            memcpy(dir, info.dli_fname, len);
+            dir[len] = '\0';
+            return dir;
+        }
+    }
+    return NULL;
+}
+
 int tvm_main(int outfd, int port)
 {
     outlog(outfd, "tvm_main: starting\n");
@@ -69,6 +85,35 @@ int tvm_main(int outfd, int port)
     }
     close(tmpfd);
 
+    // Create symlinks to bundled dylibs in a writable dir so TVM's execvp
+    // finds them via PATH and loads them through the ulinker
+    const char *fwdir = get_frameworks_dir();
+    char bindir[PATH_MAX];
+    snprintf(bindir, sizeof(bindir), "%stvm_bin", tmpdir);
+    mkdir(bindir, 0755);
+
+    struct { const char *name; const char *dylib; } bins[] = {
+        { "dropbear", "libdropbear.dylib" },
+        { "sh",       "libmksh.dylib"     },
+        { "toybox",   "libtoybox.dylib"   },
+        { "vim",      "libvim.dylib"      },
+        { NULL, NULL }
+    };
+
+    if (fwdir) {
+        for (int i = 0; bins[i].name; i++) {
+            char target[PATH_MAX], link[PATH_MAX];
+            snprintf(target, sizeof(target), "%s/%s", fwdir, bins[i].dylib);
+            snprintf(link, sizeof(link), "%s/%s", bindir, bins[i].name);
+            unlink(link);
+            if (0 == symlink(target, link)) {
+                outlog(outfd, "tvm_main: linked ");
+                outlog(outfd, bins[i].name);
+                outlog(outfd, "\n");
+            }
+        }
+    }
+
     char initrc_path[PATH_MAX];
     snprintf(initrc_path, sizeof(initrc_path), "%stvm_initrc_XXXXXX", tmpdir);
     tmpfd = mkstemp(initrc_path);
@@ -87,13 +132,16 @@ int tvm_main(int outfd, int port)
     char initrc[1024];
     int n = sprintf(initrc,
         "mount %s:/tvm\n"
-        "setenv TVM_SHELL=/tvm/bin/sh\n"
-        "setenv PATH=/tvm/bin:$PATH\n"
+        "setenv TVM_SHELL=%s/sh\n"
+        "setenv PATH=%s:/tvm/bin:$PATH\n"
         "setenv HOME=%s\n"
         "setenv TMPDIR=%s\n"
-        "setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
+        "setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
         "echo TVM initialized\n",
-        initrd_path, home, home_tmp);
+        initrd_path,
+        bindir,
+        bindir,
+        home, home_tmp);
     write(tmpfd, initrc, n);
     close(tmpfd);
 
@@ -113,7 +161,7 @@ int tvm_main(int outfd, int port)
     sprintf(port_str, "%d", port);
 
     char *argv[] = {"sshd", "-R", "-e", "-F", "-E", "-p", port_str, NULL};
-    execvp("/tvm/bin/dropbear", argv);
+    execvp("dropbear", argv);
 
     outlog(outfd, "tvm_main: execvp failed\n");
     return -1;
