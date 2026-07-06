@@ -57,6 +57,7 @@ def configure(plat):
 
     if plat == "ios-arm64":
         os.environ["ARCHFLAGS"] = "-arch arm64"
+        os.environ["TVM_IOS_CROSS"] = "1"
         cmake_args += [
             "-DCMAKE_SYSTEM_NAME=iOS",
             "-DCMAKE_OSX_ARCHITECTURES=arm64",

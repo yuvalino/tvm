@@ -6,11 +6,16 @@ set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(unicorn EXCLUDE_FROM_ALL)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    return()
-endif()
-
 set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../scripts)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(IOS_CC "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/ios-cc.sh")
+    set(CROSS_CC "${IOS_CC}")
+    set(CROSS_AR "ar")
+else()
+    set(CROSS_CC "cc")
+    set(CROSS_AR "ar")
+endif()
 
 # Helper: define exe/static/shared targets for a third-party tool.
 #   NAME      — tool name
@@ -23,15 +28,25 @@ function(add_thirdparty NAME SCRIPT OBJGLOB)
     string(REPLACE ";" " " LIBS_STR "${LIBS}")
 
     # exe: runs the full build script (configure + compile + link)
-    add_custom_target(${NAME}_exe
-        COMMAND sh ${SCRIPTS_DIR}/${SCRIPT} ${SRCDIR}
-        COMMENT "Building ${NAME}"
-    )
-    set_target_properties(${NAME}_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        add_custom_target(${NAME}_exe
+            COMMAND sh ${SCRIPTS_DIR}/${SCRIPT} ${SRCDIR}
+            COMMENT "Building ${NAME}"
+        )
+        set_target_properties(${NAME}_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    else()
+        # iOS: run build script with cross-compiler wrapper
+        add_custom_target(${NAME}_exe
+            COMMAND env CC=${IOS_CC} TVM_IOS_CROSS=1
+                sh ${SCRIPTS_DIR}/${SCRIPT} ${SRCDIR}
+            COMMENT "Building ${NAME} (iOS)"
+        )
+        set_target_properties(${NAME}_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
 
     # static lib
     add_custom_target(${NAME}_static
-        COMMAND sh -c "ar rcs ${SRCDIR}/lib${NAME}.a ${SRCDIR}/${OBJGLOB}"
+        COMMAND sh -c "${CROSS_AR} rcs ${SRCDIR}/lib${NAME}.a ${SRCDIR}/${OBJGLOB}"
         DEPENDS ${NAME}_exe
         COMMENT "Archiving ${NAME} (static)"
     )
@@ -39,7 +54,7 @@ function(add_thirdparty NAME SCRIPT OBJGLOB)
 
     # shared lib
     add_custom_target(${NAME}_shared
-        COMMAND sh -c "cc -dynamiclib -fPIC -g -o ${SRCDIR}/lib${NAME}.dylib ${SRCDIR}/${OBJGLOB} ${LIBS_STR} -install_name lib${NAME}.dylib"
+        COMMAND sh -c "${CROSS_CC} -dynamiclib -fPIC -g -o ${SRCDIR}/lib${NAME}.dylib ${SRCDIR}/${OBJGLOB} ${LIBS_STR} -install_name lib${NAME}.dylib"
         DEPENDS ${NAME}_exe
         COMMENT "Linking ${NAME} (shared)"
     )

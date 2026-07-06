@@ -9,4 +9,5 @@ if [ "$(uname)" = "Darwin" ]; then
     CFLAGS_EXTRA="-I$OPENSSL_PREFIX/include"
 fi
 
-make CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 $CFLAGS_EXTRA" V=1 MAKEOVERRIDES= || true
+HOSTCC="${CC:-cc}"
+make CC="$HOSTCC" CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 $CFLAGS_EXTRA" V=1 MAKEOVERRIDES= || true

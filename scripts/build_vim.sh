@@ -2,6 +2,12 @@
 set -e
 SRCDIR="$1"
 cd "$SRCDIR/src"
+
+CROSS_FLAGS=""
+if [ -n "$TVM_IOS_CROSS" ]; then
+    CROSS_FLAGS="--host=aarch64-apple-darwin vim_cv_toupper_strstrprogram=yes vim_cv_terminfo=yes vim_cv_tgetent=zero vim_cv_getcwd_broken=no vim_cv_stat_ignores_slash=yes vim_cv_memmove_handles_overlap=yes"
+fi
+
 if [ ! -f auto/config.mk ]; then
     EXTRA_FLAGS=""
     if [ "$(uname)" = "Darwin" ]; then
@@ -22,6 +28,7 @@ if [ ! -f auto/config.mk ]; then
         --without-wayland \
         ac_cv_header_iconv_h=no \
         $EXTRA_FLAGS \
+        $CROSS_FLAGS \
         CFLAGS="-g -gdwarf-4"
 fi
 make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4" MAKEOVERRIDES=
