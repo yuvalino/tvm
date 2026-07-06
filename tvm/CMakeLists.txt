@@ -7,21 +7,26 @@ add_library(tvm_static STATIC
 set_target_properties(tvm_static PROPERTIES OUTPUT_NAME tvm)
 target_include_directories(tvm_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(tvm_static PRIVATE -g -fPIC)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    target_compile_options(tvm_static PRIVATE -Wno-unavailable-declarations)
+endif()
 target_link_libraries(tvm_static PRIVATE unicorn)
 
-# tvm executable
-add_executable(tvm_exe main.c)
-set_target_properties(tvm_exe PROPERTIES OUTPUT_NAME tvm)
-target_link_libraries(tvm_exe PRIVATE tvm_static)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_libraries(tvm_exe PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt ncurses)
-    target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    target_link_libraries(tvm_exe PRIVATE unicorn z pthread m ncurses)
+# tvm executable (not for iOS)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_executable(tvm_exe main.c)
+    set_target_properties(tvm_exe PROPERTIES OUTPUT_NAME tvm)
+    target_link_libraries(tvm_exe PRIVATE tvm_static)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(tvm_exe PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt ncurses)
+        target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        target_link_libraries(tvm_exe PRIVATE unicorn z pthread m ncurses)
+    endif()
 endif()
 
-# libtvm.dylib — TVM runtime for Flutter app (macOS only)
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+# libtvm.dylib — TVM runtime for Flutter app (Apple platforms)
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(INITRD_CPIO "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../initrd.cpio")
 
     add_library(tvm_shared SHARED
@@ -37,14 +42,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native
     )
-    target_link_libraries(tvm_shared PRIVATE tvm_static unicorn z pthread m ncurses)
-    target_link_options(tvm_shared PRIVATE
-        -Wl,-sectcreate,__DATA,__initrd,${INITRD_CPIO}
-    )
+    set(TVM_SHARED_LIBS tvm_static unicorn z pthread m)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        list(APPEND TVM_SHARED_LIBS ncurses)
+    endif()
+    target_link_libraries(tvm_shared PRIVATE ${TVM_SHARED_LIBS})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        target_link_options(tvm_shared PRIVATE
+            -Wl,-sectcreate,__DATA,__initrd,${INITRD_CPIO}
+        )
+    endif()
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
-# tests
+# tests (not for iOS)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 add_executable(test_tvm tests/test_tvm.c)
 target_compile_options(test_tvm PRIVATE -g)
 target_link_libraries(test_tvm PRIVATE pthread)
@@ -63,3 +75,4 @@ endif()
 set_target_properties(test_rmem PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_custom_target(tests DEPENDS test_tvm test_rmem)
+endif() # NOT iOS

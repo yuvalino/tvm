@@ -6,6 +6,10 @@ set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(unicorn EXCLUDE_FROM_ALL)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    return()
+endif()
+
 set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../scripts)
 
 # Helper: define exe/static/shared targets for a third-party tool.

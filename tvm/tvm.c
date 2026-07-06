@@ -1,4 +1,16 @@
 #define _GNU_SOURCE
+
+// TVM reimplements system() using fork+exec. iOS marks the libc
+// system() as __unavailable, so undef that attribute via macro before
+// headers are included.
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#define __IOS_UNAVAILABLE
+#define __IOS_PROHIBITED
+#endif
+#endif
+
 #include <dlfcn.h>
 
 #include <sys/uio.h>

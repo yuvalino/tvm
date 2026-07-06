@@ -2,13 +2,14 @@
 """Build script for TVM. Wraps CMake + Ninja."""
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-PLATFORMS = {"linux-x64", "macos-arm64"}
+PLATFORMS = {"linux-x64", "macos-arm64", "ios-arm64"}
 
 
 def detect_platform():
@@ -44,7 +45,7 @@ def configure(plat):
     bd.mkdir(parents=True, exist_ok=True)
 
     od = output_dir(plat)
-    run([
+    cmake_args = [
         "cmake",
         "-G", "Ninja",
         "-S", str(project_root()),
@@ -52,7 +53,17 @@ def configure(plat):
         "-DCMAKE_BUILD_TYPE=Debug",
         f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={od}/bin",
         f"-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={od}/lib",
-    ])
+    ]
+
+    if plat == "ios-arm64":
+        os.environ["ARCHFLAGS"] = "-arch arm64"
+        cmake_args += [
+            "-DCMAKE_SYSTEM_NAME=iOS",
+            "-DCMAKE_OSX_ARCHITECTURES=arm64",
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
+        ]
+
+    run(cmake_args)
 
     cc_json = bd / "compile_commands.json"
     cc_link = project_root() / "compile_commands.json"
