@@ -81,15 +81,24 @@ static void patch_got_for_image(const struct mach_header_64 *header, intptr_t sl
                 // table which needs to track all fds.
                 static const char *patch_list[] = {
                     "fork", "vfork",
+                    "execv", "execve", "execvp",
+                    "exit", "_exit",
                     "waitpid", "wait",
+                    "kill",
                     "getpid", "getppid",
                     "setsid", "getsid",
                     "setpgid", "getpgid", "getpgrp",
+                    "sigprocmask", "pthread_sigmask",
+                    "tcsetattr", "tcgetattr",
+                    "ioctl",
+                    "openpty", "forkpty",
+                    "login_tty",
                     // I/O must go through TVM so thread-based fork
                     // properly refcounts fds (real close would kill
                     // the fd for both parent and child threads)
                     "open", "openat", "close",
-                    "read", "write",
+                    "read", "write", "readv", "writev",
+                    "pread", "pwrite",
                     "dup", "dup2", "pipe", "fcntl",
                     "socket", "bind", "listen", "accept",
                     "connect", "setsockopt", "getsockopt",

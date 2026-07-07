@@ -12692,6 +12692,25 @@ do_exec:
     argv = new_argv;
     envp = new_envp;
 
+    // For registered programs (dlopen'd on iOS), skip linker/emulator
+    // setup — calling main_func directly doesn't need them, and replacing
+    // the emulator context would break TVM's signal handler.
+    main_func_t main_func = find_program(pathname);
+    if (main_func) {
+        tvm_sig_enter();
+        // Reset TVM data for the new program
+        memset(current->tsk_data, 0, sizeof(*current->tsk_data));
+        *current->tsk_relocs.optind = 1;
+        *current->tsk_relocs.opterr = 1;
+        current->tsk_data->optreset = 0;
+        tvm_sig_leave();
+
+        INFO("execve: calling registered program %s directly", pathname);
+        uint64_t ret = (uint64_t)main_func(argc, argv, envp);
+        INFO("execve: registered program returned %llu", (unsigned long long)ret);
+        exit((int)ret);
+    }
+
     tvm_sig_enter();
 
     struct ulinker *new_linker = ulinker_create((void *)current);
@@ -12701,8 +12720,6 @@ do_exec:
         tvm_sig_leave();
         return -1;
     }
-    // destroy old emulator context (with stale engine/map entries) and
-    // create a fresh one so the new executable starts clean
     struct emulator_context *new_emulator = emulator_context_create(new_linker);
     if (!new_emulator) {
         ulinker_destroy(new_linker);
@@ -12715,8 +12732,6 @@ do_exec:
     struct emulator_context *old_emulator = current_thread->thr_emulator;
     current->tsk_linker = new_linker;
     current_thread->thr_emulator = new_emulator;
-
-    main_func_t main_func = find_program(pathname);
     if (!main_func) {
 
         int dlflags = RTLD_NOW | (is_noemu_binary(pathname) ? RTLD_NOEMU : 0);
@@ -12849,14 +12864,7 @@ do_exec:
     *current->tsk_relocs.opterr = 1;
     current->tsk_data->optreset = 0;
 
-    // If the function is a registered program (from dlopen, not ulinker),
-    // call it directly — emulator_call would fail because the address isn't
-    // in any ulinker-loaded range.
-    if (find_program(pathname)) {
-        INFO("execve: calling registered program %s directly", pathname);
-        ret = (uint64_t)main_func(argc, argv, envp);
-        INFO("execve: registered program returned %llu", (unsigned long long)ret);
-    } else {
+    {
         int callerr = emulator_call(&ret, (uint64_t)main_func,
                       (uint64_t)argc,
                       (uint64_t)argv,
