@@ -80,26 +80,27 @@ static void patch_got_for_image(const struct mach_header_64 *header, intptr_t sl
                 // also be patched because TVM's fork copies TVM's fd
                 // table which needs to track all fds.
                 static const char *patch_list[] = {
-                    // process
-                    "fork", "vfork", "execv", "execve", "execvp",
-                    "exit", "_exit",
-                    "getpid", "getppid", "getpgid", "getpgrp",
-                    "setpgid", "setsid", "getsid",
-                    "kill", "waitpid", "wait",
-                    // signals
-                    "sigaction", "signal", "sigprocmask",
-                    "pthread_sigmask", "raise",
-                    // env
-                    "getenv", "setenv", "unsetenv", "putenv",
-                    // I/O — needed for TVM fd table
-                    "open", "openat", "close", "read", "write",
-                    "fcntl", "dup", "dup2",
+                    "fork", "vfork",
+                    "waitpid", "wait",
+                    "getpid", "getppid",
+                    "setsid", "getsid",
+                    "setpgid", "getpgid", "getpgrp",
+                    // I/O must go through TVM so thread-based fork
+                    // properly refcounts fds (real close would kill
+                    // the fd for both parent and child threads)
+                    "open", "openat", "close",
+                    "read", "write",
+                    "dup", "dup2", "pipe", "fcntl",
                     "socket", "bind", "listen", "accept",
                     "connect", "setsockopt", "getsockopt",
+                    "getpeername", "getsockname",
+                    "send", "sendto", "sendmsg",
+                    "recv", "recvfrom", "recvmsg",
                     "select", "poll",
-                    "pipe",
-                    // misc
+                    "sigaction", "signal",
+                    "getenv", "setenv", "unsetenv", "putenv",
                     "chdir", "getcwd", "mkdir",
+                    "isatty",
                     NULL
                 };
                 int should_patch = 0;
@@ -132,6 +133,7 @@ static const struct mach_header_64 *dylib_header(void)
 static void outlog(int fd, const char *msg)
 {
     write(fd, msg, strlen(msg));
+    write(STDERR_FILENO, msg, strlen(msg));
 }
 
 static const char *get_tmpdir(void)
@@ -233,7 +235,7 @@ int tvm_main(int outfd, int port)
         if (h) {
             progs[i].main = (main_func_t)dlsym(h, "main");
             if (progs[i].main) {
-                // Patch GOT of newly loaded image to redirect syscalls to TVM
+                // Patch GOT — only fork/vfork needed for iOS
                 uint32_t img_count_after = _dyld_image_count();
                 for (uint32_t idx = img_count_before; idx < img_count_after; idx++) {
                     const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(idx);
@@ -251,15 +253,17 @@ int tvm_main(int outfd, int port)
         }
     }
 
+    // Use dup'd stderr for TVM logs so --console captures them on iOS
+    int logfd = dup(STDERR_FILENO);
+    if (logfd < 0) logfd = outfd;
+
     outlog(outfd, "tvm_main: init\n");
-    tvm_init_with_outfd("devtool", outfd);
+    tvm_init_with_outfd("devtool", logfd);
 
     unlink(initrc_path);
 
-    // Mount initrd directly from embedded data
     tvm_mount_cpio("/tvm", initrd_data, initrd_size);
 
-    // Register dlopen'd programs with TVM
     for (int i = 0; progs[i].vpath; i++) {
         if (progs[i].main)
             tvm_register_program(progs[i].vpath, progs[i].main);
@@ -267,13 +271,15 @@ int tvm_main(int outfd, int port)
 
     chdir(home);
 
-    outlog(outfd, "tvm_main: exec dropbear\n");
-
+    // Call dropbear directly (not through TVM execvp) to avoid
+    // emulator_call and TVM exec context issues
     char port_str[16];
     sprintf(port_str, "%d", port);
-
+    setenv("DROPBEAR_PASSWORD", "alpine", 1);
     char *argv[] = {"sshd", "-R", "-e", "-F", "-E", "-p", port_str, NULL};
-    execvp("/tvm/bin/dropbear", argv);
+    if (progs[0].main) {
+        progs[0].main(7, argv, (char *[]){NULL});
+    }
 
     outlog(outfd, "tvm_main: execvp failed\n");
     return -1;
