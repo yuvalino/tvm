@@ -47,11 +47,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
         list(APPEND TVM_SHARED_LIBS ncurses)
     endif()
     target_link_libraries(tvm_shared PRIVATE ${TVM_SHARED_LIBS})
-    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        target_link_options(tvm_shared PRIVATE
-            -Wl,-sectcreate,__DATA,__initrd,${INITRD_CPIO}
-        )
-    endif()
+    target_link_options(tvm_shared PRIVATE
+        -Wl,-sectcreate,__DATA,__initrd,${INITRD_CPIO}
+    )
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 

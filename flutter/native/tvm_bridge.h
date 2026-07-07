@@ -4,7 +4,7 @@
 #ifdef _WIN32
 #define TVM_EXPORT __declspec(dllexport)
 #else
-#define TVM_EXPORT __attribute__((visibility("default")))
+#define TVM_EXPORT __attribute__((visibility("default"), used))
 #endif
 
 #ifdef __cplusplus

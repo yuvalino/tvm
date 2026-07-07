@@ -79,7 +79,12 @@ class TvmBindings {
 
   static DynamicLibrary _openLibrary() {
     if (Platform.isIOS || Platform.isMacOS) {
-      return DynamicLibrary.process();
+      final lib = DynamicLibrary.process();
+      // Verify tvm_load is findable
+      if (!lib.providesSymbol('tvm_load')) {
+        throw Exception('tvm_load not found in process — tvm_bridge.c may not be linked');
+      }
+      return lib;
     }
     if (Platform.isAndroid || Platform.isLinux) {
       return DynamicLibrary.open('libtvm_bridge.so');
@@ -95,6 +100,11 @@ class TvmBindings {
       final exe = Platform.resolvedExecutable;
       final appDir = exe.substring(0, exe.lastIndexOf('/'));
       return '$appDir/../Frameworks/libtvm.dylib';
+    }
+    if (Platform.isIOS) {
+      final exe = Platform.resolvedExecutable;
+      final appDir = exe.substring(0, exe.lastIndexOf('/'));
+      return '$appDir/Frameworks/libtvm.dylib';
     }
     // Linux/Android: libtvm.so is loaded via libtvm_bridge.so linkage
     // iOS: statically linked

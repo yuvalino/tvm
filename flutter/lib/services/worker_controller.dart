@@ -58,6 +58,7 @@ class WorkerController {
 
     if (!TvmBindings.instance.isAvailable) {
       _addLog('[WARN] TVM native library not loaded');
+      _addLog('[WARN] exe: ${Platform.resolvedExecutable}');
       if (TvmBindings.instance.loadError != null) {
         _addLog('[WARN] ${TvmBindings.instance.loadError}');
       }

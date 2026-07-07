@@ -68,55 +68,20 @@ int tvm_main(int outfd, int port)
     }
 
     const char *tmpdir = get_tmpdir();
-    char initrd_path[PATH_MAX];
-    snprintf(initrd_path, sizeof(initrd_path), "%stvm_initrd_XXXXXX", tmpdir);
-    int tmpfd = mkstemp(initrd_path);
-    if (tmpfd < 0) {
-        outlog(outfd, "tvm_main: mkstemp failed\n");
+
+    // Use Frameworks dir directly on PATH — iOS requires mmap(PROT_EXEC)
+    // to operate on files in the signed app bundle, not through symlinks
+    const char *fwdir = get_frameworks_dir();
+    if (!fwdir) {
+        outlog(outfd, "tvm_main: cannot find Frameworks dir\n");
         return -1;
     }
-    const uint8_t *p = initrd_data;
-    size_t remain = initrd_size;
-    while (remain > 0) {
-        ssize_t w = write(tmpfd, p, remain);
-        if (w <= 0) { close(tmpfd); return -1; }
-        p += w;
-        remain -= w;
-    }
-    close(tmpfd);
-
-    // Create symlinks to bundled dylibs in a writable dir so TVM's execvp
-    // finds them via PATH and loads them through the ulinker
-    const char *fwdir = get_frameworks_dir();
     char bindir[PATH_MAX];
-    snprintf(bindir, sizeof(bindir), "%stvm_bin", tmpdir);
-    mkdir(bindir, 0755);
-
-    struct { const char *name; const char *dylib; } bins[] = {
-        { "dropbear", "libdropbear.dylib" },
-        { "sh",       "libmksh.dylib"     },
-        { "toybox",   "libtoybox.dylib"   },
-        { "vim",      "libvim.dylib"      },
-        { NULL, NULL }
-    };
-
-    if (fwdir) {
-        for (int i = 0; bins[i].name; i++) {
-            char target[PATH_MAX], link[PATH_MAX];
-            snprintf(target, sizeof(target), "%s/%s", fwdir, bins[i].dylib);
-            snprintf(link, sizeof(link), "%s/%s", bindir, bins[i].name);
-            unlink(link);
-            if (0 == symlink(target, link)) {
-                outlog(outfd, "tvm_main: linked ");
-                outlog(outfd, bins[i].name);
-                outlog(outfd, "\n");
-            }
-        }
-    }
+    snprintf(bindir, sizeof(bindir), "%s", fwdir);
 
     char initrc_path[PATH_MAX];
     snprintf(initrc_path, sizeof(initrc_path), "%stvm_initrc_XXXXXX", tmpdir);
-    tmpfd = mkstemp(initrc_path);
+    int tmpfd = mkstemp(initrc_path);
     if (tmpfd < 0) {
         outlog(outfd, "tvm_main: mkstemp initrc failed\n");
         return -1;
@@ -131,14 +96,12 @@ int tvm_main(int outfd, int port)
 
     char initrc[1024];
     int n = sprintf(initrc,
-        "mount %s:/tvm\n"
-        "setenv TVM_SHELL=%s/sh\n"
+        "setenv TVM_SHELL=%s/libmksh.dylib\n"
         "setenv PATH=%s:/tvm/bin:$PATH\n"
         "setenv HOME=%s\n"
         "setenv TMPDIR=%s\n"
         "setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
         "echo TVM initialized\n",
-        initrd_path,
         bindir,
         bindir,
         home, home_tmp);
@@ -150,8 +113,12 @@ int tvm_main(int outfd, int port)
     outlog(outfd, "tvm_main: init\n");
     tvm_init_with_outfd("devtool", outfd);
 
-    unlink(initrd_path);
     unlink(initrc_path);
+
+    // Mount initrd directly from embedded data (avoids temp file I/O
+    // which fails on iOS because TVM's interposed read can't access
+    // file descriptors created before tvm_init)
+    tvm_mount_cpio("/tvm", initrd_data, initrd_size);
 
     chdir(home);
 
@@ -161,7 +128,7 @@ int tvm_main(int outfd, int port)
     sprintf(port_str, "%d", port);
 
     char *argv[] = {"sshd", "-R", "-e", "-F", "-E", "-p", port_str, NULL};
-    execvp("dropbear", argv);
+    execvp("libdropbear.dylib", argv);
 
     outlog(outfd, "tvm_main: execvp failed\n");
     return -1;

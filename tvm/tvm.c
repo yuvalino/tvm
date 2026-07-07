@@ -5,6 +5,7 @@
 // headers are included.
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <libkern/OSCacheControl.h>
 #if TARGET_OS_IOS
 #define __IOS_UNAVAILABLE
 #define __IOS_PROHIBITED
@@ -8690,7 +8691,25 @@ static int     ulinker_close(void *arg, int fd)                         { VERIFY
 static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { VERIFY(arg == current); return read(fd, buf, count); }
 static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { VERIFY(arg == current); return fstat(fd, statbuf); }
 
-static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { VERIFY(arg == current); return mmap(hint, length, prot, flags, fd, offset); }
+static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) {
+    VERIFY(arg == current);
+#if TARGET_OS_IOS
+    // iOS: mmap(PROT_EXEC) on file-backed mappings is denied by the kernel.
+    // Read file content into the already-reserved region, then make it executable.
+    if ((prot & PROT_EXEC) && fd >= 0) {
+        // The hint address is within a pre-reserved PROT_NONE region (MAP_FIXED).
+        // Re-map it as writable, copy file content, then make executable.
+        void *p = mmap(hint, length, PROT_READ | PROT_WRITE,
+                        MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (p == MAP_FAILED) return MAP_FAILED;
+        pread(fd, p, length, offset);
+        mprotect(p, length, prot);
+        sys_icache_invalidate(p, length);
+        return p;
+    }
+#endif
+    return mmap(hint, length, prot, flags, fd, offset);
+}
 static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            {
                                                                     #ifdef TRACE_MMAP
                                                                         INFO("munmap %p-%p (ulinker)", addr, (uintptr_t)addr + size);
