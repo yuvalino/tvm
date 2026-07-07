@@ -1,7 +1,9 @@
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -9,9 +11,79 @@
 #include <string.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "tvm.h"
+
+// Patch a loaded dylib's GOT entries to redirect function calls to TVM's
+// interposed versions. This is needed on iOS where the ulinker can't load
+// dylibs (mmap PROT_EXEC blocked) so we use dlopen instead.
+static void patch_got_for_image(const struct mach_header_64 *header, intptr_t slide)
+{
+    const struct symtab_command *symtab_cmd = NULL;
+    const struct dysymtab_command *dysymtab_cmd = NULL;
+    const struct segment_command_64 *linkedit_seg = NULL;
+    const struct segment_command_64 *data_seg = NULL;
+    const struct segment_command_64 *data_const_seg = NULL;
+
+    const uint8_t *p = (const uint8_t *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SYMTAB)
+            symtab_cmd = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_DYSYMTAB)
+            dysymtab_cmd = (const struct dysymtab_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit_seg = seg;
+            else if (strcmp(seg->segname, "__DATA") == 0) data_seg = seg;
+            else if (strcmp(seg->segname, "__DATA_CONST") == 0) data_const_seg = seg;
+        }
+        p += lc->cmdsize;
+    }
+
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit_seg) return;
+
+    uintptr_t linkedit_base = slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
+    const struct nlist_64 *symtab = (const struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+    const char *strtab = (const char *)(linkedit_base + symtab_cmd->stroff);
+    const uint32_t *indirect_symtab = (const uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+    // Process __DATA and __DATA_CONST segments
+    const struct segment_command_64 *segs[] = { data_seg, data_const_seg, NULL };
+    for (int s = 0; segs[s]; s++) {
+        const struct section_64 *sec = (const struct section_64 *)((const uint8_t *)segs[s] + sizeof(*segs[s]));
+        for (uint32_t j = 0; j < segs[s]->nsects; j++, sec++) {
+            uint32_t type = sec->flags & SECTION_TYPE;
+            if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS)
+                continue;
+
+            uint32_t count = (uint32_t)(sec->size / sizeof(void *));
+            void **got = (void **)(slide + sec->addr);
+
+            for (uint32_t k = 0; k < count; k++) {
+                uint32_t sym_idx = indirect_symtab[sec->reserved1 + k];
+                if (sym_idx == INDIRECT_SYMBOL_ABS || sym_idx == INDIRECT_SYMBOL_LOCAL)
+                    continue;
+                if (sym_idx >= symtab_cmd->nsyms) continue;
+
+                const char *name = strtab + symtab[sym_idx].n_un.n_strx;
+                if (name[0] == '_') name++;
+
+                // Look up TVM's version from libtvm.dylib directly
+                // (RTLD_DEFAULT finds libSystem first, so use RTLD_SELF
+                // from a function inside libtvm)
+                void *tvm_func = dlsym(RTLD_SELF, name);
+                if (tvm_func && tvm_func != got[k]) {
+                    uintptr_t page = (uintptr_t)&got[k] & ~0xFFF;
+                    mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE);
+                    got[k] = tvm_func;
+                }
+            }
+        }
+    }
+}
 
 static void _anchor(void) {}
 
@@ -123,10 +195,18 @@ int tvm_main(int outfd, int port)
     for (int i = 0; progs[i].vpath; i++) {
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", fwdir, progs[i].dylib);
+        uint32_t img_count_before = _dyld_image_count();
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (h) {
             progs[i].main = (main_func_t)dlsym(h, "main");
             if (progs[i].main) {
+                // Patch GOT of newly loaded image to redirect syscalls to TVM
+                uint32_t img_count_after = _dyld_image_count();
+                for (uint32_t idx = img_count_before; idx < img_count_after; idx++) {
+                    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(idx);
+                    intptr_t slide = _dyld_get_image_vmaddr_slide(idx);
+                    if (mh) patch_got_for_image(mh, slide);
+                }
                 outlog(outfd, "tvm_main: loaded ");
                 outlog(outfd, progs[i].dylib);
                 outlog(outfd, "\n");
