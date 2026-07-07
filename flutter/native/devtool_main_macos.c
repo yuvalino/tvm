@@ -110,15 +110,47 @@ int tvm_main(int outfd, int port)
 
     setenv("TVM_INITRC", initrc_path, 1);
 
+    // Pre-load dylibs via dlopen BEFORE tvm_init (uses real dlopen).
+    // On iOS, the ulinker can't mmap(PROT_EXEC) so we dlopen and
+    // register the main symbols for tvm_register_program after init.
+    struct { const char *vpath; const char *dylib; main_func_t main; } progs[] = {
+        { "/tvm/bin/dropbear", "libdropbear.dylib", NULL },
+        { "/tvm/bin/sh",      "libmksh.dylib",     NULL },
+        { "/tvm/bin/toybox",  "libtoybox.dylib",   NULL },
+        { "/tvm/bin/vim",     "libvim.dylib",      NULL },
+        { NULL, NULL, NULL }
+    };
+    for (int i = 0; progs[i].vpath; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", fwdir, progs[i].dylib);
+        void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            progs[i].main = (main_func_t)dlsym(h, "main");
+            if (progs[i].main) {
+                outlog(outfd, "tvm_main: loaded ");
+                outlog(outfd, progs[i].dylib);
+                outlog(outfd, "\n");
+            }
+        } else {
+            outlog(outfd, "tvm_main: dlopen failed: ");
+            outlog(outfd, dlerror());
+            outlog(outfd, "\n");
+        }
+    }
+
     outlog(outfd, "tvm_main: init\n");
     tvm_init_with_outfd("devtool", outfd);
 
     unlink(initrc_path);
 
-    // Mount initrd directly from embedded data (avoids temp file I/O
-    // which fails on iOS because TVM's interposed read can't access
-    // file descriptors created before tvm_init)
+    // Mount initrd directly from embedded data
     tvm_mount_cpio("/tvm", initrd_data, initrd_size);
+
+    // Register dlopen'd programs with TVM
+    for (int i = 0; progs[i].vpath; i++) {
+        if (progs[i].main)
+            tvm_register_program(progs[i].vpath, progs[i].main);
+    }
 
     chdir(home);
 
@@ -128,7 +160,7 @@ int tvm_main(int outfd, int port)
     sprintf(port_str, "%d", port);
 
     char *argv[] = {"sshd", "-R", "-e", "-F", "-E", "-p", port_str, NULL};
-    execvp("libdropbear.dylib", argv);
+    execvp("/tvm/bin/dropbear", argv);
 
     outlog(outfd, "tvm_main: execvp failed\n");
     return -1;

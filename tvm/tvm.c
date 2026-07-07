@@ -8693,21 +8693,6 @@ static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { VERIFY
 
 static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) {
     VERIFY(arg == current);
-#if TARGET_OS_IOS
-    // iOS: mmap(PROT_EXEC) on file-backed mappings is denied by the kernel.
-    // Read file content into the already-reserved region, then make it executable.
-    if ((prot & PROT_EXEC) && fd >= 0) {
-        // The hint address is within a pre-reserved PROT_NONE region (MAP_FIXED).
-        // Re-map it as writable, copy file content, then make executable.
-        void *p = mmap(hint, length, PROT_READ | PROT_WRITE,
-                        MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-        if (p == MAP_FAILED) return MAP_FAILED;
-        pread(fd, p, length, offset);
-        mprotect(p, length, prot);
-        sys_icache_invalidate(p, length);
-        return p;
-    }
-#endif
     return mmap(hint, length, prot, flags, fd, offset);
 }
 static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            {
@@ -12864,15 +12849,25 @@ do_exec:
     *current->tsk_relocs.opterr = 1;
     current->tsk_data->optreset = 0;
 
-    int callerr = emulator_call(&ret, (uint64_t)main_func,
-                  (uint64_t)argc,
-                  (uint64_t)argv,
-                  (uint64_t)envp,
-                0, 0, 0);
-    if (callerr)
-        printf("execve emulator_call failed!\n");
+    // If the function is a registered program (from dlopen, not ulinker),
+    // call it directly — emulator_call would fail because the address isn't
+    // in any ulinker-loaded range.
+    if (find_program(pathname)) {
+        INFO("execve: calling registered program %s directly", pathname);
+        ret = (uint64_t)main_func(argc, argv, envp);
+        INFO("execve: registered program returned %llu", (unsigned long long)ret);
+    } else {
+        int callerr = emulator_call(&ret, (uint64_t)main_func,
+                      (uint64_t)argc,
+                      (uint64_t)argv,
+                      (uint64_t)envp,
+                    0, 0, 0);
+        if (callerr)
+            printf("execve emulator_call failed!\n");
+        if (callerr) { exit(callerr); }
+    }
 
-    exit(callerr ? callerr : (int)ret);
+    exit((int)ret);
 }
 
 FUNCTION_DEFINE_VA2(int, execl, const char *, pathname, const char *, arg/*, ... , (char *) NULL */) {
