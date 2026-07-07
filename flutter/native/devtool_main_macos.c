@@ -202,13 +202,12 @@ int tvm_main(int outfd, int port)
 
     char initrc[1024];
     int n = sprintf(initrc,
-        "setenv TVM_SHELL=%s/libmksh.dylib\n"
+        "setenv TVM_SHELL=/tvm/bin/sh\n"
         "setenv PATH=%s:/tvm/bin:$PATH\n"
         "setenv HOME=%s\n"
         "setenv TMPDIR=%s\n"
         "setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
         "echo TVM initialized\n",
-        bindir,
         bindir,
         home, home_tmp);
     write(tmpfd, initrc, n);
