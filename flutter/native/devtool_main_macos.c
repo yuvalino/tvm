@@ -71,14 +71,48 @@ static void patch_got_for_image(const struct mach_header_64 *header, intptr_t sl
                 const char *name = strtab + symtab[sym_idx].n_un.n_strx;
                 if (name[0] == '_') name++;
 
-                // Look up TVM's version from libtvm.dylib directly
-                // (RTLD_DEFAULT finds libSystem first, so use RTLD_SELF
-                // from a function inside libtvm)
-                void *tvm_func = dlsym(RTLD_SELF, name);
-                if (tvm_func && tvm_func != got[k]) {
-                    uintptr_t page = (uintptr_t)&got[k] & ~0xFFF;
-                    mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE);
-                    got[k] = tvm_func;
+                // Only patch process-management functions that TVM needs
+                // to interpose. I/O functions (read/write/open) should use
+                // real syscalls since the registered program's fds aren't
+                // in TVM's fd table.
+                // Patch process + I/O functions for TVM interposition.
+                // Socket I/O (read/write/close/fcntl/select/poll) must
+                // also be patched because TVM's fork copies TVM's fd
+                // table which needs to track all fds.
+                static const char *patch_list[] = {
+                    // process
+                    "fork", "vfork", "execv", "execve", "execvp",
+                    "exit", "_exit",
+                    "getpid", "getppid", "getpgid", "getpgrp",
+                    "setpgid", "setsid", "getsid",
+                    "kill", "waitpid", "wait",
+                    // signals
+                    "sigaction", "signal", "sigprocmask",
+                    "pthread_sigmask", "raise",
+                    // env
+                    "getenv", "setenv", "unsetenv", "putenv",
+                    // I/O — needed for TVM fd table
+                    "open", "openat", "close", "read", "write",
+                    "fcntl", "dup", "dup2",
+                    "socket", "bind", "listen", "accept",
+                    "connect", "setsockopt", "getsockopt",
+                    "select", "poll",
+                    "pipe",
+                    // misc
+                    "chdir", "getcwd", "mkdir",
+                    NULL
+                };
+                int should_patch = 0;
+                for (const char **pp = patch_list; *pp; pp++) {
+                    if (strcmp(name, *pp) == 0) { should_patch = 1; break; }
+                }
+                if (should_patch) {
+                    void *tvm_func = dlsym(RTLD_SELF, name);
+                    if (tvm_func && tvm_func != got[k]) {
+                        uintptr_t page = (uintptr_t)&got[k] & ~0xFFF;
+                        mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE);
+                        got[k] = tvm_func;
+                    }
                 }
             }
         }
