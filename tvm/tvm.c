@@ -10486,6 +10486,10 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
     }
 
     int ret = file_stat(pathname, statbuf, 0);
+    // Ensure regular files are marked executable — iOS sandbox may strip
+    // execute bits on files accessed through symlinks from writable dirs
+    if (ret == 0 && S_ISREG(statbuf->st_mode))
+        statbuf->st_mode |= S_IXUSR | S_IXGRP | S_IXOTH;
     tvm_sig_leave();
     return ret;
 }
@@ -12975,7 +12979,7 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
                     memcpy(trypath, path, len);
                     trypath[len] = '/';
                     strcpy(trypath + len + 1, file);
-                    if (0 == access(trypath, X_OK)) {
+                    if (0 == access(trypath, R_OK)) {
                         file = trypath;
                         found = 1;
                         break;

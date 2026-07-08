@@ -91,6 +91,7 @@ int tvm_main(int outfd, int port)
             snprintf(link, sizeof(link), "%s/%s", bindir, bins[i].name);
             unlink(link);
             if (0 == symlink(target, link)) {
+                chmod(link, 0755);
                 outlog(outfd, "tvm_main: linked ");
                 outlog(outfd, bins[i].name);
                 outlog(outfd, "\n");
@@ -117,7 +118,12 @@ int tvm_main(int outfd, int port)
             unlink(link);
             symlink(vim_target, link);
         }
-        // toybox applet symlinks — link common applets to toybox
+        // Write toybox applet wrapper scripts that exec the dylib.
+        // Can't use symlinks: iOS stat() on symlinks from $TMPDIR to
+        // Frameworks/ reports no execute permission, so mksh skips them.
+        char shell_path[PATH_MAX], toybox_path[PATH_MAX];
+        snprintf(shell_path, sizeof(shell_path), "%s/sh", bindir);
+        snprintf(toybox_path, sizeof(toybox_path), "%s/libtoybox.dylib", fwdir);
         const char *toybox_applets[] = {
             "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
             "cut", "date", "dd", "df", "diff", "dirname", "du",
@@ -132,13 +138,19 @@ int tvm_main(int outfd, int port)
             "unlink", "wc", "which", "who", "whoami", "xargs", "yes",
             NULL
         };
-        char toybox_target[PATH_MAX];
-        snprintf(toybox_target, sizeof(toybox_target), "%s/libtoybox.dylib", fwdir);
         for (const char **a = toybox_applets; *a; a++) {
-            char link[PATH_MAX];
-            snprintf(link, sizeof(link), "%s/%s", bindir, *a);
-            if (access(link, F_OK) != 0) {
-                symlink(toybox_target, link);
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s", bindir, *a);
+            if (access(path, F_OK) != 0) {
+                int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+                if (wfd >= 0) {
+                    char script[PATH_MAX * 2];
+                    int slen = snprintf(script, sizeof(script),
+                        "#!%s\nexec %s %s \"$@\"\n",
+                        shell_path, toybox_path, *a);
+                    write(wfd, script, slen);
+                    close(wfd);
+                }
             }
         }
     }
@@ -161,7 +173,7 @@ int tvm_main(int outfd, int port)
     char initrc[1024];
     int n = sprintf(initrc,
         "setenv TVM_SHELL=%s/sh\n"
-        "setenv PATH=%s:/tvm/bin:$PATH\n"
+        "setenv PATH=%s:$PATH\n"
         "setenv HOME=%s\n"
         "setenv TMPDIR=%s\n"
         "setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
@@ -179,10 +191,11 @@ int tvm_main(int outfd, int port)
     char tvm_shell[PATH_MAX];
     snprintf(tvm_shell, sizeof(tvm_shell), "%s/sh", bindir);
     setenv("TVM_SHELL", tvm_shell, 1);
+    setenv("TVM_FWDIR", fwdir, 1);
 
     // Also set PATH at process level
     char path_env[PATH_MAX * 2];
-    snprintf(path_env, sizeof(path_env), "%s:/tvm/bin:/usr/bin:/bin:/usr/sbin:/sbin", bindir);
+    snprintf(path_env, sizeof(path_env), "%s:/usr/bin:/bin:/usr/sbin:/sbin", bindir);
     setenv("PATH", path_env, 1);
 
     // Use dup'd stderr for TVM kernel logs so --console captures them
@@ -197,23 +210,14 @@ int tvm_main(int outfd, int port)
     // Mount initrd from embedded Mach-O section data directly
     tvm_mount_cpio("/tvm", initrd_data, initrd_size);
 
-    // Override initrd binaries with symlinks to the Frameworks dylibs.
-    // The initrd contains macOS binaries; on iOS we need the dylibs.
-    if (fwdir) {
-        struct { const char *vpath; const char *dylib; } overrides[] = {
-            { "/tvm/bin/dropbear", "libdropbear.dylib" },
-            { "/tvm/bin/sh",      "libmksh.dylib"     },
-            { "/tvm/bin/toybox",  "libtoybox.dylib"   },
-            { "/tvm/bin/vim",     "libvim.dylib"      },
-            { NULL, NULL }
-        };
-        for (int i = 0; overrides[i].vpath; i++) {
-            char target[PATH_MAX];
-            snprintf(target, sizeof(target), "%s/%s", fwdir, overrides[i].dylib);
-            unlink(overrides[i].vpath);
-            symlink(target, overrides[i].vpath);
-        }
-    }
+    // Register the Frameworks dylibs as the VFS binaries.
+    // The initrd contains macOS binaries which can't load on iOS.
+    // tvm_register_program makes find_program() return the main func,
+    // which __tvm_execve uses to skip the ulinker (calling main directly).
+    // This doesn't work for iOS since the registered program lacks
+    // ulinker context. Instead, we just need the PATH to find the
+    // $TMPDIR/tvm_bin/ symlinks first (before /tvm/bin VFS entries).
+    // The real fix is done below in the initrc PATH ordering.
 
     chdir(home);
 
