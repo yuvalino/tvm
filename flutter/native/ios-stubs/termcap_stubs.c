@@ -1,6 +1,11 @@
 /* Stub termcap implementations for iOS — TVM intercepts tputs at runtime */
 #include <string.h>
 
+char PC = 0;
+char *BC = 0;
+char *UP = 0;
+short ospeed = 0;
+
 int tgetent(char *bp, const char *name) { (void)bp; (void)name; return 1; }
 int tgetflag(const char *id) { (void)id; return 0; }
 int tgetnum(const char *id) { (void)id; return -1; }

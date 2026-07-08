@@ -96,6 +96,51 @@ int tvm_main(int outfd, int port)
                 outlog(outfd, "\n");
             }
         }
+        // dropbear multi-call symlinks
+        const char *dropbear_applets[] = {
+            "scp", "dbclient", "ssh", "dropbearkey", "ssh-keygen", "sshd", NULL
+        };
+        char dropbear_target[PATH_MAX];
+        snprintf(dropbear_target, sizeof(dropbear_target), "%s/libdropbear.dylib", fwdir);
+        for (const char **a = dropbear_applets; *a; a++) {
+            char link[PATH_MAX];
+            snprintf(link, sizeof(link), "%s/%s", bindir, *a);
+            unlink(link);
+            symlink(dropbear_target, link);
+        }
+        // vi -> vim
+        {
+            char link[PATH_MAX];
+            char vim_target[PATH_MAX];
+            snprintf(vim_target, sizeof(vim_target), "%s/libvim.dylib", fwdir);
+            snprintf(link, sizeof(link), "%s/vi", bindir);
+            unlink(link);
+            symlink(vim_target, link);
+        }
+        // toybox applet symlinks — link common applets to toybox
+        const char *toybox_applets[] = {
+            "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
+            "cut", "date", "dd", "df", "diff", "dirname", "du",
+            "echo", "env", "expr", "false", "find", "grep", "groups",
+            "head", "hostname", "id", "kill", "ln", "ls", "md5sum",
+            "mkdir", "mktemp", "mount", "mv", "nice", "nl", "nohup",
+            "od", "paste", "patch", "printenv", "printf", "ps", "pwd",
+            "readlink", "realpath", "rm", "rmdir", "sed", "seq",
+            "sha1sum", "sha256sum", "sleep", "sort", "split", "stat",
+            "strings", "tail", "tar", "tee", "test", "time", "touch",
+            "tr", "true", "truncate", "tty", "uname", "uniq",
+            "unlink", "wc", "which", "who", "whoami", "xargs", "yes",
+            NULL
+        };
+        char toybox_target[PATH_MAX];
+        snprintf(toybox_target, sizeof(toybox_target), "%s/libtoybox.dylib", fwdir);
+        for (const char **a = toybox_applets; *a; a++) {
+            char link[PATH_MAX];
+            snprintf(link, sizeof(link), "%s/%s", bindir, *a);
+            if (access(link, F_OK) != 0) {
+                symlink(toybox_target, link);
+            }
+        }
     }
 
     char initrc_path[PATH_MAX];
@@ -135,6 +180,11 @@ int tvm_main(int outfd, int port)
     snprintf(tvm_shell, sizeof(tvm_shell), "%s/sh", bindir);
     setenv("TVM_SHELL", tvm_shell, 1);
 
+    // Also set PATH at process level
+    char path_env[PATH_MAX * 2];
+    snprintf(path_env, sizeof(path_env), "%s:/tvm/bin:/usr/bin:/bin:/usr/sbin:/sbin", bindir);
+    setenv("PATH", path_env, 1);
+
     // Use dup'd stderr for TVM kernel logs so --console captures them
     int logfd = dup(STDERR_FILENO);
     if (logfd < 0) logfd = outfd;
@@ -146,6 +196,24 @@ int tvm_main(int outfd, int port)
 
     // Mount initrd from embedded Mach-O section data directly
     tvm_mount_cpio("/tvm", initrd_data, initrd_size);
+
+    // Override initrd binaries with symlinks to the Frameworks dylibs.
+    // The initrd contains macOS binaries; on iOS we need the dylibs.
+    if (fwdir) {
+        struct { const char *vpath; const char *dylib; } overrides[] = {
+            { "/tvm/bin/dropbear", "libdropbear.dylib" },
+            { "/tvm/bin/sh",      "libmksh.dylib"     },
+            { "/tvm/bin/toybox",  "libtoybox.dylib"   },
+            { "/tvm/bin/vim",     "libvim.dylib"      },
+            { NULL, NULL }
+        };
+        for (int i = 0; overrides[i].vpath; i++) {
+            char target[PATH_MAX];
+            snprintf(target, sizeof(target), "%s/%s", fwdir, overrides[i].dylib);
+            unlink(overrides[i].vpath);
+            symlink(target, overrides[i].vpath);
+        }
+    }
 
     chdir(home);
 

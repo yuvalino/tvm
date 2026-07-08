@@ -3345,7 +3345,8 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         siginfo.fs_file_start = 0; // thin binary, no fat offset
         siginfo.fs_blob_start = (void *)(long)codesig_off;
         siginfo.fs_blob_size  = codesig_size;
-        if (fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo) == -1) {
+        int sigresult = fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo);
+        if (sigresult == -1) {
             ERROR("failed to register code signature for \"%s\": -%d (%s)", filename, errno, strerror(errno));
             goto out;
         }
