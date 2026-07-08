@@ -1,6 +1,9 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <errno.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -3283,9 +3286,15 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
     Elf64_Addr min_vaddr = UINTPTR_MAX;
     Elf64_Addr max_vaddr = 0;
 
+    uint32_t codesig_off = 0, codesig_size = 0;
     int found_lc_segment = 0;
     curr_lc = lc;
     for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+        if (curr_lc->cmd == LC_CODE_SIGNATURE) {
+            const struct linkedit_data_command *sig = (const struct linkedit_data_command *)curr_lc;
+            codesig_off = sig->dataoff;
+            codesig_size = sig->datasize;
+        }
         if (curr_lc->cmd != LC_SEGMENT_64) {
             continue;
         }
@@ -3327,6 +3336,21 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
     DLBASE(dl)->dl_size = load_size;
 
     dl->dlm64_load_bias = (uintptr_t)base - min_vaddr;
+
+    // Register code signature with kernel so mmap(PROT_EXEC) is allowed on iOS.
+    // Must happen before any executable segment mapping.
+#if defined(__APPLE__) && TARGET_OS_IOS
+    if (codesig_off && codesig_size && !DLBASE(dl)->dl_emu) {
+        fsignatures_t siginfo;
+        siginfo.fs_file_start = 0; // thin binary, no fat offset
+        siginfo.fs_blob_start = (void *)(long)codesig_off;
+        siginfo.fs_blob_size  = codesig_size;
+        if (fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo) == -1) {
+            ERROR("failed to register code signature for \"%s\": -%d (%s)", filename, errno, strerror(errno));
+            goto out;
+        }
+    }
+#endif
 
     // load segments
 
