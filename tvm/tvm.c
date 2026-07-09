@@ -13029,7 +13029,17 @@ FUNCTION_DEFINE1(int, system, const char *, command) {
         sigaction(SIGINT, &old_int, NULL);
         sigaction(SIGQUIT, &old_quit, NULL);
         sigprocmask(SIG_SETMASK, &old_mask, NULL);
-        execl(sh, "sh", "-c", command, (char *)NULL);
+        // Source $ENV so shell functions (e.g. toybox applets on iOS)
+        // are available in the subshell
+        const char *env_file = getenv("ENV");
+        if (env_file && *env_file) {
+            size_t elen = strlen(env_file) + strlen(command) + 16;
+            char *wrapped = alloca(elen);
+            snprintf(wrapped, elen, ". '%s';%s", env_file, command);
+            execl(sh, "sh", "-c", wrapped, (char *)NULL);
+        } else {
+            execl(sh, "sh", "-c", command, (char *)NULL);
+        }
         _exit(127);
     }
 

@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -155,7 +156,10 @@ def forkless() -> Iterator[Forkless]:
 def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localhost") -> Iterator[spawn]:
 
     if command:
-        command = " " + command
+        if address != "localhost" and exe == "ssh":
+            command = " " + shlex.quote(command)
+        else:
+            command = " " + command
     else:
         command = ""
     portarg = "-p"
@@ -235,27 +239,31 @@ def test_connect_echo(forkless: Forkless):
         assert 0 == p.wait()
 
 def test_scp(forkless: Forkless):
-    if DEVICE:
-        pytest.skip("SCP via pexpect unreliable over network — manual SCP works")
     # Get a writable dir inside TVM for SCP source/dest
     with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address) as p:
         p.expect(r"(/\S+)")
-        home = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
+        remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
         p.expect(EOF)
 
-    f1 = f"{home}/scp_src"
-    f2 = f"{home}/scp_dst"
+    f1 = f"{remote_dir}/scp_src"
+    f2 = tempfile.mktemp(prefix="scp_dst_") if DEVICE else f"{remote_dir}/scp_dst"
 
     with ssh(forkless.port, f"echo hello > {f1}", address=forkless.address) as p:
         p.expect(EOF)
 
-    with ssh(forkless.port, f"{'root@' if forkless.address != 'localhost' else ''}{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address) as p:
+    user_prefix = "root@" if forkless.address != "localhost" else ""
+    with ssh(forkless.port, f"{user_prefix}{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address) as p:
         p.expect(EOF)
         assert 0 == p.wait()
 
-    with ssh(forkless.port, f"cat {f2}", address=forkless.address) as p:
-        p.expect("hello")
-        p.expect(EOF)
+    if DEVICE:
+        with open(f2, "r") as f:
+            assert "hello" in f.read()
+        os.unlink(f2)
+    else:
+        with ssh(forkless.port, f"cat {f2}", address=forkless.address) as p:
+            p.expect("hello")
+            p.expect(EOF)
 
 def test_interactive(sshi: spawn):
     sshi.sendline("echo hello")
@@ -515,15 +523,13 @@ def test_concurrent_interactive(forkless: Forkless):
 
 def test_scp_large_file(forkless: Forkless):
     """SCP a larger file — exercises pipe buffering and stdio with bulk data."""
-    if DEVICE:
-        pytest.skip("SCP via pexpect unreliable over network — manual SCP works")
     with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address) as p:
         p.expect(r"(/\S+)")
-        home = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
+        remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
         p.expect(EOF)
 
-    f1 = f"{home}/scp_large_src"
-    f2 = f"{home}/scp_large_dst"
+    f1 = f"{remote_dir}/scp_large_src"
+    f2 = tempfile.mktemp(prefix="scp_large_dst_") if DEVICE else f"{remote_dir}/scp_large_dst"
 
     # Generate large file inside TVM (seq produces ~50k of text)
     with ssh(forkless.port, f"seq 1 10000 > {f1}", address=forkless.address) as p:
@@ -535,15 +541,20 @@ def test_scp_large_file(forkless: Forkless):
         p.expect(EOF)
         assert src_size > 10000, f"source file too small: {src_size}"
 
-    with ssh(forkless.port, f"{'root@' if forkless.address != 'localhost' else ''}{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address) as p:
+    user_prefix = "root@" if forkless.address != "localhost" else ""
+    with ssh(forkless.port, f"{user_prefix}{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address) as p:
         p.expect(EOF)
         assert 0 == p.wait()
 
-    with ssh(forkless.port, f"wc -c < {f2}", address=forkless.address) as p:
-        p.expect(r"(\d+)")
-        dst_size = int(p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1))
-        p.expect(EOF)
-        assert dst_size == src_size, f"expected {src_size}, got {dst_size}"
+    if DEVICE:
+        dst_size = os.path.getsize(f2)
+        os.unlink(f2)
+    else:
+        with ssh(forkless.port, f"wc -c < {f2}", address=forkless.address) as p:
+            p.expect(r"(\d+)")
+            dst_size = int(p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1))
+            p.expect(EOF)
+    assert dst_size == src_size, f"expected {src_size}, got {dst_size}"
 
 # ── Edge cases ────────────────────────────────────────────────
 
@@ -1401,8 +1412,6 @@ def test_system_false(sshi: spawn):
 
 def test_system_pipeline(sshi: spawn):
     """tvm system can run shell pipelines."""
-    if DEVICE:
-        pytest.skip("system() subshell doesn't source $ENV on iOS")
     sshi.sendline("/usr/bin/tvm shell 'echo abc | cat'; echo rc=$?")
     sshi.expect(r"abc")
     sshi.expect(r"rc=0")
