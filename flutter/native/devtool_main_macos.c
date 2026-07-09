@@ -155,12 +155,16 @@ int tvm_main(int outfd, int port)
                 toybox_path);
             write(pfd, line, len);
             const char *toybox_applets[] = {
-                "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
+                "base64", "basename", "cal", "cat", "chmod", "chown",
+                "cksum", "clear", "cmp", "comm", "cp", "cpio",
                 "cut", "date", "dd", "df", "diff", "dirname", "du",
-                "env", "expr", "false", "find", "grep", "groups",
-                "head", "hostname", "id", "kill", "ln", "ls", "md5sum",
+                "env", "expand", "expr", "false", "find",
+                "grep", "groups",
+                "head", "hostname", "id", "install", "kill",
+                "ln", "ls", "md5sum",
                 "mkdir", "mktemp", "mv", "nice", "nl", "nohup",
-                "od", "paste", "patch", "printenv", "printf", "ps", "pwd",
+                "od", "paste", "patch", "printenv", "printf",
+                "ps", "pwd",
                 "readlink", "realpath", "rm", "rmdir", "sed", "seq",
                 "sha1sum", "sha256sum", "sleep", "sort", "split", "stat",
                 "strings", "tail", "tar", "tee", "time", "touch",
@@ -225,6 +229,7 @@ int tvm_main(int outfd, int port)
     snprintf(path_env, sizeof(path_env), "%s:/usr/bin:/bin:/usr/sbin:/sbin", bindir);
     setenv("PATH", path_env, 1);
 
+
     // Use dup'd stderr for TVM kernel logs so --console captures them
     int logfd = dup(STDERR_FILENO);
     if (logfd < 0) logfd = outfd;
@@ -246,7 +251,23 @@ int tvm_main(int outfd, int port)
     // $TMPDIR/tvm_bin/ symlinks first (before /tvm/bin VFS entries).
     // The real fix is done below in the initrc PATH ordering.
 
-    chdir(home);
+    // Re-read HOME after tvm_init (the initrc sets it to the container path)
+    const char *real_home = getenv("HOME");
+    if (!real_home || !real_home[0]) real_home = home;
+    chdir(real_home);
+
+    // Create $HOME/.profile for interactive login shells
+    {
+        char dot_profile[PATH_MAX];
+        snprintf(dot_profile, sizeof(dot_profile), "%s/.profile", real_home);
+        int dpfd = open(dot_profile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (dpfd >= 0) {
+            char line[PATH_MAX * 2];
+            int len = snprintf(line, sizeof(line), ". '%s'\n", profile_path);
+            write(dpfd, line, len);
+            close(dpfd);
+        }
+    }
 
     const char *shell_check = getenv("TVM_SHELL");
     outlog(outfd, "tvm_main: TVM_SHELL=");
