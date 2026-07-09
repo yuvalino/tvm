@@ -118,41 +118,63 @@ int tvm_main(int outfd, int port)
             unlink(link);
             symlink(vim_target, link);
         }
-        // Write toybox applet wrapper scripts that exec the dylib.
-        // Can't use symlinks: iOS stat() on symlinks from $TMPDIR to
-        // Frameworks/ reports no execute permission, so mksh skips them.
-        char shell_path[PATH_MAX], toybox_path[PATH_MAX];
-        snprintf(shell_path, sizeof(shell_path), "%s/sh", bindir);
-        snprintf(toybox_path, sizeof(toybox_path), "%s/libtoybox.dylib", fwdir);
-        const char *toybox_applets[] = {
+        // Clean stale wrapper scripts from previous builds
+        const char *stale_applets[] = {
             "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
             "cut", "date", "dd", "df", "diff", "dirname", "du",
-            "echo", "env", "expr", "false", "find", "grep", "groups",
+            "env", "expr", "false", "find", "grep", "groups",
             "head", "hostname", "id", "kill", "ln", "ls", "md5sum",
-            "mkdir", "mktemp", "mount", "mv", "nice", "nl", "nohup",
+            "mkdir", "mktemp", "mv", "nice", "nl", "nohup",
             "od", "paste", "patch", "printenv", "printf", "ps", "pwd",
             "readlink", "realpath", "rm", "rmdir", "sed", "seq",
             "sha1sum", "sha256sum", "sleep", "sort", "split", "stat",
-            "strings", "tail", "tar", "tee", "test", "time", "touch",
+            "strings", "tail", "tar", "tee", "time", "touch",
             "tr", "true", "truncate", "tty", "uname", "uniq",
             "unlink", "wc", "which", "who", "whoami", "xargs", "yes",
             NULL
         };
-        for (const char **a = toybox_applets; *a; a++) {
+        for (const char **a = stale_applets; *a; a++) {
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/%s", bindir, *a);
-            if (access(path, F_OK) != 0) {
-                int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-                if (wfd >= 0) {
-                    char script[PATH_MAX * 2];
-                    int slen = snprintf(script, sizeof(script),
-                        "#!%s\nexec %s %s \"$@\"\n",
-                        shell_path, toybox_path, *a);
-                    write(wfd, script, slen);
-                    close(wfd);
-                }
-            }
+            unlink(path);
         }
+        // Write a shell profile that defines toybox applets as functions.
+        // Wrapper scripts don't work: mksh's 68-byte shebang buffer is too
+        // small for iOS container paths, and /tmp is read-only.
+        char toybox_path[PATH_MAX];
+        snprintf(toybox_path, sizeof(toybox_path), "%s/libtoybox.dylib", fwdir);
+        char profile_path[PATH_MAX];
+        snprintf(profile_path, sizeof(profile_path), "%stvm_profile", tmpdir);
+        int pfd = open(profile_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (pfd >= 0) {
+            char line[PATH_MAX * 2];
+            // T is the toybox dylib; the 'toybox' function calls it properly
+            int len = snprintf(line, sizeof(line),
+                "T='%s'\n"
+                "function toybox { \"$T\" \"$@\"; }\n",
+                toybox_path);
+            write(pfd, line, len);
+            const char *toybox_applets[] = {
+                "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
+                "cut", "date", "dd", "df", "diff", "dirname", "du",
+                "env", "expr", "false", "find", "grep", "groups",
+                "head", "hostname", "id", "kill", "ln", "ls", "md5sum",
+                "mkdir", "mktemp", "mv", "nice", "nl", "nohup",
+                "od", "paste", "patch", "printenv", "printf", "ps", "pwd",
+                "readlink", "realpath", "rm", "rmdir", "sed", "seq",
+                "sha1sum", "sha256sum", "sleep", "sort", "split", "stat",
+                "strings", "tail", "tar", "tee", "time", "touch",
+                "tr", "true", "truncate", "tty", "uname", "uniq",
+                "unlink", "wc", "which", "who", "whoami", "xargs", "yes",
+                NULL
+            };
+            for (const char **a = toybox_applets; *a; a++) {
+                len = snprintf(line, sizeof(line), "function %s { \"$T\" %s \"$@\"; }\n", *a, *a);
+                write(pfd, line, len);
+            }
+            close(pfd);
+        }
+        setenv("ENV", profile_path, 1);
     }
 
     char initrc_path[PATH_MAX];
@@ -170,17 +192,22 @@ int tvm_main(int outfd, int port)
     snprintf(home_tmp, sizeof(home_tmp), "%s/tmp", home);
     mkdir(home_tmp, 0777);
 
-    char initrc[1024];
+    char profile_path[PATH_MAX];
+    snprintf(profile_path, sizeof(profile_path), "%stvm_profile", tmpdir);
+
+    char initrc[2048];
     int n = sprintf(initrc,
         "setenv TVM_SHELL=%s/sh\n"
         "setenv PATH=%s:$PATH\n"
         "setenv HOME=%s\n"
         "setenv TMPDIR=%s\n"
+        "setenv ENV=%s\n"
         "setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
         "echo TVM initialized\n",
         bindir,
         bindir,
-        home, home_tmp);
+        home, home_tmp,
+        profile_path);
     write(tmpfd, initrc, n);
     close(tmpfd);
 
