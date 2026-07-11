@@ -52,13 +52,22 @@ function(add_thirdparty NAME SCRIPT OBJGLOB)
     )
     set_target_properties(${NAME}_static PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-    # shared lib
+    # shared lib — output to the platform lib/ dir alongside libtvm
     add_custom_target(${NAME}_shared
-        COMMAND sh -c "${CROSS_CC} -dynamiclib -fPIC -g -o ${SRCDIR}/lib${NAME}.dylib ${SRCDIR}/${OBJGLOB} ${LIBS_STR} -install_name lib${NAME}.dylib"
+        COMMAND sh -c "${CROSS_CC} -dynamiclib -fPIC -g -o ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/lib${NAME}.dylib ${SRCDIR}/${OBJGLOB} ${LIBS_STR} -install_name lib${NAME}.dylib"
         DEPENDS ${NAME}_exe
         COMMENT "Linking ${NAME} (shared)"
     )
     set_target_properties(${NAME}_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    # launcher — tiny executable that execs the dylib via PATH
+    set(LAUNCHER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/launcher.c)
+    add_custom_target(${NAME}_launcher
+        COMMAND cc -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${NAME}_launcher
+            ${LAUNCHER_SRC} -DTARGET=\\\"lib${NAME}.dylib\\\"
+        COMMENT "Building ${NAME} launcher"
+    )
+    set_target_properties(${NAME}_launcher PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endfunction()
 
 # dropbear (SSH)

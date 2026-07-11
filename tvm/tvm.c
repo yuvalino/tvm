@@ -43,6 +43,7 @@
 #include <termios.h>
 #include <getopt.h>
 #include <grp.h>
+#include <pwd.h>
 #include <signal.h>
 #include <dirent.h>
 
@@ -1644,6 +1645,18 @@ struct task_data {
 
     char  *optarg;
     int    optind, opterr, optopt, optpos, optreset;
+
+    // Per-task buffers for non-reentrant libc wrappers.
+    // String backing data (pw_strings, gr_strings) is malloc'd
+    // from the task arena at the right size.
+    struct passwd  pw_buf;
+    char          *pw_strings;
+    struct group   gr_buf;
+    char          *gr_strings;
+    struct tm      tm_buf;
+    char           ctime_buf[26];
+    char           strerror_buf[256];
+    int            usershell_idx;
 };
 
 /**
@@ -8846,6 +8859,8 @@ static int is_noemu_binary(const char *pathname)
 }
 
 
+static void usershell_cache_init(void);
+
 void tvm_init_with_outfd(const char *init_comm, int outfd)
 {
     g_outfd = outfd;
@@ -8882,6 +8897,8 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
 
+
+    usershell_cache_init();
 
     // FROM HERE ON WE ENTER TVM ON CURRENT THREAD
 
@@ -12564,6 +12581,195 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
     return 0;
 }
 
+/////////////
+// MARK: Thread-safe wrappers for non-reentrant libc
+/////////////
+
+// getusershell cache — populated once at tvm_init (single-threaded)
+static char **usershell_cache = NULL;
+static int    usershell_cache_count = 0;
+
+static void usershell_cache_init(void)
+{
+    if (usershell_cache) return;
+
+    int cap = 16, n = 0;
+    char **list = calloc(cap, sizeof(char *));
+    if (!list) return;
+
+    // Call real libc functions directly — we're before tvm_init, single-threaded
+    void (*real_setusershell)(void) = dlsym(RTLD_DEFAULT, "setusershell");
+    char *(*real_getusershell)(void) = dlsym(RTLD_DEFAULT, "getusershell");
+    void (*real_endusershell)(void) = dlsym(RTLD_DEFAULT, "endusershell");
+    if (!real_setusershell || !real_getusershell || !real_endusershell) return;
+
+    real_setusershell();
+    char *sh;
+    while ((sh = real_getusershell()) != NULL) {
+        if (n >= cap - 1) {
+            cap *= 2;
+            list = realloc(list, cap * sizeof(char *));
+            if (!list) return;
+        }
+        list[n++] = strdup(sh);
+    }
+    real_endusershell();
+
+    const char *tvm_shell = getenv("TVM_SHELL");
+    if (tvm_shell && *tvm_shell) {
+        int found = 0;
+        for (int i = 0; i < n; i++)
+            if (strcmp(list[i], tvm_shell) == 0) { found = 1; break; }
+        if (!found) {
+            if (n >= cap - 1) {
+                cap *= 2;
+                list = realloc(list, cap * sizeof(char *));
+                if (!list) return;
+            }
+            list[n++] = strdup(tvm_shell);
+        }
+    }
+
+    // Append DROPBEAR_EMBEDDED_USERSHELL (/tvm/bin/sh) if not already listed
+    const char *embedded = "/tvm/bin/sh";
+    {
+        int found = 0;
+        for (int i = 0; i < n; i++)
+            if (strcmp(list[i], embedded) == 0) { found = 1; break; }
+        if (!found) {
+            if (n >= cap - 1) {
+                cap *= 2;
+                list = realloc(list, cap * sizeof(char *));
+                if (!list) return;
+            }
+            list[n++] = strdup(embedded);
+        }
+    }
+
+    list[n] = NULL;
+    usershell_cache = list;
+    usershell_cache_count = n;
+}
+
+DECL_FUNC(getpwnam);
+DECL_FUNC(getpwuid);
+DECL_FUNC(getgrnam);
+DECL_FUNC(getgrgid);
+DECL_FUNC(localtime);
+DECL_FUNC(gmtime);
+DECL_FUNC(ctime);
+DECL_FUNC(strerror);
+DECL_FUNC(getusershell);
+DECL_FUNC(setusershell);
+DECL_FUNC(endusershell);
+
+FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
+    struct passwd *result = NULL;
+    size_t bufsz = 256;
+    for (;;) {
+        char *buf = malloc(bufsz);
+        if (!buf) return NULL;
+        int rc = getpwnam_r(name, &current->tsk_data->pw_buf, buf, bufsz, &result);
+        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
+        free(current->tsk_data->pw_strings);
+        current->tsk_data->pw_strings = buf;
+        break;
+    }
+    if (!result) return NULL;
+    const char *home = getenv("HOME");
+    if (home && *home)
+        current->tsk_data->pw_buf.pw_dir = (char *)home;
+    const char *tvm_shell = getenv("TVM_SHELL");
+    if (tvm_shell && *tvm_shell)
+        current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
+    return &current->tsk_data->pw_buf;
+}
+
+FUNCTION_DEFINE1(struct passwd *, getpwuid, uid_t, uid) {
+    struct passwd *result = NULL;
+    size_t bufsz = 256;
+    for (;;) {
+        char *buf = malloc(bufsz);
+        if (!buf) return NULL;
+        int rc = getpwuid_r(uid, &current->tsk_data->pw_buf, buf, bufsz, &result);
+        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
+        free(current->tsk_data->pw_strings);
+        current->tsk_data->pw_strings = buf;
+        break;
+    }
+    if (!result) return NULL;
+    const char *home = getenv("HOME");
+    if (home && *home)
+        current->tsk_data->pw_buf.pw_dir = (char *)home;
+    const char *tvm_shell = getenv("TVM_SHELL");
+    if (tvm_shell && *tvm_shell)
+        current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
+    return &current->tsk_data->pw_buf;
+}
+
+FUNCTION_DEFINE1(struct group *, getgrnam, const char *, name) {
+    struct group *result = NULL;
+    size_t bufsz = 256;
+    for (;;) {
+        char *buf = malloc(bufsz);
+        if (!buf) return NULL;
+        int rc = getgrnam_r(name, &current->tsk_data->gr_buf, buf, bufsz, &result);
+        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
+        free(current->tsk_data->gr_strings);
+        current->tsk_data->gr_strings = buf;
+        break;
+    }
+    return result ? &current->tsk_data->gr_buf : NULL;
+}
+
+FUNCTION_DEFINE1(struct group *, getgrgid, gid_t, gid) {
+    struct group *result = NULL;
+    size_t bufsz = 256;
+    for (;;) {
+        char *buf = malloc(bufsz);
+        if (!buf) return NULL;
+        int rc = getgrgid_r(gid, &current->tsk_data->gr_buf, buf, bufsz, &result);
+        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
+        free(current->tsk_data->gr_strings);
+        current->tsk_data->gr_strings = buf;
+        break;
+    }
+    return result ? &current->tsk_data->gr_buf : NULL;
+}
+
+FUNCTION_DEFINE1(struct tm *, localtime, const time_t *, timep) {
+    return localtime_r(timep, &current->tsk_data->tm_buf);
+}
+
+FUNCTION_DEFINE1(struct tm *, gmtime, const time_t *, timep) {
+    return gmtime_r(timep, &current->tsk_data->tm_buf);
+}
+
+FUNCTION_DEFINE1(char *, ctime, const time_t *, timep) {
+    return ctime_r(timep, current->tsk_data->ctime_buf);
+}
+
+FUNCTION_DEFINE1(char *, strerror, int, errnum) {
+    strerror_r(errnum, current->tsk_data->strerror_buf,
+               sizeof(current->tsk_data->strerror_buf));
+    return current->tsk_data->strerror_buf;
+}
+
+FUNCTION_DEFINE_VOID0(setusershell) {
+    current->tsk_data->usershell_idx = 0;
+}
+
+FUNCTION_DEFINE0(char *, getusershell) {
+    if (!usershell_cache) return NULL;
+    int idx = current->tsk_data->usershell_idx;
+    if (idx >= usershell_cache_count) return NULL;
+    current->tsk_data->usershell_idx = idx + 1;
+    return usershell_cache[idx];
+}
+
+FUNCTION_DEFINE_VOID0(endusershell) {
+    current->tsk_data->usershell_idx = 0;
+}
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     char pathname_abs[PATH_MAX];

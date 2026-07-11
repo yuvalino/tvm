@@ -27,14 +27,12 @@ endif()
 
 # libtvm.dylib — TVM runtime for Flutter app (Apple platforms)
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(INITRD_CPIO "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../initrd.cpio")
-
     add_library(tvm_shared SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native/devtool_main_macos.c
     )
     set_target_properties(tvm_shared PROPERTIES
         OUTPUT_NAME tvm
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/.."
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}"
         INSTALL_NAME_DIR "@rpath"
         C_VISIBILITY_PRESET default
     )
@@ -47,9 +45,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
         list(APPEND TVM_SHARED_LIBS ncurses)
     endif()
     target_link_libraries(tvm_shared PRIVATE ${TVM_SHARED_LIBS})
-    target_link_options(tvm_shared PRIVATE
-        -Wl,-sectcreate,__DATA,__initrd,${INITRD_CPIO}
-    )
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 

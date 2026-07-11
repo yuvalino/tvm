@@ -9,24 +9,50 @@ add_subdirectory(tvm)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_subdirectory(examples)
 
-    # initrd.cpio — rootfs archive with dropbear, mksh, toybox, vim
+    # initrd.cpio — rootfs archive with real binaries (CLI builds)
     add_custom_target(initrd
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/mkinitrd.sh
             ${CMAKE_CURRENT_BINARY_DIR}/.rootfs
-            ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/..
+            ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}
             ${CMAKE_CURRENT_SOURCE_DIR}
         DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe
         COMMENT "Assembling initrd.cpio"
     )
     set_target_properties(initrd PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+    # initrd_flutter — rootfs with launcher stubs instead of real binaries
+    add_custom_target(initrd_flutter
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/mkinitrd_flutter.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/.rootfs_flutter
+            ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/toybox/toybox
+        DEPENDS dropbear_launcher mksh_launcher toybox_launcher vim_launcher toybox_exe
+        COMMENT "Assembling initrd.cpio (flutter)"
+    )
+    set_target_properties(initrd_flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
     # flutter app (calls build_flutter.sh after cmake targets are built)
     add_custom_target(flutter
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_flutter.sh
             ${CMAKE_CURRENT_SOURCE_DIR}/flutter
-            ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/..
-        DEPENDS tvm_shared initrd
+            ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}
+        DEPENDS tvm_shared initrd_flutter
         COMMENT "Building Flutter app"
     )
     set_target_properties(flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)
+else()
+    # iOS: launchers + initrd using host toybox for applet list
+    add_custom_target(initrd_flutter
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/mkinitrd_flutter.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/.rootfs_flutter
+            ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/toybox/toybox
+        DEPENDS dropbear_launcher mksh_launcher toybox_launcher vim_launcher
+        COMMENT "Assembling initrd.cpio (flutter/iOS)"
+    )
+    set_target_properties(initrd_flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()

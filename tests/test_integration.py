@@ -21,9 +21,6 @@ FLUTTER_APP = f"./flutter/build/macos/Build/Products/Debug/tvm.app"
 IOS_APP = f"./flutter/build/ios/iphoneos/Runner.app"
 IOS_BUNDLE_ID = "com.yuvalino.tvm"
 
-# Resolved at session start from pytest options
-BACKEND = None
-DEVICE = None
 
 
 
@@ -35,6 +32,7 @@ class Forkless:
     proc: subprocess.Popen
     address: str
     port: int
+    user: str
 
 def _pick_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -68,17 +66,11 @@ def _start_flutter_backend() -> subprocess.Popen:
     proc._logpath = logpath
     return proc
 
-def _device_name():
-    """Strip .local from device hostname for devicectl."""
-    if DEVICE and DEVICE.endswith(".local"):
-        return DEVICE[:-len(".local")]
-    return DEVICE
-
 _device_app_installed = False
 
-def _start_device_backend() -> subprocess.Popen:
+def _start_device_backend(device: str) -> subprocess.Popen:
     global _device_app_installed
-    dev = _device_name()
+    dev = device[:-len(".local")] if device.endswith(".local") else device
     if not _device_app_installed:
         subprocess.run(
             ["xcrun", "devicectl", "device", "install", "app",
@@ -101,20 +93,18 @@ def _start_device_backend() -> subprocess.Popen:
 _device_forkless = None
 
 @pytest.fixture()
-def forkless() -> Iterator[Forkless]:
+def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
     global _device_forkless
 
     # Device mode: launch once, reuse across tests
-    if DEVICE:
+    if device:
         if _device_forkless and _device_forkless.proc.poll() is None:
-            print(f"\n[reusing device backend]")
             yield _device_forkless
             return
-        print(f"\n[launching device backend (existing={_device_forkless is not None})]")
         port = FLUTTER_DEFAULT_PORT
-        address = DEVICE if "." in DEVICE else f"{DEVICE}.local"
-        proc = _start_device_backend()
-    elif BACKEND == "flutter":
+        address = device if "." in device else f"{device}.local"
+        proc = _start_device_backend(device)
+    elif backend == "flutter":
         port = FLUTTER_DEFAULT_PORT
         address = "localhost"
         proc = _start_flutter_backend()
@@ -131,7 +121,7 @@ def forkless() -> Iterator[Forkless]:
             raise RuntimeError(f"backend died on startup:\n{proc._logfile.read()}")
         proc._logfile.seek(0)
         if ready in proc._logfile.read():
-            if DEVICE:
+            if device:
                 time.sleep(2)
             break
         time.sleep(0.1)
@@ -141,19 +131,19 @@ def forkless() -> Iterator[Forkless]:
         proc._logfile.seek(0)
         raise RuntimeError(f"backend did not become ready:\n{proc._logfile.read()}")
 
-    fl = Forkless(proc, address, port)
-    if DEVICE:
+    fl = Forkless(proc, address, port, ssh_user)
+    if device:
         _device_forkless = fl
     yield fl
 
-    if not DEVICE:
+    if not device:
         proc.kill()
         proc.wait()
         proc._logfile.close()
         os.unlink(proc._logpath)
 
 @contextmanager
-def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localhost") -> Iterator[spawn]:
+def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localhost", user: str = "") -> Iterator[spawn]:
 
     if command:
         if address != "localhost" and exe == "ssh":
@@ -166,12 +156,11 @@ def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localh
     if exe == "scp":
         portarg = "-O -P"
 
-    user = "root@" if address != "localhost" else ""
+    userhost = f"{user}@{address}" if user else address
     if exe == "scp":
-        # SCP: host is embedded in file args, not as a separate argument
         command = f"{exe} -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPubkeyAuthentication=no {portarg} {port}" + command
     else:
-        command = f"{exe} -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPubkeyAuthentication=no {portarg} {port} {user}{address}" + command
+        command = f"{exe} -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPubkeyAuthentication=no {portarg} {port} {userhost}" + command
     print(f"{command=}")
     fname = tempfile.mktemp()
 
@@ -192,12 +181,12 @@ def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localh
                 print(stdout)
 
 @contextmanager
-def ssh_interactive(port: int, address: str = "localhost") -> Iterator[spawn]:
+def ssh_interactive(port: int, address: str = "localhost", user: str = "") -> Iterator[spawn]:
     """Open an interactive SSH session in text mode (for vim tests)."""
+    userhost = f"{user}@{address}" if user else address
     command = (
         f"ssh -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null "
-        f"-oPubkeyAuthentication=no -p {port} "
-        f"{'root@' if address != 'localhost' else ''}{address}"
+        f"-oPubkeyAuthentication=no -p {port} {userhost}"
     )
     with spawn(command, timeout=TIMEOUT_SECONDS,
                encoding='utf-8', codec_errors='replace') as p:
@@ -208,24 +197,15 @@ def ssh_interactive(port: int, address: str = "localhost") -> Iterator[spawn]:
             raise Exception("ssh: connection closed before password prompt")
         p.sendline(PASSWORD)
         p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
-        if DEVICE:
-            p.sendline(". $ENV 2>/dev/null")
-            p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
-        p.sendline("export TMPDIR=${TMPDIR:-/tmp}; mkdir -p $TMPDIR")
+        p.sendline(". $ENV 2>/dev/null; export TMPDIR=${TMPDIR:-/tmp}; mkdir -p $TMPDIR")
         p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
         yield p
 
 @pytest.fixture
 def sshi(forkless: Forkless) -> Iterator[spawn]:
-    with ssh(forkless.port, address=forkless.address) as p:
+    with ssh(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.expect(r"\$ ")
-        # Source $ENV for interactive sessions on iOS (mksh doesn't
-        # auto-source it despite being set in the environment)
-        if DEVICE:
-            p.sendline(". $ENV 2>/dev/null")
-            p.expect(r"\$ ")
-        # ensure TMPDIR is set and writable for all tests
-        p.sendline("export TMPDIR=${TMPDIR:-/tmp}; mkdir -p $TMPDIR")
+        p.sendline(". $ENV 2>/dev/null; export TMPDIR=${TMPDIR:-/tmp}; mkdir -p $TMPDIR")
         p.expect(r"\$ ")
         yield p
 
@@ -233,35 +213,34 @@ def test_running(forkless: Forkless):
     pass
 
 def test_connect_echo(forkless: Forkless):
-    with ssh(forkless.port, "echo hello", address=forkless.address) as p:
+    with ssh(forkless.port, "echo hello", address=forkless.address, user=forkless.user) as p:
         p.expect("hello")
         p.expect(EOF)
         assert 0 == p.wait()
 
-def test_scp(forkless: Forkless):
+def test_scp(forkless: Forkless, device):
     # Get a writable dir inside TVM for SCP source/dest
-    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address) as p:
+    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(/\S+)")
         remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
         p.expect(EOF)
 
     f1 = f"{remote_dir}/scp_src"
-    f2 = tempfile.mktemp(prefix="scp_dst_") if DEVICE else f"{remote_dir}/scp_dst"
+    f2 = tempfile.mktemp(prefix="scp_dst_") if device else f"{remote_dir}/scp_dst"
 
-    with ssh(forkless.port, f"echo hello > {f1}", address=forkless.address) as p:
+    with ssh(forkless.port, f"echo hello > {f1}", address=forkless.address, user=forkless.user) as p:
         p.expect(EOF)
 
-    user_prefix = "root@" if forkless.address != "localhost" else ""
-    with ssh(forkless.port, f"{user_prefix}{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address) as p:
+    with ssh(forkless.port, f"{forkless.user}@{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address, user=forkless.user) as p:
         p.expect(EOF)
         assert 0 == p.wait()
 
-    if DEVICE:
+    if device:
         with open(f2, "r") as f:
             assert "hello" in f.read()
         os.unlink(f2)
     else:
-        with ssh(forkless.port, f"cat {f2}", address=forkless.address) as p:
+        with ssh(forkless.port, f"cat {f2}", address=forkless.address, user=forkless.user) as p:
             p.expect("hello")
             p.expect(EOF)
 
@@ -497,8 +476,8 @@ def test_getopt_repeated(sshi: spawn):
 
 def test_concurrent_sessions(forkless: Forkless):
     """Two SSH sessions at once — exercises thread isolation, per-task state."""
-    with ssh(forkless.port, "echo session1", address=forkless.address) as p1:
-        with ssh(forkless.port, "echo session2", address=forkless.address) as p2:
+    with ssh(forkless.port, "echo session1", address=forkless.address, user=forkless.user) as p1:
+        with ssh(forkless.port, "echo session2", address=forkless.address, user=forkless.user) as p2:
             p1.expect("session1")
             p2.expect("session2")
             p1.expect(EOF)
@@ -508,9 +487,9 @@ def test_concurrent_sessions(forkless: Forkless):
 
 def test_concurrent_interactive(forkless: Forkless):
     """Two interactive sessions — exercises per-task fd tables and TTY."""
-    with ssh(forkless.port, address=forkless.address) as s1:
+    with ssh(forkless.port, address=forkless.address, user=forkless.user) as s1:
         s1.expect(r"\$ ")
-        with ssh(forkless.port, address=forkless.address) as s2:
+        with ssh(forkless.port, address=forkless.address, user=forkless.user) as s2:
             s2.expect(r"\$ ")
             s1.sendline("echo from_s1")
             s1.expect("from_s1")
@@ -521,36 +500,35 @@ def test_concurrent_interactive(forkless: Forkless):
 
 # ── SCP extended ──────────────────────────────────────────────
 
-def test_scp_large_file(forkless: Forkless):
+def test_scp_large_file(forkless: Forkless, device):
     """SCP a larger file — exercises pipe buffering and stdio with bulk data."""
-    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address) as p:
+    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(/\S+)")
         remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
         p.expect(EOF)
 
     f1 = f"{remote_dir}/scp_large_src"
-    f2 = tempfile.mktemp(prefix="scp_large_dst_") if DEVICE else f"{remote_dir}/scp_large_dst"
+    f2 = tempfile.mktemp(prefix="scp_large_dst_") if device else f"{remote_dir}/scp_large_dst"
 
     # Generate large file inside TVM (seq produces ~50k of text)
-    with ssh(forkless.port, f"seq 1 10000 > {f1}", address=forkless.address) as p:
+    with ssh(forkless.port, f"seq 1 10000 > {f1}", address=forkless.address, user=forkless.user) as p:
         p.expect(EOF)
 
-    with ssh(forkless.port, f"wc -c < {f1}", address=forkless.address) as p:
+    with ssh(forkless.port, f"wc -c < {f1}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(\d+)")
         src_size = int(p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1))
         p.expect(EOF)
         assert src_size > 10000, f"source file too small: {src_size}"
 
-    user_prefix = "root@" if forkless.address != "localhost" else ""
-    with ssh(forkless.port, f"{user_prefix}{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address) as p:
+    with ssh(forkless.port, f"{forkless.user}@{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address, user=forkless.user) as p:
         p.expect(EOF)
         assert 0 == p.wait()
 
-    if DEVICE:
+    if device:
         dst_size = os.path.getsize(f2)
         os.unlink(f2)
     else:
-        with ssh(forkless.port, f"wc -c < {f2}", address=forkless.address) as p:
+        with ssh(forkless.port, f"wc -c < {f2}", address=forkless.address, user=forkless.user) as p:
             p.expect(r"(\d+)")
             dst_size = int(p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1))
             p.expect(EOF)
@@ -705,7 +683,7 @@ def test_vim_interactive_tty(sshi: spawn):
 
 def test_vim_opens_and_quits(forkless: Forkless):
     """Vim opens a file and quits with :q"""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("echo 'hello vim' > $TMPDIR/vt1.txt")
         p.expect(r'\$\s*$')
         p.sendline("vim -n $TMPDIR/vt1.txt")
@@ -718,7 +696,7 @@ def test_vim_opens_and_quits(forkless: Forkless):
 
 def test_vim_insert_mode(forkless: Forkless):
     """Insert text in vim using insert mode, save and verify."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("vim -n $TMPDIR/vt2.txt")
         time.sleep(1.5)
         p.send("i")
@@ -734,7 +712,7 @@ def test_vim_insert_mode(forkless: Forkless):
 
 def test_vim_insert_mode_indicator(forkless: Forkless):
     """Insert mode shows -- INSERT -- on the status line."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("echo 'test' > $TMPDIR/vt_ind.txt")
         p.expect(r'\$\s*$')
         p.sendline("vim -n $TMPDIR/vt_ind.txt")
@@ -784,7 +762,7 @@ def test_vim_visual_line_yank(sshi: spawn):
 
 def test_vim_vimrc(forkless: Forkless):
     """Vim loads .vimrc settings."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("echo 'set number' > ~/.vimrc")
         p.expect(r'\$\s*$')
         p.sendline("printf 'aaa\\nbbb\\nccc\\n' > $TMPDIR/vt5.txt")
@@ -804,8 +782,8 @@ def test_vim_vimrc(forkless: Forkless):
 
 def test_vim_multi_session(forkless: Forkless):
     """Two concurrent SSH sessions each running vim."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p1:
-        with ssh_interactive(forkless.port, address=forkless.address) as p2:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p1:
+        with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p2:
             p1.sendline("vim -n -u NONE $TMPDIR/vt6a.txt")
             time.sleep(1)
             p1.send("iSession1Text")
@@ -834,7 +812,7 @@ def test_vim_multi_session(forkless: Forkless):
 
 def test_vim_ex_search_replace(forkless: Forkless):
     """Test ex commands: search/replace in interactive mode."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("printf 'foo bar\\nfoo baz\\nfoo qux\\n' > $TMPDIR/vt7.txt")
         p.expect(r'\$\s*$')
         p.sendline("vim -n $TMPDIR/vt7.txt")
@@ -848,7 +826,7 @@ def test_vim_ex_search_replace(forkless: Forkless):
 
 def test_vim_undo(forkless: Forkless):
     """Test undo with 'u' in normal mode."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("echo 'original' > $TMPDIR/vt8.txt")
         p.expect(r'\$\s*$')
         p.sendline("vim -n $TMPDIR/vt8.txt")
@@ -866,7 +844,7 @@ def test_vim_undo(forkless: Forkless):
 
 def test_vim_vi_opens(forkless: Forkless):
     """The 'vi' command works (symlink to vim wrapper)."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("echo 'vi test' > $TMPDIR/vt9.txt")
         p.expect(r'\$\s*$')
         p.sendline("vi $TMPDIR/vt9.txt")
@@ -904,7 +882,7 @@ def test_vim_search(sshi: spawn):
 
 def test_vim_no_error_on_startup(forkless: Forkless):
     """Vim starts without error messages (no E1286, no defaults.vim error)."""
-    with ssh_interactive(forkless.port, address=forkless.address) as p:
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.sendline("echo 'test' > $TMPDIR/vt12.txt")
         p.expect(r'\$\s*$')
         p.sendline("vim -n $TMPDIR/vt12.txt")
@@ -1190,10 +1168,10 @@ def test_exec_nonexistent(sshi: spawn):
     sshi.expect("rc=127")
     sshi.expect(r"\$ ")
 
-def test_exec_noexec(sshi: spawn):
+def test_exec_noexec(sshi: spawn, device):
     """exec a non-executable file — exercises EACCES in execve."""
     # iOS: chmod may not take effect in sandbox, exit code may differ
-    expected = "rc=127" if DEVICE else "rc=126"
+    expected = "rc=127" if device else "rc=126"
     sshi.sendline("echo 'not a script' > $TMPDIR/noexec && chmod 644 $TMPDIR/noexec && $TMPDIR/noexec 2>/dev/null; echo rc=$?")
     sshi.expect(expected)
     sshi.expect(r"\$ ")
@@ -1208,11 +1186,11 @@ def test_execvp_path_search(sshi: spawn):
 
 def test_concurrent_env_isolation(forkless: Forkless):
     """Env vars in one session don't leak to another."""
-    with ssh(forkless.port, address=forkless.address) as s1:
+    with ssh(forkless.port, address=forkless.address, user=forkless.user) as s1:
         s1.expect(r"\$ ")
         s1.sendline("export ISOLATED_VAR=session1_value")
         s1.expect(r"\$ ")
-        with ssh(forkless.port, "echo val=$ISOLATED_VAR", address=forkless.address) as s2:
+        with ssh(forkless.port, "echo val=$ISOLATED_VAR", address=forkless.address, user=forkless.user) as s2:
             s2.expect(EOF)
             output = s2.before.decode() if s2.before else ""
             assert "session1_value" not in output
@@ -1222,9 +1200,9 @@ def test_concurrent_env_isolation(forkless: Forkless):
 
 def test_concurrent_cwd_isolation(forkless: Forkless):
     """cwd changes in one session don't affect another."""
-    with ssh(forkless.port, address=forkless.address) as s1:
+    with ssh(forkless.port, address=forkless.address, user=forkless.user) as s1:
         s1.expect(r"\$ ")
-        with ssh(forkless.port, address=forkless.address) as s2:
+        with ssh(forkless.port, address=forkless.address, user=forkless.user) as s2:
             s2.expect(r"\$ ")
             s1.sendline("cd /tmp && pwd")
             s1.expect("/tmp")
@@ -1235,9 +1213,9 @@ def test_concurrent_cwd_isolation(forkless: Forkless):
 
 def test_concurrent_fd_isolation(forkless: Forkless):
     """fd tables are per-task — opening a file in one session doesn't affect another."""
-    with ssh(forkless.port, address=forkless.address) as s1:
+    with ssh(forkless.port, address=forkless.address, user=forkless.user) as s1:
         s1.expect(r"\$ ")
-        with ssh(forkless.port, address=forkless.address) as s2:
+        with ssh(forkless.port, address=forkless.address, user=forkless.user) as s2:
             s2.expect(r"\$ ")
             s1.sendline("exec 7>$TMPDIR/fd7test; echo fd7_open")
             s1.expect("fd7_open")
@@ -1249,9 +1227,9 @@ def test_concurrent_fd_isolation(forkless: Forkless):
 
 def test_concurrent_pipes(forkless: Forkless):
     """Concurrent pipelines — exercises pipe fd isolation across tasks."""
-    with ssh(forkless.port, address=forkless.address) as s1:
+    with ssh(forkless.port, address=forkless.address, user=forkless.user) as s1:
         s1.expect(r"\$ ")
-        with ssh(forkless.port, address=forkless.address) as s2:
+        with ssh(forkless.port, address=forkless.address, user=forkless.user) as s2:
             s2.expect(r"\$ ")
             s1.sendline("seq 1 1000 | wc -l")
             s2.sendline("seq 1 2000 | wc -l")
@@ -1306,16 +1284,16 @@ def test_tty_columns(sshi: spawn):
 
 # ── Getopt isolation across tasks ────────────────────────────
 
-def test_getopt_concurrent_tasks(forkless: Forkless):
+def test_getopt_concurrent_tasks(forkless: Forkless, device):
     """getopt/optind isolation — two sessions using getopt simultaneously."""
-    with ssh(forkless.port, address=forkless.address) as s1:
+    with ssh(forkless.port, address=forkless.address, user=forkless.user) as s1:
         s1.expect(r"\$ ")
-        if DEVICE:
+        if device:
             s1.sendline(". $ENV 2>/dev/null")
             s1.expect(r"\$ ")
-        with ssh(forkless.port, address=forkless.address) as s2:
+        with ssh(forkless.port, address=forkless.address, user=forkless.user) as s2:
             s2.expect(r"\$ ")
-            if DEVICE:
+            if device:
                 s2.sendline(". $ENV 2>/dev/null")
                 s2.expect(r"\$ ")
             for _ in range(3):

@@ -1,4 +1,6 @@
-import sys
+import os
+import pytest
+
 
 def pytest_addoption(parser):
     parser.addoption("--backend", default="tvm", choices=["tvm", "flutter"],
@@ -7,12 +9,20 @@ def pytest_addoption(parser):
                      help="Target device hostname (e.g. pan1c.local). "
                           "If set, defaults backend to 'flutter' and deploys via devicectl.")
 
-def pytest_collection_modifyitems(config, items):
-    device = config.getoption("--device", None)
-    backend = config.getoption("--backend", "tvm")
-    if device and backend == "tvm":
-        backend = "flutter"
-    for name, mod in sys.modules.items():
-        if name.endswith("test_integration") and hasattr(mod, "BACKEND"):
-            mod.DEVICE = device
-            mod.BACKEND = backend
+
+@pytest.fixture(scope="session")
+def device(request):
+    return request.config.getoption("--device")
+
+
+@pytest.fixture(scope="session")
+def backend(request, device):
+    b = request.config.getoption("--backend")
+    if device and b == "tvm":
+        return "flutter"
+    return b
+
+
+@pytest.fixture(scope="session")
+def ssh_user(device):
+    return "mobile" if device else os.getlogin()

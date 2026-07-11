@@ -1,7 +1,5 @@
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <mach-o/getsect.h>
-#include <mach-o/loader.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,14 +12,6 @@
 #include "tvm.h"
 
 static void _anchor(void) {}
-
-static const struct mach_header_64 *dylib_header(void)
-{
-    Dl_info info;
-    if (dladdr((void *)_anchor, &info))
-        return (const struct mach_header_64 *)info.dli_fbase;
-    return NULL;
-}
 
 static void outlog(int fd, const char *msg)
 {
@@ -56,138 +46,13 @@ int tvm_main(int outfd, int port)
 {
     outlog(outfd, "tvm_main: starting\n");
 
-    const struct mach_header_64 *hdr = dylib_header();
-    if (!hdr) {
-        outlog(outfd, "tvm_main: cannot find dylib header\n");
-        return -1;
-    }
-    unsigned long initrd_size = 0;
-    const uint8_t *initrd_data = getsectiondata(hdr, "__DATA", "__initrd", &initrd_size);
-    if (!initrd_data || initrd_size == 0) {
-        outlog(outfd, "tvm_main: no embedded initrd\n");
-        return -1;
-    }
-
     const char *tmpdir = get_tmpdir();
-
-    // Create symlinks to bundled dylibs so TVM's execvp finds them via PATH
     const char *fwdir = get_frameworks_dir();
-    char bindir[PATH_MAX];
-    snprintf(bindir, sizeof(bindir), "%stvm_bin", tmpdir);
-    mkdir(bindir, 0755);
-
-    struct { const char *name; const char *dylib; } bins[] = {
-        { "dropbear", "libdropbear.dylib" },
-        { "sh",       "libmksh.dylib"     },
-        { "toybox",   "libtoybox.dylib"   },
-        { "vim",      "libvim.dylib"      },
-        { NULL, NULL }
-    };
-
-    if (fwdir) {
-        for (int i = 0; bins[i].name; i++) {
-            char target[PATH_MAX], link[PATH_MAX];
-            snprintf(target, sizeof(target), "%s/%s", fwdir, bins[i].dylib);
-            snprintf(link, sizeof(link), "%s/%s", bindir, bins[i].name);
-            unlink(link);
-            if (0 == symlink(target, link)) {
-                chmod(link, 0755);
-                outlog(outfd, "tvm_main: linked ");
-                outlog(outfd, bins[i].name);
-                outlog(outfd, "\n");
-            }
-        }
-        // dropbear multi-call symlinks
-        const char *dropbear_applets[] = {
-            "scp", "dbclient", "ssh", "dropbearkey", "ssh-keygen", "sshd", NULL
-        };
-        char dropbear_target[PATH_MAX];
-        snprintf(dropbear_target, sizeof(dropbear_target), "%s/libdropbear.dylib", fwdir);
-        for (const char **a = dropbear_applets; *a; a++) {
-            char link[PATH_MAX];
-            snprintf(link, sizeof(link), "%s/%s", bindir, *a);
-            unlink(link);
-            symlink(dropbear_target, link);
-        }
-        // vi -> vim
-        {
-            char link[PATH_MAX];
-            char vim_target[PATH_MAX];
-            snprintf(vim_target, sizeof(vim_target), "%s/libvim.dylib", fwdir);
-            snprintf(link, sizeof(link), "%s/vi", bindir);
-            unlink(link);
-            symlink(vim_target, link);
-        }
-        // Clean stale wrapper scripts from previous builds
-        const char *stale_applets[] = {
-            "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
-            "cut", "date", "dd", "df", "diff", "dirname", "du",
-            "env", "expr", "false", "find", "grep", "groups",
-            "head", "hostname", "id", "kill", "ln", "ls", "md5sum",
-            "mkdir", "mktemp", "mv", "nice", "nl", "nohup",
-            "od", "paste", "patch", "printenv", "printf", "ps", "pwd",
-            "readlink", "realpath", "rm", "rmdir", "sed", "seq",
-            "sha1sum", "sha256sum", "sleep", "sort", "split", "stat",
-            "strings", "tail", "tar", "tee", "time", "touch",
-            "tr", "true", "truncate", "tty", "uname", "uniq",
-            "unlink", "wc", "which", "who", "whoami", "xargs", "yes",
-            NULL
-        };
-        for (const char **a = stale_applets; *a; a++) {
-            char path[PATH_MAX];
-            snprintf(path, sizeof(path), "%s/%s", bindir, *a);
-            unlink(path);
-        }
-        // Write a shell profile that defines toybox applets as functions.
-        // Wrapper scripts don't work: mksh's 68-byte shebang buffer is too
-        // small for iOS container paths, and /tmp is read-only.
-        char toybox_path[PATH_MAX];
-        snprintf(toybox_path, sizeof(toybox_path), "%s/libtoybox.dylib", fwdir);
-        char profile_path[PATH_MAX];
-        snprintf(profile_path, sizeof(profile_path), "%stvm_profile", tmpdir);
-        int pfd = open(profile_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (pfd >= 0) {
-            char line[PATH_MAX * 2];
-            // T is the toybox dylib; the 'toybox' function calls it properly
-            int len = snprintf(line, sizeof(line),
-                "T='%s'\n"
-                "function toybox { \"$T\" \"$@\"; }\n",
-                toybox_path);
-            write(pfd, line, len);
-            const char *toybox_applets[] = {
-                "base64", "basename", "cal", "cat", "chmod", "chown",
-                "cksum", "clear", "cmp", "comm", "cp", "cpio",
-                "cut", "date", "dd", "df", "diff", "dirname", "du",
-                "env", "expand", "expr", "false", "find",
-                "grep", "groups",
-                "head", "hostname", "id", "install", "kill",
-                "ln", "ls", "md5sum",
-                "mkdir", "mktemp", "mv", "nice", "nl", "nohup",
-                "od", "paste", "patch", "printenv", "printf",
-                "ps", "pwd",
-                "readlink", "realpath", "rm", "rmdir", "sed", "seq",
-                "sha1sum", "sha256sum", "sleep", "sort", "split", "stat",
-                "strings", "tail", "tar", "tee", "time", "touch",
-                "tr", "true", "truncate", "tty", "uname", "uniq",
-                "unlink", "wc", "which", "who", "whoami", "xargs", "yes",
-                NULL
-            };
-            for (const char **a = toybox_applets; *a; a++) {
-                len = snprintf(line, sizeof(line), "function %s { \"$T\" %s \"$@\"; }\n", *a, *a);
-                write(pfd, line, len);
-            }
-            close(pfd);
-        }
-        setenv("ENV", profile_path, 1);
-    }
-
-    char initrc_path[PATH_MAX];
-    snprintf(initrc_path, sizeof(initrc_path), "%stvm_initrc_XXXXXX", tmpdir);
-    int tmpfd = mkstemp(initrc_path);
-    if (tmpfd < 0) {
-        outlog(outfd, "tvm_main: mkstemp initrc failed\n");
+    if (!fwdir) {
+        outlog(outfd, "tvm_main: cannot find Frameworks dir\n");
         return -1;
     }
+
     const char *home = getenv("HOME");
     if (!home || !home[0])
         home = tmpdir;
@@ -196,39 +61,31 @@ int tvm_main(int outfd, int port)
     snprintf(home_tmp, sizeof(home_tmp), "%s/tmp", home);
     mkdir(home_tmp, 0777);
 
-    char profile_path[PATH_MAX];
-    snprintf(profile_path, sizeof(profile_path), "%stvm_profile", tmpdir);
+    // initrc: set up environment
+    // PATH includes Frameworks dir so launchers' execvp finds the dylibs
+    char initrc_path[PATH_MAX];
+    snprintf(initrc_path, sizeof(initrc_path), "%stvm_initrc_XXXXXX", tmpdir);
+    int tmpfd = mkstemp(initrc_path);
+    if (tmpfd < 0) {
+        outlog(outfd, "tvm_main: mkstemp initrc failed\n");
+        return -1;
+    }
 
     char initrc[2048];
     int n = sprintf(initrc,
-        "setenv TVM_SHELL=%s/sh\n"
-        "setenv PATH=%s:$PATH\n"
+        "setenv TVM_SHELL=/tvm/bin/sh\n"
+        "setenv PATH=%s:/tvm/bin:$PATH\n"
         "setenv HOME=%s\n"
         "setenv TMPDIR=%s\n"
-        "setenv ENV=%s\n"
-        "setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim\n"
+        "setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib\n"
         "echo TVM initialized\n",
-        bindir,
-        bindir,
-        home, home_tmp,
-        profile_path);
+        fwdir,
+        home, home_tmp);
     write(tmpfd, initrc, n);
     close(tmpfd);
 
     setenv("TVM_INITRC", initrc_path, 1);
-
-    // Set TVM_SHELL at the process level too (the initrc sets it in TVM's
-    // env table, but dropbear's getenv might use the process environ)
-    char tvm_shell[PATH_MAX];
-    snprintf(tvm_shell, sizeof(tvm_shell), "%s/sh", bindir);
-    setenv("TVM_SHELL", tvm_shell, 1);
-    setenv("TVM_FWDIR", fwdir, 1);
-
-    // Also set PATH at process level
-    char path_env[PATH_MAX * 2];
-    snprintf(path_env, sizeof(path_env), "%s:/usr/bin:/bin:/usr/sbin:/sbin", bindir);
-    setenv("PATH", path_env, 1);
-
+    setenv("TVM_SHELL", "/tvm/bin/sh", 1);
 
     // Use dup'd stderr for TVM kernel logs so --console captures them
     int logfd = dup(STDERR_FILENO);
@@ -239,40 +96,27 @@ int tvm_main(int outfd, int port)
 
     unlink(initrc_path);
 
-    // Mount initrd from embedded Mach-O section data directly
-    tvm_mount_cpio("/tvm", initrd_data, initrd_size);
-
-    // Register the Frameworks dylibs as the VFS binaries.
-    // The initrd contains macOS binaries which can't load on iOS.
-    // tvm_register_program makes find_program() return the main func,
-    // which __tvm_execve uses to skip the ulinker (calling main directly).
-    // This doesn't work for iOS since the registered program lacks
-    // ulinker context. Instead, we just need the PATH to find the
-    // $TMPDIR/tvm_bin/ symlinks first (before /tvm/bin VFS entries).
-    // The real fix is done below in the initrc PATH ordering.
-
-    // Re-read HOME after tvm_init (the initrc sets it to the container path)
-    const char *real_home = getenv("HOME");
-    if (!real_home || !real_home[0]) real_home = home;
-    chdir(real_home);
-
-    // Create $HOME/.profile for interactive login shells
+    // Mount initrd from file in the Frameworks dir
     {
-        char dot_profile[PATH_MAX];
-        snprintf(dot_profile, sizeof(dot_profile), "%s/.profile", real_home);
-        int dpfd = open(dot_profile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (dpfd >= 0) {
-            char line[PATH_MAX * 2];
-            int len = snprintf(line, sizeof(line), ". '%s'\n", profile_path);
-            write(dpfd, line, len);
-            close(dpfd);
+        char initrd_path[PATH_MAX];
+        snprintf(initrd_path, sizeof(initrd_path), "%s/initrd.cpio", fwdir);
+        int ifd = open(initrd_path, O_RDONLY);
+        if (ifd < 0) {
+            outlog(outfd, "tvm_main: cannot open initrd.cpio\n");
+            return -1;
         }
+        struct stat st;
+        fstat(ifd, &st);
+        void *initrd_data = malloc(st.st_size);
+        if (!initrd_data) { close(ifd); return -1; }
+        read(ifd, initrd_data, st.st_size);
+        close(ifd);
+        tvm_mount_cpio("/tvm", initrd_data, st.st_size);
+        free(initrd_data);
     }
 
-    const char *shell_check = getenv("TVM_SHELL");
-    outlog(outfd, "tvm_main: TVM_SHELL=");
-    outlog(outfd, shell_check ? shell_check : "(null)");
-    outlog(outfd, "\n");
+    chdir(home);
+
     outlog(outfd, "tvm_main: exec dropbear\n");
 
     char port_str[16];

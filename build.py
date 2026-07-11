@@ -86,6 +86,23 @@ def build(plat, targets, verbose=False):
     run(ninja_args)
 
 
+def list_targets(plat):
+    bd = build_dir(plat)
+    if not (bd / "build.ninja").exists():
+        configure(plat)
+    result = subprocess.run(
+        ["ninja", "-C", str(bd), "-t", "targets", "all"],
+        capture_output=True, text=True,
+    )
+    skip = {"all", "edit_cache", "rebuild_cache", "CMakeCache.txt", "bundling_target"}
+    for line in sorted(result.stdout.splitlines()):
+        name, _, rule = line.partition(":")
+        if "/" not in name and rule.strip() == "phony" \
+                and not name.startswith(("cmake_", "lib")) \
+                and name not in skip:
+            print(name)
+
+
 def clean(plat):
     od = output_dir(plat)
     if od.exists():
@@ -103,10 +120,16 @@ def main():
                         help="remove build directory before building")
     parser.add_argument("--verbose", action="store_true",
                         help="show full build commands")
+    parser.add_argument("-l", action="store_true",
+                        help="list available targets")
     args = parser.parse_args()
 
     if args.a is None:
         args.a = detect_platform()
+
+    if args.l:
+        list_targets(args.a)
+        return
 
     if args.clean:
         clean(args.a)
