@@ -10503,10 +10503,6 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
     }
 
     int ret = file_stat(pathname, statbuf, 0);
-    // Ensure regular files are marked executable — iOS sandbox may strip
-    // execute bits on files accessed through symlinks from writable dirs
-    if (ret == 0 && S_ISREG(statbuf->st_mode))
-        statbuf->st_mode |= S_IXUSR | S_IXGRP | S_IXOTH;
     tvm_sig_leave();
     return ret;
 }
@@ -12597,15 +12593,9 @@ static void usershell_cache_init(void)
     char **list = calloc(cap, sizeof(char *));
     if (!list) return;
 
-    // Call real libc functions directly — we're before tvm_init, single-threaded
-    void (*real_setusershell)(void) = dlsym(RTLD_DEFAULT, "setusershell");
-    char *(*real_getusershell)(void) = dlsym(RTLD_DEFAULT, "getusershell");
-    void (*real_endusershell)(void) = dlsym(RTLD_DEFAULT, "endusershell");
-    if (!real_setusershell || !real_getusershell || !real_endusershell) return;
-
-    real_setusershell();
+    setusershell();
     char *sh;
-    while ((sh = real_getusershell()) != NULL) {
+    while ((sh = getusershell()) != NULL) {
         if (n >= cap - 1) {
             cap *= 2;
             list = realloc(list, cap * sizeof(char *));
@@ -12613,7 +12603,7 @@ static void usershell_cache_init(void)
         }
         list[n++] = strdup(sh);
     }
-    real_endusershell();
+    endusershell();
 
     const char *tvm_shell = getenv("TVM_SHELL");
     if (tvm_shell && *tvm_shell) {
@@ -12659,9 +12649,6 @@ DECL_FUNC(localtime);
 DECL_FUNC(gmtime);
 DECL_FUNC(ctime);
 DECL_FUNC(strerror);
-DECL_FUNC(getusershell);
-DECL_FUNC(setusershell);
-DECL_FUNC(endusershell);
 
 FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
     struct passwd *result = NULL;
@@ -12755,21 +12742,27 @@ FUNCTION_DEFINE1(char *, strerror, int, errnum) {
     return current->tsk_data->strerror_buf;
 }
 
-FUNCTION_DEFINE_VOID0(setusershell) {
+// These are registered via FUNCTION_METADATA (not FUNCTION_DEFINE) so they
+// only apply to ulinker-loaded programs and don't shadow libc's versions.
+// This avoids RTLD_NEXT resolution issues during usershell_cache_init.
+static void __tvm_setusershell(void) {
     current->tsk_data->usershell_idx = 0;
 }
+FUNCTION_METADATA(setusershell, &__tvm_setusershell);
 
-FUNCTION_DEFINE0(char *, getusershell) {
+static char *__tvm_getusershell(void) {
     if (!usershell_cache) return NULL;
     int idx = current->tsk_data->usershell_idx;
     if (idx >= usershell_cache_count) return NULL;
     current->tsk_data->usershell_idx = idx + 1;
     return usershell_cache[idx];
 }
+FUNCTION_METADATA(getusershell, &__tvm_getusershell);
 
-FUNCTION_DEFINE_VOID0(endusershell) {
+static void __tvm_endusershell(void) {
     current->tsk_data->usershell_idx = 0;
 }
+FUNCTION_METADATA(endusershell, &__tvm_endusershell);
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     char pathname_abs[PATH_MAX];

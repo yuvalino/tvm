@@ -1,7 +1,13 @@
 #!/bin/sh
 set -e
 SRCDIR="$1"
-cd "$SRCDIR"
+BUILDDIR="$2"
+
+rsync -a --exclude='*.o' --exclude='*.a' --exclude=obj/ \
+    --exclude=Makefile --exclude=config.h --exclude=config.log --exclude=config.status \
+    "$SRCDIR/" "$BUILDDIR/"
+
+cd "$BUILDDIR"
 
 CROSS_FLAGS=""
 if [ -n "$TVM_IOS_CROSS" ]; then

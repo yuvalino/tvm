@@ -15,11 +15,15 @@ cd "$SRCDIR"
 
 case "$(uname)" in
     Darwin)
-        "$FLUTTER" config --enable-macos-desktop 2>/dev/null || true
-        "$FLUTTER" build macos --debug
+        if [ "${TVM_IOS_CROSS:-}" = "1" ]; then
+            "$FLUTTER" build ios --release
+        else
+            "$FLUTTER" config --enable-macos-desktop 2>/dev/null || true
+            "$FLUTTER" build macos --debug
 
-        mkdir -p "$OUTDIR"
-        ln -sfn "$(cd build/macos/Build/Products/Debug && pwd)/tvm.app" "$OUTDIR/flutter"
+            mkdir -p "$OUTDIR"
+            ln -sfn "$(cd build/macos/Build/Products/Debug && pwd)/tvm.app" "$OUTDIR/flutter"
+        fi
         ;;
     Linux)
         "$FLUTTER" build linux

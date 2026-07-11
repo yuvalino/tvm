@@ -11,3 +11,8 @@ compile_commands.json
 .cache/
 test_rmem
 test_tvm
+.viminfo
+scp_src
+scp_dst
+scp_large_src
+scp_large_dst

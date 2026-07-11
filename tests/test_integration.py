@@ -45,6 +45,7 @@ def _start_tvm_backend(port: int) -> subprocess.Popen:
     logfile = open(logpath, "w+")
     env = dict(os.environ)
     env.setdefault("TVM_NOEMU", TVM_NOEMU_DEFAULT)
+    env.setdefault("PLATFORM", PLATFORM)
     proc = subprocess.Popen(cmd.split(), stdout=logfile, stderr=subprocess.STDOUT, env=env)
     proc._logfile = logfile
     proc._logpath = logpath
@@ -1168,12 +1169,10 @@ def test_exec_nonexistent(sshi: spawn):
     sshi.expect("rc=127")
     sshi.expect(r"\$ ")
 
-def test_exec_noexec(sshi: spawn, device):
+def test_exec_noexec(sshi: spawn):
     """exec a non-executable file — exercises EACCES in execve."""
-    # iOS: chmod may not take effect in sandbox, exit code may differ
-    expected = "rc=127" if device else "rc=126"
     sshi.sendline("echo 'not a script' > $TMPDIR/noexec && chmod 644 $TMPDIR/noexec && $TMPDIR/noexec 2>/dev/null; echo rc=$?")
-    sshi.expect(expected)
+    sshi.expect("rc=126")
     sshi.expect(r"\$ ")
 
 def test_execvp_path_search(sshi: spawn):

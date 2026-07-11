@@ -4,17 +4,18 @@ set -e
 ROOTFS="$1"
 OUTDIR="$2"
 SRCDIR="$3"
+BUILDDIR="$4"  # third_party build dir (e.g. output/<platform>/build/third_party)
 
 rm -rf "$ROOTFS" && mkdir -p "$ROOTFS/bin"
 
-# copy binaries
-cp "$SRCDIR/third_party/dropbear/dropbearmulti" "$ROOTFS/bin/dropbear"
-cp "$SRCDIR/third_party/mksh/mksh"              "$ROOTFS/bin/sh"
-cp "$SRCDIR/third_party/toybox/toybox"           "$ROOTFS/bin/toybox"
-cp "$SRCDIR/third_party/vim/src/vim"             "$ROOTFS/bin/vim"
+# copy binaries from build dir
+cp "$BUILDDIR/dropbear/dropbearmulti" "$ROOTFS/bin/dropbear"
+cp "$BUILDDIR/mksh/mksh"             "$ROOTFS/bin/sh"
+cp "$BUILDDIR/toybox/toybox"         "$ROOTFS/bin/toybox"
+cp "$BUILDDIR/vim/src/vim"           "$ROOTFS/bin/vim"
 ln -sf vim "$ROOTFS/bin/vi"
 
-# vim runtime
+# vim runtime (from source)
 mkdir -p "$ROOTFS/share/vim/syntax"
 cp "$SRCDIR/third_party/vim/runtime/defaults.vim"  "$ROOTFS/share/vim/"
 cp "$SRCDIR/third_party/vim/runtime/filetype.vim"  "$ROOTFS/share/vim/"
@@ -48,4 +49,4 @@ for cmd in $(./bin/toybox); do
 done
 
 # create cpio archive
-cd "$ROOTFS" && find . | ./bin/toybox cpio -o -H newc > "$OUTDIR/initrd.cpio"
+cd "$ROOTFS" && find . | ./bin/toybox cpio -o -H newc > "$OUTDIR/initrd-cli.cpio"
