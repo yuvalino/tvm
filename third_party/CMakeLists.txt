@@ -93,7 +93,8 @@ ExternalProject_Add(mksh_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/mksh
     BINARY_DIR ${MKSH_BUILD}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND sh ${SCRIPTS_DIR}/build_mksh.sh ${THIRDPARTY_SRC}/mksh ${MKSH_BUILD}
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env CC=${TVM_CC}
+        sh ${SCRIPTS_DIR}/build_mksh.sh ${THIRDPARTY_SRC}/mksh ${MKSH_BUILD}
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
