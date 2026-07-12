@@ -110,12 +110,10 @@ endfunction()
 
 # ── initrd targets ──────────────────────────────────────────────
 
-# CLI initrd (real binaries, not for iOS)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    mkinitrd_target(initrd
-        DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe
-    )
-endif()
+# CLI initrd (real binaries)
+mkinitrd_target(initrd_cli
+    DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe
+)
 
 # Flutter initrd (launcher stubs)
 mkinitrd_target(initrd_flutter FLUTTER
