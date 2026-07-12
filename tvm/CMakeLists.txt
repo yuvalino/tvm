@@ -28,7 +28,7 @@ endif()
 # libtvm.dylib — TVM runtime for Flutter app (Apple platforms)
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_library(tvm_shared SHARED
-        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native/devtool_main_macos.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native/tvm_main_apple.c
     )
     set_target_properties(tvm_shared PROPERTIES
         OUTPUT_NAME tvm

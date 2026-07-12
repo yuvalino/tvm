@@ -91,7 +91,7 @@ int tvm_main(int outfd, int port)
     setenv("TVM_INITRC", initrc_path, 1);
 
     outlog(outfd, "tvm_main: init\n");
-    tvm_init_with_outfd("devtool", outfd);
+    tvm_init_with_outfd("tvm", outfd);
 
     unlink(initrd_path);
     unlink(initrc_path);

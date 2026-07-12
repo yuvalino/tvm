@@ -74,7 +74,7 @@ add_custom_target(initrd_obj DEPENDS "${INITRD_OBJ}")
 # Native TVM bridge shared library.
 add_library(tvm_bridge SHARED
   "${CMAKE_CURRENT_SOURCE_DIR}/../native/tvm_bridge.c"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../native/devtool_main.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../native/tvm_main_linux.c"
 )
 set_target_properties(tvm_bridge PROPERTIES
   OUTPUT_NAME "tvm_bridge"

@@ -92,7 +92,7 @@ int tvm_main(int outfd, int port)
     if (logfd < 0) logfd = outfd;
 
     outlog(outfd, "tvm_main: init\n");
-    tvm_init_with_outfd("devtool", logfd);
+    tvm_init_with_outfd("tvm", logfd);
 
     unlink(initrc_path);
 
