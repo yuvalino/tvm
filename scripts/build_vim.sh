@@ -30,12 +30,12 @@ ln -sf "$SRC/configure" .
 ln -sf "$SRC/auto/configure" auto/
 
 CROSS_FLAGS=""
-TLIB="ncurses"
+TLIB_FLAG="--with-tlib=ncurses"
 CC_FLAG=""
 CFLAGS_EXTRA=""
 if [ -n "$TVM_IOS_CROSS" ]; then
     CROSS_FLAGS="--host=aarch64-apple-darwin vim_cv_toupper_strstrprogram=yes vim_cv_terminfo=no vim_cv_tgetent=zero vim_cv_getcwd_broken=no vim_cv_stat_ignores_slash=yes vim_cv_memmove_handles_overlap=yes"
-    TLIB=""
+    TLIB_FLAG=""
     CC_FLAG="${CC:+CC=$CC}"
     CFLAGS_EXTRA="${TVM_STUBS_DIR:+-I$TVM_STUBS_DIR}"
 fi
@@ -56,7 +56,7 @@ if [ ! -f auto/config.mk ]; then
         --disable-xattr \
         --disable-selinux \
         --disable-smack \
-        ${TLIB:+--with-tlib=$TLIB} \
+        $TLIB_FLAG \
         --without-wayland \
         ac_cv_header_iconv_h=no \
         $EXTRA_FLAGS \
