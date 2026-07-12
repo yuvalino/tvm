@@ -1,7 +1,7 @@
 # TVM init.rc
 
 # Mount rootfs
-mount output/$PLATFORM/lib/initrd-cli.cpio:/tvm
+mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/sh

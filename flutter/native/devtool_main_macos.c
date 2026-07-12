@@ -99,10 +99,10 @@ int tvm_main(int outfd, int port)
     // Mount initrd from file in the Frameworks dir
     {
         char initrd_path[PATH_MAX];
-        snprintf(initrd_path, sizeof(initrd_path), "%s/initrd.cpio", fwdir);
+        snprintf(initrd_path, sizeof(initrd_path), "%s/initrd.flutter.cpio", fwdir);
         int ifd = open(initrd_path, O_RDONLY);
         if (ifd < 0) {
-            outlog(outfd, "tvm_main: cannot open initrd.cpio\n");
+            outlog(outfd, "tvm_main: cannot open initrd.flutter.cpio\n");
             return -1;
         }
         struct stat st;

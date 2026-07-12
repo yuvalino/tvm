@@ -42,9 +42,9 @@ function(mkinitrd_target NAME)
 
     set(ROOTFS ${CMAKE_CURRENT_BINARY_DIR}/.rootfs_${NAME})
     if(ARG_FLUTTER)
-        set(OUTFILE ${LIB_OUT}/initrd.cpio)
+        set(OUTFILE ${LIB_OUT}/initrd.flutter.cpio)
     else()
-        set(OUTFILE ${LIB_OUT}/initrd-cli.cpio)
+        set(OUTFILE ${LIB_OUT}/initrd.cli.cpio)
     endif()
 
     # Build the shell script inline
@@ -54,12 +54,10 @@ function(mkinitrd_target NAME)
 
     # ── Binaries ──
     if(ARG_FLUTTER)
-        # Compiled launchers for sh and dropbear (need emulator / argv[0])
         string(APPEND SCRIPT "cp '${BIN_OUT}/mksh_launcher' \"$ROOTFS/bin/sh\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/dropbear_launcher' \"$ROOTFS/bin/dropbear\"\n")
-        # Shell script launchers for toybox and vim (avoid emulator)
-        string(APPEND SCRIPT "printf '#!/tvm/bin/sh\\nexec -a \"\${0##*/}\" libtoybox.dylib \"$@\"\\n' > \"$ROOTFS/bin/toybox\" && chmod +x \"$ROOTFS/bin/toybox\"\n")
-        string(APPEND SCRIPT "printf '#!/tvm/bin/sh\\nexec -a \"\${0##*/}\" libvim.dylib \"$@\"\\n' > \"$ROOTFS/bin/vim\" && chmod +x \"$ROOTFS/bin/vim\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/toybox_launcher' \"$ROOTFS/bin/toybox\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/vim_launcher' \"$ROOTFS/bin/vim\"\n")
     else()
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")

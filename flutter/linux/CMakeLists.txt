@@ -59,15 +59,15 @@ set(TVM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(TVM_OUTPUT "${TVM_ROOT}/output/linux-x64")
 set(TVM_OBJECTS_DIR "${TVM_OUTPUT}/build/tvm/CMakeFiles/tvm_objects.dir")
 
-# Embed initrd.cpio as a linkable object.
-set(INITRD_CPIO "${TVM_OUTPUT}/initrd.cpio")
-set(INITRD_OBJ "${CMAKE_CURRENT_BINARY_DIR}/initrd.cpio.o")
+# Embed initrd.flutter.cpio as a linkable object.
+set(INITRD_CPIO "${TVM_OUTPUT}/lib/initrd.flutter.cpio")
+set(INITRD_OBJ "${CMAKE_CURRENT_BINARY_DIR}/initrd.flutter.cpio.o")
 add_custom_command(
   OUTPUT "${INITRD_OBJ}"
-  COMMAND ld -r -b binary -o "${INITRD_OBJ}" initrd.cpio
-  WORKING_DIRECTORY "${TVM_OUTPUT}"
+  COMMAND ld -r -b binary -o "${INITRD_OBJ}" initrd.flutter.cpio
+  WORKING_DIRECTORY "${TVM_OUTPUT}/lib"
   DEPENDS "${INITRD_CPIO}"
-  COMMENT "Embedding initrd.cpio"
+  COMMENT "Embedding initrd.flutter.cpio"
 )
 add_custom_target(initrd_obj DEPENDS "${INITRD_OBJ}")
 
