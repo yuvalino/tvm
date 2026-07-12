@@ -32,11 +32,12 @@ ln -sf "$SRC/auto/configure" auto/
 CROSS_FLAGS=""
 TLIB="ncurses"
 CC_FLAG=""
+CFLAGS_EXTRA=""
 if [ -n "$TVM_IOS_CROSS" ]; then
     CROSS_FLAGS="--host=aarch64-apple-darwin vim_cv_toupper_strstrprogram=yes vim_cv_terminfo=no vim_cv_tgetent=zero vim_cv_getcwd_broken=no vim_cv_stat_ignores_slash=yes vim_cv_memmove_handles_overlap=yes"
     TLIB=""
-    SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
-    CC_FLAG="CC=$SCRIPTS_DIR/ios-cc.sh"
+    CC_FLAG="${CC:+CC=$CC}"
+    CFLAGS_EXTRA="${TVM_STUBS_DIR:+-I$TVM_STUBS_DIR}"
 fi
 
 if [ ! -f auto/config.mk ]; then
@@ -61,6 +62,6 @@ if [ ! -f auto/config.mk ]; then
         $EXTRA_FLAGS \
         $CROSS_FLAGS \
         $CC_FLAG \
-        CFLAGS="-g -gdwarf-4"
+        CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA"
 fi
-make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4" MAKEOVERRIDES=
+make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA" MAKEOVERRIDES=

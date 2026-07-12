@@ -18,7 +18,12 @@ set(LIB_OUT ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
 set(BIN_OUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(TVM_CC "${SCRIPTS_DIR}/ios-cc.sh")
+    set(IOS_CC_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/ios-cc.sh)
+    file(WRITE ${IOS_CC_SCRIPT} [=[#!/bin/sh
+exec xcrun --sdk iphoneos cc -arch arm64 -miphoneos-version-min=15.0 "$@"
+]=])
+    file(CHMOD ${IOS_CC_SCRIPT} PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+    set(TVM_CC "${IOS_CC_SCRIPT}")
 else()
     set(TVM_CC "cc")
 endif()
@@ -146,10 +151,13 @@ add_launcher(toybox)
 # vim
 ###############################################################################
 set(VIM_BUILD ${THIRDPARTY_BUILD}/vim)
+set(STUBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../stubs)
 
 set(VIM_LINK_LIBS -lm)
+set(VIM_BUILD_ENV "")
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND VIM_LINK_LIBS ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libtermcap_stubs.a)
+    set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" "TVM_STUBS_DIR=${STUBS_DIR}")
 else()
     list(APPEND VIM_LINK_LIBS -lncurses)
 endif()
@@ -158,7 +166,7 @@ ExternalProject_Add(vim_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/vim
     BINARY_DIR ${VIM_BUILD}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND sh ${SCRIPTS_DIR}/build_vim.sh ${THIRDPARTY_SRC}/vim ${VIM_BUILD}
+    BUILD_COMMAND ${VIM_BUILD_ENV} sh ${SCRIPTS_DIR}/build_vim.sh ${THIRDPARTY_SRC}/vim ${VIM_BUILD}
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
