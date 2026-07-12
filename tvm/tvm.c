@@ -6196,7 +6196,7 @@ uc_engine *uc_open_arch(int arch)
 
     if (err) {
         INFO("uc_open(ess_arch=%d) failed: %s", arch, uc_strerror(err));
-        return NULL;    
+        return NULL;
     }
     uc_ctl_exits_enable(engine);
 
@@ -10503,6 +10503,13 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
     }
 
     int ret = file_stat(pathname, statbuf, 0);
+#if TARGET_OS_IOS
+    // iOS sandbox may not report execute permission on signed dylibs
+    // accessed from the app bundle. Add execute bits so the shell's
+    // search_access doesn't reject them.
+    if (ret == 0 && S_ISREG(statbuf->st_mode))
+        statbuf->st_mode |= S_IXUSR | S_IXGRP | S_IXOTH;
+#endif
     tvm_sig_leave();
     return ret;
 }

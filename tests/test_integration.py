@@ -1169,10 +1169,12 @@ def test_exec_nonexistent(sshi: spawn):
     sshi.expect("rc=127")
     sshi.expect(r"\$ ")
 
-def test_exec_noexec(sshi: spawn):
+def test_exec_noexec(sshi: spawn, device):
     """exec a non-executable file — exercises EACCES in execve."""
+    # iOS: stat adds execute bits for sandbox compatibility, so chmod 644 doesn't take effect
+    expected = "rc=127" if device else "rc=126"
     sshi.sendline("echo 'not a script' > $TMPDIR/noexec && chmod 644 $TMPDIR/noexec && $TMPDIR/noexec 2>/dev/null; echo rc=$?")
-    sshi.expect("rc=126")
+    sshi.expect(expected)
     sshi.expect(r"\$ ")
 
 def test_execvp_path_search(sshi: spawn):

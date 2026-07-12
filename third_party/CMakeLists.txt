@@ -6,6 +6,9 @@ set(UNICORN_ARCH "x86;aarch64" CACHE STRING "" FORCE)
 set(UNICORN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# Reduce TCG buffer from 1GB default — multiple emulator instances
+# on iOS would exceed the process virtual memory limit.
+add_definitions(-DDEFAULT_CODE_GEN_BUFFER_SIZE_1=8388608)
 add_subdirectory(unicorn EXCLUDE_FROM_ALL)
 
 set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../scripts)

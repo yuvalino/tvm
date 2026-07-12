@@ -9,11 +9,18 @@ HOST_TOYBOX="$5"  # path to host-built toybox (for applet list)
 
 rm -rf "$ROOTFS" && mkdir -p "$ROOTFS/bin"
 
-# Copy pre-built launchers, renaming from x_launcher to the initrd name
+# sh and dropbear must be compiled launchers (sh can't use itself as
+# shebang interpreter; dropbear needs argv[0] preserved for multi-call).
+# Other launchers are shell scripts — they don't need the emulator,
+# avoiding Unicorn's single-JIT-buffer limitation for concurrent pipes.
+cp "$BINDIR/mksh_launcher" "$ROOTFS/bin/sh"
 cp "$BINDIR/dropbear_launcher" "$ROOTFS/bin/dropbear"
-cp "$BINDIR/mksh_launcher"    "$ROOTFS/bin/sh"
-cp "$BINDIR/toybox_launcher"  "$ROOTFS/bin/toybox"
-cp "$BINDIR/vim_launcher"     "$ROOTFS/bin/vim"
+for pair in "toybox:libtoybox.dylib" "vim:libvim.dylib"; do
+    name="${pair%%:*}"
+    dylib="${pair#*:}"
+    printf '#!/tvm/bin/sh\nexec -a "${0##*/}" %s "$@"\n' "$dylib" > "$ROOTFS/bin/$name"
+    chmod +x "$ROOTFS/bin/$name"
+done
 ln -sf vim "$ROOTFS/bin/vi"
 
 # dropbear multi-call symlinks
