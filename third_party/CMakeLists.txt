@@ -64,6 +64,8 @@ endif()
 ExternalProject_Add(dropbear_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/dropbear
     BINARY_DIR ${DROPBEAR_BUILD}
+    PATCH_COMMAND ${CMAKE_COMMAND} -E copy
+        ${THIRDPARTY_SRC}/dropbear/localoptions.h ${DROPBEAR_BUILD}/localoptions.h
     CONFIGURE_COMMAND ${THIRDPARTY_SRC}/dropbear/configure ${DROPBEAR_CONFIGURE_ARGS}
     BUILD_COMMAND make
         "PROGRAMS=dropbear dbclient dropbearkey scp"

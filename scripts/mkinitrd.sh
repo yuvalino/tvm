@@ -12,7 +12,7 @@ rm -rf "$ROOTFS" && mkdir -p "$ROOTFS/bin"
 cp "$BUILDDIR/dropbear/dropbearmulti" "$ROOTFS/bin/dropbear"
 cp "$BUILDDIR/mksh/mksh"             "$ROOTFS/bin/sh"
 cp "$BUILDDIR/toybox/toybox"         "$ROOTFS/bin/toybox"
-cp "$BUILDDIR/vim/src/vim"           "$ROOTFS/bin/vim"
+cp "$BUILDDIR/vim/vim"               "$ROOTFS/bin/vim"
 ln -sf vim "$ROOTFS/bin/vi"
 
 # vim runtime (from source)
