@@ -1,9 +1,6 @@
 #define _GNU_SOURCE
-#include <dlfcn.h>
-#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <link.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,35 +11,8 @@
 
 #include "tvm.h"
 
-extern const unsigned char _binary_initrd_cpio_start[];
-extern const unsigned char _binary_initrd_cpio_end[];
-
-char __executable_start __attribute__((weak));
-char etext __attribute__((weak));
-
-static void _anchor(void) {}
-
-void get_text(uintptr_t *out_start, uintptr_t *out_end)
-{
-    Dl_info info;
-    struct link_map *lm;
-    if (dladdr1((void *)_anchor, &info, (void **)&lm, RTLD_DL_LINKMAP) && lm) {
-        *out_start = (uintptr_t)lm->l_addr;
-        const ElfW(Ehdr) *ehdr = (const ElfW(Ehdr) *)lm->l_addr;
-        const ElfW(Phdr) *phdr = (const ElfW(Phdr) *)((char *)lm->l_addr + ehdr->e_phoff);
-        uintptr_t end = *out_start;
-        for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X)) {
-                uintptr_t seg_end = lm->l_addr + phdr[i].p_vaddr + phdr[i].p_memsz;
-                if (seg_end > end) end = seg_end;
-            }
-        }
-        *out_end = end;
-    } else {
-        *out_start = 0;
-        *out_end = 0;
-    }
-}
+extern const unsigned char _binary_initrd_flutter_cpio_start[];
+extern const unsigned char _binary_initrd_flutter_cpio_end[];
 
 static void outlog(int fd, const char *msg)
 {
@@ -53,7 +23,7 @@ int tvm_main(int outfd, int port)
 {
     outlog(outfd, "tvm_main: starting\n");
 
-    size_t initrd_size = (size_t)(_binary_initrd_cpio_end - _binary_initrd_cpio_start);
+    size_t initrd_size = (size_t)(_binary_initrd_flutter_cpio_end - _binary_initrd_flutter_cpio_start);
 
     char initrd_path[] = "/tmp/tvm_initrd_XXXXXX";
     int tmpfd = mkstemp(initrd_path);
@@ -61,7 +31,7 @@ int tvm_main(int outfd, int port)
         outlog(outfd, "tvm_main: mkstemp failed\n");
         return -1;
     }
-    const unsigned char *p = _binary_initrd_cpio_start;
+    const unsigned char *p = _binary_initrd_flutter_cpio_start;
     size_t remain = initrd_size;
     while (remain > 0) {
         ssize_t w = syscall(SYS_write, tmpfd, p, remain);
