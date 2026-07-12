@@ -13183,8 +13183,8 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
             file = pathname;
         } else {
             const char *path = getenv("PATH");
-            if (!path) path = "/bin:/usr/bin";
-            int found = 0;
+            if (!path) path = "/usr/local/bin:/bin:/usr/bin";
+            int eacces = 0;
             char trypath[PATH_MAX];
             while (*path) {
                 const char *end = strchr(path, ':');
@@ -13193,22 +13193,36 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
                     memcpy(trypath, path, len);
                     trypath[len] = '/';
                     strcpy(trypath + len + 1, file);
-                    if (0 == access(trypath, R_OK)) {
+                    if (0 == access(trypath, X_OK)) {
                         file = trypath;
-                        found = 1;
-                        break;
+                        goto found;
                     }
+                    if (errno == EACCES)
+                        eacces = 1;
                 }
                 path = end ? end + 1 : path + strlen(path);
             }
-            if (!found) {
-                errno = ENOENT;
-                return -1;
-            }
+            errno = eacces ? EACCES : ENOENT;
+            return -1;
         }
     }
-
-    return execve(file, argv, *current->tsk_relocs.__environ);
+found:;
+    int rc = execve(file, argv, *current->tsk_relocs.__environ);
+    if (errno == ENOEXEC) {
+        const char *sh = getenv("TVM_SHELL");
+        if (!sh || !*sh) sh = "/bin/sh";
+        int argc = 0;
+        while (argv[argc]) argc++;
+        char **nargv = kalloc((argc + 2) * sizeof(char *));
+        if (!nargv) return -1;
+        nargv[0] = (char *)sh;
+        nargv[1] = (char *)file;
+        for (int i = 1; i <= argc; i++)
+            nargv[i + 1] = argv[i];
+        rc = execve(sh, nargv, *current->tsk_relocs.__environ);
+        kfree(nargv);
+    }
+    return rc;
 }
 
 FUNCTION_DEFINE1(int, system, const char *, command) {
