@@ -17,16 +17,19 @@ case "$(uname)" in
     Darwin)
         if [ "${TVM_IOS_CROSS:-}" = "1" ]; then
             "$FLUTTER" build ios --release
-        else
-            "$FLUTTER" config --enable-macos-desktop 2>/dev/null || true
-            "$FLUTTER" build macos --debug
 
             mkdir -p "$OUTDIR"
-            ln -sfn "$(cd build/macos/Build/Products/Debug && pwd)/tvm.app" "$OUTDIR/flutter"
+            ln -sfn "$(cd build/ios/iphoneos && pwd)/Runner.app" "$OUTDIR/flutter"
+        else
+            "$FLUTTER" config --enable-macos-desktop 2>/dev/null || true
+            "$FLUTTER" build macos --release
+
+            mkdir -p "$OUTDIR"
+            ln -sfn "$(cd build/macos/Build/Products/Release && pwd)/tvm.app" "$OUTDIR/flutter"
         fi
         ;;
     Linux)
-        "$FLUTTER" build linux
+        "$FLUTTER" build linux --release
 
         mkdir -p "$OUTDIR"
         ln -sfn "$(cd build/linux/x64/release/bundle && pwd)" "$OUTDIR/flutter"
