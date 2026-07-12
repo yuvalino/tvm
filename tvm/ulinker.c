@@ -3337,18 +3337,22 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
 
     dl->dlm64_load_bias = (uintptr_t)base - min_vaddr;
 
-    // Register code signature with kernel so mmap(PROT_EXEC) is allowed on iOS.
-    // Must happen before any executable segment mapping.
-#if defined(__APPLE__) && TARGET_OS_IOS
+    // Register code signature with kernel so mmap(PROT_EXEC) is allowed.
+    // Required on iOS; best-effort on macOS.
+#if defined(__APPLE__)
     if (codesig_off && codesig_size && !DLBASE(dl)->dl_emu) {
         fsignatures_t siginfo;
-        siginfo.fs_file_start = 0; // thin binary, no fat offset
+        siginfo.fs_file_start = 0;
         siginfo.fs_blob_start = (void *)(long)codesig_off;
         siginfo.fs_blob_size  = codesig_size;
         int sigresult = fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo);
         if (sigresult == -1) {
+#if TARGET_OS_IOS
             ERROR("failed to register code signature for \"%s\": -%d (%s)", filename, errno, strerror(errno));
             goto out;
+#else
+            PRINT("ulinker: code signature registration failed for \"%s\" (non-fatal): %s", filename, strerror(errno));
+#endif
         }
     }
 #endif
