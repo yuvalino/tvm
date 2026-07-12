@@ -95,9 +95,11 @@ set(MKSH_BUILD ${THIRDPARTY_BUILD}/mksh)
 ExternalProject_Add(mksh_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/mksh
     BINARY_DIR ${MKSH_BUILD}
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${CMAKE_COMMAND} -E env CC=${TVM_CC}
-        sh ${SCRIPTS_DIR}/build_mksh.sh ${THIRDPARTY_SRC}/mksh ${MKSH_BUILD}
+    CONFIGURE_COMMAND sh -c "cd ${MKSH_BUILD} && \
+        CC=${TVM_CC} CFLAGS='-g -gdwarf-4 -fcommon -DMKSH_FORKLESS=1' \
+        sh ${THIRDPARTY_SRC}/mksh/Build.sh"
+    BUILD_COMMAND sh -c "cd ${MKSH_BUILD} && sh ./Rebuild.sh && \
+        ${TVM_CC} -g -gdwarf-4 -o mksh ./*.o"
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
