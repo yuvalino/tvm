@@ -12619,56 +12619,37 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 static char **usershell_cache = NULL;
 static int    usershell_cache_count = 0;
 
+static void usershell_cache_add(char ***list, int *n, int *cap, const char *shell)
+{
+    for (int i = 0; i < *n; i++)
+        if (strcmp((*list)[i], shell) == 0) return;
+    if (*n >= *cap - 1) {
+        *cap *= 2;
+        *list = krealloc(*list, *cap * sizeof(char *));
+        if (!*list) return;
+    }
+    (*list)[(*n)++] = kstrdup(shell);
+}
+
 static void usershell_cache_init(void)
 {
     if (usershell_cache) return;
 
     int cap = 16, n = 0;
-    char **list = calloc(cap, sizeof(char *));
+    char **list = kalloc(cap * sizeof(char *));
     if (!list) return;
 
     setusershell();
     char *sh;
-    while ((sh = getusershell()) != NULL) {
-        if (n >= cap - 1) {
-            cap *= 2;
-            list = realloc(list, cap * sizeof(char *));
-            if (!list) return;
-        }
-        list[n++] = strdup(sh);
-    }
+    while ((sh = getusershell()) != NULL)
+        usershell_cache_add(&list, &n, &cap, sh);
     endusershell();
 
-    const char *tvm_shell = getenv("TVM_SHELL");
-    if (tvm_shell && *tvm_shell) {
-        int found = 0;
-        for (int i = 0; i < n; i++)
-            if (strcmp(list[i], tvm_shell) == 0) { found = 1; break; }
-        if (!found) {
-            if (n >= cap - 1) {
-                cap *= 2;
-                list = realloc(list, cap * sizeof(char *));
-                if (!list) return;
-            }
-            list[n++] = strdup(tvm_shell);
-        }
-    }
+    const char *tvm_shell = CALL_FUNC(getenv, "TVM_SHELL");
+    if (tvm_shell && *tvm_shell)
+        usershell_cache_add(&list, &n, &cap, tvm_shell);
 
-    // Append DROPBEAR_EMBEDDED_USERSHELL (/tvm/bin/sh) if not already listed
-    const char *embedded = "/tvm/bin/sh";
-    {
-        int found = 0;
-        for (int i = 0; i < n; i++)
-            if (strcmp(list[i], embedded) == 0) { found = 1; break; }
-        if (!found) {
-            if (n >= cap - 1) {
-                cap *= 2;
-                list = realloc(list, cap * sizeof(char *));
-                if (!list) return;
-            }
-            list[n++] = strdup(embedded);
-        }
-    }
+    usershell_cache_add(&list, &n, &cap, "/tvm/bin/sh");
 
     list[n] = NULL;
     usershell_cache = list;
