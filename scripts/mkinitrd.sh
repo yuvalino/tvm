@@ -42,11 +42,12 @@ ln -sf dropbear dropbearkey
 ln -sf dropbear ssh-keygen
 ln -sf dropbear sshd
 
-# toybox applet symlinks
+# toybox applet symlinks (from static list)
+APPLETS="$SRCDIR/scripts/toybox_applets.list"
 cd "$ROOTFS"
-for cmd in $(./bin/toybox); do
-    [ ! -e "bin/$cmd" ] && ln -sf toybox "bin/$cmd"
-done
+while read -r cmd; do
+    [ -n "$cmd" ] && [ ! -e "bin/$cmd" ] && ln -sf toybox "bin/$cmd"
+done < "$APPLETS"
 
 # create cpio archive
-cd "$ROOTFS" && find . | ./bin/toybox cpio -o -H newc > "$OUTDIR/initrd-cli.cpio"
+cd "$ROOTFS" && find . | cpio -o -H newc > "$OUTDIR/initrd-cli.cpio"

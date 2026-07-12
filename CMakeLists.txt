@@ -24,20 +24,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 endif()
 
 # initrd_flutter — rootfs with launcher stubs instead of real binaries
-# On non-iOS, depends on toybox_exe for the applet list.
-# On iOS, toybox must be pre-built for the host (it can't run cross-compiled).
-set(INITRD_FLUTTER_DEPS dropbear_launcher mksh_launcher toybox_launcher vim_launcher)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    list(APPEND INITRD_FLUTTER_DEPS toybox_exe)
-endif()
+# Applet list is static (scripts/toybox_applets.list) — no host toybox needed.
 add_custom_target(initrd_flutter
     COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/mkinitrd_flutter.sh
         ${CMAKE_CURRENT_BINARY_DIR}/.rootfs_flutter
         ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-        ${CMAKE_CURRENT_SOURCE_DIR}/output/macos-arm64/build/third_party/toybox/toybox
-    DEPENDS ${INITRD_FLUTTER_DEPS}
+    DEPENDS dropbear_launcher mksh_launcher toybox_launcher vim_launcher
     COMMENT "Assembling initrd.cpio (flutter)"
 )
 set_target_properties(initrd_flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)

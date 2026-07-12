@@ -4,15 +4,14 @@ set -e
 ROOTFS="$1"
 OUTDIR="$2"
 SRCDIR="$3"
-BINDIR="$4"       # path to bin/ dir with pre-built launchers
-HOST_TOYBOX="$5"  # path to host-built toybox (for applet list)
+BINDIR="$4"  # path to bin/ dir with pre-built launchers
 
 rm -rf "$ROOTFS" && mkdir -p "$ROOTFS/bin"
 
 # sh and dropbear must be compiled launchers (sh can't use itself as
 # shebang interpreter; dropbear needs argv[0] preserved for multi-call).
 # Other launchers are shell scripts — they don't need the emulator,
-# avoiding Unicorn's single-JIT-buffer limitation for concurrent pipes.
+# avoiding Unicorn's TCG buffer exhaustion for concurrent pipes.
 cp "$BINDIR/mksh_launcher" "$ROOTFS/bin/sh"
 cp "$BINDIR/dropbear_launcher" "$ROOTFS/bin/dropbear"
 for pair in "toybox:libtoybox.dylib" "vim:libvim.dylib"; do
@@ -32,13 +31,12 @@ ln -sf dropbear dropbearkey
 ln -sf dropbear ssh-keygen
 ln -sf dropbear sshd
 
-# toybox applet symlinks
+# toybox applet symlinks (from static list)
+APPLETS="$SRCDIR/scripts/toybox_applets.list"
 cd "$ROOTFS"
-if [ -x "$HOST_TOYBOX" ]; then
-    for cmd in $("$HOST_TOYBOX"); do
-        [ ! -e "bin/$cmd" ] && ln -sf toybox "bin/$cmd"
-    done
-fi
+while read -r cmd; do
+    [ -n "$cmd" ] && [ ! -e "bin/$cmd" ] && ln -sf toybox "bin/$cmd"
+done < "$APPLETS"
 
 # vim runtime
 cd "$SRCDIR"
