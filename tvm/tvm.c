@@ -7505,22 +7505,14 @@ static int _phdr_callback(struct dl_phdr_info *info, size_t size, void *data)
     uintptr_t *out = data;
     uintptr_t addr = (uintptr_t)get_text;
     for (int i = 0; i < info->dlpi_phnum; i++) {
-        if (info->dlpi_phdr[i].p_type != PT_LOAD)
+        if (info->dlpi_phdr[i].p_type != PT_LOAD ||
+            !(info->dlpi_phdr[i].p_flags & PF_X))
             continue;
         uintptr_t seg_start = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr;
         uintptr_t seg_end = seg_start + info->dlpi_phdr[i].p_memsz;
         if (addr >= seg_start && addr < seg_end) {
-            out[0] = info->dlpi_addr;
-            uintptr_t end = out[0];
-            for (int j = 0; j < info->dlpi_phnum; j++) {
-                if (info->dlpi_phdr[j].p_type == PT_LOAD &&
-                    (info->dlpi_phdr[j].p_flags & PF_X)) {
-                    uintptr_t e = info->dlpi_addr + info->dlpi_phdr[j].p_vaddr +
-                                  info->dlpi_phdr[j].p_memsz;
-                    if (e > end) end = e;
-                }
-            }
-            out[1] = end;
+            out[0] = seg_start;
+            out[1] = seg_end;
             return 1;
         }
     }
