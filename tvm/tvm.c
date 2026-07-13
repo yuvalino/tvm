@@ -12749,9 +12749,8 @@ FUNCTION_DEFINE1(char *, strerror, int, errnum) {
     return current->tsk_data->strerror_buf;
 }
 
-// These are registered via FUNCTION_METADATA (not FUNCTION_DEFINE) so they
-// only apply to ulinker-loaded programs and don't shadow libc's versions.
-// This avoids RTLD_NEXT resolution issues during usershell_cache_init.
+// FUNCTION_METADATA (not FUNCTION_DEFINE) — FUNCTION_DEFINE causes a
+// segfault at init time. Needs investigation.
 static void __tvm_setusershell(void) {
     current->tsk_data->usershell_idx = 0;
 }
