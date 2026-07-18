@@ -55,6 +55,62 @@ Output goes to `output/<platform>/bin/` (auto-detected: `linux-x64` or `macos-ar
 ./output/linux-x64/bin/tvm -v /tvm:path/to/initrd.cpio <program>
 ```
 
+## Flutter app (iOS / macOS)
+
+`flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
+on-device, letting you `ssh` into a full POSIX environment. The TVM core is
+built as `libtvm.dylib`; dropbear/mksh/toybox/vim ship as sidecar dylibs; the
+rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
+native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm and runs it on a
+worker thread.
+
+```sh
+# Build the app (always release). Pick the platform with -a.
+python3 build.py -a ios-arm64   -t flutter
+python3 build.py -a macos-arm64 -t flutter
+```
+
+The build symlinks the app at `output/<arch>/lib/flutter` (→ `Runner.app` on
+iOS, `tvm.app` on macOS) — use that path, consistent with the rest of the
+`output/<arch>` layout.
+
+### Running on an iOS device
+
+The device must be paired/trusted (over USB once, then usable over the network
+tunnel). Use `xcrun devicectl` with the device name (e.g. `pan1c`):
+
+```sh
+xcrun devicectl device install app --device pan1c output/ios-arm64/lib/flutter
+xcrun devicectl device process launch --device pan1c com.yuvalino.tvm
+# then: ssh -p 2222 mobile@pan1c.local   (default password: alpine)
+```
+
+Signing note: the Runner target is pinned to a development team, and
+`iOS.entitlements` requests `increased-memory-limit` — that capability must be
+enabled on the App ID in the Apple Developer portal, otherwise signing fails.
+
+### Viewing logs on a device
+
+The app writes its startup info and TVM kernel logs to its in-app console **and**
+to real `stderr` (fd 2). To see them from your Mac, launch with
+`--terminate-existing --console`:
+
+```sh
+xcrun devicectl device process launch --terminate-existing --console \
+    --device pan1c com.yuvalino.tvm
+```
+
+**`--terminate-existing` is required.** devicectl only connects the app's
+stdout/stderr *"if the app is not already running"* — i.e. on a fresh launch.
+A plain launch, or `--console` while the app is already up, shows nothing.
+
+### Testing on a device
+
+```sh
+# Runs the integration suite against the app's SSH server on the device.
+pytest tests/test_integration.py --device pan1c --backend flutter
+```
+
 ## Programs
 
 ### Builtin
@@ -127,3 +183,4 @@ Test runner flags: `-l` list tests, `-k=TEST` filter, `-v` verbose, `-g` debug w
 
 - Linux x86-64
 - macOS arm64
+- iOS arm64 (via the Flutter app)

@@ -10,6 +10,7 @@
 		331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C807B294A618700263BE5 /* RunnerTests.swift */; };
 		3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */ = {isa = PBXBuildFile; fileRef = 3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */; };
 		78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */ = {isa = PBXBuildFile; productRef = 78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */; };
+		AABB00332044BEEF0003C045 /* tvm_bindings.c in Sources */ = {isa = PBXBuildFile; fileRef = AABB00312044BEEF0003C045 /* tvm_bindings.c */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +45,8 @@
 		9740EEB21CF90195004384FC /* Debug.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Debug.xcconfig; path = Flutter/Debug.xcconfig; sourceTree = "<group>"; };
 		9740EEB31CF90195004384FC /* Generated.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Generated.xcconfig; path = Flutter/Generated.xcconfig; sourceTree = "<group>"; };
 		97C146EE1CF9000F007C117D /* Runner.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Runner.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AABB00312044BEEF0003C045 /* tvm_bindings.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = tvm_bindings.c; path = ../tvm/tvm_bindings.c; sourceTree = SOURCE_ROOT; };
+		AABB00322044BEEF0003C045 /* tvm_bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = tvm_bindings.h; path = ../tvm/tvm_bindings.h; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -97,6 +100,7 @@
 			children = (
 				9740EEB11CF90186004384FC /* Flutter */,
 				97C146F01CF9000F007C117D /* Runner */,
+				AABB00342044BEEF0003C045 /* TVM */,
 				97C146EF1CF9000F007C117D /* Products */,
 				331C8082294A63A400263BE5 /* RunnerTests */,
 			);
@@ -109,6 +113,15 @@
 				331C8081294A63A400263BE5 /* RunnerTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		AABB00342044BEEF0003C045 /* TVM */ = {
+			isa = PBXGroup;
+			children = (
+				AABB00312044BEEF0003C045 /* tvm_bindings.c */,
+				AABB00322044BEEF0003C045 /* tvm_bindings.h */,
+			);
+			name = TVM;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -283,6 +296,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AABB00332044BEEF0003C045 /* tvm_bindings.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
