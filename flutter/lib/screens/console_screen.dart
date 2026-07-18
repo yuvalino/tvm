@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import '../services/worker_controller.dart';
@@ -62,37 +63,43 @@ class _ConsoleScreenState extends State<ConsoleScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return CupertinoPageScaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
-        title: const Text('tvm'),
-        backgroundColor: const Color(0xFF1C1C1E),
-      ),
-      body: Column(
+      child: Column(
         children: [
           Expanded(
             child: ValueListenableBuilder<double>(
               valueListenable: _worker.fontSizeNotifier,
               builder: (context, fontSize, _) {
                 final logs = _worker.logs.value;
-                return ListView.builder(
+                return CustomScrollView(
                   controller: _scrollController,
-                  padding: const EdgeInsets.all(12),
-                  itemCount: logs.length,
-                  itemBuilder: (context, index) {
-                    return Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Text(
-                        logs[index],
-                        style: TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: fontSize,
-                          color: Colors.green,
-                          height: 1.3,
-                        ),
+                  slivers: [
+                    const CupertinoSliverNavigationBar(
+                      largeTitle: Text('tvm'),
+                    ),
+                    SliverPadding(
+                      padding: const EdgeInsets.all(12),
+                      sliver: SliverList.builder(
+                        itemCount: logs.length,
+                        itemBuilder: (context, index) {
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 2),
+                            child: Text(
+                              logs[index],
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: fontSize,
+                                color: Colors.green,
+                                height: 1.3,
+                                decoration: TextDecoration.none,
+                              ),
+                            ),
+                          );
+                        },
                       ),
-                    );
-                  },
+                    ),
+                  ],
                 );
               },
             ),

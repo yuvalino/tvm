@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
 
 class NumberEditorScreen extends StatefulWidget {
@@ -41,47 +41,34 @@ class _NumberEditorScreenState extends State<NumberEditorScreen> {
   void _onChanged(String text) {
     final parsed = int.tryParse(text);
     if (parsed != null) {
-      final clamped = parsed.clamp(widget.min, widget.max);
-      widget.onChanged(clamped);
+      widget.onChanged(parsed.clamp(widget.min, widget.max));
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF1C1C1E),
-      appBar: AppBar(title: Text(widget.title)),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+    return CupertinoPageScaffold(
+      backgroundColor: CupertinoColors.black,
+      navigationBar: CupertinoNavigationBar(
+        middle: Text(widget.title),
+        previousPageTitle: 'Settings',
+      ),
+      child: SafeArea(
+        child: ListView(
           children: [
-            TextField(
-              controller: _controller,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              style: const TextStyle(color: Colors.white, fontSize: 16),
-              decoration: InputDecoration(
-                filled: true,
-                fillColor: const Color(0xFF2C2C2E),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: BorderSide.none,
+            CupertinoFormSection.insetGrouped(
+              footer: widget.footer != null ? Text(widget.footer!) : null,
+              children: [
+                CupertinoTextFormFieldRow(
+                  controller: _controller,
+                  placeholder: widget.title,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  onChanged: _onChanged,
+                  autofocus: true,
                 ),
-                hintText: widget.title,
-                hintStyle: const TextStyle(color: Colors.white24),
-              ),
-              onChanged: _onChanged,
-              autofocus: true,
+              ],
             ),
-            if (widget.footer != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(
-                  widget.footer!,
-                  style: const TextStyle(color: Colors.white38, fontSize: 13),
-                ),
-              ),
           ],
         ),
       ),

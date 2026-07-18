@@ -1,15 +1,17 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 
 class PasswordEditorScreen extends StatefulWidget {
   const PasswordEditorScreen({
     super.key,
     required this.title,
     required this.initialValue,
+    required this.onChanged,
     this.footer,
   });
 
   final String title;
   final String initialValue;
+  final ValueChanged<String> onChanged;
   final String? footer;
 
   @override
@@ -34,66 +36,46 @@ class _PasswordEditorScreenState extends State<PasswordEditorScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF1C1C1E),
-      appBar: AppBar(
-        title: Text(widget.title),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, _controller.text),
-            child: const Text('Save'),
-          ),
-        ],
+    return CupertinoPageScaffold(
+      backgroundColor: CupertinoColors.black,
+      navigationBar: CupertinoNavigationBar(
+        middle: Text(widget.title),
+        previousPageTitle: 'Settings',
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+      child: SafeArea(
+        child: ListView(
           children: [
-            TextField(
-              controller: _controller,
-              obscureText: !_showPassword,
-              autocorrect: false,
-              enableSuggestions: false,
-              style: const TextStyle(color: Colors.white, fontSize: 16),
-              decoration: InputDecoration(
-                filled: true,
-                fillColor: const Color(0xFF2C2C2E),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: BorderSide.none,
-                ),
-                hintText: widget.title,
-                hintStyle: const TextStyle(color: Colors.white24),
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    _showPassword ? Icons.visibility_off : Icons.visibility,
-                    color: Colors.white38,
+            CupertinoFormSection.insetGrouped(
+              footer: widget.footer != null ? Text(widget.footer!) : null,
+              children: [
+                CupertinoTextField.borderless(
+                  controller: _controller,
+                  placeholder: widget.title,
+                  obscureText: !_showPassword,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  onChanged: widget.onChanged,
+                  autofocus: true,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 16, vertical: 12),
+                  suffix: Padding(
+                    padding: const EdgeInsets.only(right: 12),
+                    child: GestureDetector(
+                      onTap: () =>
+                          setState(() => _showPassword = !_showPassword),
+                      child: Icon(
+                        _showPassword
+                            ? CupertinoIcons.eye_slash_fill
+                            : CupertinoIcons.eye_fill,
+                        size: 22,
+                        color: CupertinoColors.secondaryLabel.resolveFrom(
+                            context),
+                      ),
+                    ),
                   ),
-                  onPressed: () =>
-                      setState(() => _showPassword = !_showPassword),
                 ),
-              ),
-              autofocus: true,
+              ],
             ),
-            const SizedBox(height: 12),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text(
-                'Show Password',
-                style: TextStyle(color: Colors.white),
-              ),
-              value: _showPassword,
-              onChanged: (v) => setState(() => _showPassword = v),
-            ),
-            if (widget.footer != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(
-                  widget.footer!,
-                  style: const TextStyle(color: Colors.white38, fontSize: 13),
-                ),
-              ),
           ],
         ),
       ),

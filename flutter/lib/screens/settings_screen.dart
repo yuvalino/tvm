@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../services/worker_controller.dart';
@@ -26,71 +26,108 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF1C1C1E),
-      appBar: AppBar(title: const Text('Settings')),
-      body: ListView(
-        children: [
-          _SectionHeader(title: 'Console'),
-          _SettingsRow(
-            title: 'Font Size',
-            value: '${_worker.consoleFontSize.toInt()}',
-            onTap: () => _pushNumberEditor(
-              title: 'Font Size',
-              value: _worker.consoleFontSize.toInt(),
-              range: (10, 30),
-              footer: 'Recommended range: 10–30',
-              onChanged: (v) =>
-                  setState(() => _worker.consoleFontSize = v.toDouble()),
-            ),
+    // Native iOS grouped-section header: small, gray, uppercase, and aligned
+    // with the row title text (CupertinoListSection.insetGrouped otherwise
+    // renders it 20pt bold at the card edge). The row title of a notched tile
+    // without a leading widget sits 28pt in from the card edge, so pad the
+    // header to match.
+    final headerStyle = TextStyle(
+      fontSize: 13,
+      fontWeight: FontWeight.w400,
+      color: CupertinoColors.secondaryLabel.resolveFrom(context),
+    );
+    Widget sectionHeader(String title) => Padding(
+          padding: const EdgeInsetsDirectional.only(start: 28),
+          child: Text(title.toUpperCase(), style: headerStyle),
+        );
+    return CupertinoPageScaffold(
+      backgroundColor: CupertinoColors.black,
+      child: CustomScrollView(
+        slivers: [
+          const CupertinoSliverNavigationBar(
+            largeTitle: Text('Settings'),
+            previousPageTitle: 'tvm',
           ),
-          _SectionHeader(title: 'Network'),
-          _SettingsRow(
-            title: 'SSH Port',
-            value: '${_worker.sshPort}',
-            onTap: () => _pushNumberEditor(
-              title: 'SSH Port',
-              value: _worker.sshPort,
-              range: (1, 65535),
-              footer: 'Enter a value between 1 and 65535.',
-              onChanged: (v) => setState(() => _worker.sshPort = v),
-            ),
-          ),
-          _SettingsRow(
-            title: 'SSH Pass',
-            value: '*' * _worker.sshPass.length.clamp(1, 20),
-            onTap: () async {
-              final result = await Navigator.push<String>(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => PasswordEditorScreen(
-                    title: 'SSH Pass',
-                    initialValue: _worker.sshPass,
-                    footer: 'Default password is alpine.',
-                  ),
+          SliverToBoxAdapter(
+            child: Column(
+              children: [
+                CupertinoListSection.insetGrouped(
+                  header: sectionHeader('Console'),
+                  children: [
+                    CupertinoListTile.notched(
+                      title: const Text('Font Size'),
+                      additionalInfo:
+                          Text('${_worker.consoleFontSize.toInt()}'),
+                      trailing: const CupertinoListTileChevron(),
+                      onTap: () => _pushNumberEditor(
+                        title: 'Font Size',
+                        value: _worker.consoleFontSize.toInt(),
+                        range: (10, 30),
+                        footer: 'Recommended range: 10–30',
+                        onChanged: (v) => setState(
+                            () => _worker.consoleFontSize = v.toDouble()),
+                      ),
+                    ),
+                  ],
                 ),
-              );
-              if (result != null) {
-                setState(() => _worker.sshPass = result);
-              }
-            },
-          ),
-          _SectionHeader(title: 'About'),
-          _InfoRow(
-            title: 'Version',
-            value: _packageInfo?.version ?? '...',
-          ),
-          _InfoRow(
-            title: 'Build',
-            value: _packageInfo?.buildNumber ?? '...',
-          ),
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 16),
-            child: Center(
-              child: Text(
-                'tvm by yuvalino',
-                style: TextStyle(color: Colors.white38, fontSize: 13),
-              ),
+                CupertinoListSection.insetGrouped(
+                  header: sectionHeader('Network'),
+                  children: [
+                    CupertinoListTile.notched(
+                      title: const Text('SSH Port'),
+                      additionalInfo: Text('${_worker.sshPort}'),
+                      trailing: const CupertinoListTileChevron(),
+                      onTap: () => _pushNumberEditor(
+                        title: 'SSH Port',
+                        value: _worker.sshPort,
+                        range: (1, 65535),
+                        footer: 'Enter a value between 1 and 65535.',
+                        onChanged: (v) => setState(() => _worker.sshPort = v),
+                      ),
+                    ),
+                    CupertinoListTile.notched(
+                      title: const Text('SSH Pass'),
+                      additionalInfo:
+                          Text('*' * _worker.sshPass.length.clamp(1, 20)),
+                      trailing: const CupertinoListTileChevron(),
+                      onTap: () => Navigator.push(
+                        context,
+                        CupertinoPageRoute(
+                          builder: (_) => PasswordEditorScreen(
+                            title: 'SSH Pass',
+                            initialValue: _worker.sshPass,
+                            footer: 'Default password is alpine.',
+                            onChanged: (v) =>
+                                setState(() => _worker.sshPass = v),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                CupertinoListSection.insetGrouped(
+                  header: sectionHeader('About'),
+                  footer: Center(
+                    child: Text(
+                      'tvm by yuvalino',
+                      style: TextStyle(
+                        color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                  children: [
+                    CupertinoListTile.notched(
+                      title: const Text('Version'),
+                      additionalInfo: Text(_packageInfo?.version ?? '...'),
+                    ),
+                    CupertinoListTile.notched(
+                      title: const Text('Build'),
+                      additionalInfo: Text(_packageInfo?.buildNumber ?? '...'),
+                    ),
+                  ],
+                ),
+              ],
             ),
           ),
         ],
@@ -107,7 +144,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }) {
     Navigator.push(
       context,
-      MaterialPageRoute(
+      CupertinoPageRoute(
         builder: (_) => NumberEditorScreen(
           title: title,
           initialValue: value,
@@ -117,72 +154,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           onChanged: onChanged,
         ),
       ),
-    );
-  }
-}
-
-class _SectionHeader extends StatelessWidget {
-  const _SectionHeader({required this.title});
-  final String title;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
-      child: Text(
-        title.toUpperCase(),
-        style: const TextStyle(
-          color: Colors.white38,
-          fontSize: 13,
-          fontWeight: FontWeight.w600,
-          letterSpacing: 0.5,
-        ),
-      ),
-    );
-  }
-}
-
-class _SettingsRow extends StatelessWidget {
-  const _SettingsRow({
-    required this.title,
-    required this.value,
-    required this.onTap,
-  });
-
-  final String title;
-  final String value;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListTile(
-      tileColor: const Color(0xFF2C2C2E),
-      title: Text(title, style: const TextStyle(color: Colors.white)),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(value, style: const TextStyle(color: Colors.white38)),
-          const SizedBox(width: 4),
-          const Icon(Icons.chevron_right, color: Colors.white24, size: 20),
-        ],
-      ),
-      onTap: onTap,
-    );
-  }
-}
-
-class _InfoRow extends StatelessWidget {
-  const _InfoRow({required this.title, required this.value});
-
-  final String title;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListTile(
-      tileColor: const Color(0xFF2C2C2E),
-      title: Text(title, style: const TextStyle(color: Colors.white)),
-      trailing: Text(value, style: const TextStyle(color: Colors.white38)),
     );
   }
 }

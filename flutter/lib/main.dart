@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
 import 'screens/console_screen.dart';
@@ -25,38 +26,36 @@ class DevtoolApp extends StatelessWidget {
         ),
         scaffoldBackgroundColor: Colors.black,
         fontFamily: 'SF Pro',
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFF1C1C1E),
-          elevation: 0,
-          scrolledUnderElevation: 0,
-          centerTitle: true,
-          iconTheme: IconThemeData(color: Colors.white70),
-          actionsIconTheme: IconThemeData(color: Colors.white70),
-          titleTextStyle: TextStyle(
-            color: Colors.white,
-            fontSize: 18,
-            fontWeight: FontWeight.w600,
+        useMaterial3: true,
+      ),
+      // iOS chrome (nav bars, back buttons, form rows) inherits this — dark,
+      // with green as the tint for back buttons and controls. The
+      // DefaultTextStyle keeps raw Text under CupertinoPageScaffold from
+      // falling back to WidgetsApp's error style (yellow underlines).
+      builder: (context, child) => CupertinoTheme(
+        data: const CupertinoThemeData(
+          brightness: Brightness.dark,
+          primaryColor: Color(0xFF34C759),
+          scaffoldBackgroundColor: Colors.black,
+        ),
+        child: Builder(
+          builder: (context) => DefaultTextStyle(
+            style: CupertinoTheme.of(context).textTheme.textStyle,
+            child: child!,
           ),
         ),
-        pageTransitionsTheme: const PageTransitionsTheme(
-          builders: {
-            TargetPlatform.android: CupertinoPageTransitionsBuilder(),
-            TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
-          },
-        ),
-        useMaterial3: true,
       ),
       initialRoute: '/',
       onGenerateRoute: (settings) {
         switch (settings.name) {
           case '/settings':
-            return MaterialPageRoute(
+            return CupertinoPageRoute(
               settings: settings,
               builder: (_) => const SettingsScreen(),
             );
           case '/':
           default:
-            return MaterialPageRoute(
+            return CupertinoPageRoute(
               settings: settings,
               builder: (_) => const ConsoleScreen(),
             );
