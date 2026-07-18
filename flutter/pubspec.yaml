@@ -24,3 +24,6 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/init.flutter.rc
+    - assets/initrd.flutter.cpio

@@ -25,22 +25,19 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     endif()
 endif()
 
-# libtvm.dylib — TVM runtime for Flutter app (Apple platforms)
+# libtvm.dylib — TVM runtime for Flutter app (Apple platforms).
+# Pure export of TVM core; the app-side tvm_bindings.c dlsym's
+# tvm_init_with_outfd / tvm_mount_cpio from it.
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    add_library(tvm_shared SHARED
-        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native/tvm_main_apple.c
-    )
+    add_library(tvm_shared SHARED $<TARGET_OBJECTS:tvm_static>)
     set_target_properties(tvm_shared PROPERTIES
         OUTPUT_NAME tvm
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}"
         INSTALL_NAME_DIR "@rpath"
         C_VISIBILITY_PRESET default
     )
-    target_include_directories(tvm_shared PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/native
-    )
-    set(TVM_SHARED_LIBS tvm_static unicorn z pthread m)
+    # Objects come from tvm_static via TARGET_OBJECTS; only link the deps.
+    set(TVM_SHARED_LIBS unicorn z pthread m)
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         list(APPEND TVM_SHARED_LIBS ncurses)
     endif()

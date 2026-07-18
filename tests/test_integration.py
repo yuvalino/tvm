@@ -17,7 +17,7 @@ TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
 TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim"
-FLUTTER_APP = f"./flutter/build/macos/Build/Products/Debug/tvm.app"
+FLUTTER_APP = f"./flutter/build/macos/Build/Products/Release/tvm.app"
 IOS_APP = f"./flutter/build/ios/iphoneos/Runner.app"
 IOS_BUNDLE_ID = "com.yuvalino.tvm"
 

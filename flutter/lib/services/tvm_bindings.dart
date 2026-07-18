@@ -1,113 +1,103 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
-typedef _LoadNative = Int32 Function(Pointer<Utf8> path);
-typedef _LoadDart = int Function(Pointer<Utf8> path);
+typedef _OutputCbNative = Void Function(Pointer<Uint8> data, Int32 len);
 
-typedef _StartNative = Int32 Function(Int32 port, Pointer<Utf8> password);
-typedef _StartDart = int Function(int port, Pointer<Utf8> password);
-
-typedef _PollNative = Int32 Function(Pointer<Uint8> buf, Int32 bufSize);
-typedef _PollDart = int Function(Pointer<Uint8> buf, int bufSize);
-
-typedef _StopNative = Void Function();
-typedef _StopDart = void Function();
+typedef _StartNative = Int32 Function(
+  Pointer<Utf8> libtvmPath,
+  Int32 port,
+  Pointer<Utf8> password,
+  Pointer<Utf8> initrcPath,
+  Pointer<Utf8> initrdPath,
+  Pointer<NativeFunction<_OutputCbNative>> onOutput,
+);
+typedef _StartDart = int Function(
+  Pointer<Utf8> libtvmPath,
+  int port,
+  Pointer<Utf8> password,
+  Pointer<Utf8> initrcPath,
+  Pointer<Utf8> initrdPath,
+  Pointer<NativeFunction<_OutputCbNative>> onOutput,
+);
 
 class TvmBindings {
   TvmBindings._();
   static final TvmBindings instance = TvmBindings._();
 
   DynamicLibrary? _lib;
-  _LoadDart? _load;
   _StartDart? _start;
-  _PollDart? _poll;
-  _StopDart? _stop;
-
-  bool get isAvailable => _lib != null;
+  NativeCallable<_OutputCbNative>? _callback;
 
   String? loadError;
 
+  bool get isAvailable => _lib != null;
+
+  /// Sink for TVM output. Set by the caller before [start].
+  void Function(String)? onOutput;
+
   void init() {
     try {
-      _lib = _openLibrary();
-      _load = _lib!.lookupFunction<_LoadNative, _LoadDart>('tvm_load');
-      _start = _lib!.lookupFunction<_StartNative, _StartDart>('tvm_start');
-      _poll = _lib!.lookupFunction<_PollNative, _PollDart>('tvm_poll');
-      _stop = _lib!.lookupFunction<_StopNative, _StopDart>('tvm_stop');
-
-      final tvmPath = _tvmLibraryPath();
-      if (tvmPath != null) {
-        final ptr = tvmPath.toNativeUtf8();
-        try {
-          if (_load!(ptr) != 0) {
-            loadError = 'tvm_load failed for $tvmPath';
-            _lib = null;
-          }
-        } finally {
-          malloc.free(ptr);
-        }
+      if (!(Platform.isIOS || Platform.isMacOS)) {
+        throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
       }
+      final lib = DynamicLibrary.process();
+      if (!lib.providesSymbol('tvm_start')) {
+        throw Exception('tvm_start not found — tvm_bindings.c may not be linked');
+      }
+      _lib = lib;
+      _start = lib.lookupFunction<_StartNative, _StartDart>('tvm_start');
+      // .listener runs the callback on this isolate's event loop, so it is
+      // safe to touch Dart state / the UI from it.
+      _callback = NativeCallable<_OutputCbNative>.listener(_onNativeOutput);
     } catch (e) {
       loadError = e.toString();
       _lib = null;
     }
   }
 
-  int start(int port, String password) {
-    final ptr = password.toNativeUtf8();
+  // Called (asynchronously) from the native reader thread. `data` is a
+  // malloc'd buffer of `len` bytes that we own and must free.
+  void _onNativeOutput(Pointer<Uint8> data, int len) {
     try {
-      return _start!(port, ptr);
+      final bytes = data.asTypedList(len);
+      final text = utf8.decode(bytes, allowMalformed: true);
+      onOutput?.call(text);
     } finally {
-      malloc.free(ptr);
+      malloc.free(data);
     }
   }
 
-  String? poll() {
-    final buf = malloc<Uint8>(65536);
+  /// Starts TVM. Returns 0 on success.
+  int start({
+    required String libtvmPath,
+    required int port,
+    required String password,
+    required String initrcPath,
+    required String initrdPath,
+  }) {
+    if (_start == null || _callback == null) return -1;
+
+    final pLib = libtvmPath.toNativeUtf8();
+    final pPass = password.toNativeUtf8();
+    final pInitrc = initrcPath.toNativeUtf8();
+    final pInitrd = initrdPath.toNativeUtf8();
     try {
-      final n = _poll!(buf, 65536);
-      if (n <= 0) return null;
-      return String.fromCharCodes(buf.asTypedList(n));
+      return _start!(
+        pLib,
+        port,
+        pPass,
+        pInitrc,
+        pInitrd,
+        _callback!.nativeFunction,
+      );
     } finally {
-      malloc.free(buf);
+      malloc.free(pLib);
+      malloc.free(pPass);
+      malloc.free(pInitrc);
+      malloc.free(pInitrd);
     }
-  }
-
-  void stop() => _stop!();
-
-  static DynamicLibrary _openLibrary() {
-    if (Platform.isIOS || Platform.isMacOS) {
-      final lib = DynamicLibrary.process();
-      // Verify tvm_load is findable
-      if (!lib.providesSymbol('tvm_load')) {
-        throw Exception('tvm_load not found in process — tvm_bridge.c may not be linked');
-      }
-      return lib;
-    }
-    if (Platform.isAndroid || Platform.isLinux) {
-      return DynamicLibrary.open('libtvm_bridge.so');
-    }
-    if (Platform.isWindows) {
-      return DynamicLibrary.open('tvm_bridge.dll');
-    }
-    throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
-  }
-
-  static String? _tvmLibraryPath() {
-    if (Platform.isMacOS) {
-      final exe = Platform.resolvedExecutable;
-      final appDir = exe.substring(0, exe.lastIndexOf('/'));
-      return '$appDir/../Frameworks/libtvm.dylib';
-    }
-    if (Platform.isIOS) {
-      final exe = Platform.resolvedExecutable;
-      final appDir = exe.substring(0, exe.lastIndexOf('/'));
-      return '$appDir/Frameworks/libtvm.dylib';
-    }
-    // Linux/Android: libtvm.so is loaded via libtvm_bridge.so linkage
-    // iOS: statically linked
-    return null;
   }
 }

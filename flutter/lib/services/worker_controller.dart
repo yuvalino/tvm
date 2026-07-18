@@ -12,7 +12,6 @@ class WorkerController {
   static final WorkerController instance = WorkerController._();
 
   late SharedPreferences _prefs;
-  Timer? _pollTimer;
 
   final ValueNotifier<List<String>> logs =
       ValueNotifier(const ['[INFO] App started']);
@@ -20,11 +19,13 @@ class WorkerController {
   final ValueNotifier<double> fontSizeNotifier = ValueNotifier(14.0);
 
   bool _started = false;
+  String _lineBuf = '';
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
     autoScroll.value = _prefs.getBool('autoScroll') ?? true;
     fontSizeNotifier.value = consoleFontSize;
+    TvmBindings.instance.onOutput = _onOutput;
     TvmBindings.instance.init();
     autoScroll.addListener(() {
       _prefs.setBool('autoScroll', autoScroll.value);
@@ -47,14 +48,10 @@ class WorkerController {
     if (_started) return;
     _started = true;
 
-    _addLog(
-        'os: ${Platform.operatingSystem} ${Platform.operatingSystemVersion}');
+    _addLog('os: ${Platform.operatingSystem} ${Platform.operatingSystemVersion}');
     _addLog('pid: $pid');
     _addLog('hostname: ${Platform.localHostname}');
     _addLog('ssh port: $sshPort');
-    _addLog('cwd: ${Directory.current.path}');
-    _addLog(
-        'home: ${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? ''}');
 
     if (!TvmBindings.instance.isAvailable) {
       _addLog('[WARN] TVM native library not loaded');
@@ -62,35 +59,56 @@ class WorkerController {
       if (TvmBindings.instance.loadError != null) {
         _addLog('[WARN] ${TvmBindings.instance.loadError}');
       }
-      return;
-    }
-
-    _addLog('[INFO] Starting tvm');
-    final result = TvmBindings.instance.start(sshPort, sshPass);
-    if (result != 0) {
-      _addLog('[ERROR] Failed to start TVM');
       _started = false;
       return;
     }
 
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      final output = TvmBindings.instance.poll();
-      if (output != null && output.isNotEmpty) {
-        for (final line in output.split('\n')) {
-          if (line.isNotEmpty) _addLog(line);
-        }
-      }
-    });
+    final libtvmPath = _libtvmPath();
+    final assets = _flutterAssetsDir();
+
+    _addLog('[INFO] Starting tvm');
+    final result = TvmBindings.instance.start(
+      libtvmPath: libtvmPath,
+      port: sshPort,
+      password: sshPass,
+      initrcPath: '$assets/assets/init.flutter.rc',
+      initrdPath: '$assets/assets/initrd.flutter.cpio',
+    );
+    if (result != 0) {
+      _addLog('[ERROR] Failed to start TVM');
+      _started = false;
+    }
   }
 
-  void stop() {
-    if (!_started) return;
-    _started = false;
-    _pollTimer?.cancel();
-    _pollTimer = null;
-    if (TvmBindings.instance.isAvailable) {
-      TvmBindings.instance.stop();
+  // TVM output arrives here (on the main isolate). Buffer partial lines so a
+  // chunk split mid-line doesn't produce a broken log entry.
+  void _onOutput(String text) {
+    _lineBuf += text;
+    int nl;
+    while ((nl = _lineBuf.indexOf('\n')) >= 0) {
+      final line = _lineBuf.substring(0, nl);
+      _lineBuf = _lineBuf.substring(nl + 1);
+      if (line.isNotEmpty) _addLog(line);
     }
+  }
+
+  static String _appDir() {
+    final exe = Platform.resolvedExecutable;
+    return exe.substring(0, exe.lastIndexOf('/'));
+  }
+
+  static String _libtvmPath() {
+    final appDir = _appDir();
+    if (Platform.isMacOS) return '$appDir/../Frameworks/libtvm.dylib';
+    return '$appDir/Frameworks/libtvm.dylib'; // iOS
+  }
+
+  static String _flutterAssetsDir() {
+    final appDir = _appDir();
+    if (Platform.isMacOS) {
+      return '$appDir/../Frameworks/App.framework/Resources/flutter_assets';
+    }
+    return '$appDir/Frameworks/App.framework/flutter_assets'; // iOS
   }
 
   void _addLog(String line) {

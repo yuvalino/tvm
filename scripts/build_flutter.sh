@@ -28,14 +28,8 @@ case "$(uname)" in
             ln -sfn "$(cd build/macos/Build/Products/Release && pwd)/tvm.app" "$OUTDIR/flutter"
         fi
         ;;
-    Linux)
-        "$FLUTTER" build linux --release
-
-        mkdir -p "$OUTDIR"
-        ln -sfn "$(cd build/linux/x64/release/bundle && pwd)" "$OUTDIR/flutter"
-        ;;
     *)
-        echo "error: unsupported platform $(uname)" >&2
+        echo "error: unsupported platform $(uname) (macOS/iOS only)" >&2
         exit 1
         ;;
 esac

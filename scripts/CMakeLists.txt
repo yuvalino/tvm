@@ -42,7 +42,8 @@ function(mkinitrd_target NAME)
 
     set(ROOTFS ${CMAKE_CURRENT_BINARY_DIR}/.rootfs_${NAME})
     if(ARG_FLUTTER)
-        set(OUTFILE ${LIB_OUT}/initrd.flutter.cpio)
+        # Build directly into the Flutter assets dir so it's bundled as an asset.
+        set(OUTFILE ${ROOTDIR}/flutter/assets/initrd.flutter.cpio)
     else()
         set(OUTFILE ${LIB_OUT}/initrd.cli.cpio)
     endif()
@@ -94,6 +95,8 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/colors/lists/default.vim' \"$ROOTFS/share/vim/colors/lists/\"\n\n")
 
     # ── Create cpio ──
+    get_filename_component(OUTDIR "${OUTFILE}" DIRECTORY)
+    string(APPEND SCRIPT "mkdir -p '${OUTDIR}'\n")
     string(APPEND SCRIPT "cd \"$ROOTFS\" && find . | cpio -o -H newc > '${OUTFILE}'\n")
 
     # Write and register target
