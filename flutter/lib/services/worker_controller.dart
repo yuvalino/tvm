@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 
+import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -49,16 +50,20 @@ class WorkerController {
     if (_started) return;
     _started = true;
 
-    _addLog('os: ${Platform.operatingSystem} ${Platform.operatingSystemVersion}');
-    _addLog('pid: $pid');
-    _addLog('hostname: ${Platform.localHostname}');
-    _addLog('ssh port: $sshPort');
+    _log('device: ${_NativeInfo.device()}');
+    _log('pid: $pid');
+    _log('uid: ${_NativeInfo.uid()}');
+    _log('username: ${_NativeInfo.username()}');
+    _log('hostname: ${Platform.localHostname}');
+    _log('ssh port: $sshPort');
+    _log('cwd: ${Directory.current.path}');
+    _log('home: ${_NativeInfo.home()}');
 
     if (!TvmBindings.instance.isAvailable) {
-      _addLog('[WARN] TVM native library not loaded');
-      _addLog('[WARN] exe: ${Platform.resolvedExecutable}');
+      _log('[WARN] TVM native library not loaded');
+      _log('[WARN] exe: ${Platform.resolvedExecutable}');
       if (TvmBindings.instance.loadError != null) {
-        _addLog('[WARN] ${TvmBindings.instance.loadError}');
+        _log('[WARN] ${TvmBindings.instance.loadError}');
       }
       _started = false;
       return;
@@ -68,7 +73,7 @@ class WorkerController {
     final assets = _flutterAssetsDir();
     final arch = _archTag();
 
-    _addLog('[INFO] Starting tvm');
+    _log('[INFO] Starting tvm');
     final result = TvmBindings.instance.start(
       libtvmPath: libtvmPath,
       port: sshPort,
@@ -77,7 +82,7 @@ class WorkerController {
       initrdPath: '$assets/assets/initrd.flutter.$arch.cpio',
     );
     if (result != 0) {
-      _addLog('[ERROR] Failed to start TVM');
+      _log('[ERROR] Failed to start TVM');
       _started = false;
     }
   }
@@ -90,7 +95,7 @@ class WorkerController {
     while ((nl = _lineBuf.indexOf('\n')) >= 0) {
       final line = _lineBuf.substring(0, nl);
       _lineBuf = _lineBuf.substring(nl + 1);
-      if (line.isNotEmpty) _addLog(line);
+      if (line.isNotEmpty) _log(line);
     }
   }
 
@@ -122,8 +127,119 @@ class WorkerController {
     throw UnsupportedError('unsupported abi: $abi');
   }
 
-  void _addLog(String line) {
+  // Single log sink: the in-app console UI, plus real stderr (fd 2) so
+  // `devicectl --console` surfaces everything on a fresh (--terminate-existing)
+  // launch. Flutter routes print/debugPrint to os_log rather than stdio, but
+  // dart:io's stderr writes to the real fd that --console captures.
+  void _log(String line) {
     logs.value = [...logs.value, line];
-    debugPrint('[TVM] $line');
+    try {
+      stderr.writeln(line);
+    } catch (_) {}
+  }
+}
+
+// Startup info gathered via libc, matching the original devtool app:
+//   device = hw.machine _ kern.osproductversion _ kern.osversion
+//   uid    = getuid()
+//   name   = getpwuid(getuid())->pw_name
+class _NativeInfo {
+  static final DynamicLibrary _libc = DynamicLibrary.process();
+
+  static final int Function() _getuid =
+      _libc.lookupFunction<Uint32 Function(), int Function()>('getuid');
+
+  static final Pointer<Void> Function(int) _getpwuid = _libc.lookupFunction<
+      Pointer<Void> Function(Uint32), Pointer<Void> Function(int)>('getpwuid');
+
+  static final int Function(
+    Pointer<Utf8>,
+    Pointer<Void>,
+    Pointer<IntPtr>,
+    Pointer<Void>,
+    int,
+  ) _sysctlbyname = _libc.lookupFunction<
+      Int32 Function(
+          Pointer<Utf8>, Pointer<Void>, Pointer<IntPtr>, Pointer<Void>, IntPtr),
+      int Function(Pointer<Utf8>, Pointer<Void>, Pointer<IntPtr>, Pointer<Void>,
+          int)>('sysctlbyname');
+
+  static int uid() {
+    try {
+      return _getuid();
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  static String username() {
+    try {
+      final pw = _getpwuid(_getuid());
+      if (pw == nullptr) return '';
+      // pw_name is the first field of struct passwd (a char *).
+      final namePtr = pw.cast<Pointer<Utf8>>().value;
+      return namePtr == nullptr ? '' : namePtr.toDartString();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static String device() =>
+      '${_sysctl('hw.machine')}_${_sysctl('kern.osproductversion')}'
+      '_${_sysctl('kern.osversion')}';
+
+  // NSHomeDirectory()/Documents — the writable home used by the TVM shell
+  // (the sandbox root itself isn't writable on iOS). NSHomeDirectory is a
+  // Foundation C function; its NSString is read via -[NSString UTF8String].
+  static final Pointer<Void> Function() _nsHomeDirectory =
+      _libc.lookupFunction<Pointer<Void> Function(), Pointer<Void> Function()>(
+          'NSHomeDirectory');
+  static final Pointer<Void> Function(Pointer<Utf8>) _selRegisterName =
+      _libc.lookupFunction<Pointer<Void> Function(Pointer<Utf8>),
+          Pointer<Void> Function(Pointer<Utf8>)>('sel_registerName');
+  static final Pointer<Utf8> Function(Pointer<Void>, Pointer<Void>) _msgSendStr =
+      _libc.lookupFunction<
+          Pointer<Utf8> Function(Pointer<Void>, Pointer<Void>),
+          Pointer<Utf8> Function(Pointer<Void>, Pointer<Void>)>('objc_msgSend');
+
+  static String home() {
+    try {
+      final nsstr = _nsHomeDirectory();
+      if (nsstr == nullptr) return '';
+      final sel = 'UTF8String'.toNativeUtf8();
+      try {
+        final cstr = _msgSendStr(nsstr, _selRegisterName(sel));
+        if (cstr == nullptr) return '';
+        return '${cstr.toDartString()}/Documents';
+      } finally {
+        calloc.free(sel);
+      }
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static String _sysctl(String name) {
+    final namePtr = name.toNativeUtf8();
+    final lenPtr = calloc<IntPtr>();
+    try {
+      if (_sysctlbyname(namePtr, nullptr, lenPtr, nullptr, 0) != 0) return '';
+      final len = lenPtr.value;
+      if (len <= 0) return '';
+      final buf = calloc<Uint8>(len);
+      try {
+        if (_sysctlbyname(namePtr, buf.cast(), lenPtr, nullptr, 0) != 0) {
+          return '';
+        }
+        return buf.cast<Utf8>().toDartString();
+      } finally {
+        calloc.free(buf);
+      }
+    } catch (_) {
+      return '';
+    } finally {
+      calloc.free(namePtr);
+      calloc.free(lenPtr);
+    }
   }
 }

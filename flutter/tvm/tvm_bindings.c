@@ -40,8 +40,9 @@ static void logline(const char *msg)
     write(pipe_write, msg, strlen(msg));
 }
 
-// Reader thread: blocks on the pipe, forwards each chunk to stderr (Xcode
-// console) and to the Dart callback. The callback owns the malloc'd copy.
+// Reader thread: blocks on the pipe and forwards each chunk to the Dart
+// callback (which owns the malloc'd copy). Dart is the single sink — it
+// mirrors everything to stderr for `devicectl --console` and to the UI.
 static void *reader_entry(void *arg)
 {
     (void)arg;
@@ -50,7 +51,6 @@ static void *reader_entry(void *arg)
         ssize_t n = read(pipe_read, tmp, sizeof(tmp));
         if (n <= 0)
             break;
-        write(STDERR_FILENO, tmp, n);
         if (worker_cb) {
             char *copy = malloc(n);
             if (copy) {
@@ -129,13 +129,16 @@ TVM_EXPORT int tvm_start(const char *libtvm_path, int port,
     if (slash)
         *slash = '\0';
 
-    const char *home = getenv("HOME");
-    if (!home || !home[0])
-        home = getenv("TMPDIR");
-    if (!home || !home[0])
-        home = "/tmp";
-    strncpy(worker_home, home, sizeof(worker_home) - 1);
+    // Home is the app sandbox's Documents dir (the writable area on iOS),
+    // matching devtool. The sandbox root itself is not writable.
+    const char *home_base = getenv("HOME");
+    if (!home_base || !home_base[0])
+        home_base = getenv("TMPDIR");
+    if (!home_base || !home_base[0])
+        home_base = "/tmp";
+    snprintf(worker_home, sizeof(worker_home), "%s/Documents", home_base);
     worker_home[sizeof(worker_home) - 1] = '\0';
+    mkdir(worker_home, 0777);
 
     char home_tmp[PATH_MAX];
     snprintf(home_tmp, sizeof(home_tmp), "%s/tmp", worker_home);
