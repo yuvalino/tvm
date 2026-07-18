@@ -562,6 +562,18 @@ DECL_FUNC(get_current_dir_name);
 DECL_FUNC_OPT(CFDictionaryApplyFunction);
 #endif
 
+DECL_FUNC(setusershell);
+DECL_FUNC(getusershell);
+DECL_FUNC(endusershell);
+DECL_FUNC(getpwnam);
+DECL_FUNC(getpwuid);
+DECL_FUNC(getgrnam);
+DECL_FUNC(getgrgid);
+DECL_FUNC(localtime);
+DECL_FUNC(gmtime);
+DECL_FUNC(ctime);
+DECL_FUNC(strerror);
+
 __attribute__((constructor))
 static void init_funcs()
 {
@@ -12631,11 +12643,11 @@ static void usershell_cache_init(void)
     char **list = kalloc(cap * sizeof(char *));
     if (!list) return;
 
-    setusershell();
+    CALL_FUNC(setusershell);
     char *sh;
-    while ((sh = getusershell()) != NULL)
+    while ((sh = CALL_FUNC(getusershell)) != NULL)
         usershell_cache_add(&list, &n, &cap, sh);
-    endusershell();
+    CALL_FUNC(endusershell);
 
     const char *tvm_shell = CALL_FUNC(getenv, "TVM_SHELL");
     if (tvm_shell && *tvm_shell)
@@ -12647,15 +12659,6 @@ static void usershell_cache_init(void)
     usershell_cache = list;
     usershell_cache_count = n;
 }
-
-DECL_FUNC(getpwnam);
-DECL_FUNC(getpwuid);
-DECL_FUNC(getgrnam);
-DECL_FUNC(getgrgid);
-DECL_FUNC(localtime);
-DECL_FUNC(gmtime);
-DECL_FUNC(ctime);
-DECL_FUNC(strerror);
 
 FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
     struct passwd *result = NULL;
@@ -12749,26 +12752,21 @@ FUNCTION_DEFINE1(char *, strerror, int, errnum) {
     return current->tsk_data->strerror_buf;
 }
 
-// FUNCTION_METADATA (not FUNCTION_DEFINE) — FUNCTION_DEFINE causes a
-// segfault at init time. Needs investigation.
-static void __tvm_setusershell(void) {
+FUNCTION_DEFINE_VOID0(setusershell) {
     current->tsk_data->usershell_idx = 0;
 }
-FUNCTION_METADATA(setusershell, &__tvm_setusershell);
 
-static char *__tvm_getusershell(void) {
+FUNCTION_DEFINE0(char *, getusershell) {
     if (!usershell_cache) return NULL;
     int idx = current->tsk_data->usershell_idx;
     if (idx >= usershell_cache_count) return NULL;
     current->tsk_data->usershell_idx = idx + 1;
     return usershell_cache[idx];
 }
-FUNCTION_METADATA(getusershell, &__tvm_getusershell);
 
-static void __tvm_endusershell(void) {
+FUNCTION_DEFINE_VOID0(endusershell) {
     current->tsk_data->usershell_idx = 0;
 }
-FUNCTION_METADATA(endusershell, &__tvm_endusershell);
 
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     char pathname_abs[PATH_MAX];
