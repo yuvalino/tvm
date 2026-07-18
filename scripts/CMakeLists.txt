@@ -4,6 +4,17 @@ set(LIB_OUT ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
 set(BIN_OUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 set(THIRDPARTY_BUILD ${CMAKE_CURRENT_BINARY_DIR}/../third_party)
 
+# Flutter initrd arch tag — matches build.py platform names (ios-arm64,
+# macos-arm64, linux-x64). The initrd holds arch-specific binaries, so each
+# platform's app bundles its own via pubspec `platforms:`.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(FLUTTER_ARCH ios-arm64)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(FLUTTER_ARCH macos-arm64)
+else()
+    set(FLUTTER_ARCH linux-x64)
+endif()
+
 # ── Toybox applets ──────────────────────────────────────────────
 set(TOYBOX_APPLETS
     ascii base32 base64 basename bzcat cal cat chgrp chmod chown
@@ -42,8 +53,8 @@ function(mkinitrd_target NAME)
 
     set(ROOTFS ${CMAKE_CURRENT_BINARY_DIR}/.rootfs_${NAME})
     if(ARG_FLUTTER)
-        # Build directly into the Flutter assets dir so it's bundled as an asset.
-        set(OUTFILE ${ROOTDIR}/flutter/assets/initrd.flutter.cpio)
+        # Per-arch name; pubspec `platforms:` bundles only the matching one.
+        set(OUTFILE ${ROOTDIR}/flutter/assets/initrd.flutter.${FLUTTER_ARCH}.cpio)
     else()
         set(OUTFILE ${LIB_OUT}/initrd.cli.cpio)
     endif()

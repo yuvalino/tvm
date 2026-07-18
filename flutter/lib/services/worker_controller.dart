@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -65,6 +66,7 @@ class WorkerController {
 
     final libtvmPath = _libtvmPath();
     final assets = _flutterAssetsDir();
+    final arch = _archTag();
 
     _addLog('[INFO] Starting tvm');
     final result = TvmBindings.instance.start(
@@ -72,7 +74,7 @@ class WorkerController {
       port: sshPort,
       password: sshPass,
       initrcPath: '$assets/assets/init.flutter.rc',
-      initrdPath: '$assets/assets/initrd.flutter.cpio',
+      initrdPath: '$assets/assets/initrd.flutter.$arch.cpio',
     );
     if (result != 0) {
       _addLog('[ERROR] Failed to start TVM');
@@ -109,6 +111,15 @@ class WorkerController {
       return '$appDir/../Frameworks/App.framework/Resources/flutter_assets';
     }
     return '$appDir/Frameworks/App.framework/flutter_assets'; // iOS
+  }
+
+  // Matches build.py platform names / the per-arch initrd asset suffix.
+  static String _archTag() {
+    final abi = Abi.current();
+    if (abi == Abi.iosArm64) return 'ios-arm64';
+    if (abi == Abi.macosArm64) return 'macos-arm64';
+    if (abi == Abi.linuxX64) return 'linux-x64';
+    throw UnsupportedError('unsupported abi: $abi');
   }
 
   void _addLog(String line) {
