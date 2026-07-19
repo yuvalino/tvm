@@ -32,7 +32,12 @@ jobs:
     - uses: actions/upload-artifact@v4
       with:
         name: build-linux-x64
-        path: output/
+        # Only the bin/ + lib/ outputs are needed downstream; exclude the huge
+        # build/ tree (objects, unicorn, etc.) to stay within artifact quota.
+        path: |
+          output/
+          !output/*/build
+        retention-days: 3
 
   build-macos:
     runs-on: [self-hosted, macOS]
@@ -52,7 +57,11 @@ jobs:
     - uses: actions/upload-artifact@v4
       with:
         name: build-macos-arm64
-        path: output/
+        # See build-linux: exclude the build/ tree to stay within artifact quota.
+        path: |
+          output/
+          !output/*/build
+        retention-days: 3
     # Tar the .app for transit: upload-artifact does not reliably preserve the
     # bundle's internal framework symlinks / executable bits.
     - name: package flutter app
@@ -61,6 +70,7 @@ jobs:
       with:
         name: flutter-macos-arm64
         path: tvm-app-macos-arm64.tar.gz
+        retention-days: 3
 
   test-linux:
     needs: build-linux

@@ -106,9 +106,19 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/colors/lists/default.vim' \"$ROOTFS/share/vim/colors/lists/\"\n\n")
 
     # ── Create cpio ──
+    # Pack with our own toybox's cpio so the build needs no host cpio (the CI
+    # Linux runner has none). The CLI toybox is built for the host arch, so it
+    # runs here. The Flutter initrd keeps the host cpio: its toybox is built for
+    # the target (cross-arch on iOS — unrunnable on the macOS build host), and
+    # macOS always ships cpio.
+    if(ARG_FLUTTER)
+        set(CPIO "cpio")
+    else()
+        set(CPIO "'${THIRDPARTY_BUILD}/toybox/toybox' cpio")
+    endif()
     get_filename_component(OUTDIR "${OUTFILE}" DIRECTORY)
     string(APPEND SCRIPT "mkdir -p '${OUTDIR}'\n")
-    string(APPEND SCRIPT "cd \"$ROOTFS\" && find . | cpio -o -H newc > '${OUTFILE}'\n")
+    string(APPEND SCRIPT "cd \"$ROOTFS\" && find . | ${CPIO} -o -H newc > '${OUTFILE}'\n")
 
     # Write and register target
     set(SCRIPT_FILE ${CMAKE_CURRENT_BINARY_DIR}/mkinitrd_${NAME}.sh)
