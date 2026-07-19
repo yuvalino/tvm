@@ -10,8 +10,13 @@ permissions:
   checks: write
   contents: read
 
+# Build and test run in one job per platform, on the same self-hosted runner —
+# no artifact upload/download (the runners are single machines, so build and
+# test would run back-to-back anyway, and this keeps CI independent of the
+# Actions artifact storage quota).
+
 jobs:
-  build-linux:
+  linux:
     runs-on: [self-hosted, linux]
     steps:
     - uses: actions/checkout@v4
@@ -29,62 +34,6 @@ jobs:
         done
     - name: build
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
-    - uses: actions/upload-artifact@v4
-      with:
-        name: build-linux-x64
-        # Only the bin/ + lib/ outputs are needed downstream; exclude the huge
-        # build/ tree (objects, unicorn, etc.) to stay within artifact quota.
-        path: |
-          output/
-          !output/*/build
-        retention-days: 3
-
-  build-macos:
-    runs-on: [self-hosted, macOS]
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    # See build-linux: reset stale third-party ext state for a clean build.
-    - name: reset third-party ext build state
-      run: |
-        for p in dropbear mksh toybox vim; do
-          rm -rf output/*/build/third_party/$p output/*/build/third_party/${p}_ext-prefix
-        done
-    - name: build
-      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli flutter
-    - uses: actions/upload-artifact@v4
-      with:
-        name: build-macos-arm64
-        # See build-linux: exclude the build/ tree to stay within artifact quota.
-        path: |
-          output/
-          !output/*/build
-        retention-days: 3
-    # Tar the .app for transit: upload-artifact does not reliably preserve the
-    # bundle's internal framework symlinks / executable bits.
-    - name: package flutter app
-      run: tar -C flutter/build/macos/Build/Products/Release -czf tvm-app-macos-arm64.tar.gz tvm.app
-    - uses: actions/upload-artifact@v4
-      with:
-        name: flutter-macos-arm64
-        path: tvm-app-macos-arm64.tar.gz
-        retention-days: 3
-
-  test-linux:
-    needs: build-linux
-    runs-on: [self-hosted, linux]
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-linux-x64
-        path: output/
-    - run: chmod +x output/linux-x64/bin/*
     - name: test_tvm
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
     - name: test_rmem
@@ -100,19 +49,21 @@ jobs:
         report_paths: report.xml
         annotate_only: true
 
-  test-macos:
-    needs: build-macos
+  macos:
     runs-on: [self-hosted, macOS]
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
-    - uses: actions/download-artifact@v4
-      with:
-        name: build-macos-arm64
-        path: output/
-    - run: chmod +x output/macos-arm64/bin/*
+    # See linux: reset stale third-party ext state for a clean build.
+    - name: reset third-party ext build state
+      run: |
+        for p in dropbear mksh toybox vim; do
+          rm -rf output/*/build/third_party/$p output/*/build/third_party/${p}_ext-prefix
+        done
+    - name: build
+      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli flutter
     - name: test_tvm
       run: ./output/macos-arm64/bin/tvm ./output/macos-arm64/bin/test_tvm
     - name: test_rmem
@@ -127,32 +78,11 @@ jobs:
       with:
         report_paths: report.xml
         annotate_only: true
-
-  test-flutter:
-    needs: test-macos
-    runs-on: [self-hosted, macOS]
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    - uses: actions/download-artifact@v4
-      with:
-        name: flutter-macos-arm64
-        path: .
-    # Unpack the .app and expose it at output/<arch>/lib/flutter, the path the
-    # test harness (FLUTTER_APP) expects — build.py normally symlinks it there.
-    - name: unpack flutter app into output layout
-      run: |
-        mkdir -p flutter/build/macos/Build/Products/Release
-        tar -C flutter/build/macos/Build/Products/Release -xzf tvm-app-macos-arm64.tar.gz
-        mkdir -p output/macos-arm64/lib
-        ln -sfn "$PWD/flutter/build/macos/Build/Products/Release/tvm.app" output/macos-arm64/lib/flutter
-    - name: pip
-      run: pip3 install -r python_requirements.txt
+    # build.py -t flutter builds the macOS app and symlinks it at
+    # output/macos-arm64/lib/flutter, the path the harness (FLUTTER_APP) uses.
     - name: test_integration (flutter)
       run: pytest tests/test_integration.py -v --backend flutter --junitxml=report-flutter.xml
-    - name: test report
+    - name: test report (flutter)
       uses: mikepenz/action-junit-report@v5
       if: always()
       with:
