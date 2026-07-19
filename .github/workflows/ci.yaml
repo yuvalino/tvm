@@ -19,7 +19,7 @@ jobs:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: build
-      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd
+      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
     - uses: actions/upload-artifact@v4
       with:
         name: build-linux-x64
@@ -33,15 +33,19 @@ jobs:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: build
-      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd flutter
+      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli flutter
     - uses: actions/upload-artifact@v4
       with:
         name: build-macos-arm64
         path: output/
+    # Tar the .app for transit: upload-artifact does not reliably preserve the
+    # bundle's internal framework symlinks / executable bits.
+    - name: package flutter app
+      run: tar -C flutter/build/macos/Build/Products/Release -czf tvm-app-macos-arm64.tar.gz tvm.app
     - uses: actions/upload-artifact@v4
       with:
         name: flutter-macos-arm64
-        path: flutter/build/macos/Build/Products/Debug/tvm.app/
+        path: tvm-app-macos-arm64.tar.gz
 
   test-linux:
     needs: build-linux
@@ -110,12 +114,19 @@ jobs:
     - uses: actions/download-artifact@v4
       with:
         name: flutter-macos-arm64
-        path: flutter/build/macos/Build/Products/Debug/tvm.app/
-    - run: chmod +x flutter/build/macos/Build/Products/Debug/tvm.app/Contents/MacOS/tvm
+        path: .
+    # Unpack the .app and expose it at output/<arch>/lib/flutter, the path the
+    # test harness (FLUTTER_APP) expects — build.py normally symlinks it there.
+    - name: unpack flutter app into output layout
+      run: |
+        mkdir -p flutter/build/macos/Build/Products/Release
+        tar -C flutter/build/macos/Build/Products/Release -xzf tvm-app-macos-arm64.tar.gz
+        mkdir -p output/macos-arm64/lib
+        ln -sfn "$PWD/flutter/build/macos/Build/Products/Release/tvm.app" output/macos-arm64/lib/flutter
     - name: pip
       run: pip3 install -r python_requirements.txt
     - name: test_integration (flutter)
-      run: TVM_INTEG_BACKEND=flutter pytest tests/test_integration.py -v --junitxml=report-flutter.xml
+      run: pytest tests/test_integration.py -v --backend flutter --junitxml=report-flutter.xml
     - name: test report
       uses: mikepenz/action-junit-report@v5
       if: always()
