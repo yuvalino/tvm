@@ -10,6 +10,13 @@ permissions:
   checks: write
   contents: read
 
+# The runners are self-hosted (one machine per platform), so a superseded run
+# left in-progress hogs the runner and makes later runs queue behind it. Cancel
+# the older run for the same ref when a new one starts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Build and test run in one job per platform, on the same self-hosted runner —
 # no artifact upload/download (the runners are single machines, so build and
 # test would run back-to-back anyway, and this keeps CI independent of the
@@ -18,6 +25,11 @@ permissions:
 jobs:
   linux:
     runs-on: [self-hosted, linux]
+    # Hard backstop: the runners are self-hosted, so a hung job (e.g. a test
+    # deadlock) is NOT auto-cancelled by GitHub's 6h limit — it blocks the
+    # single runner for every later run until manually cancelled. Cap it above
+    # the sum of the per-step timeouts (build 10 + tests 3+3 + integration 10).
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
       with:
@@ -34,14 +46,21 @@ jobs:
         rm -rf output flutter/build
         git submodule foreach --recursive git clean -ffdx
     - name: build
+      timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
+    # -t 30: per-subtest timeout inside the harness — a hung subtest is SIGKILLed
+    # and reported as TIMEOUT rather than hanging the step. Step timeout is the
+    # outer backstop.
     - name: test_tvm
-      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm
+      timeout-minutes: 3
+      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
     - name: test_rmem
+      timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
     - name: pip
       run: pip3 install -r python_requirements.txt
     - name: test_integration
+      timeout-minutes: 10
       run: pytest tests/test_integration.py -v --junitxml=report.xml
     - name: test report
       uses: mikepenz/action-junit-report@v5
@@ -52,6 +71,10 @@ jobs:
 
   macos:
     runs-on: [self-hosted, macOS]
+    # See linux: self-hosted runners have no auto-cancel; cap hung jobs. Larger
+    # budget than linux — this job also builds the Flutter app and runs the
+    # flutter integration pass (build 10 + tests 3+3 + integration 10 + 20).
+    timeout-minutes: 55
     steps:
     - uses: actions/checkout@v4
       with:
@@ -64,14 +87,19 @@ jobs:
         rm -rf output flutter/build
         git submodule foreach --recursive git clean -ffdx
     - name: build
+      timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli flutter
+    # -t 30: per-subtest harness timeout (see linux job).
     - name: test_tvm
-      run: ./output/macos-arm64/bin/tvm ./output/macos-arm64/bin/test_tvm
+      timeout-minutes: 3
+      run: ./output/macos-arm64/bin/tvm ./output/macos-arm64/bin/test_tvm -t 30
     - name: test_rmem
+      timeout-minutes: 3
       run: ./output/macos-arm64/bin/test_rmem
     - name: pip
       run: pip3 install -r python_requirements.txt
     - name: test_integration
+      timeout-minutes: 10
       run: pytest tests/test_integration.py -v --junitxml=report.xml
     - name: test report
       uses: mikepenz/action-junit-report@v5
@@ -82,6 +110,7 @@ jobs:
     # build.py -t flutter builds the macOS app and symlinks it at
     # output/macos-arm64/lib/flutter, the path the harness (FLUTTER_APP) uses.
     - name: test_integration (flutter)
+      timeout-minutes: 20
       run: pytest tests/test_integration.py -v --backend flutter --junitxml=report-flutter.xml
     - name: test report (flutter)
       uses: mikepenz/action-junit-report@v5

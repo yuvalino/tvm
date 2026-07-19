@@ -1785,6 +1785,7 @@ struct tvm_tls {
     int tls_tvm_sig_depth;
     int tls_tvm_sig_synchronous_depth;
     int tls_tvm_in_emu;
+    int tls_tvm_emu_call_depth; // >0 while inside emulated execution in emulator_call_ex; signals defer and drain only at the emulator_step safe point
     int tls_sigshutup;
     int tls_tasks_lock_held; // set during task teardown when tasks_lock is held
 
@@ -1835,6 +1836,7 @@ static inline struct tvm_tls *tvm_tls(void) {
 #define tvm_sig_depth               (tvm_tls()->tls_tvm_sig_depth)
 #define tvm_sig_synchronous_depth   (tvm_tls()->tls_tvm_sig_synchronous_depth)
 #define tvm_in_emu                  (tvm_tls()->tls_tvm_in_emu)
+#define tvm_emu_call_depth          (tvm_tls()->tls_tvm_emu_call_depth)
 #define tasks_lock_held             (tvm_tls()->tls_tasks_lock_held)
 #define sigshutup                   (tvm_tls()->tls_sigshutup)
 #define call                        (tvm_tls()->tls_call)
@@ -2448,18 +2450,18 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
  * both are unlocked before returning
  */
 /**
- * Remove the calling thread from its (exiting) task like a normal non-last
- * pthread_exit and die, letting the task's terminator finish its drain loop.
- * tasks_lock and current must be locked; both are released.
+ * Detach the calling (non-last) thread from its task and terminate it: remove
+ * it from the thread list, drop the task's thread/ref counts, and pthread_exit.
+ * The current lock must be held (NOT tasks_lock); it is released here.
+ * Shared by pthread_exit and the task-teardown self-reap paths.
  */
 __attribute__((noreturn))
-static void thread_exit_for_task_exit_locked(void)
+static void detach_current_thread_and_exit(void *retval)
 {
     list_del(&current_thread->thr_list);
     current->tsk_threads_cnt--;
     current->tsk_refcount--;
     task_unlock(current);
-    pthread_mutex_unlock(&tasks_lock);
 
     sigset_t all_sigs;
     sigfillset(&all_sigs);
@@ -2467,8 +2469,22 @@ static void thread_exit_for_task_exit_locked(void)
 
     // current_thread left set → tvm_thread_destructor calls threaddealloc
     current = NULL;
-    CALL_FUNC(pthread_exit, 0);
+    CALL_FUNC(pthread_exit, retval);
     __builtin_unreachable();
+}
+
+/**
+ * Remove the calling thread from its (exiting) task like a normal non-last
+ * pthread_exit and die, letting the task's terminator finish its drain loop.
+ * tasks_lock and current must be locked; both are released. (Unlock order is
+ * irrelevant to correctness — only lock-acquisition order matters — and the
+ * thread list / counts are protected by the current lock, not tasks_lock.)
+ */
+__attribute__((noreturn))
+static void thread_exit_for_task_exit_locked(void)
+{
+    pthread_mutex_unlock(&tasks_lock);
+    detach_current_thread_and_exit(NULL);
 }
 
 __attribute__((noreturn))
@@ -3561,8 +3577,10 @@ static void dump_stacktrace()
 static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext)
 {
     if (!sigshutup) {
-        if (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL)
-            INFO("signum=%d at %p", signum, siginfo->si_addr);
+        if (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL) {
+            INFO("signum=%d at %p si_code=%d in_emu=%d sigblk=%d depth=%d", signum, siginfo->si_addr, siginfo->si_code, tvm_in_emu, tvm_sig_blocked, tvm_sig_depth);
+            dump_stacktrace();
+        }
         else if (signum != SIGCHLD) {
             INFO("signum=%d", signum);
             if (signum == SIGABRT)
@@ -3741,13 +3759,19 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         panic("crash in signal handler (signum %d)", signum);
     }
 
-    // tvm_in_emu: the thread is executing guest code inside uc_emu_start.
-    // Dispatching now would run the guest signal handler reentrantly on the
-    // same thread, corrupting the interrupted emulation's shared guest stack
-    // and engine state (observed: outer emulation resumes and faults on a
-    // clobbered near-NULL pointer). Defer; emulator_step drains at the safe
-    // point right after uc_emu_start returns. Hardware faults are handled above.
-    if (tvm_sig_blocked || tvm_in_emu || sigismember(&current_thread->thr_sigmask, signum)) {
+    // tvm_in_emu:        the thread is executing guest code inside uc_emu_start.
+    // tvm_emu_call_depth: the thread is anywhere inside emulator_call_ex's
+    //                     emulated path — engine setup/teardown, the step loop,
+    //                     and the between-steps intr-processing that mutates
+    //                     ec->ec_ss / the engine and allocates saved states.
+    // Dispatching a signal in either window runs the guest handler reentrantly
+    // (via call_sighandler -> emulator_call) on top of an inconsistent emulator
+    // context, corrupting it — the outer emulation then faults on clobbered
+    // near-NULL state (seen in emulated code, __tvm_pause, and TCG helpers).
+    // Defer; emulator_step drains deferred signals at its one safe point, right
+    // after uc_emu_start returns with the guest state saved and the engine idle.
+    // Hardware faults are handled above.
+    if (tvm_sig_blocked || tvm_in_emu || tvm_emu_call_depth || sigismember(&current_thread->thr_sigmask, signum)) {
         // Real hardware fault while in critical section = bug in our implementation
         // si_code > 0 distinguishes kernel-generated (real fault) from user-sent (kill/sigqueue)
         if (tvm_sig_blocked && siginfo->si_code > 0 &&
@@ -7293,6 +7317,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
 {
     int prevtvm;
     int r = 1;
+    int emu_deferred = 0;  // did we enter the emulated path (and bump tvm_emu_call_depth)?
     struct emulator_saved_state *ess = NULL;
     struct emulator_context *ec = current_thread->thr_emulator;
     uc_err err;
@@ -7351,6 +7376,12 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
 
     // this should run in an emulator
 
+    // Enter the emulated path: defer signal dispatch until the emulator_step
+    // safe point. Covers engine setup/teardown, the step loop, and the
+    // between-steps intr-processing that mutates ec->ec_ss / the engine.
+    tvm_emu_call_depth++;
+    emu_deferred = 1;
+
     struct emulator_engine *prev_engine = ec->ec_curr_engine;
     struct emulator_engine *ee = emulator_context_get_or_create_engine(ec, pcinfo->udli_farch);
     if (!ee)
@@ -7404,9 +7435,18 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
                     struct emulator_call_params fault_params;
                     emulator_call_params_from_saved_state(&fault_params, ess);
 
-                    // call with parameters and save ret
+                    // call with parameters and save ret. This is an upcall OUT
+                    // of emulation to a host function (or a different-arch
+                    // callee); the outer ess/engine are consistent here, so a
+                    // signal is safe to dispatch — and must be, or a blocking or
+                    // sleeping host call (usleep, read, …) would defer the guest's
+                    // own signals until it returns. Drop our deferral for the
+                    // duration; the callee re-establishes its own if emulated.
                     uint64_t fault_ret;
-                    if (0 != emulator_call_ex(&fault_info, &fault_params, &fault_ret))
+                    tvm_emu_call_depth--;
+                    int __call_err = emulator_call_ex(&fault_info, &fault_params, &fault_ret);
+                    tvm_emu_call_depth++;
+                    if (0 != __call_err)
                         goto out;
 
                     // NOTE! It is possible `fork()` was called!
@@ -7455,6 +7495,11 @@ out:
         ess = NULL;
         ec->ec_curr_engine = prev_engine;
     }
+
+    // Leave the emulated path (after teardown, so the ess-destroy kfree is still
+    // covered). Draining is left to the ordinary boundaries; do not drain here.
+    if (emu_deferred)
+        tvm_emu_call_depth--;
 
     TVM_RESTORE(prevtvm);
 
@@ -11344,6 +11389,11 @@ struct fork_arg {
     pid_t pid;
 
     uintptr_t thread_fp;
+
+    // parent's tvm_emu_call_depth at fork time. The child inherits the parent's
+    // copied emulator_call_ex frames, so it must resume emulation with the same
+    // depth or its signal-deferral (and the frames' decrements) go out of sync.
+    int emu_call_depth;
 };
 
 static void fork_dup_emulator_cb(struct fork_arg *arg, void *old_mem, void *new_mem, size_t size) {
@@ -11635,6 +11685,10 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
 
     jmpbuf_mangle(&arg->jmpbuf_parent);
 
+    // Resume emulation at the parent's emulator_call_ex depth: the longjmp lands
+    // back in the copied emulated frame, whose eventual out: will decrement.
+    tvm_emu_call_depth = arg->emu_call_depth;
+
     longjmp(arg->jmpbuf_parent, 1);
 
 fail:
@@ -11707,6 +11761,7 @@ pid_t fork(void) {
     arg->thr = thr;
     arg->parent = current;
     arg->parent_thr = current_thread;
+    arg->emu_call_depth = tvm_emu_call_depth;  // child resumes emulation at this depth
 
     arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #ifdef TRACE_MMAP
@@ -11992,20 +12047,7 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
         exit((int) ((long) retval));
     }
 
-    list_del(&current_thread->thr_list);
-    current->tsk_threads_cnt--;
-    current->tsk_refcount--;
-    task_unlock(current);
-
-    sigset_t all_sigs;
-    sigfillset(&all_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, NULL);
-
-    // current_thread left set → tvm_thread_destructor calls threaddealloc
-    current = NULL;
-
-    CALL_FUNC(pthread_exit, retval);
-    __builtin_unreachable();
+    detach_current_thread_and_exit(retval);
 }
 
 FUNCTION_DEFINE_NORET1(exit, int, status) {
