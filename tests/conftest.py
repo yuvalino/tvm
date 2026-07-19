@@ -1,4 +1,5 @@
 import os
+import pwd
 import pytest
 
 
@@ -25,4 +26,13 @@ def backend(request, device):
 
 @pytest.fixture(scope="session")
 def ssh_user(device):
-    return "mobile" if device else os.getlogin()
+    if device:
+        return "mobile"
+    # Resolve from the process's real uid, NOT os.getlogin(): dropbear-in-TVM
+    # runs as this process's uid and (single-user mode) only permits logging in
+    # as that same user. os.getlogin() reads the controlling-terminal login name,
+    # which in a headless daemon context (e.g. the CI runner) returns "root"
+    # even though the process runs as an ordinary user — the SSH login is then
+    # rejected as "wrong user" and every test hangs. getpwuid(getuid()) always
+    # matches what dropbear runs as.
+    return pwd.getpwuid(os.getuid()).pw_name
