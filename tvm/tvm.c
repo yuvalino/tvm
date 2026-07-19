@@ -7510,6 +7510,10 @@ struct tvm_call {
     void *lr;
 };
 
+// Defined per-platform below; _phdr_callback (Linux) takes its address to
+// locate the executable text segment, so it needs the forward declaration.
+void get_text(uintptr_t *out_start, uintptr_t *out_end);
+
 #if defined(__linux__)
 
 static int _phdr_callback(struct dl_phdr_info *info, size_t size, void *data)
