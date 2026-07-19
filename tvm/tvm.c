@@ -8773,38 +8773,51 @@ static struct ulinker_ops ulinker_ops = {
 
 static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
 {
-    if (0 == strcmp(s, "sigaction"))    return &emulator_sigaction;
-    if (0 == strcmp(s, "signal"))       return &emulator_signal;
+    // Version-suffixed symbol variants (Mach-O `sym$DARWIN_EXTSN`/`$UNIX2003`,
+    // ELF `sym@GLIBC_x`) must interpose to the same target as their base name;
+    // otherwise e.g. `fdopen$DARWIN_EXTSN` escapes interposition and hands out a
+    // real libc FILE that our interposed `fclose` then mis-frees. Every lookup
+    // below matches against the stripped base name; only the host dlsym()
+    // fallthrough gets the original, fully-qualified symbol.
+    char base[256];
+    size_t base_len = strcspn(s, "$@");
+    if (base_len >= sizeof(base))
+        base_len = sizeof(base) - 1;
+    memcpy(base, s, base_len);
+    base[base_len] = '\0';
+
+    if (0 == strcmp(base, "sigaction"))    return &emulator_sigaction;
+    if (0 == strcmp(base, "signal"))       return &emulator_signal;
 
     // only intercept setjmp/longjmp for emulated binaries — in NOEMU mode
     // emulator_setjmp calls real _setjmp which saves the host stack frame,
     // but longjmp back into that frame corrupts the stack canary (the frame
     // was reused by guest code in between), triggering __stack_chk_fail/SIGABRT
     if (emu) {
-        if (0 == strcmp(s, "_setjmp"))      return &emulator_setjmp;
-        if (0 == strcmp(s, "setjmp"))       return &emulator_setjmp;
-        if (0 == strcmp(s, "__sigsetjmp"))  return &emulator_setjmp;
-        if (0 == strcmp(s, "sigsetjmp"))    return &emulator_setjmp;
-        if (0 == strcmp(s, "longjmp"))      return &emulator_longjmp;
-        if (0 == strcmp(s, "_longjmp"))     return &emulator_longjmp;
-        if (0 == strcmp(s, "siglongjmp"))   return &emulator_longjmp;
+        if (0 == strcmp(base, "_setjmp"))      return &emulator_setjmp;
+        if (0 == strcmp(base, "setjmp"))       return &emulator_setjmp;
+        if (0 == strcmp(base, "__sigsetjmp"))  return &emulator_setjmp;
+        if (0 == strcmp(base, "sigsetjmp"))    return &emulator_setjmp;
+        if (0 == strcmp(base, "longjmp"))      return &emulator_longjmp;
+        if (0 == strcmp(base, "_longjmp"))     return &emulator_longjmp;
+        if (0 == strcmp(base, "siglongjmp"))   return &emulator_longjmp;
     }
 
-    if (0 == strcmp(s, "__chkstk_darwin")) return &chkstk_nop;
+    if (0 == strcmp(base, "__chkstk_darwin")) return &chkstk_nop;
 
-    if (0 == strcmp(s, "pthread_create")) return &emulator_pthread_create;
+    if (0 == strcmp(base, "pthread_create")) return &emulator_pthread_create;
 
-    if (0 == strcmp(s, "optarg"))   return &current->tsk_data->optarg;
-    if (0 == strcmp(s, "optind"))   return &current->tsk_data->optind;
-    if (0 == strcmp(s, "opterr"))   return &current->tsk_data->opterr;
-    if (0 == strcmp(s, "optopt"))   return &current->tsk_data->optopt;
+    if (0 == strcmp(base, "optarg"))   return &current->tsk_data->optarg;
+    if (0 == strcmp(base, "optind"))   return &current->tsk_data->optind;
+    if (0 == strcmp(base, "opterr"))   return &current->tsk_data->opterr;
+    if (0 == strcmp(base, "optopt"))   return &current->tsk_data->optopt;
 
-    if (0 == strcmp(s, "__environ"))  return &current->tsk_data->__environ;
-    if (0 == strcmp(s, "environ"))    return &current->tsk_data->__environ;
+    if (0 == strcmp(base, "__environ"))  return &current->tsk_data->__environ;
+    if (0 == strcmp(base, "environ"))    return &current->tsk_data->__environ;
 
     struct function_metadata *fm;
     list_for_each_entry(fm, &all_function_metadata, fm_list) {
-        if (0 == strcmp(fm->fm_name, s))
+        if (0 == strcmp(fm->fm_name, base))
             return fm->fm_ptr;
     }
     return dlsym(RTLD_DEFAULT, s);
