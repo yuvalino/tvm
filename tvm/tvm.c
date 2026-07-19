@@ -1714,6 +1714,8 @@ struct task_relocations {
 
 #define TS_ZOMBIE  0x1
 #define TS_CTTY    0x2
+#define TS_EXITING 0x4  // a thread is tearing this task down; racing terminators must not re-enter the drain loop
+#define TS_REAPED  0x8  // a waitpid() has claimed this zombie; task_next_zombie_child must skip it
 
 typedef void (*exit_t)(void);
 
@@ -1746,6 +1748,7 @@ struct task {
     struct task_relocations tsk_relocs; // oh my god
     int tsk_timers[MAX_TIMERS_PER_TASK]; // indices into vtimers[], -1 = unused
     int tsk_itimer_real; // tsk_timers[] index for ITIMER_REAL, -1 = unset
+    struct thread *tsk_exiting_thread; // thread running terminate_current_locked; written under tasks_lock+tsk_lock, read with __atomic (lock-free checks in tvm_sig_leave/waitpid)
 };
 
 struct thread {
@@ -2028,8 +2031,11 @@ static void taskdealloc(struct task *t)
     t->tsk_ar = NULL;
     t->tsk_data = NULL; // allocated in the task arena
 
+    // tsk_lock must be unheld here: unlocking it unconditionally used to
+    // release a mutex this thread didn't own in the waitpid-reap path (UB that
+    // could break a concurrent holder's critical section). The auto-reap path
+    // unlocks it explicitly in terminate_current_locked before pthread_exit.
     pthread_cond_destroy(&t->tsk_wait_cond);
-    pthread_mutex_unlock(&t->tsk_lock);
     pthread_mutex_destroy(&t->tsk_lock);
 
     kfree(t);
@@ -2262,8 +2268,12 @@ static void task_lock_with_file_locked(struct task *task, struct file *file)
  * returns locked task
  */
 static struct task *task_for_pid(pid_t pid, int dolocktasks) {
-    if (main_task->tsk_pid == pid)
+    if (main_task->tsk_pid == pid) {
+        // callers task_unlock() the result — returning it unlocked would make
+        // them release a mutex they don't own (possibly held by another thread)
+        task_lock(main_task);
         return main_task;
+    }
 
     if (dolocktasks)
         pthread_mutex_lock(&tasks_lock);
@@ -2357,6 +2367,8 @@ static int task_set_pgid(struct task *t, int pgid)
  * Prefers delivering to a thread that isn't in a signal-deferred section.
  */
 static int task_kill_locked(struct task *t, int signum) {
+    int r;
+
     if (list_empty(&t->tsk_threads))
         return ESRCH;
 
@@ -2366,8 +2378,10 @@ static int task_kill_locked(struct task *t, int signum) {
     list_for_each_entry(thr, &t->tsk_threads, thr_list) {
         if (!fallback)
             fallback = thr;
-        if (!__atomic_load_n(&thr->thr_sig_blocked, __ATOMIC_ACQUIRE))
-            return pthread_kill(thr->thr_pthread, signum);
+        if (!__atomic_load_n(&thr->thr_sig_blocked, __ATOMIC_ACQUIRE)) {
+            r = pthread_kill(thr->thr_pthread, signum);
+            goto delivered;
+        }
     }
 
     // All threads blocked — still deliver via pthread_kill so that any
@@ -2376,7 +2390,17 @@ static int task_kill_locked(struct task *t, int signum) {
     // gets drained on the next tvm_sig_leave().
     if (!fallback)
         panic("fallback thread NULL");
-    return pthread_kill(fallback->thr_pthread, signum);
+    r = pthread_kill(fallback->thr_pthread, signum);
+
+delivered:
+    // pthread_cond_wait is not EINTR-interruptible, so a thread sleeping in
+    // waitpid would absorb the pthread_kill (deferred) and keep sleeping —
+    // even for SIGKILL. Wake the task's waitpid sleepers so they drain the
+    // now-pending signal. Broadcast after pthread_kill: the OS delivers the
+    // signal (setting the pending bit via signal_handler) before cond_wait can
+    // return to userspace, so a woken waiter always observes the pending bit.
+    pthread_cond_broadcast(&t->tsk_wait_cond);
+    return r;
 }
 
 /**
@@ -2388,6 +2412,10 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
     struct task *childt;
     list_for_each_entry(childt, &main_task->tsk_list, tsk_list) {
         if (childt->tsk_parent != t)
+            continue;
+
+        // already claimed by another thread's waitpid — invisible to this one
+        if (childt->tsk_state & TS_REAPED)
             continue;
 
         if (pid == -1)
@@ -2419,9 +2447,44 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
  * both tasks_lock and current are locked
  * both are unlocked before returning
  */
+/**
+ * Remove the calling thread from its (exiting) task like a normal non-last
+ * pthread_exit and die, letting the task's terminator finish its drain loop.
+ * tasks_lock and current must be locked; both are released.
+ */
+__attribute__((noreturn))
+static void thread_exit_for_task_exit_locked(void)
+{
+    list_del(&current_thread->thr_list);
+    current->tsk_threads_cnt--;
+    current->tsk_refcount--;
+    task_unlock(current);
+    pthread_mutex_unlock(&tasks_lock);
+
+    sigset_t all_sigs;
+    sigfillset(&all_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, NULL);
+
+    // current_thread left set → tvm_thread_destructor calls threaddealloc
+    current = NULL;
+    CALL_FUNC(pthread_exit, 0);
+    __builtin_unreachable();
+}
+
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
+    // Another thread of this task is already tearing it down (e.g. this thread
+    // took a fatal signal while a sibling is in exit()/_exit()). Two threads
+    // both running the tsk_threads_cnt drain loop below would each wait for the
+    // other to decrement and neither ever would — a permanent livelock. So a
+    // racing terminator just removes itself like a normal non-last thread
+    // (mirrors pthread_exit) and lets the first terminator's loop converge.
+    if (current->tsk_state & TS_EXITING)
+        thread_exit_for_task_exit_locked();
+    current->tsk_state |= TS_EXITING;
+    __atomic_store_n(&current->tsk_exiting_thread, current_thread, __ATOMIC_RELEASE);
+
     // Destroy this task's timers so the vtimer manager spawns no new callbacks.
     // Any already-running SIGEV_THREAD callbacks are regular task threads and
     // will be drained by the tsk_threads_cnt loop below.
@@ -2434,10 +2497,20 @@ static void terminate_current_locked(int result)
     }
     pthread_mutex_unlock(&vtimers_lock);
 
-    // Drain sibling threads. Release both locks so a callback thread can take
-    // task_lock(current) to decrement the count (and call into the kernel if it
-    // needs to). With the timers gone, no new callbacks can appear.
+    // Drain sibling threads. Poke each one so blocked threads exit too: the
+    // pthread_kill interrupts blocking syscalls and (via TS_EXITING checks in
+    // signal_dispatch / tvm_sig_leave / waitpid) makes the sibling reap itself
+    // at its next safe point; SIGCONT is used as the carrier since its default
+    // action is harmless if it gets dispatched normally. The broadcast wakes
+    // siblings sleeping in waitpid's cond wait. Then release both locks so
+    // siblings can take task_lock(current) to decrement the count.
     while (current->tsk_threads_cnt != 1) {
+        struct thread *sib;
+        list_for_each_entry(sib, &current->tsk_threads, thr_list) {
+            if (sib != current_thread)
+                pthread_kill(sib->thr_pthread, SIGCONT);
+        }
+        pthread_cond_broadcast(&current->tsk_wait_cond);
         task_unlock(current);
         pthread_mutex_unlock(&tasks_lock);
         usleep(500);
@@ -2518,14 +2591,23 @@ static void terminate_current_locked(int result)
         task_kill_locked(parent, SIGCHLD);  // best-effort; parent may have already exited
 
     // parent may be blocked on waitpid but no more pids, wake him up!
+    // broadcast, not signal: multiple parent threads can wait for different
+    // specific pids — a single wakeup could go to the wrong waiter and leave
+    // the right one asleep with its zombie unreaped.
     if (parent) {
-        pthread_cond_signal(&parent->tsk_wait_cond);
+        pthread_cond_broadcast(&parent->tsk_wait_cond);
         task_unlock(parent);
     }
 
-    // if this is before the pthread_cond_signal, a not-that-rare deadlock occurs in stress tests on unlocked mutex of parent.
+    // if this is before the pthread_cond_broadcast, a not-that-rare deadlock occurs in stress tests on unlocked mutex of parent.
     // not sure why, nor gonna figure this out now
     pthread_mutex_unlock(&tasks_lock);
+
+    // auto_reap: tsk_lock is still held from entry; release it before the TLS
+    // destructor's taskdealloc destroys the mutex (destroying a locked mutex is
+    // UB). The task is already list_del'd, so nothing can re-lock it.
+    if (auto_reap)
+        task_unlock(current);
 
     CALL_FUNC(pthread_exit, 0);
     __builtin_unreachable();
@@ -3656,10 +3738,16 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             __builtin_unreachable();
         }
         
-        panic("crash in signal handler (signum %s)", signum);
+        panic("crash in signal handler (signum %d)", signum);
     }
 
-    if (tvm_sig_blocked || sigismember(&current_thread->thr_sigmask, signum)) {
+    // tvm_in_emu: the thread is executing guest code inside uc_emu_start.
+    // Dispatching now would run the guest signal handler reentrantly on the
+    // same thread, corrupting the interrupted emulation's shared guest stack
+    // and engine state (observed: outer emulation resumes and faults on a
+    // clobbered near-NULL pointer). Defer; emulator_step drains at the safe
+    // point right after uc_emu_start returns. Hardware faults are handled above.
+    if (tvm_sig_blocked || tvm_in_emu || sigismember(&current_thread->thr_sigmask, signum)) {
         // Real hardware fault while in critical section = bug in our implementation
         // si_code > 0 distinguishes kernel-generated (real fault) from user-sent (kill/sigqueue)
         if (tvm_sig_blocked && siginfo->si_code > 0 &&
@@ -6885,21 +6973,42 @@ int emulator_step(struct emulator_context *ec)
             goto out;
     }
 
-    if (0 != emulator_saved_state_to_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc))
-        goto out;
-
-    ec->ec_ss->ess_intr = ESS_INTR_UNSPEC;
-
+    // Guard the whole engine-touching span, not just uc_emu_start: to_uc and
+    // from_uc mutate the engine's uc registers and ec->ec_ss. If a signal is
+    // dispatched here it reenters via emulator_call and, because this engine is
+    // not yet marked in-use, get_or_create_engine hands the handler this very
+    // engine mid-load — corrupting it so the outer step later faults on garbage
+    // (observed near-NULL data fault). tvm_in_emu makes signal_handler defer;
+    // ee_inuse is belt-and-suspenders against engine reuse either way.
     tvm_in_emu = 1;
     ec->ec_curr_engine->ee_inuse = 1;
 
+    if (0 != emulator_saved_state_to_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc)) {
+        ec->ec_curr_engine->ee_inuse = 0;
+        tvm_in_emu = 0;
+        goto out;
+    }
+
+    ec->ec_ss->ess_intr = ESS_INTR_UNSPEC;
+
     err = uc_emu_start(ec->ec_curr_engine->ee_uc, pc, 0, 0, 0);
+
+    int from_uc_err = emulator_saved_state_from_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc);
 
     ec->ec_curr_engine->ee_inuse = 0;
     tvm_in_emu = 0;
 
-    if (0 != emulator_saved_state_from_uc(ec->ec_ss, ec->ec_curr_engine->ee_uc))
+    if (0 != from_uc_err)
         goto out;
+
+    // Safe point: the engine is no longer in use and the guest state is saved
+    // back into ec->ec_ss. Now it is safe to run any signal handlers that
+    // arrived during emulation (deferred by signal_handler's tvm_in_emu check)
+    // — they dispatch via a fresh nested emulator_call rather than corrupting
+    // this interrupted emulation. Skip if signals are blocked for another
+    // reason (they drain at that tvm_sig_leave).
+    if (!tvm_sig_blocked)
+        tvm_sig_drain();
 
     pc = emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC);
     if (ec->ec_ss->ess_intr == ESS_INTR_UNSPEC) {
@@ -12065,16 +12174,53 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
             return 0;
         }
         pthread_cond_wait(&current->tsk_wait_cond, &tasks_lock);
+
+        // A sibling thread is tearing our task down (its exit()/_exit(), or a
+        // fatal signal it took). Its drain loop is waiting for us to leave;
+        // reap ourselves like a normal non-last thread instead of looping here.
+        struct thread *exiting = __atomic_load_n(&current->tsk_exiting_thread, __ATOMIC_ACQUIRE);
+        if (exiting && exiting != current_thread) {
+            task_lock(current);
+            thread_exit_for_task_exit_locked();  // releases both locks, no return
+        }
+
+        // Signals are deferred across waitpid (tvm_sig_enter) and cond_wait is
+        // not EINTR-interruptible, so without this a task sleeping here is
+        // unkillable — even by SIGKILL. task_kill_locked broadcasts our wait
+        // cond after delivering; drain the pending signal at a safe point
+        // (fatal → terminate, no return; handlers just run) and restart. Only
+        // *deliverable* (unblocked) pending signals count — a blocked one keeps
+        // its pending bit and would otherwise spin this check forever.
+        uint32_t pend = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE);
+        if (current_thread)
+            pend |= __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
+        int deliverable = 0;
+        for (int sig = 1; sig < MAX_SIGNALS; sig++) {
+            if ((pend & (1u << sig)) && !sigismember(&current_thread->thr_sigmask, sig)) {
+                deliverable = 1;
+                break;
+            }
+        }
+        if (deliverable) {
+            pthread_mutex_unlock(&tasks_lock);
+            tvm_sig_leave();  // may not return
+            tvm_sig_enter();
+            pthread_mutex_lock(&tasks_lock);
+        }
     }
 
     task_lock(zombiet);
+    // claim the zombie before dropping tasks_lock: a concurrent waitpid in
+    // another thread would otherwise find it too and reap it twice (second
+    // pthread_join on a joined thread is UB, then double taskfreelastref)
+    zombiet->tsk_state |= TS_REAPED;
     pthread_mutex_unlock(&tasks_lock);
 
     if (list_empty(&zombiet->tsk_threads))
         panic("waitpid tsk_pthreads empty");
     struct thread *thr = list_entry(zombiet->tsk_threads.next, struct thread, thr_list);
     pthread_join(thr->thr_pthread, NULL);
-    
+
     pid_t childpid = zombiet->tsk_pid;
     if (wstatus)
         *wstatus = zombiet->tsk_result;
@@ -12082,6 +12228,10 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     // lock ordering: tasks_lock before task
     task_unlock(zombiet);
     taskfreelastref(zombiet, 1, 1);
+
+    // wake fellow waiters: one may be blocked waiting for this specific child
+    // (it skipped the TS_REAPED zombie) and must re-scan to discover ECHILD
+    pthread_cond_broadcast(&current->tsk_wait_cond);
 
     tvm_sig_leave();
 
@@ -12385,11 +12535,18 @@ FUNCTION_DEFINE1(int, sigsuspend, const sigset_t *, mask) {
     tvm_sig_drain();
 
     while (!tvm_sig_interrupted) {
-        // Sleep until an OS signal arrives. TVM's signal_handler will fire,
-        // either dispatching (if unblocked) or deferring (if blocked).
-        sigset_t empty;
+        // A signal dispatched between the loop condition above and the real
+        // sigsuspend below would be lost and park this thread forever. Block
+        // all OS signals, re-check, then let the real sigsuspend atomically
+        // unblock-and-wait — a signal arriving after the block stays
+        // kernel-pending and is delivered inside the sigsuspend.
+        sigset_t all, os_old, empty;
+        sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        if (!tvm_sig_interrupted)
+            CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
         // Drain again — the handler may have deferred a now-unblocked signal
         tvm_sig_drain();
     }
@@ -12404,9 +12561,14 @@ FUNCTION_DEFINE0(int, pause) {
     tvm_sig_drain();
 
     while (!tvm_sig_interrupted) {
-        sigset_t empty;
+        // Same lost-wakeup guard as sigsuspend: block, re-check, park atomically.
+        sigset_t all, os_old, empty;
+        sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        if (!tvm_sig_interrupted)
+            CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
         tvm_sig_drain();
     }
 
@@ -12445,9 +12607,18 @@ static int tvm_consume_pending(const sigset_t *set, siginfo_t *info) {
 FUNCTION_DEFINE2(int, sigwait, const sigset_t *, set, int *, sig) {
     int s;
     while (!(s = tvm_consume_pending(set, NULL))) {
-        sigset_t empty;
+        // Lost-wakeup guard: a signal deferred into the pending set between
+        // the consume above and the real sigsuspend below would leave this
+        // thread parked forever. Block, re-check, park atomically.
+        sigset_t all, os_old, empty;
+        sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        if (!(s = tvm_consume_pending(set, NULL)))
+            CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+        if (s)
+            break;
     }
     *sig = s;
     return 0;
@@ -12457,9 +12628,16 @@ FUNCTION_DEFINE2(int, sigwaitinfo, const sigset_t *, set, siginfo_t *, info) {
     siginfo_t local_info;
     int s;
     while (!(s = tvm_consume_pending(set, &local_info))) {
-        sigset_t empty;
+        // Lost-wakeup guard: block, re-check, park atomically (see sigwait).
+        sigset_t all, os_old, empty;
+        sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        if (!(s = tvm_consume_pending(set, &local_info)))
+            CALL_FUNC(sigsuspend, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+        if (s)
+            break;
     }
     if (info)
         *info = local_info;
@@ -12516,9 +12694,17 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
             remaining.tv_sec = 3600;
             remaining.tv_nsec = 0;
         }
-        sigset_t empty;
+        // Lost-wakeup guard: block, re-check, then pselect atomically swaps
+        // to the empty mask while sleeping (see sigwait).
+        sigset_t all, os_old, empty;
+        sigfillset(&all);
         sigemptyset(&empty);
-        pselect(0, NULL, NULL, NULL, &remaining, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        if (!(s = tvm_consume_pending(set, &local_info)))
+            pselect(0, NULL, NULL, NULL, &remaining, &empty);
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+        if (s)
+            break;
     }
     if (info)
         *info = local_info;
