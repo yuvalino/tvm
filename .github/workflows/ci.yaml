@@ -53,7 +53,10 @@ jobs:
     # outer backstop.
     - name: test_tvm
       timeout-minutes: 3
-      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
+      # DIAGNOSTIC (temporary): --verbose streams the kernel INFO log (unbuffered
+      # direct writes) so we see where test_tvm hangs on the linux runner even
+      # when the step SIGKILLs on timeout. Revert once the linux hang is understood.
+      run: stdbuf -oL -eL ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 30 2>&1
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
