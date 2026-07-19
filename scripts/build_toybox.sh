@@ -39,8 +39,15 @@ bash scripts/make.sh || true
 if [ ! -x "$BUILDDIR/toybox" ] || file "$BUILDDIR/toybox" | grep -q "text"; then
     rm -f "$BUILDDIR/toybox"
     LINK_LIBS="-lm -lz"
+    STRIP_FLAG=""
     if [ "$(uname)" = "Darwin" ] && [ -z "$TVM_IOS_CROSS" ]; then
         LINK_LIBS="$LINK_LIBS -lcrypto -lresolv -lssl -L$OPENSSL_PREFIX/lib"
     fi
-    $CC -g -Wl,-dead_strip generated/obj/*.o $LINK_LIBS -o "$BUILDDIR/toybox"
+    # -dead_strip is an Apple ld flag; GNU ld rejects it. Use --gc-sections there.
+    if [ "$(uname)" = "Darwin" ]; then
+        STRIP_FLAG="-Wl,-dead_strip"
+    else
+        STRIP_FLAG="-Wl,--gc-sections"
+    fi
+    $CC -g $STRIP_FLAG generated/obj/*.o $LINK_LIBS -o "$BUILDDIR/toybox"
 fi
