@@ -75,7 +75,12 @@ ExternalProject_Add(dropbear_ext
     PATCH_COMMAND ${CMAKE_COMMAND} -E copy
         ${THIRDPARTY_SRC}/dropbear/localoptions.h ${DROPBEAR_BUILD}/localoptions.h
     CONFIGURE_COMMAND ${THIRDPARTY_SRC}/dropbear/configure ${DROPBEAR_CONFIGURE_ARGS}
-    BUILD_COMMAND make
+    # -B (--always-make): on the CI runners a clean `make -C libtomcrypt` /
+    # `-C libtommath` sometimes reports "Nothing to be done" and never produces
+    # libtomcrypt.a / libtommath.a, so the dropbearmulti link can't find them
+    # (not reproducible locally — an incremental-state quirk of the persistent
+    # runner). Forcing an unconditional rebuild of the bundled libs sidesteps it.
+    BUILD_COMMAND make -B
         "PROGRAMS=dropbear dbclient dropbearkey scp"
         MULTI=1
         "CFLAGS=-g -gdwarf-4 -DDROPBEAR_FORKLESS"
