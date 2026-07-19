@@ -108,16 +108,7 @@ jobs:
       run: pip3 install -r python_requirements.txt
     - name: test_integration
       timeout-minutes: 10
-      # DIAGNOSTIC (temporary): run only the first SSH test with -s so pytest
-      # prints the pexpect buffer showing exactly where the CI SSH hangs (user
-      # resolution / password prompt / command). Also log who the runner is.
-      run: |
-        echo "RUNNER-USER: whoami=$(whoami) uid=$(id -u) USER=${USER:-unset} LOGNAME=${LOGNAME:-unset}"
-        python3 -c "import os,getpass
-        try: print('getlogin=', os.getlogin())
-        except Exception as e: print('getlogin ERR:', e)
-        print('getuser=', getpass.getuser())" 2>&1 || true
-        pytest tests/test_integration.py -v -s -k "test_running or test_connect_echo" --junitxml=report.xml 2>&1 || true
+      run: pytest tests/test_integration.py -v --junitxml=report.xml
     - name: test report
       uses: mikepenz/action-junit-report@v5
       if: always()
