@@ -57,6 +57,7 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <asm/prctl.h>
+#include <link.h>
 #endif
 
 #if defined(__linux__)
@@ -3109,7 +3110,7 @@ void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
         if (fsle->fsle_stream == fs)
             break;
     }
-    
+
     if (!list_entry_is_head(fsle, &t->tsk_filestreams, fsle_list)) {
         list_del(&fsle->fsle_list);
         kfree(fsle);
@@ -7510,7 +7511,6 @@ struct tvm_call {
 };
 
 #if defined(__linux__)
-#include <link.h>
 
 static int _phdr_callback(struct dl_phdr_info *info, size_t size, void *data)
 {
@@ -12509,6 +12509,12 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
 }
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
+    // Before any task exists (e.g. during tvm_init) there is no per-task env;
+    // fall back to the real libc getenv (process environ) instead of a NULL
+    // deref. This lets callers use bare getenv() uniformly.
+    if (!current)
+        return CALL_FUNC(getenv, name);
+
     char **env = NULL;
     if (*current->tsk_relocs.__environ)
         env = findenv(*current->tsk_relocs.__environ, name, strlen(name));
@@ -12649,7 +12655,8 @@ static void usershell_cache_init(void)
         usershell_cache_add(&list, &n, &cap, sh);
     CALL_FUNC(endusershell);
 
-    const char *tvm_shell = CALL_FUNC(getenv, "TVM_SHELL");
+    // current is NULL here (init) — getenv falls back to libc / process env.
+    const char *tvm_shell = getenv("TVM_SHELL");
     if (tvm_shell && *tvm_shell)
         usershell_cache_add(&list, &n, &cap, tvm_shell);
 
@@ -13158,8 +13165,11 @@ FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
     return execve(pathname, argv, *current->tsk_relocs.__environ);
 }
 
-FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
-    INFO("execvp: %s", file);
+// PATH search + ENOEXEC-shell fallback, shared by execvp (all platforms) and
+// execvpe (Linux only — that libc function doesn't exist on Apple). The two
+// differ only in the environment handed to execve.
+static int tvm_execvpe(const char *file, char * const *argv,
+                       char * const *envp) {
     char file_abs[PATH_MAX];
     if (strchr(file, '/')) {
         if (!normalize_path(NULL, file, file_abs))
@@ -13196,7 +13206,7 @@ FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
         }
     }
 found:;
-    int rc = execve(file, argv, *current->tsk_relocs.__environ);
+    int rc = execve(file, argv, envp);
     if (errno == ENOEXEC) {
         const char *sh = getenv("TVM_SHELL");
         if (!sh || !*sh) sh = "/bin/sh";
@@ -13208,10 +13218,15 @@ found:;
         nargv[1] = (char *)file;
         for (int i = 1; i <= argc; i++)
             nargv[i + 1] = argv[i];
-        rc = execve(sh, nargv, *current->tsk_relocs.__environ);
+        rc = execve(sh, nargv, envp);
         kfree(nargv);
     }
     return rc;
+}
+
+FUNCTION_DEFINE2(int, execvp, const char *, file, char * const *, argv) {
+    INFO("execvp: %s", file);
+    return tvm_execvpe(file, argv, *current->tsk_relocs.__environ);
 }
 
 FUNCTION_DEFINE1(int, system, const char *, command) {
@@ -14412,24 +14427,8 @@ FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode,
 }
 
 FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {
-    char file_abs[PATH_MAX];
-    if (strchr(file, '/')) {
-        if (!normalize_path(NULL, file, file_abs))
-            return -1;
-        file = file_abs;
-    }
-    else {
-        tvm_sig_enter();
-        const char *pathname = find_program_pathname(file);
-        tvm_sig_leave();
-        if (!pathname) {
-            errno = ENOENT;
-            return -1;
-        }
-        file = pathname;
-    }
-
-    return execve(file, argv, envp);
+    INFO("execvpe: %s", file);
+    return tvm_execvpe(file, argv, envp);
 }
 
 FUNCTION_DEFINE0(int, clearenv) {
