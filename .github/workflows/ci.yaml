@@ -49,6 +49,22 @@ jobs:
         done
     - name: build
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli flutter
+    - name: DEBUG dropbear libtom env (temporary)
+      if: always()
+      run: |
+        echo "PATH=$PATH"
+        echo "MAKEFLAGS=$MAKEFLAGS"
+        echo "MFLAGS=$MFLAGS"
+        which make sed awk gcc cc || true
+        make --version 2>&1 | head -1 || true
+        sed --version 2>&1 | head -1 || true
+        D=output/macos-arm64/build/third_party/dropbear/libtomcrypt
+        echo "=== ls $D ==="; ls -la "$D" 2>&1 | grep -iE "makefile|\.a$|\.o$" | head
+        echo "=== generated Makefile: default/OBJECTS/LIBMAIN_S ==="
+        grep -nE "^default|^OBJECTS *=|LIBMAIN_S" "$D/Makefile" 2>&1 | head
+        echo "=== make -C libtomcrypt -n (dry run: what WOULD it do?) ==="
+        make -C "$D" -n 2>&1 | head -20
+        echo "=== libtomcrypt.a present? ==="; ls -la "$D/libtomcrypt.a" 2>&1
     - uses: actions/upload-artifact@v4
       with:
         name: build-macos-arm64
