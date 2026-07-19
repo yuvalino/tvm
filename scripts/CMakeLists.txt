@@ -106,16 +106,10 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/colors/lists/default.vim' \"$ROOTFS/share/vim/colors/lists/\"\n\n")
 
     # ── Create cpio ──
-    # Pack with our own toybox's cpio so the build needs no host cpio (the CI
-    # Linux runner has none). The CLI toybox is built for the host arch, so it
-    # runs here. The Flutter initrd keeps the host cpio: its toybox is built for
-    # the target (cross-arch on iOS — unrunnable on the macOS build host), and
-    # macOS always ships cpio.
-    if(ARG_FLUTTER)
-        set(CPIO "cpio")
-    else()
-        set(CPIO "'${THIRDPARTY_BUILD}/toybox/toybox' cpio")
-    endif()
+    # Always pack with our own host toybox's cpio — hermetic, no dependency on a
+    # host cpio, and it runs on the build machine for every target (the host
+    # toybox is built with the host compiler even when the target is iOS).
+    set(CPIO "'${THIRDPARTY_BUILD}/toybox_host/toybox' cpio")
     get_filename_component(OUTDIR "${OUTFILE}" DIRECTORY)
     string(APPEND SCRIPT "mkdir -p '${OUTDIR}'\n")
     string(APPEND SCRIPT "cd \"$ROOTFS\" && find . | ${CPIO} -o -H newc > '${OUTFILE}'\n")
@@ -136,10 +130,10 @@ endfunction()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe
+    DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe toybox_host_ext
 )
 
 # Flutter initrd (launcher stubs)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher mksh_launcher toybox_launcher vim_launcher
+    DEPENDS dropbear_launcher mksh_launcher toybox_launcher vim_launcher toybox_host_ext
 )

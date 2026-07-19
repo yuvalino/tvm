@@ -75,12 +75,7 @@ ExternalProject_Add(dropbear_ext
     PATCH_COMMAND ${CMAKE_COMMAND} -E copy
         ${THIRDPARTY_SRC}/dropbear/localoptions.h ${DROPBEAR_BUILD}/localoptions.h
     CONFIGURE_COMMAND ${THIRDPARTY_SRC}/dropbear/configure ${DROPBEAR_CONFIGURE_ARGS}
-    # -B (--always-make): on the CI runners a clean `make -C libtomcrypt` /
-    # `-C libtommath` sometimes reports "Nothing to be done" and never produces
-    # libtomcrypt.a / libtommath.a, so the dropbearmulti link can't find them
-    # (not reproducible locally — an incremental-state quirk of the persistent
-    # runner). Forcing an unconditional rebuild of the bundled libs sidesteps it.
-    BUILD_COMMAND make -B
+    BUILD_COMMAND make
         "PROGRAMS=dropbear dbclient dropbearkey scp"
         MULTI=1
         "CFLAGS=-g -gdwarf-4 -DDROPBEAR_FORKLESS"
@@ -151,6 +146,19 @@ set_target_properties(toybox_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(toybox "generated/obj/*.o" ${TOYBOX_LINK_LIBS})
 add_launcher(toybox)
+
+# Host toybox — hermetic cpio tool for packing initrds. Built with the host
+# compiler (not TVM_CC) so it runs on the build machine even when the target
+# toybox is cross-compiled (e.g. iOS). mkinitrd uses its cpio for every initrd.
+set(TOYBOX_HOST_BUILD ${THIRDPARTY_BUILD}/toybox_host)
+ExternalProject_Add(toybox_host_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/toybox
+    BINARY_DIR ${TOYBOX_HOST_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=cc" sh ${SCRIPTS_DIR}/build_toybox.sh ${THIRDPARTY_SRC}/toybox ${TOYBOX_HOST_BUILD}
+    INSTALL_COMMAND ""
+    EXCLUDE_FROM_ALL TRUE
+)
 
 ###############################################################################
 # vim

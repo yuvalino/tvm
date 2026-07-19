@@ -23,15 +23,16 @@ jobs:
       with:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
-    # The runner's output/ persists across runs; the third-party ExternalProject
-    # builds fail on stale incremental state (e.g. dropbear's libtomcrypt.a gone
-    # while its objects look up-to-date). Reset them for a clean build; unicorn
-    # and the tvm objects stay cached.
-    - name: reset third-party ext build state
+    # Hermetic clean build every run. The runner's workspace persists across
+    # runs; stale build output and — critically — stale in-source artifacts in
+    # the submodules (which actions/checkout does not git-clean) break the
+    # third-party builds (e.g. dropbear's libtomcrypt Makefile uses VPATH into
+    # the source tree, so a leftover in-source libtomcrypt.a makes `make` skip
+    # building it into the build dir, and the link then can't find it).
+    - name: clean workspace
       run: |
-        for p in dropbear mksh toybox vim; do
-          rm -rf output/*/build/third_party/$p output/*/build/third_party/${p}_ext-prefix
-        done
+        rm -rf output flutter/build
+        git submodule foreach --recursive git clean -ffdx
     - name: build
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
     - name: test_tvm
@@ -56,12 +57,12 @@ jobs:
       with:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
-    # See linux: reset stale third-party ext state for a clean build.
-    - name: reset third-party ext build state
+    # See linux: hermetic clean build (also clears stale in-source submodule
+    # artifacts that break the third-party builds).
+    - name: clean workspace
       run: |
-        for p in dropbear mksh toybox vim; do
-          rm -rf output/*/build/third_party/$p output/*/build/third_party/${p}_ext-prefix
-        done
+        rm -rf output flutter/build
+        git submodule foreach --recursive git clean -ffdx
     - name: build
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli flutter
     - name: test_tvm
