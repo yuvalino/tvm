@@ -43,6 +43,10 @@ jobs:
     # building it into the build dir, and the link then can't find it).
     - name: clean workspace
       run: |
+        # Self-hosted runners accumulate orphaned processes from prior hung/cancelled
+        # runs (clean-workspace only cleans files). A leftover tvm/dropbear can hold
+        # the SSH port and make the integration tests hang. Kill strays first.
+        pkill -9 -f 'bin/tvm|bin/test_tvm|bin/test_rmem|dropbear|initrc' 2>/dev/null || true
         rm -rf output flutter/build
         git submodule foreach --recursive git clean -ffdx
     - name: build
@@ -53,10 +57,7 @@ jobs:
     # outer backstop.
     - name: test_tvm
       timeout-minutes: 3
-      # DIAGNOSTIC (temporary): --verbose streams the kernel INFO log (unbuffered
-      # direct writes) so we see where test_tvm hangs on the linux runner even
-      # when the step SIGKILLs on timeout. Revert once the linux hang is understood.
-      run: stdbuf -oL -eL ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 30 2>&1
+      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
@@ -87,6 +88,10 @@ jobs:
     # artifacts that break the third-party builds).
     - name: clean workspace
       run: |
+        # Self-hosted runners accumulate orphaned processes from prior hung/cancelled
+        # runs (clean-workspace only cleans files). A leftover tvm/dropbear can hold
+        # the SSH port and make the integration tests hang. Kill strays first.
+        pkill -9 -f 'bin/tvm|bin/test_tvm|bin/test_rmem|dropbear|initrc' 2>/dev/null || true
         rm -rf output flutter/build
         git submodule foreach --recursive git clean -ffdx
     - name: build
