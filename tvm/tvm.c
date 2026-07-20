@@ -3766,9 +3766,12 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             fbp = (unsigned long)gr[10]; fsp = (unsigned long)gr[15]; fpc = (unsigned long)gr[16];
         }
 #endif
-        INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d cur=%p in_emu=%d sigblk=%d emu_depth=%d",
-             signum, siginfo->si_addr, fpc, fbp, fsp, siginfo->si_code, (void *)current,
-             tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
+        // NOTE: use ONLY handler args (siginfo/ucontext) here — no tvm_tls()
+        // access (current / tvm_in_emu / …). Those go through pthread_getspecific
+        // and, if the crash is corrupted glibc thread state, would re-fault before
+        // we ever print, hiding the RIP (exactly the HWFAULT=0 we kept seeing).
+        INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d",
+             signum, siginfo->si_addr, fpc, fbp, fsp, siginfo->si_code);
     }
 
     if (!current)
