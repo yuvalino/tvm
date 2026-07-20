@@ -57,11 +57,30 @@ jobs:
     # outer backstop.
     - name: test_tvm
       timeout-minutes: 5
-      # KNOWN-FAILING (linux-x64 only, pre-existing): SIGSEGVs early in
-      # fork()->pthread_create()->glibc get_cached_stack — glibc's thread-stack
-      # cache holds a dangling pointer to an 8MB region freed in TVM's
-      # fork/COW/emulator path. macOS is green. Tracked separately.
-      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
+      # TEMP DIAGNOSTIC (linux-x64): capture the test~7 crash backtrace after the
+      # fork-stack fix advanced it from test~2. gdb intercepts SIGSEGV before
+      # TVM's handler (which doesn't run for this crash) — first fault seen IS the
+      # crash (no handled faults precede it on this path). Reverted after capture.
+      run: |
+        cat > /tmp/g.cmds <<'GDB'
+        set pagination off
+        set width 0
+        handle SIGSEGV stop nopass
+        run
+        printf "\n===CRASHBT===\n"
+        thread apply all bt
+        printf "\n===FAULTING REGS===\n"
+        info registers rip rbx r12 r13 r14 r15 rbp rsp
+        GDB
+        RC=0; timeout -s KILL 240 gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
+        echo "===== gdb rc=$RC  dots(tests passed):"; grep -oE "tvm \.+" /tmp/tt.out | tail -1
+        echo "===== FAULTING THREAD full bt ====="
+        sed -n '/received signal SIGSEGV/,/===CRASHBT===/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "#[0-9]+|signal SIGSEGV|Thread 0x" | head -50
+        echo "===== all-thread bt (tvm/glibc frames of interest) ====="
+        sed -n '/===CRASHBT===/,/===FAULTING REGS===/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "Thread 0x|in (fork|tvm_proc|tvm_thread|emulator|__tvm|get_cached|allocate_stack|pthread_create|start_thread|clone|terminate|taskdealloc|threaddealloc|rmem|cow|ulinker|vtimer|uc_|munmap)" | head -60
+        echo "===== regs ====="
+        sed -n '/===FAULTING REGS===/,$p' /tmp/tt.out | grep -E "rip|rbx|r1[2345]|rbp|rsp" | head
+        exit 1
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
