@@ -65,7 +65,12 @@ jobs:
         cat > /tmp/g.cmds <<'GDB'
         set pagination off
         set width 0
-        handle SIGSEGV stop nopass
+        handle SIGTERM SIGINT SIGUSR1 SIGUSR2 SIGCHLD SIGCONT SIGHUP SIGQUIT SIGALRM SIGPIPE SIGTSTP SIGTTIN SIGTTOU SIGWINCH SIGURG nostop noprint pass
+        handle SIGSEGV stop print nopass
+        handle SIGBUS stop print nopass
+        handle SIGILL stop print nopass
+        handle SIGFPE stop print nopass
+        handle SIGABRT stop print nopass
         run
         printf "\n===CRASHBT===\n"
         thread apply all bt
@@ -75,7 +80,7 @@ jobs:
         RC=0; timeout -s KILL 240 gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
         echo "===== gdb rc=$RC  dots(tests passed):"; grep -oE "tvm \.+" /tmp/tt.out | tail -1
         echo "===== FAULTING THREAD full bt ====="
-        sed -n '/received signal SIGSEGV/,/===CRASHBT===/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "#[0-9]+|signal SIGSEGV|Thread 0x" | head -50
+        sed -n '/received signal SIG/,/===CRASHBT===/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "#[0-9]+|received signal SIG|Thread 0x" | head -50
         echo "===== all-thread bt (tvm/glibc frames of interest) ====="
         sed -n '/===CRASHBT===/,/===FAULTING REGS===/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "Thread 0x|in (fork|tvm_proc|tvm_thread|emulator|__tvm|get_cached|allocate_stack|pthread_create|start_thread|clone|terminate|taskdealloc|threaddealloc|rmem|cow|ulinker|vtimer|uc_|munmap)" | head -60
         echo "===== regs ====="
