@@ -56,8 +56,23 @@ jobs:
     # and reported as TIMEOUT rather than hanging the step. Step timeout is the
     # outer backstop.
     - name: test_tvm
-      timeout-minutes: 3
-      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
+      timeout-minutes: 5
+      # DIAGNOSTIC (temporary): linux test_tvm SIGSEGVs at startup with zero
+      # output (before tvm_init). Run under gdb to capture the crash backtrace.
+      # Revert once the linux-x64 startup crash is understood/fixed.
+      run: |
+        if ! command -v gdb >/dev/null 2>&1; then sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y gdb >/dev/null 2>&1 || true; fi
+        if ! command -v gdb >/dev/null 2>&1; then
+          echo "gdb unavailable; running plain to preserve the failure"
+          exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
+        fi
+        gdb -batch -nx -ex 'set pagination off' \
+          -ex 'run' \
+          -ex 'printf "\n===BACKTRACE===\n"' -ex 'bt' \
+          -ex 'printf "\n===REGS===\n"' -ex 'info registers rip rsp rbp' \
+          -ex 'printf "\n===DISASM===\n"' -ex 'x/8i $pc' \
+          --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | tail -120
+        exit 1  # keep the step red so the run reflects the real failure
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
