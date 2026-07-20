@@ -9228,6 +9228,18 @@ void tvm_init_with_outfd(const char *init_comm, int outfd)
     tvm_init(init_comm);
 }
 
+// Clean task-exit for embedders (flutter worker): after tvm_init the calling
+// thread IS the init task's thread and must never plain-return — the pthread
+// TLS destructor would then tear down the task with the thread still
+// registered and panic ("taskdealloc tsk_threads_cnt"). Calling exit() from
+// libtvm text enters TVM's exit path (can_enter_tvm sees a tvm lr), which
+// unwinds the task and pthread_exits the thread cleanly.
+void tvm_exit(int status)
+{
+    exit(status);
+    __builtin_unreachable();
+}
+
 void tvm_init(const char *init_comm)
 {
     INFO("tvm_init()");

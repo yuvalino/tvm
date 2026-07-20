@@ -22,11 +22,13 @@ typedef int (*tvm_mount_cpio_fn)(const char *pathname, const void *buf,
                                  unsigned long size);
 typedef int (*execvp_fn)(const char *file, char *const argv[]);
 typedef int (*chdir_fn)(const char *path);
+typedef void (*tvm_exit_fn)(int status);
 
 static tvm_init_with_outfd_fn fn_tvm_init;
 static tvm_mount_cpio_fn fn_tvm_mount_cpio;
 static execvp_fn fn_tvm_execvp;
 static chdir_fn fn_tvm_chdir;
+static tvm_exit_fn fn_tvm_exit;
 
 static int pipe_read = -1;
 static int pipe_write = -1;
@@ -84,6 +86,12 @@ static void *reader_entry(void *arg)
 }
 
 // Worker thread: initializes TVM, mounts the initrd, execs dropbear.
+//
+// After fn_tvm_init this thread IS the init task's thread and must never
+// plain-return: the pthread TLS destructor would tear down the task with the
+// thread still registered and panic ("taskdealloc tsk_threads_cnt 1").  Every
+// failure path ends in fn_tvm_exit, which unwinds the TVM task and exits the
+// thread cleanly (the app stays alive with the failure in the log).
 static void *worker_entry(void *arg)
 {
     (void)arg;
@@ -95,28 +103,25 @@ static void *worker_entry(void *arg)
     if (ifd < 0) {
         tvm_log("tvm_start: open(%s) failed: %s\n", worker_initrd,
                 strerror(errno));
-        return NULL;
+        fn_tvm_exit(1);
     }
     struct stat st;
     if (fstat(ifd, &st) != 0) {
         tvm_log("tvm_start: fstat(initrd) failed: %s\n", strerror(errno));
-        close(ifd);
-        return NULL;
+        fn_tvm_exit(1);
     }
     void *initrd_data = malloc(st.st_size);
     if (!initrd_data) {
         tvm_log("tvm_start: malloc(%lld) for initrd failed\n",
                 (long long)st.st_size);
-        close(ifd);
-        return NULL;
+        fn_tvm_exit(1);
     }
     ssize_t rd = read(ifd, initrd_data, st.st_size);
     close(ifd);
     if (rd != (ssize_t)st.st_size) {
         tvm_log("tvm_start: short read of initrd (%zd/%lld): %s\n", rd,
                 (long long)st.st_size, strerror(errno));
-        free(initrd_data);
-        return NULL;
+        fn_tvm_exit(1);
     }
     if (fn_tvm_mount_cpio("/tvm", initrd_data, st.st_size) != 0)
         tvm_log("tvm_start: tvm_mount_cpio(/tvm) failed\n");
@@ -133,6 +138,7 @@ static void *worker_entry(void *arg)
     fn_tvm_execvp("dropbear", argv);
 
     tvm_log("tvm_start: execvp(dropbear) failed: %s\n", strerror(errno));
+    fn_tvm_exit(1);
     return NULL;
 }
 
@@ -159,11 +165,14 @@ TVM_EXPORT int tvm_start(const char *libtvm_path, int port,
     fn_tvm_mount_cpio = (tvm_mount_cpio_fn)dlsym(h, "tvm_mount_cpio");
     fn_tvm_execvp = (execvp_fn)dlsym(h, "execvp");
     fn_tvm_chdir = (chdir_fn)dlsym(h, "chdir");
-    if (!fn_tvm_init || !fn_tvm_mount_cpio || !fn_tvm_execvp || !fn_tvm_chdir) {
+    fn_tvm_exit = (tvm_exit_fn)dlsym(h, "tvm_exit");
+    if (!fn_tvm_init || !fn_tvm_mount_cpio || !fn_tvm_execvp || !fn_tvm_chdir ||
+        !fn_tvm_exit) {
         tvm_log("tvm_start: dlsym failed "
-                "(init=%p mount=%p execvp=%p chdir=%p): %s\n",
+                "(init=%p mount=%p execvp=%p chdir=%p exit=%p): %s\n",
                 (void *)fn_tvm_init, (void *)fn_tvm_mount_cpio,
-                (void *)fn_tvm_execvp, (void *)fn_tvm_chdir, dlerror());
+                (void *)fn_tvm_execvp, (void *)fn_tvm_chdir,
+                (void *)fn_tvm_exit, dlerror());
         return -1;
     }
 
