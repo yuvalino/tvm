@@ -199,7 +199,14 @@ def ssh_interactive(port: int, address: str = "localhost", user: str = "") -> It
             raise Exception("ssh: connection closed before password prompt")
         p.sendline(PASSWORD)
         p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
-        p.sendline(". $ENV 2>/dev/null; export TMPDIR=${TMPDIR:-/tmp}; mkdir -p $TMPDIR")
+        # Force TMPDIR=/tmp (the only writable dir in the guest's read-only root).
+        # The guest inherits the host's TMPDIR through the SSH session env; on a
+        # macOS self-hosted runner that's a deep /var/folders/... path that
+        # `mkdir -p` cannot create under the read-only root, and programs writing
+        # temp files there (e.g. vim's swap on `:wq`) then crash instead of
+        # erroring. NOTE: `. $ENV` with an empty $ENV is a no-arg `.` that eats
+        # the rest of the line in mksh, so guard it before the export.
+        p.sendline('[ -f "$ENV" ] && . "$ENV"; export TMPDIR=/tmp; mkdir -p /tmp')
         p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
         yield p
 
@@ -207,7 +214,14 @@ def ssh_interactive(port: int, address: str = "localhost", user: str = "") -> It
 def sshi(forkless: Forkless) -> Iterator[spawn]:
     with ssh(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.expect(r"\$ ")
-        p.sendline(". $ENV 2>/dev/null; export TMPDIR=${TMPDIR:-/tmp}; mkdir -p $TMPDIR")
+        # Force TMPDIR=/tmp (the only writable dir in the guest's read-only root).
+        # The guest inherits the host's TMPDIR through the SSH session env; on a
+        # macOS self-hosted runner that's a deep /var/folders/... path that
+        # `mkdir -p` cannot create under the read-only root, and programs writing
+        # temp files there (e.g. vim's swap on `:wq`) then crash instead of
+        # erroring. NOTE: `. $ENV` with an empty $ENV is a no-arg `.` that eats
+        # the rest of the line in mksh, so guard it before the export.
+        p.sendline('[ -f "$ENV" ] && . "$ENV"; export TMPDIR=/tmp; mkdir -p /tmp')
         p.expect(r"\$ ")
         yield p
 
