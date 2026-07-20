@@ -11522,25 +11522,6 @@ static void fork_done_heap_cb(struct fork_arg *arg)
 
         cow_fixup_process(&arg->fixup);
 
-#if defined(__linux__) && defined(__x86_64__)
-        // glibc's TCB (tcbhead_t) lives on the pthread stack, outside every
-        // duplicated range, so after COW its dtv pointer still references the
-        // DTV copy in the PARENT's arena. glibc's _dl_deallocate_tls on this
-        // child's exit then free()s that pointer with current==child, i.e.
-        // rmem_arena_free(child_arena, parent_arena_ptr) — a cross-arena free
-        // that faults (the __nptl_free_tcb/_dl_deallocate_tls SIGSEGV). Point
-        // the TCB at this child's duplicated DTV instead. cow_fixup_translate is
-        // a no-op if dtv is not in a duplicated range, so this is safe either way.
-        // tcbhead_t layout (x86-64): { void *tcb@0; dtv_t *dtv@8; ... }; %fs:0 is
-        // the self-pointer (== &tcbhead_t).
-        {
-            void *tcb;
-            __asm__ volatile ("movq %%fs:0, %0" : "=r"(tcb));
-            void **dtv_slot = (void **)((char *)tcb + 8);
-            *dtv_slot = cow_fixup_translate(&arg->fixup, *dtv_slot);
-        }
-#endif
-
         // re-mark only handlers that were originally marked
         for (int i = 0; i < MAX_SIGNALS; i++) {
             if (!(emu_marked & (1u << i)))
