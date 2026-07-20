@@ -62,20 +62,34 @@ jobs:
       # cache holds a dangling pointer to a stack TVM munmapped (fork/COW memory
       # corruption, linux-x64-specific). macOS passes. DIAGNOSTIC: gdb backtrace.
       run: |
-        command -v gdb >/dev/null 2>&1 || { echo "no gdb; plain run"; exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30; }
-        ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || true
-        echo "===== TASKDEALLOC calls (t, ar, caller ra) ====="
-        grep -E "TASKDEALLOC" /tmp/tt.out | tail -40
-        echo "===== duplicate taskdealloc (same t freed more than once) ====="
-        grep -oE "TASKDEALLOC t=0x[0-9a-f]+" /tmp/tt.out | sort | uniq -c | sort -rn | head
-        echo "===== symbolize distinct caller ra0/ra1 (PIE base 0x555555554000) ====="
-        for RA in $(grep -oE "ra[01]=0x[0-9a-f]+" /tmp/tt.out | sed 's/ra[01]=//' | sort -u); do
-          OFF=$(printf "0x%x" $(( RA - 0x555555554000 )) 2>/dev/null)
-          echo -n "$RA -> "; addr2line -f -e ./output/linux-x64/bin/tvm $OFF 2>/dev/null | tr '\n' ' '; echo
-        done
-        echo "===== WPENTER count: $(grep -c WPENTER /tmp/tt.out)  FORKCOPY count: $(grep -c FORKCOPY /tmp/tt.out) ====="
-        echo "===== tail of output (crash) ====="
-        tail -8 /tmp/tt.out
+        # Capture the REAL (plain-timing) crash via a core dump — gdb's slow
+        # timing changes the crash. Set an in-workspace core file.
+        ulimit -c unlimited || true
+        CORE_DIR="$PWD/cores"; mkdir -p "$CORE_DIR"
+        echo "core_pattern before: $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+        echo "$CORE_DIR/core.%e.%p" > /proc/sys/kernel/core_pattern 2>/dev/null \
+          || sudo sh -c "echo '$CORE_DIR/core.%e.%p' > /proc/sys/kernel/core_pattern" 2>/dev/null \
+          || echo "could not set core_pattern (need root); relying on default"
+        echo "core_pattern now: $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+        ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1
+        RC=$?
+        echo "===== exit=$RC   WPENTER=$(grep -c WPENTER /tmp/tt.out) FORKCOPY=$(grep -c FORKCOPY /tmp/tt.out) TASKDEALLOC=$(grep -c TASKDEALLOC /tmp/tt.out) ====="
+        echo "===== tail of app output ====="
+        tail -12 /tmp/tt.out
+        echo "===== core files ====="
+        ls -la "$CORE_DIR" 2>/dev/null; ls -la ./core* 2>/dev/null; ls -la /tmp/core* 2>/dev/null || true
+        CORE=$(ls -t "$CORE_DIR"/core.* ./core* /tmp/core.* 2>/dev/null | head -1)
+        echo "core=$CORE"
+        if [ -n "$CORE" ] && command -v gdb >/dev/null 2>&1; then
+          echo "===== crash backtrace (all threads) ====="
+          gdb -batch -nx -ex 'set pagination off' -ex 'set width 0' \
+            -ex 'thread apply all bt' -ex 'info registers rip rax rbx r14 rsp' \
+            ./output/linux-x64/bin/tvm "$CORE" 2>&1 \
+            | grep -E "#[0-9]+|Thread|Program terminated|signal SIG|rip|rax|rbx|r14|rsp|in \?\?" \
+            | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | head -100
+        else
+          echo "no core file captured; cannot backtrace the plain-timing crash"
+        fi
         exit 1
     - name: test_rmem
       timeout-minutes: 3
