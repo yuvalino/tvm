@@ -1765,6 +1765,7 @@ struct thread {
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
     void *thr_ownstack;  // linux-only: TVM-owned pthread stack (pthread_attr_setstack) so fork threads bypass glibc's thread-stack cache; NULL elsewhere. Freed in threaddealloc (SP-guarded).
+    size_t thr_ownstack_size;  // size of thr_ownstack (DEFAULT_STACK_SIZE is #defined far below threaddealloc, so carry the size here)
 };
 
 static Dl_info main_dlinfo = {0};
@@ -2793,8 +2794,8 @@ void threaddealloc(struct thread *thr)
         char probe;
         uintptr_t sp = (uintptr_t)&probe;
         uintptr_t base = (uintptr_t)thr->thr_ownstack;
-        if (sp < base || sp >= base + DEFAULT_STACK_SIZE)
-            CALL_FUNC(munmap, thr->thr_ownstack, DEFAULT_STACK_SIZE);
+        if (sp < base || sp >= base + thr->thr_ownstack_size)
+            CALL_FUNC(munmap, thr->thr_ownstack, thr->thr_ownstack_size);
         thr->thr_ownstack = NULL;
     }
 #endif
@@ -11804,6 +11805,7 @@ pid_t fork(void) {
         goto out;
     }
     thr->thr_ownstack = ownstack;
+    thr->thr_ownstack_size = DEFAULT_STACK_SIZE;
     if ((r = pthread_attr_setstack(&attr, ownstack, DEFAULT_STACK_SIZE))) {
         errno = r;
         goto out;
