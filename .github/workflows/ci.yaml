@@ -57,12 +57,18 @@ jobs:
     # outer backstop.
     - name: test_tvm
       timeout-minutes: 5
-      # EXPERIMENT: linux test_tvm SIGSEGVs in glibc's thread-stack cache
-      # (get_cached_stack) during fork->pthread_create, corruption accumulating
-      # across forks. Disable glibc's stack cache so exited thread stacks are
-      # munmapped immediately instead of cached — avoids the corrupted-cache code
-      # path. If this goes green, it both confirms the cause and is the fix.
-      run: GLIBC_TUNABLES=glibc.pthread.stack_cache_size=0 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
+      # KNOWN-FAILING (linux-x64 only): test_tvm runs ~7 tests then SIGSEGVs in a
+      # fork()->pthread_create()->glibc allocate_stack path — memory corruption
+      # in TVM's fork/COW that accumulates across forks (disabling glibc's stack
+      # cache did not help, so it's broad, not cache-specific). macOS passes.
+      # DIAGNOSTIC: run under gdb (if present) to keep the crash backtrace visible.
+      run: |
+        command -v gdb >/dev/null 2>&1 || { echo "no gdb; plain run"; exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30; }
+        gdb -batch -nx -ex 'set pagination off' -ex 'run' \
+          -ex 'printf "\n===BACKTRACE===\n"' -ex 'bt' \
+          -ex 'printf "\n===REGS===\n"' -ex 'info registers rip rsp rbp' \
+          --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | tail -100
+        exit 1
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
