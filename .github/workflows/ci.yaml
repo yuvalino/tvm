@@ -62,16 +62,19 @@ jobs:
       # in TVM's fork/COW that accumulates across forks (disabling glibc's stack
       # cache did not help, so it's broad, not cache-specific). macOS passes.
       # DIAGNOSTIC: run under gdb (if present) to keep the crash backtrace visible.
+      timeout-minutes: 8
       run: |
         command -v gdb >/dev/null 2>&1 || { echo "no gdb; plain run"; exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30; }
-        gdb -batch -nx -ex 'set pagination off' -ex 'run' \
-          -ex 'printf "\n===BACKTRACE===\n"' -ex 'bt' \
-          -ex 'printf "\n===REGS===\n"' -ex 'info registers' \
-          -ex 'printf "\n===r14 (corrupted cache-list ptr)===\n"' -ex 'p/x $r14' \
-          -ex 'printf "\n===mem around r14===\n"' -ex 'x/16gx $r14-0x40' \
-          -ex 'printf "\n===mem at rbx (glibc pd)===\n"' -ex 'x/8gx $rbx' \
-          -ex 'printf "\n===info proc mappings (tail)===\n"' -ex 'info proc mappings' \
-          --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | tail -140
+        # Log every large munmap (>=1MB) with a brief backtrace, then on the crash
+        # print the fault region — so we can see if a TVM munmap frees the glibc
+        # thread stack whose dangling cache pointer causes the SIGSEGV.
+        gdb -batch -nx -ex 'set pagination off' -ex 'set breakpoint pending on' \
+          -ex 'break munmap if $rsi >= 0x100000' \
+          -ex 'commands' -ex 'silent' -ex 'printf "MUNMAP addr=%p size=0x%lx :: ", $rdi, $rsi' -ex 'bt 3' -ex 'printf "----\n"' -ex 'continue' -ex 'end' \
+          -ex 'run' \
+          -ex 'printf "\n===CRASH BT===\n"' -ex 'bt' \
+          -ex 'printf "\n===fault region===\n"' -ex 'p/x $r14' -ex 'info proc mappings' \
+          --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | grep -E "MUNMAP|CRASH|fault|get_cached|fork|#|0x7f|Start Addr|SIGSEGV" | tail -120
         exit 1
     - name: test_rmem
       timeout-minutes: 3
