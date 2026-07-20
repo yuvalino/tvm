@@ -11520,7 +11520,42 @@ static void fork_done_heap_cb(struct fork_arg *arg)
             }
         }
 
+#if defined(__linux__) && defined(__x86_64__)
+        // TEMP DIAG: dump the child's DTV around the fixup to see exactly what
+        // cow_fixup_process does to glibc's DTV words.
+        {
+            void *tcb;
+            __asm__ volatile ("movq %%fs:0, %0" : "=r"(tcb));
+            void **parent_dtv = *(void ***)((char *)tcb + 8);
+            void **child_dtv = (void **)cow_fixup_translate(&arg->fixup, parent_dtv);
+            fprintf(stderr, "[dtv] tcb=%p parent_dtv=%p child_dtv=%p in_arena=%d\n",
+                    tcb, (void *)parent_dtv, (void *)child_dtv, (child_dtv != parent_dtv));
+            void **w = (void **)((char *)child_dtv - 16); // start at dtv[-1]
+            for (int i = -1; i <= 6; i++) {
+                void *pre0 = w[0], *pre1 = w[1];
+                void *xl0 = cow_fixup_translate(&arg->fixup, pre0);
+                fprintf(stderr, "[dtv]  pre dtv[%d]={%p,%p} word0->%s\n",
+                        i, pre0, pre1, (xl0 != pre0) ? "XLATE" : "keep");
+                w += 2;
+            }
+        }
+#endif
+
         cow_fixup_process(&arg->fixup);
+
+#if defined(__linux__) && defined(__x86_64__)
+        {
+            void *tcb;
+            __asm__ volatile ("movq %%fs:0, %0" : "=r"(tcb));
+            void **parent_dtv = *(void ***)((char *)tcb + 8);
+            void **child_dtv = (void **)cow_fixup_translate(&arg->fixup, parent_dtv);
+            void **w = (void **)((char *)child_dtv - 16);
+            for (int i = -1; i <= 6; i++) {
+                fprintf(stderr, "[dtv] post dtv[%d]={%p,%p}\n", i, w[0], w[1]);
+                w += 2;
+            }
+        }
+#endif
 
         // re-mark only handlers that were originally marked
         for (int i = 0; i < MAX_SIGNALS; i++) {
