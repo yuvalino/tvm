@@ -67,46 +67,29 @@ jobs:
         set pagination off
         set width 0
         set breakpoint pending on
-        break munmap if $rsi >= 0x100000
+        break rmem_arena_destroy
         commands
         silent
-        printf "M %p %lx ra=%p\n", (void*)$rdi, (long)$rsi, *(void**)$rsp
+        printf "\n===ARENA_DESTROY ar=%p===\n", ar
+        bt 12
+        continue
+        end
+        break taskdealloc
+        commands
+        silent
+        printf "\n===TASKDEALLOC t=%p===\n", t
+        bt 8
         continue
         end
         run
         printf "\n===CRASH===\n"
-        p/x $r14
-        printf "\n===MAPPINGS===\n"
-        info proc mappings
+        bt 6
         GDB
         gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/gdb.out 2>&1 || true
-        R14=$(grep -oE '\$1 = 0x[0-9a-f]+' /tmp/gdb.out | head -1 | grep -oE '0x[0-9a-f]+')
-        echo "===== r14 = $R14 ====="
-        # Find the mapped stack just BELOW r14 and the unmapped gap ABOVE it: the
-        # freed stack occupied that gap. Its start = end of the last mapping below r14.
-        echo "===== mappings bracketing r14 ====="
-        awk -v r="$R14" '
-          /===MAPPINGS===/{m=1;next}
-          m && $1 ~ /^0x/ {
-            # compare as hex strings of equal width (addresses are 12 hex digits)
-            print
-          }' /tmp/gdb.out | grep -E "0x7ff[0-9a-f]" > /tmp/maps.txt
-        # print the maps in r14's arena (same top 5 hex digits)
-        ARENA=$(echo "$R14" | cut -c1-7)
-        echo "arena=$ARENA (maps in this arena, to see the gap):"
-        grep -E "$ARENA" /tmp/maps.txt | head -30
-        echo "===== ALL large munmaps (addr size ra) — find the one freeing r14's gap ====="
-        # The gap-freeing munmap addr is the largest mapped-stack end just below r14.
-        # Print every munmap whose addr shares r14's arena prefix.
-        grep -E "^M 0x" /tmp/gdb.out | grep -E "$ARENA" | head -40
-        echo "===== total large munmaps logged: $(grep -cE '^M 0x' /tmp/gdb.out) ====="
-        echo "===== unique return addresses (ra) of large munmaps + symbol (PIE base 0x555555554000) ====="
-        for RA in $(grep -oE "ra=0x[0-9a-f]+" /tmp/gdb.out | sort -u | sed 's/ra=//'); do
-          CNT=$(grep -cE "ra=$RA(\$| )" /tmp/gdb.out)
-          OFF=$(printf "0x%x" $(( RA - 0x555555554000 )) 2>/dev/null)
-          SYM=$(addr2line -f -e ./output/linux-x64/bin/tvm $OFF 2>/dev/null | head -1)
-          echo "ra=$RA off=$OFF count=$CNT -> $SYM"
-        done
+        echo "===== ARENA_DESTROY + TASKDEALLOC call sites (bt) ====="
+        grep -E "ARENA_DESTROY|TASKDEALLOC|CRASH|#[0-9]+ +0x[0-9a-f]+ in " /tmp/gdb.out \
+          | grep -viE " in (rmem_arena_destroy|taskdealloc) " \
+          | sed -E 's/\(.*\)//; s#/home/[^ ]*/tvm.c#tvm.c#' | head -120
         exit 1
     - name: test_rmem
       timeout-minutes: 3
