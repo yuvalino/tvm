@@ -62,28 +62,23 @@ jobs:
       # cache holds a dangling pointer to a stack TVM munmapped (fork/COW memory
       # corruption, linux-x64-specific). macOS passes. DIAGNOSTIC: gdb backtrace.
       run: |
-        # gdb intercepts the SIGSEGV directly (before TVM's handler, which we've
-        # shown never runs for this crash), so it always yields a backtrace of the
-        # current binary regardless of the handler/altstack/mask state. Timing
-        # differs from a bare run but the crash site is what we need.
-        cat > /tmp/g.cmds <<'GDB'
-        set pagination off
-        set width 0
-        handle SIGSEGV stop nopass
-        run
-        printf "\n===CRASHBT===\n"
-        thread apply all bt
-        printf "\n===FAULTING THREAD REGS===\n"
-        info registers rip rbx r13 r14 r15 rbp rsp
-        GDB
-        RC=0; timeout -s KILL 240 gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
-        echo "===== gdb rc=$RC ====="
-        echo "===== faulting thread backtrace (tvm + glibc frames) ====="
-        sed -n '/received signal SIGSEGV/,/===FAULTING/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "#[0-9]+|SIGSEGV|Thread" | head -40
-        echo "===== all-thread bt (tvm frames only) ====="
-        sed -n '/===CRASHBT===/,/===FAULTING/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "Thread 0x|in (fork|tvm_proc|emulator|__tvm|get_cached|allocate_stack|pthread_create|start_thread|terminate|taskdealloc|rmem|cow_fixup|ulinker)" | head -50
-        echo "===== regs ====="
-        sed -n '/===FAULTING THREAD REGS===/,$p' /tmp/tt.out | grep -E "rip|rbx|r1[345]|rbp|rsp" | head
+        # EXPERIMENT (env-only, no code change): disable glibc's thread-stack cache.
+        # The crash is get_cached_stack walking a dangling cache entry; with the
+        # cache off, glibc frees each stack on exit and get_cached_stack can't trip.
+        # If test_tvm now passes, the cache list is the crash surface; if it moves,
+        # the corruption is broader. Re-checking on the current binary (all fixes).
+        echo "GLIBC_TUNABLES=$GLIBC_TUNABLES"
+        RC=0; GLIBC_TUNABLES=glibc.pthread.stack_cache_size=0 timeout -s KILL 90 \
+          ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
+        echo "===== stack_cache=0 rc=$RC ====="
+        echo "===== tail ====="; tail -12 /tmp/tt.out
+        echo ""
+        echo "===== control: default cache ====="
+        RC2=0; timeout -s KILL 90 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt2.out 2>&1 || RC2=$?
+        echo "===== default rc=$RC2 ====="
+        echo "===== tail ====="; tail -6 /tmp/tt2.out
+        # pass the step iff the tunable made it green
+        [ "$RC" = "0" ] && { echo "PASS with stack_cache=0"; exit 0; }
         exit 1
     - name: test_rmem
       timeout-minutes: 3
