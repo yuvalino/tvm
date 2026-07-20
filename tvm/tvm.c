@@ -12352,11 +12352,18 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     }
 
     task_lock(zombiet);
-    // claim the zombie before dropping tasks_lock: a concurrent waitpid in
-    // another thread would otherwise find it too and reap it twice (second
-    // pthread_join on a joined thread is UB, then double taskfreelastref)
-    INFO("WPCLAIM t=%p pid=%d state=0x%x bytid=%d", (void *)zombiet, zombiet->tsk_pid, zombiet->tsk_state, __gettid());
+    // Claim the zombie AND remove it from the task list atomically under
+    // tasks_lock, before dropping the lock for pthread_join. TS_REAPED alone
+    // left a window: between here and taskfreelastref()'s list_del (after the
+    // join), tasks_lock is released, and another waitpid — concurrent on a
+    // sibling thread, or re-entrant on this one via the emulator — could scan,
+    // find, and reap the same zombie again (double pthread_join + double
+    // taskfreelastref -> double rmem_arena_destroy -> munmap of a reused/live
+    // region). list_del now makes it unreachable immediately; INIT_LIST_HEAD
+    // keeps taskfreelastref()'s later list_del a safe no-op on the empty node.
     zombiet->tsk_state |= TS_REAPED;
+    list_del(&zombiet->tsk_list);
+    INIT_LIST_HEAD(&zombiet->tsk_list);
     pthread_mutex_unlock(&tasks_lock);
 
     if (list_empty(&zombiet->tsk_threads))
