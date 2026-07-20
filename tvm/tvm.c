@@ -3799,22 +3799,10 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
                 fault_pc = (unsigned long)gr[16];
             }
 #endif
+            (void)fault_sp;
             INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d in_emu=%d sigblk=%d emu_depth=%d",
                  signum, siginfo->si_addr, fault_pc, fault_bp, fault_sp, siginfo->si_code,
                  tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
-            // Walk the trapped frame's saved-rbp chain via safeio (never faults).
-            struct safeio_ctx __sio = SAFEIO_NULL;
-            if (fault_bp && 0 == safeio_open(&__sio)) {
-                void **fp = (void **)fault_bp;
-                for (int i = 0; i < 16 && fp; i++) {
-                    void *ret = NULL, *nextfp = NULL;
-                    if (sizeof(void *) != safeio_copy(&__sio, &ret, fp + 1, sizeof(void *))) break;
-                    INFO("  hwbt[% 2d] = %p", i, ret);
-                    if (sizeof(void *) != safeio_copy(&__sio, &nextfp, fp, sizeof(void *))) break;
-                    fp = (void **)nextfp;
-                }
-                safeio_close(&__sio);
-            }
             CALL_FUNC(_exit, 139);
             __builtin_unreachable();
         }
