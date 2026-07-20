@@ -199,14 +199,18 @@ def ssh_interactive(port: int, address: str = "localhost", user: str = "") -> It
             raise Exception("ssh: connection closed before password prompt")
         p.sendline(PASSWORD)
         p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
-        # Force TMPDIR=/tmp (the only writable dir in the guest's read-only root).
-        # The guest inherits the host's TMPDIR through the SSH session env; on a
-        # macOS self-hosted runner that's a deep /var/folders/... path that
-        # `mkdir -p` cannot create under the read-only root, and programs writing
-        # temp files there (e.g. vim's swap on `:wq`) then crash instead of
-        # erroring. NOTE: `. $ENV` with an empty $ENV is a no-arg `.` that eats
-        # the rest of the line in mksh, so guard it before the export.
-        p.sendline('[ -f "$ENV" ] && . "$ENV"; export TMPDIR=/tmp; mkdir -p /tmp')
+        # Pick a writable, backend-appropriate TMPDIR by probing /tmp.
+        #  - CLI backend: the guest (host fs) inherits the runner's
+        #    TMPDIR=/var/folders/... where vim's swap write flakily faults; /tmp
+        #    is writable there and avoids it.
+        #  - flutter backend: the app is sandboxed and CANNOT access /tmp
+        #    (EPERM), but provides a sandbox-accessible TMPDIR ($HOME/Documents/
+        #    tmp). Hardcoding /tmp broke every file-writing flutter test.
+        # So use /tmp iff writable, else keep the provided/HOME tmpdir.
+        # (Guard `. $ENV`: empty $ENV is a no-arg `.` that eats the line in mksh.)
+        p.sendline('[ -f "$ENV" ] && . "$ENV"; if touch /tmp/.tvmwt 2>/dev/null; '
+                   'then rm -f /tmp/.tvmwt; export TMPDIR=/tmp; '
+                   'else export TMPDIR="${TMPDIR:-$HOME/tmp}"; fi; mkdir -p "$TMPDIR"')
         p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
         yield p
 
@@ -214,14 +218,18 @@ def ssh_interactive(port: int, address: str = "localhost", user: str = "") -> It
 def sshi(forkless: Forkless) -> Iterator[spawn]:
     with ssh(forkless.port, address=forkless.address, user=forkless.user) as p:
         p.expect(r"\$ ")
-        # Force TMPDIR=/tmp (the only writable dir in the guest's read-only root).
-        # The guest inherits the host's TMPDIR through the SSH session env; on a
-        # macOS self-hosted runner that's a deep /var/folders/... path that
-        # `mkdir -p` cannot create under the read-only root, and programs writing
-        # temp files there (e.g. vim's swap on `:wq`) then crash instead of
-        # erroring. NOTE: `. $ENV` with an empty $ENV is a no-arg `.` that eats
-        # the rest of the line in mksh, so guard it before the export.
-        p.sendline('[ -f "$ENV" ] && . "$ENV"; export TMPDIR=/tmp; mkdir -p /tmp')
+        # Pick a writable, backend-appropriate TMPDIR by probing /tmp.
+        #  - CLI backend: the guest (host fs) inherits the runner's
+        #    TMPDIR=/var/folders/... where vim's swap write flakily faults; /tmp
+        #    is writable there and avoids it.
+        #  - flutter backend: the app is sandboxed and CANNOT access /tmp
+        #    (EPERM), but provides a sandbox-accessible TMPDIR ($HOME/Documents/
+        #    tmp). Hardcoding /tmp broke every file-writing flutter test.
+        # So use /tmp iff writable, else keep the provided/HOME tmpdir.
+        # (Guard `. $ENV`: empty $ENV is a no-arg `.` that eats the line in mksh.)
+        p.sendline('[ -f "$ENV" ] && . "$ENV"; if touch /tmp/.tvmwt 2>/dev/null; '
+                   'then rm -f /tmp/.tvmwt; export TMPDIR=/tmp; '
+                   'else export TMPDIR="${TMPDIR:-$HOME/tmp}"; fi; mkdir -p "$TMPDIR"')
         p.expect(r"\$ ")
         yield p
 
