@@ -2021,9 +2021,6 @@ out:
 
 static void taskdealloc(struct task *t)
 {
-    INFO("TASKDEALLOC t=%p ar=%p cnt=%u ra0=%p ra1=%p tid=%d", (void *)t, (void *)t->tsk_ar,
-         t->tsk_threads_cnt, __builtin_return_address(0), __builtin_return_address(1), __gettid());
-
     if (t->tsk_threads_cnt != 0)
         panic("taskdealloc tsk_threads_cnt %u", t->tsk_threads_cnt);
 
@@ -3570,26 +3567,6 @@ static void dump_stacktrace()
     }
 }
 
-// TEMP DIAG (linux-only): install a per-thread alternate signal stack so the
-// fault handler can still run (and report the RIP) when the thread's own stack
-// has overflowed. Guarded to __linux__ so macOS — which is green and whose
-// emulator signal dispatch is incompatible with routing all signals onto a
-// small altstack — is completely unaffected. 2MB because TVM's signal dispatch
-// can run the emulator.
-static void install_sigaltstack(void)
-{
-#if defined(__linux__)
-    stack_t ss;
-    ss.ss_size = 2 * 1024 * 1024;
-    ss.ss_flags = 0;
-    ss.ss_sp = CALL_FUNC(mmap, NULL, ss.ss_size, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ss.ss_sp == MAP_FAILED)
-        return;
-    sigaltstack(&ss, NULL);  // not interposed by TVM; call libc directly
-#endif
-}
-
 /**
  * Dispatch a signal on the current thread.  Must NOT be called while
  * tvm_sig_blocked — callers are responsible for checking.
@@ -3752,28 +3729,6 @@ static inline void tvm_sig_leave(void)
  */
 static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
-    // TEMP DIAG (log-only, no control-flow change): record the RIP of every real
-    // hardware fault the instant the handler runs, before any check that could
-    // swallow it, then fall through to normal handling (so legitimate caught
-    // guest faults still dispatch). If the crash never logs this, the handler
-    // isn't running at all (stack overflow / double fault / blocked signal).
-    if (siginfo->si_code > 0 &&
-        (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE)) {
-        unsigned long fpc = 0, fbp = 0, fsp = 0;
-#if defined(__linux__) && defined(__x86_64__)
-        if (ucontext) {
-            long long *gr = (long long *)((ucontext_t *)ucontext)->uc_mcontext.gregs;
-            fbp = (unsigned long)gr[10]; fsp = (unsigned long)gr[15]; fpc = (unsigned long)gr[16];
-        }
-#endif
-        // NOTE: use ONLY handler args (siginfo/ucontext) here — no tvm_tls()
-        // access (current / tvm_in_emu / …). Those go through pthread_getspecific
-        // and, if the crash is corrupted glibc thread state, would re-fault before
-        // we ever print, hiding the RIP (exactly the HWFAULT=0 we kept seeing).
-        INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d",
-             signum, siginfo->si_addr, fpc, fbp, fsp, siginfo->si_code);
-    }
-
     if (!current)
         return;  // thread is exiting or not yet initialized — ignore
 
@@ -9270,15 +9225,9 @@ void tvm_init(const char *init_comm)
 
     vtimer_init(); // must be before signal handler installation
 
-    install_sigaltstack();  // main thread (linux-only; no-op on macOS)
-
     struct sigaction act = {
         .sa_sigaction = signal_handler,
-        .sa_flags = SA_SIGINFO
-#if defined(__linux__)
-                  | SA_ONSTACK  // TEMP DIAG: run fault handler on the altstack
-#endif
-        ,
+        .sa_flags = SA_SIGINFO,
     };
 
     for (int i = 0; i < MAX_SIGNALS; i++) {
@@ -11572,8 +11521,6 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     sigemptyset(&empty_sigs);
     CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
 
-    install_sigaltstack();  // per-thread (linux-only; no-op on macOS)
-
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
     // the error number is set to thread's errno
@@ -11665,14 +11612,6 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // by pthread's `__thread_entry` func (which calls the start routine)
     uintptr_t child_fp = curr_fp;
     uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
-
-    // TEMP DIAGNOSTIC: fork stack-copy bounds. child_sp must stay within the
-    // child's DEFAULT_STACK_SIZE glibc stack whose top is ~curr_fp; if the copy
-    // size (parent_fp-parent_sp) approaches DEFAULT_STACK_SIZE, child_sp
-    // underflows into the adjacent mapping and corrupts it.
-    INFO("FORKCOPY size=0x%lx parent_sp=%p parent_fp=%p curr_fp=%p child_sp=%p headroom=0x%lx",
-         (unsigned long)(parent_fp - parent_sp), (void *)parent_sp, (void *)parent_fp,
-         (void *)curr_fp, (void *)child_sp, (unsigned long)(child_fp - child_sp));
 
     memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
     // for debugging when unwinder crashes
@@ -12005,8 +11944,6 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
     memset(t, 0, sizeof(struct tvm_tls));
     pthread_setspecific(tls_key, t);
 
-    install_sigaltstack();  // per-thread (linux-only; no-op on macOS)
-
     pthread_mutex_lock(&arg->mtx);
 
     current = arg->tsk;
@@ -12289,8 +12226,6 @@ FUNCTION_DEFINE1(pid_t, wait, int *, wstatus) {
 FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     struct task *zombiet = NULL;
     int found;
-
-    INFO("WPENTER pid=%d options=%d bytid=%d ra=%p", pid, options, __gettid(), __builtin_return_address(0));
 
     tvm_sig_enter();
 
