@@ -11846,8 +11846,17 @@ pid_t fork(void) {
     // blocked signal mask.  The child unblocks after setting current/current_thread
     // in tvm_proc_entry — without this, a signal arriving on the new thread
     // before those thread-locals are set causes a panic (current == NULL).
+    // Never block the synchronous fault signals: blocking SIGSEGV/BUS/ILL/FPE
+    // and then faulting (e.g. inside pthread_create) is undefined — the kernel
+    // force-kills with a core dump instead of delivering to signal_handler, so
+    // the fault escapes TVM's handler entirely. They are per-thread and
+    // synchronous, so leaving them unblocked can't spuriously hit the new thread.
     sigset_t all_sigs, old_sigs;
     sigfillset(&all_sigs);
+    sigdelset(&all_sigs, SIGSEGV);
+    sigdelset(&all_sigs, SIGBUS);
+    sigdelset(&all_sigs, SIGILL);
+    sigdelset(&all_sigs, SIGFPE);
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
 
     pthread_t pth;
