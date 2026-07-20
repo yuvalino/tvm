@@ -3570,6 +3570,26 @@ static void dump_stacktrace()
     }
 }
 
+// TEMP DIAG (linux-only): install a per-thread alternate signal stack so the
+// fault handler can still run (and report the RIP) when the thread's own stack
+// has overflowed. Guarded to __linux__ so macOS — which is green and whose
+// emulator signal dispatch is incompatible with routing all signals onto a
+// small altstack — is completely unaffected. 2MB because TVM's signal dispatch
+// can run the emulator.
+static void install_sigaltstack(void)
+{
+#if defined(__linux__)
+    stack_t ss;
+    ss.ss_size = 2 * 1024 * 1024;
+    ss.ss_flags = 0;
+    ss.ss_sp = CALL_FUNC(mmap, NULL, ss.ss_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ss.ss_sp == MAP_FAILED)
+        return;
+    sigaltstack(&ss, NULL);  // not interposed by TVM; call libc directly
+#endif
+}
+
 /**
  * Dispatch a signal on the current thread.  Must NOT be called while
  * tvm_sig_blocked — callers are responsible for checking.
@@ -9247,9 +9267,15 @@ void tvm_init(const char *init_comm)
 
     vtimer_init(); // must be before signal handler installation
 
+    install_sigaltstack();  // main thread (linux-only; no-op on macOS)
+
     struct sigaction act = {
         .sa_sigaction = signal_handler,
-        .sa_flags = SA_SIGINFO,
+        .sa_flags = SA_SIGINFO
+#if defined(__linux__)
+                  | SA_ONSTACK  // TEMP DIAG: run fault handler on the altstack
+#endif
+        ,
     };
 
     for (int i = 0; i < MAX_SIGNALS; i++) {
@@ -11543,6 +11569,8 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     sigemptyset(&empty_sigs);
     CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
 
+    install_sigaltstack();  // per-thread (linux-only; no-op on macOS)
+
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
     // the error number is set to thread's errno
@@ -11973,6 +12001,8 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
         panic("tvm_thread_entry: tvm_tls alloc");
     memset(t, 0, sizeof(struct tvm_tls));
     pthread_setspecific(tls_key, t);
+
+    install_sigaltstack();  // per-thread (linux-only; no-op on macOS)
 
     pthread_mutex_lock(&arg->mtx);
 
