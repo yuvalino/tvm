@@ -7736,10 +7736,25 @@ static int _phdr_callback(struct dl_phdr_info *info, size_t size, void *data)
 
 void get_text(uintptr_t *out_start, uintptr_t *out_end)
 {
-    uintptr_t out[2] = {0, 0};
-    dl_iterate_phdr(_phdr_callback, out);
-    *out_start = out[0];
-    *out_end = out[1];
+    // The executable segment containing get_text() is the main binary's .text —
+    // fixed for the process lifetime — so cache it (as the __APPLE__ path does).
+    // Beyond avoiding a dl_iterate_phdr on every malloc/free/can_enter_tvm, this
+    // is a correctness fix: glibc thread exit runs __libc_thread_freeres, which
+    // frees TLS-internal buffers via free() -> can_enter_tvm -> get_text. Calling
+    // dl_iterate_phdr there re-resolves TLS (_dl_tls_get_addr_soft) on a thread
+    // whose TLS is being torn down -> SIGSEGV. The first call happens during
+    // normal startup (main thread), long before any thread exits, so the cache
+    // is warm by then. A benign first-call race just recomputes the same value.
+    static uintptr_t cached_start = 0;
+    static uintptr_t cached_end = 0;
+    if (!cached_start) {
+        uintptr_t out[2] = {0, 0};
+        dl_iterate_phdr(_phdr_callback, out);
+        cached_start = out[0];
+        cached_end = out[1];
+    }
+    *out_start = cached_start;
+    *out_end = cached_end;
 }
 
 #elif defined(__APPLE__)
