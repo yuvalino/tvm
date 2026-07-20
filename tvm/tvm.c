@@ -1764,8 +1764,6 @@ struct thread {
     siginfo_t thr_pending_siginfo[MAX_SIGNALS];
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
-    void *thr_ownstack;  // linux-only: TVM-owned pthread stack (pthread_attr_setstack) so fork threads bypass glibc's thread-stack cache; NULL elsewhere. Freed in threaddealloc (SP-guarded).
-    size_t thr_ownstack_size;  // size of thr_ownstack (DEFAULT_STACK_SIZE is #defined far below threaddealloc, so carry the size here)
 };
 
 static Dl_info main_dlinfo = {0};
@@ -2782,23 +2780,6 @@ void threaddealloc(struct thread *thr)
     }
 
     pthread_attr_destroy(&thr->thr_pthread_attr);
-
-#ifdef __linux__
-    if (thr->thr_ownstack) {
-        // Free the TVM-owned fork stack — but only if we are NOT currently
-        // running on it. In the auto-reap path threaddealloc runs from the
-        // dying thread's own TLS destructor, still on thr_ownstack; munmapping
-        // it there would pull the ground out. That case leaks the stack (bounded
-        // — auto-reaped forks are rare; the common waitpid-reap path frees it
-        // from the parent's stack, where the guard passes).
-        char probe;
-        uintptr_t sp = (uintptr_t)&probe;
-        uintptr_t base = (uintptr_t)thr->thr_ownstack;
-        if (sp < base || sp >= base + thr->thr_ownstack_size)
-            CALL_FUNC(munmap, thr->thr_ownstack, thr->thr_ownstack_size);
-        thr->thr_ownstack = NULL;
-    }
-#endif
 
     kfree(thr);
 }
@@ -11817,28 +11798,6 @@ pid_t fork(void) {
         errno = ENOMEM;
         goto out;
     }
-
-#ifdef __linux__
-    // Give the fork thread a TVM-owned stack instead of a glibc-managed one.
-    // The linux-x64 test_tvm SIGSEGVs in fork()->pthread_create()->glibc
-    // get_cached_stack: glibc's thread-stack cache holds a dangling pointer to
-    // an 8MB region freed elsewhere in TVM's fork/COW/emulator path. Providing
-    // the stack via pthread_attr_setstack makes glibc use it directly and never
-    // cache it, so the corrupt cache is not walked on this (very frequent) path.
-    // Freed in threaddealloc (SP-guarded so the auto-reap path, which runs on
-    // this very stack, doesn't munmap out from under itself).
-    void *ownstack = CALL_FUNC(mmap, NULL, DEFAULT_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ownstack == MAP_FAILED) {
-        errno = ENOMEM;
-        goto out;
-    }
-    thr->thr_ownstack = ownstack;
-    thr->thr_ownstack_size = DEFAULT_STACK_SIZE;
-    if ((r = pthread_attr_setstack(&attr, ownstack, DEFAULT_STACK_SIZE))) {
-        errno = r;
-        goto out;
-    }
-#endif
 
     if ((r = copy_pthread_attr(&attr, &thr->thr_pthread_attr))) {
         errno = r;
