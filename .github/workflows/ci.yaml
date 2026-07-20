@@ -66,34 +66,37 @@ jobs:
         cat > /tmp/g.cmds <<'GDB'
         set pagination off
         set width 0
+        set breakpoint pending on
+        break munmap if $rsi == 0x800000
+        commands
+        silent
+        printf "MUNMAP8M %p from:\n", (void*)$rdi
+        bt 5
+        printf "====\n"
+        continue
+        end
         run
         printf "\n===CRASH===\n"
-        thread apply all bt
-        printf "\n===REGS===\n"
-        info registers
-        printf "\n===R14-NEIGHBORHOOD===\n"
         p/x $r14
-        printf "deref [r14-0x10]:\n"
-        x/4gx $r14-0x10
-        printf "\n===DISAS===\n"
-        x/3i $pc
         printf "\n===MAPPINGS===\n"
         info proc mappings
+        printf "\n===CRASHBT===\n"
+        thread apply all bt
+        printf "\n===DEREF(last, may fault gdb)===\n"
+        x/4gx $r14-0x10
         GDB
         gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/gdb.out 2>&1 || true
-        echo "===== crash bt (all threads, tvm frames) ====="
-        sed -n '/===CRASH===/,/===REGS===/p' /tmp/gdb.out | grep -E "Thread|#|CRASH|REGS" | head -60
-        echo "===== r14 neighborhood + disas + regs r14/rax/rbx ====="
-        sed -n '/===REGS===/,/===MAPPINGS===/p' /tmp/gdb.out | grep -iE "r14|rax|rbx|deref|Cannot access|R14-NEIGH|DISAS|=>|0x[0-9a-f]+ <" | head -30
-        echo "===== mappings near r14 (grep by r14 address prefix) ====="
         R14=$(grep -oE '\$1 = 0x[0-9a-f]+' /tmp/gdb.out | head -1 | grep -oE '0x[0-9a-f]+')
-        echo "r14=$R14"
-        # first 9 hex chars (0x + 7) -> ~256MB granularity to catch the arena + neighbors
+        echo "===== r14 = $R14 ====="
         PFX=$(echo "$R14" | cut -c1-9)
-        echo "prefix=$PFX"
-        sed -n '/===MAPPINGS===/,$p' /tmp/gdb.out | grep -E "$PFX|Start Addr" | head -40
-        echo "===== full mappings tail (largest addresses) ====="
-        sed -n '/===MAPPINGS===/,$p' /tmp/gdb.out | grep -E "0x7ff[0-9a-f]" | tail -50
+        echo "===== 8MB munmaps with backtraces ====="
+        grep -E "MUNMAP8M|====|#[0-9]|in " /tmp/gdb.out | grep -iE "MUNMAP8M|====|in (fork|tvm_proc|emulator|__tvm|execve|free_code_gen|release|ulinker|rmem|terminate|threaddealloc|taskdealloc|_dl_|nptl|free_stack|deallocate)" | head -80
+        echo "===== mappings around r14 (prefix $PFX) ====="
+        sed -n '/===MAPPINGS===/,/===CRASHBT===/p' /tmp/gdb.out | grep -E "${PFX}|Start Addr" | head -20
+        echo "===== all mappings in r14's 0x7ff5 arena (find the gap) ====="
+        sed -n '/===MAPPINGS===/,/===CRASHBT===/p' /tmp/gdb.out | grep -E "0x7ff5[0-9a-f]" | head -40
+        echo "===== crash bt (thread 7) ====="
+        sed -n '/===CRASHBT===/,/===DEREF/p' /tmp/gdb.out | grep -E "Thread 0x7ff985|get_cached|allocate_stack|pthread_create|fork|__tvm_execve|start_thread" | head -20
         exit 1
     - name: test_rmem
       timeout-minutes: 3
