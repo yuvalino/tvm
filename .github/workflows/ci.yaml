@@ -62,23 +62,28 @@ jobs:
       # cache holds a dangling pointer to a stack TVM munmapped (fork/COW memory
       # corruption, linux-x64-specific). macOS passes. DIAGNOSTIC: gdb backtrace.
       run: |
-        # Plain run (real timing). A hardware fault in a critical section now
-        # dumps HWFAULT + stacktrace + panics (see signal_handler), so the crash
-        # backtrace lands in the output instead of a silent core dump.
-        # SIGKILL (not SIGTERM — TVM catches SIGTERM and would hang) after 90s so
-        # a hang cannot eat the whole 5-min step budget before diagnostics run.
-        RC=0; timeout -s KILL 90 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
-        echo "===== tvm rc=$RC (124/137 => killed by timeout => HUNG; 139 => our _exit) ====="
-        echo "===== counts: WPENTER=$(grep -c WPENTER /tmp/tt.out) FORKCOPY=$(grep -c FORKCOPY /tmp/tt.out) HWFAULT=$(grep -c HWFAULT /tmp/tt.out) ====="
-        echo "===== HWFAULT line(s) ====="
-        grep -E "HWFAULT|signum=" /tmp/tt.out | tail -10
-        echo "===== symbolize pc (PIE base 0x555555554000) ====="
-        for A in $(grep -oE "pc=0x[0-9a-f]+" /tmp/tt.out | grep -oE "0x[0-9a-f]+" | sort -u); do
-          OFF=$(printf "0x%x" $(( A - 0x555555554000 )) 2>/dev/null)
-          echo -n "$A off=$OFF -> "; addr2line -f -e ./output/linux-x64/bin/tvm $OFF 2>/dev/null | tr '\n' ' ' | sed -E 's#/home/[^ ]*/tvm/tvm##g'; echo
-        done
-        echo "===== last 20 lines of tt.out ====="
-        tail -20 /tmp/tt.out
+        # gdb intercepts the SIGSEGV directly (before TVM's handler, which we've
+        # shown never runs for this crash), so it always yields a backtrace of the
+        # current binary regardless of the handler/altstack/mask state. Timing
+        # differs from a bare run but the crash site is what we need.
+        cat > /tmp/g.cmds <<'GDB'
+        set pagination off
+        set width 0
+        handle SIGSEGV stop nopass
+        run
+        printf "\n===CRASHBT===\n"
+        thread apply all bt
+        printf "\n===FAULTING THREAD REGS===\n"
+        info registers rip rbx r13 r14 r15 rbp rsp
+        GDB
+        RC=0; timeout -s KILL 240 gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
+        echo "===== gdb rc=$RC ====="
+        echo "===== faulting thread backtrace (tvm + glibc frames) ====="
+        sed -n '/received signal SIGSEGV/,/===FAULTING/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "#[0-9]+|SIGSEGV|Thread" | head -40
+        echo "===== all-thread bt (tvm frames only) ====="
+        sed -n '/===CRASHBT===/,/===FAULTING/p' /tmp/tt.out | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | grep -E "Thread 0x|in (fork|tvm_proc|emulator|__tvm|get_cached|allocate_stack|pthread_create|start_thread|terminate|taskdealloc|rmem|cow_fixup|ulinker)" | head -50
+        echo "===== regs ====="
+        sed -n '/===FAULTING THREAD REGS===/,$p' /tmp/tt.out | grep -E "rip|rbx|r1[345]|rbp|rsp" | head
         exit 1
     - name: test_rmem
       timeout-minutes: 3
