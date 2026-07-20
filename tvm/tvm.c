@@ -11918,7 +11918,18 @@ pid_t fork(void) {
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
 
     pthread_t pth;
-    if ((r = CALL_FUNC(pthread_create, &pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg))) {
+    // glibc allocates the child's TCB/DTV/TLS synchronously *inside* pthread_create,
+    // in this (parent) thread's context where current_thread is set — so
+    // can_enter_tvm() short-circuits to true and calloc() would route those
+    // allocations into the parent task's rmem arena. The child's COW then
+    // duplicates that arena and the brute-force pointer fixup (cow_fixup_process)
+    // rewrites words inside the DTV, so glibc faults in _dl_deallocate_tls on the
+    // child's exit (__nptl_free_tcb). Force glibc's own thread bookkeeping to the
+    // real heap for the duration of pthread_create.
+    int __tvm_was_off = TVM_OFF;
+    r = CALL_FUNC(pthread_create, &pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg);
+    TVM_RESTORE(__tvm_was_off);
+    if (r) {
         CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
         errno = r;
         goto out;
