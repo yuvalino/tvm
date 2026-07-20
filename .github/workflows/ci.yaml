@@ -57,41 +57,7 @@ jobs:
     # outer backstop.
     - name: test_tvm
       timeout-minutes: 5
-      # TEMP DIAGNOSTIC: cache fix didn't budge the crash — show the [warm] line
-      # (did the constructor populate get_text's cache?) and the true fatal frame.
-      run: |
-        cat > /tmp/g.py <<'PY'
-        import gdb
-        gdb.execute("set pagination off"); gdb.execute("set width 0")
-        for s in ["SIGTERM","SIGINT","SIGUSR1","SIGUSR2","SIGCHLD","SIGCONT","SIGHUP","SIGQUIT","SIGALRM","SIGPIPE","SIGTSTP","SIGTTIN","SIGTTOU","SIGWINCH","SIGURG"]:
-            gdb.execute("handle %s nostop noprint pass" % s)
-        for s in ["SIGSEGV","SIGBUS","SIGILL","SIGFPE","SIGABRT"]:
-            gdb.execute("handle %s stop print pass" % s)
-        gdb.execute("run")
-        n = 0
-        while n < 400:
-            n += 1
-            try:
-                gdb.selected_frame()
-            except gdb.error:
-                print("=== NO FRAME / exited at stop %d ===" % n); break
-            print("=== STOP #%d ===" % n)
-            try:
-                gdb.execute("bt 16"); gdb.execute("info registers rip r13 r14 r15")
-            except gdb.error as e:
-                print("=== bt error: %s ===" % e)
-            try:
-                gdb.execute("continue")
-            except gdb.error as e:
-                print("=== TERMINATED after stop %d: %s ===" % (n, e)); break
-        PY
-        RC=0; timeout -s KILL 240 gdb -batch -nx -x /tmp/g.py --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
-        echo "===== gdb rc=$RC ; total stops: $(grep -c '=== STOP' /tmp/tt.out) ====="
-        echo "===== [warm] lines (constructor cache result) ====="; grep -a "\[warm\]" /tmp/tt.out | head
-        echo "===== LAST (fatal) stop ====="
-        sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' /tmp/tt.out | awk '/=== STOP|=== TERMINATED|=== NO FRAME/{seg=$0"\n";grab=1;next} grab{seg=seg $0"\n"} /rip /{if(grab){last=seg;grab=0}} END{print last}'
-        echo "===== signals seen ====="; grep -oE "received signal SIG[A-Z]+" /tmp/tt.out | sort | uniq -c
-        exit 1
+      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem

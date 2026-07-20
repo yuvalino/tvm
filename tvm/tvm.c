@@ -7766,9 +7766,8 @@ void get_text(uintptr_t *out_start, uintptr_t *out_end)
 __attribute__((constructor))
 static void _warm_get_text_cache(void)
 {
-    uintptr_t s = 0, e = 0;
+    uintptr_t s, e;
     get_text(&s, &e);
-    fprintf(stderr, "[warm] get_text cached: %p-%p\n", (void *)s, (void *)e);  // TEMP DIAG
 }
 
 #elif defined(__APPLE__)
