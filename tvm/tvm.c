@@ -1804,27 +1804,44 @@ struct tvm_tls {
 
 static pthread_key_t tls_key;
 static int tls_initialized = 0;
-static struct tvm_tls _tls_bootstrap;
 
 static void taskdealloc(struct task *t);
 void threaddealloc(struct thread *thr);
 
 static void tvm_thread_destructor(void *arg) {
     struct tvm_tls *tls = arg;
-    if (tls == &_tls_bootstrap)
-        return;
+    // glibc clears the key value BEFORE invoking the destructor, but the
+    // teardown below is VM code (emulator/task destruction reads TLS, e.g.
+    // TVM_OFF).  Chokepoint rule: re-install the TLS for the teardown's
+    // duration, and clear it at the end so glibc doesn't re-run us (it loops
+    // while any key value is non-NULL).
+    pthread_setspecific(tls_key, tls);
     if (tls->tls_current_thread)
         threaddealloc(tls->tls_current_thread);
     if (tls->tls_current)
         taskdealloc(tls->tls_current);
+    pthread_setspecific(tls_key, NULL);
     kfree(tls);
 }
 
+// Peek at this thread's TLS without asserting it exists. ONLY for the VM-enter
+// chokepoints (FUNCTION_DEFINE wrappers, signal_handler, can_enter_tvm, panic):
+// they must gate on "no TLS -> host behavior" before any code that calls
+// tvm_tls(). Everything else calls tvm_tls(), which treats a missing TLS as a
+// fatal bug (a code path that slipped past every chokepoint).
+#define TVM_TLS_PEEK() (tls_initialized ? (struct tvm_tls *)pthread_getspecific(tls_key) : NULL)
+
 static inline struct tvm_tls *tvm_tls(void) {
-    if (!tls_initialized)
-        return &_tls_bootstrap;
-    struct tvm_tls *t = pthread_getspecific(tls_key);
-    return t ? t : &_tls_bootstrap;
+    struct tvm_tls *t = TVM_TLS_PEEK();
+    if (!t) {
+        // No per-thread TLS and somebody still reached VM state: missed
+        // chokepoint. Raw report + abort — panic()/INFO read TLS via this
+        // very function and would recurse.
+        static const char __msg[] = "tvm_tls: no thread TLS (code path missed a VM-enter chokepoint)\n";
+        CALL_FUNC(write, 2, __msg, sizeof(__msg) - 1);
+        CALL_FUNC(abort);
+    }
+    return t;
 }
 
 #define current                     (tvm_tls()->tls_current)
@@ -3729,11 +3746,35 @@ static inline void tvm_sig_leave(void)
  */
 static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
-    if (!current)
-        return;  // thread is exiting or not yet initialized — ignore
-
     if (signum < 1 || signum >= MAX_SIGNALS)
         return;
+
+    // VM-enter chokepoint: a thread with no VM identity (no TLS: newborn,
+    // dying, or TVM-internal; or TLS but no task yet) has no task to
+    // virtualize the signal into — apply the HOST default semantics.
+    struct tvm_tls *tls = TVM_TLS_PEEK();
+    if (!tls || !tls->tls_current) {
+        int sad = default_signal_actions[signum];
+        if (sad == SAD_TERM || sad == SAD_CORE) {
+            // Fatal default: die deterministically inside the handler, by the
+            // kernel's hand (correct termination status + core dump).  Never
+            // return on a synchronous fault — re-executing the instruction is
+            // racy (the address may have become mapped meanwhile), and
+            // surviving would leave this handler uninstalled process-wide.
+            struct sigaction dfl = { .sa_handler = SIG_DFL };
+            CALL_FUNC(sigaction, signum, &dfl, NULL);
+            sigset_t unblk;
+            sigemptyset(&unblk);
+            sigaddset(&unblk, signum);
+            CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &unblk, NULL);
+            CALL_FUNC(raise, signum);
+            CALL_FUNC(_exit, 128 + signum);
+        }
+        // SAD_IGN: drop.  SAD_STOP/SAD_CONT: also drop (dying by-the-book
+        // would require uninstalling our handler for a signal the process
+        // SURVIVES, permanently breaking its virtualization afterwards).
+        return;
+    }
 
     int hardware_fault = siginfo->si_code > 0 && (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE);
 
@@ -7846,6 +7887,13 @@ int in_tvm_range(void *lr) {
 }
 
 int can_enter_tvm(void *lr) {
+    // A thread without per-thread TLS (newborn inside pthread_create, dying
+    // after the key destructor, TVM-internal helpers) never enters TVM.
+    // This must come first: everything below reads TLS via tvm_tls(), which
+    // aborts when there is none.
+    if (!TVM_TLS_PEEK())
+        return 0;
+
     // not initialized
     if (!main_task)
         return 0;
@@ -7917,15 +7965,23 @@ static void _fmc_ ## _name () { list_add_tail( & (_fm_ ## _name).fm_list, &all_f
 #define __FN_DECL(t, a)	t a
 #define __FN_ARGS(t, a)	a
 
+// VM-enter chokepoint: a thread with no per-thread TLS is not a VM thread —
+// route it straight to the host function and touch NOTHING of TVM's state
+// (in particular the tls_call chain: glibc calls interposed functions on
+// newborn threads inside pthread_create and on dying threads after the key
+// destructor, and pushing onto shared state from there is a data race).
 #define __FUNCTION_DEFINEx(_x, _rettype, _name, ...) \
 _rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
 _rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
-    struct tvm_call __call = { call, __builtin_return_address(0) }; \
-    call = &__call; \
+    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
+    if (!__tls) \
+        return CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); \
+    struct tvm_call __call = { __tls->tls_call, __builtin_return_address(0) }; \
+    __tls->tls_call = &__call; \
     _rettype __r; \
     if (!can_enter_tvm(NULL)) { __r = CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     else { __r = __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    call = call->prev; \
+    __tls->tls_call = __call.prev; \
     return __r; \
 } \
 FUNCTION_METADATA(_name, &_name); \
@@ -7934,11 +7990,16 @@ _rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
 #define __FUNCTION_DEFINE_VOIDx(_x, _name, ...) \
 void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
 void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
-    struct tvm_call __call = { call, __builtin_return_address(0) }; \
-    call = &__call; \
+    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
+    if (!__tls) { \
+        CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); \
+        return; \
+    } \
+    struct tvm_call __call = { __tls->tls_call, __builtin_return_address(0) }; \
+    __tls->tls_call = &__call; \
     if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     else { __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    call = call->prev; \
+    __tls->tls_call = __call.prev; \
 } \
 FUNCTION_METADATA(_name, &_name); \
 void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
@@ -7946,8 +8007,14 @@ void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
 #define __FUNCTION_DEFINE_NORETx(_x, _name, ...) \
 void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
 void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
-    struct tvm_call __call = { call, __builtin_return_address(0) }; \
-    call = &__call; \
+    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
+    if (!__tls) { \
+        CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); \
+        CALL_FUNC(abort); \
+        __builtin_unreachable(); \
+    } \
+    struct tvm_call __call = { __tls->tls_call, __builtin_return_address(0) }; \
+    __tls->tls_call = &__call; \
     if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     else {__tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
     panic("returned"); \
@@ -7959,13 +8026,16 @@ void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
 #define __FUNCTION_DEFINE_VAx(_x, _rettype, _name, ...) \
 _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
 _rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
-    struct tvm_call __call = { call, __builtin_return_address(0) }; \
-    call = &__call; \
+    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
+    struct tvm_call __call = { __tls ? __tls->tls_call : NULL, __builtin_return_address(0) }; \
+    if (__tls) \
+        __tls->tls_call = &__call; \
     va_list __ap; \
     va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
     _rettype __r = __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
     va_end(__ap); \
-    call = call->prev; \
+    if (__tls) \
+        __tls->tls_call = __call.prev; \
     return __r; \
 } \
 FUNCTION_METADATA(_name, &_name); \
@@ -7974,8 +8044,10 @@ _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 #define __FUNCTION_DEFINE_NORET_VAx(_x, _name, ...) \
 void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
 void _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
-    struct tvm_call __call = { call, __builtin_return_address(0) }; \
-    call = &__call; \
+    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
+    struct tvm_call __call = { __tls ? __tls->tls_call : NULL, __builtin_return_address(0) }; \
+    if (__tls) \
+        __tls->tls_call = &__call; \
     va_list __ap; \
     va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
     __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
@@ -9349,14 +9421,19 @@ void tvm_dump(int mode)
 
 static void __panic(const char *msg, const char *file, int line)
 {
+    // Peek, don't tvm_tls(): panic must work on keyless threads (tvm_tls()
+    // aborts there — and its abort report would recurse into us via SIGABRT).
+    struct tvm_tls *__tls = TVM_TLS_PEEK();
+    struct task *cur = __tls ? __tls->tls_current : NULL;
+
     CALL_FUNC(fprintf, stderr, "\n");
-    CALL_FUNC(fprintf, stderr, "panic(caller pid %d tid %d): \"%s\"\n", (current?current->tsk_pid:-1), __gettid(), msg);
+    CALL_FUNC(fprintf, stderr, "panic(caller pid %d tid %d): \"%s\"\n", (cur?cur->tsk_pid:-1), __gettid(), msg);
     CALL_FUNC(fprintf, stderr, "%s:%d\n\n", file, line);
-    
+
     CALL_FUNC(fprintf, stderr, "Thread Info:\n");
-    CALL_FUNC(fprintf, stderr, " ppid: %d\n", (current?(current->tsk_parent?current->tsk_parent->tsk_pid:1):-1));
+    CALL_FUNC(fprintf, stderr, " ppid: %d\n", (cur?(cur->tsk_parent?cur->tsk_parent->tsk_pid:1):-1));
     CALL_FUNC(fprintf, stderr, " host pid: %d\n", CALL_FUNC(getpid));
-    CALL_FUNC(fprintf, stderr, " current: %p\n", current);
+    CALL_FUNC(fprintf, stderr, " current: %p\n", cur);
     CALL_FUNC(fprintf, stderr, " main_task: %p\n", main_task);
     CALL_FUNC(fprintf, stderr, " errno: %d (%s)\n", errno, strerror(errno));
     CALL_FUNC(fprintf, stderr, "\n");
