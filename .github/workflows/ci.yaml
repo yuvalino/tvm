@@ -57,17 +57,11 @@ jobs:
     # outer backstop.
     - name: test_tvm
       timeout-minutes: 5
-      # KNOWN-FAILING (linux-x64 only): test_tvm runs ~7 tests then SIGSEGVs in
-      # fork()->pthread_create()->glibc allocate_stack — glibc's thread-stack
-      # cache holds a dangling pointer to a stack TVM munmapped (fork/COW memory
-      # corruption, linux-x64-specific). macOS passes. DIAGNOSTIC: gdb backtrace.
-      run: |
-        RC=0; timeout -s KILL 120 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
-        DOTS=$(grep -oE "tvm \.+" /tmp/tt.out | tail -1 | awk '{print length($2)}')
-        echo "===== rc=$RC  tests-passed(dots)=$DOTS  (rc=0 => GREEN) ====="
-        echo "===== tail ====="; tail -15 /tmp/tt.out
-        [ "$RC" = "0" ] && exit 0
-        exit 1
+      # KNOWN-FAILING (linux-x64 only, pre-existing): SIGSEGVs early in
+      # fork()->pthread_create()->glibc get_cached_stack — glibc's thread-stack
+      # cache holds a dangling pointer to an 8MB region freed in TVM's
+      # fork/COW/emulator path. macOS is green. Tracked separately.
+      run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
