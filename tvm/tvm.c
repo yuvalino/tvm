@@ -3732,6 +3732,25 @@ static inline void tvm_sig_leave(void)
  */
 static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
+    // TEMP DIAG (log-only, no control-flow change): record the RIP of every real
+    // hardware fault the instant the handler runs, before any check that could
+    // swallow it, then fall through to normal handling (so legitimate caught
+    // guest faults still dispatch). If the crash never logs this, the handler
+    // isn't running at all (stack overflow / double fault / blocked signal).
+    if (siginfo->si_code > 0 &&
+        (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE)) {
+        unsigned long fpc = 0, fbp = 0, fsp = 0;
+#if defined(__linux__) && defined(__x86_64__)
+        if (ucontext) {
+            long long *gr = (long long *)((ucontext_t *)ucontext)->uc_mcontext.gregs;
+            fbp = (unsigned long)gr[10]; fsp = (unsigned long)gr[15]; fpc = (unsigned long)gr[16];
+        }
+#endif
+        INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d cur=%p in_emu=%d sigblk=%d emu_depth=%d",
+             signum, siginfo->si_addr, fpc, fbp, fsp, siginfo->si_code, (void *)current,
+             tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
+    }
+
     if (!current)
         return;  // thread is exiting or not yet initialized — ignore
 
