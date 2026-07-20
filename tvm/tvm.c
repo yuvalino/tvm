@@ -3783,11 +3783,40 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         // than silently record it as pending (which loops or dies with no trace).
         if (siginfo->si_code > 0 &&
             (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE)) {
-            INFO("HWFAULT signum=%d at %p si_code=%d in_emu=%d sigblk=%d emu_depth=%d",
-                 signum, siginfo->si_addr, siginfo->si_code, tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
-            dump_stacktrace();
-            panic("hardware fault %d (si_code=%d) in critical section (sigblk=%d emu_depth=%d)",
-                  signum, siginfo->si_code, tvm_sig_blocked, tvm_emu_call_depth);
+            // Lock-free crash report: dump_stacktrace()/panic() can hang here
+            // because the faulting context may hold a lock (dl lock via dladdr,
+            // or glibc's stack_cache_lock). Print the faulting instruction
+            // pointer + a few caller return addresses read straight from the
+            // trapped frame (via safeio, fault-safe) and _exit immediately.
+            unsigned long fault_pc = 0, fault_bp = 0, fault_sp = 0;
+#if defined(__linux__) && defined(__x86_64__)
+            if (ucontext) {
+                // glibc x86_64 gregs indices (avoid REG_* macros / greg_t which
+                // need _GNU_SOURCE): RBP=10, RSP=15, RIP=16.
+                long long *gr = (long long *)((ucontext_t *)ucontext)->uc_mcontext.gregs;
+                fault_bp = (unsigned long)gr[10];
+                fault_sp = (unsigned long)gr[15];
+                fault_pc = (unsigned long)gr[16];
+            }
+#endif
+            INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d in_emu=%d sigblk=%d emu_depth=%d",
+                 signum, siginfo->si_addr, fault_pc, fault_bp, fault_sp, siginfo->si_code,
+                 tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
+            // Walk the trapped frame's saved-rbp chain via safeio (never faults).
+            struct safeio_ctx __sio = SAFEIO_NULL;
+            if (fault_bp && 0 == safeio_open(&__sio)) {
+                void **fp = (void **)fault_bp;
+                for (int i = 0; i < 16 && fp; i++) {
+                    void *ret = NULL, *nextfp = NULL;
+                    if (sizeof(void *) != safeio_copy(&__sio, &ret, fp + 1, sizeof(void *))) break;
+                    INFO("  hwbt[% 2d] = %p", i, ret);
+                    if (sizeof(void *) != safeio_copy(&__sio, &nextfp, fp, sizeof(void *))) break;
+                    fp = (void **)nextfp;
+                }
+                safeio_close(&__sio);
+            }
+            CALL_FUNC(_exit, 139);
+            __builtin_unreachable();
         }
 
         // Thread-directed: defer at thread level

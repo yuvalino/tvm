@@ -65,12 +65,18 @@ jobs:
         # Plain run (real timing). A hardware fault in a critical section now
         # dumps HWFAULT + stacktrace + panics (see signal_handler), so the crash
         # backtrace lands in the output instead of a silent core dump.
-        ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || true
+        timeout 120 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || true
         echo "===== counts: WPENTER=$(grep -c WPENTER /tmp/tt.out) FORKCOPY=$(grep -c FORKCOPY /tmp/tt.out) TASKDEALLOC=$(grep -c TASKDEALLOC /tmp/tt.out) HWFAULT=$(grep -c HWFAULT /tmp/tt.out) ====="
-        echo "===== HWFAULT + stacktrace + panic ====="
-        grep -nE "HWFAULT|stacktrace\[|panic|PANIC|__panic|signum=" /tmp/tt.out | tail -40
-        echo "===== last 30 lines of output ====="
-        tail -30 /tmp/tt.out
+        echo "===== HWFAULT line + hwbt frames ====="
+        grep -E "HWFAULT|hwbt\[" /tmp/tt.out | tail -25
+        echo "===== symbolize pc + hwbt addresses (PIE base 0x555555554000) ====="
+        for A in $(grep -oE "(pc=0x[0-9a-f]+|hwbt\[[ 0-9]+\] = 0x[0-9a-f]+)" /tmp/tt.out | grep -oE "0x[0-9a-f]+" | sort -u); do
+          OFF=$(printf "0x%x" $(( A - 0x555555554000 )) 2>/dev/null)
+          # only symbolize addresses that fall in the tvm binary (< 0x400000 span from base)
+          echo -n "$A off=$OFF -> "; addr2line -f -e ./output/linux-x64/bin/tvm $OFF 2>/dev/null | tr '\n' ' ' | sed -E 's#/home/[^ ]*/tvm/tvm##g'; echo
+        done
+        echo "===== last 15 lines ====="
+        tail -15 /tmp/tt.out
         exit 1
     - name: test_rmem
       timeout-minutes: 3
