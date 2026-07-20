@@ -7742,9 +7742,11 @@ void get_text(uintptr_t *out_start, uintptr_t *out_end)
     // is a correctness fix: glibc thread exit runs __libc_thread_freeres, which
     // frees TLS-internal buffers via free() -> can_enter_tvm -> get_text. Calling
     // dl_iterate_phdr there re-resolves TLS (_dl_tls_get_addr_soft) on a thread
-    // whose TLS is being torn down -> SIGSEGV. The first call happens during
-    // normal startup (main thread), long before any thread exits, so the cache
-    // is warm by then. A benign first-call race just recomputes the same value.
+    // whose TLS is being torn down -> SIGSEGV. can_enter_tvm short-circuits on
+    // current_thread for normal calls, so get_text is often first *reached* on
+    // exactly that thread-exit path — hence the eager constructor below warms
+    // the cache on the main thread before any worker thread can exit. A benign
+    // first-call race just recomputes the same value.
     static uintptr_t cached_start = 0;
     static uintptr_t cached_end = 0;
     if (!cached_start) {
@@ -7755,6 +7757,17 @@ void get_text(uintptr_t *out_start, uintptr_t *out_end)
     }
     *out_start = cached_start;
     *out_end = cached_end;
+}
+
+// Warm get_text()'s cache before main(), on the main thread — so the interposed
+// free() on any later thread-exit path hits the cache and never calls
+// dl_iterate_phdr during that thread's TLS teardown. dl_iterate_phdr is safe in
+// a constructor (the link map is complete post-relocation).
+__attribute__((constructor))
+static void _warm_get_text_cache(void)
+{
+    uintptr_t s, e;
+    get_text(&s, &e);
 }
 
 #elif defined(__APPLE__)
