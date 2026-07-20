@@ -65,7 +65,7 @@ jobs:
       run: pip3 install -r python_requirements.txt
     - name: test_integration
       timeout-minutes: 10
-      run: pytest tests/test_integration.py -v --junitxml=report.xml
+      run: pytest tests/test_integration.py -v --maxfail=3 --junitxml=report.xml
     - name: test report
       uses: mikepenz/action-junit-report@v5
       if: always()
@@ -108,7 +108,7 @@ jobs:
       run: pip3 install -r python_requirements.txt
     - name: test_integration
       timeout-minutes: 10
-      run: pytest tests/test_integration.py -v --junitxml=report.xml
+      run: pytest tests/test_integration.py -v --maxfail=3 --junitxml=report.xml
     - name: test report
       uses: mikepenz/action-junit-report@v5
       if: always()
@@ -119,7 +119,7 @@ jobs:
     # output/macos-arm64/lib/flutter, the path the harness (FLUTTER_APP) uses.
     - name: test_integration (flutter)
       timeout-minutes: 20
-      run: pytest tests/test_integration.py -v --backend flutter --junitxml=report-flutter.xml
+      run: pytest tests/test_integration.py -v --maxfail=3 --backend flutter --junitxml=report-flutter.xml
     - name: test report (flutter)
       uses: mikepenz/action-junit-report@v5
       if: always()
