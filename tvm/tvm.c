@@ -6534,11 +6534,43 @@ out:
 }
 
 int emulator_engine_add_map_entry(struct emulator_engine *ee, uint64_t start, size_t size) {
-    struct emulator_map_entry *eme = emulator_map_entry_create(start, size);
-    if (!eme)
-        return 1;
-    eme->eme_next = ee->ee_eme;
-    ee->ee_eme = eme;
+    uint64_t end = start + size;
+
+    // Keep the list sorted by address and merge overlapping/adjacent ranges.
+    // The same range can be added twice when nested emulations fault it again
+    // before a reset consumed the previous add (seen with back-to-back
+    // signal-handler dispatches), and emulator_engine_reset's gap-walk assumes
+    // an ascending, non-overlapping list — a duplicate or out-of-order entry
+    // makes its uc_mem_map_ptr fail with UC_ERR_MAP, permanently wedging the
+    // engine (ee_refresh stays set, every subsequent step fails).
+    struct emulator_map_entry **link = &ee->ee_eme;
+    while (*link && (*link)->eme_start + (*link)->eme_size < start)
+        link = &(*link)->eme_next;
+
+    if (*link && (*link)->eme_start <= end) {
+        // overlaps or touches: extend this entry, then swallow any later
+        // entries the merged range now covers
+        struct emulator_map_entry *eme = *link;
+        if (start < eme->eme_start)
+            eme->eme_start = start;
+        if (end > eme->eme_start + eme->eme_size)
+            eme->eme_size = end - eme->eme_start;
+        while (eme->eme_next && eme->eme_next->eme_start <= eme->eme_start + eme->eme_size) {
+            struct emulator_map_entry *victim = eme->eme_next;
+            uint64_t victim_end = victim->eme_start + victim->eme_size;
+            if (victim_end > eme->eme_start + eme->eme_size)
+                eme->eme_size = victim_end - eme->eme_start;
+            eme->eme_next = victim->eme_next;
+            emulator_map_entry_destroy(victim);
+        }
+    } else {
+        struct emulator_map_entry *eme = emulator_map_entry_create(start, size);
+        if (!eme)
+            return 1;
+        eme->eme_next = *link;
+        *link = eme;
+    }
+
     ee->ee_refresh = 1;
     return 0;
 }
@@ -7060,8 +7092,10 @@ int emulator_step(struct emulator_context *ec)
         if (0 == reset_err)
             ec->ec_curr_engine->ee_refresh = 0;
         tvm_sig_leave();
-        if (0 != reset_err)
+        if (0 != reset_err) {
+            INFO("emulator_step: engine_reset failed (%d)", reset_err);
             goto out;
+        }
     }
 
     // Guard the whole engine-touching span, not just uc_emu_start: to_uc and
@@ -7451,12 +7485,16 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
 
     struct emulator_engine *prev_engine = ec->ec_curr_engine;
     struct emulator_engine *ee = emulator_context_get_or_create_engine(ec, pcinfo->udli_farch);
-    if (!ee)
+    if (!ee) {
+        INFO("emulator_call_ex: get_or_create_engine(arch=%d) failed", pcinfo->udli_farch);
         goto out;
+    }
     ec->ec_curr_engine = ee;
 
-    if (!(ess = emulator_saved_state_create(pcinfo->udli_farch, pcinfo->udli_fabi)))
+    if (!(ess = emulator_saved_state_create(pcinfo->udli_farch, pcinfo->udli_fabi))) {
+        INFO("emulator_call_ex: saved_state_create failed");
         goto out;
+    }
 
     ess->ess_next = ec->ec_ss;
     ec->ec_ss = ess;
