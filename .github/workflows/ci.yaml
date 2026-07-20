@@ -65,22 +65,16 @@ jobs:
         command -v gdb >/dev/null 2>&1 || { echo "no gdb; plain run"; exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30; }
         cat > /tmp/g.cmds <<'GDB'
         set pagination off
-        set breakpoint pending on
-        break munmap if $rsi >= 0x7d0000
-        commands
-        silent
-        printf "MUNMAP %p 0x%lx from:\n", (void*)$rdi, (long)$rsi
-        bt 4
-        printf "====\n"
-        continue
-        end
+        set width 0
         run
         printf "\n===CRASH===\n"
         bt
-        printf "r14="
-        p/x $r14
+        printf "r14=" ; p/x $r14
+        printf "r14-0x10 deref:\n" ; x/2gx $r14-0x10
+        printf "===MAPPINGS===\n"
+        info proc mappings
         GDB
-        gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | grep -E "MUNMAP|====|CRASH|r14=|#[0-9]+ +0x|in (fork|threaddealloc|taskdealloc|terminate|emulator|rmem|tvm_proc|__tvm|munmap)" | tail -120
+        gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | grep -E "FORKCOPY|CRASH|MAPPINGS|r14|deref|Cannot access|#[0-9]+ +0x|in (fork|tvm_proc|emulator|__tvm|get_cached|allocate_stack|pthread_create|start_thread)|Start Addr|^ +0x7ff5|^ +0x7ffb" | tail -140
         exit 1
     - name: test_rmem
       timeout-minutes: 3

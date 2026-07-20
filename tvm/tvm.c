@@ -11587,6 +11587,14 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     uintptr_t child_fp = curr_fp;
     uintptr_t child_sp = curr_fp - (parent_fp - parent_sp);
 
+    // TEMP DIAGNOSTIC: fork stack-copy bounds. child_sp must stay within the
+    // child's DEFAULT_STACK_SIZE glibc stack whose top is ~curr_fp; if the copy
+    // size (parent_fp-parent_sp) approaches DEFAULT_STACK_SIZE, child_sp
+    // underflows into the adjacent mapping and corrupts it.
+    INFO("FORKCOPY size=0x%lx parent_sp=%p parent_fp=%p curr_fp=%p child_sp=%p headroom=0x%lx",
+         (unsigned long)(parent_fp - parent_sp), (void *)parent_sp, (void *)parent_fp,
+         (void *)curr_fp, (void *)child_sp, (unsigned long)(child_fp - child_sp));
+
     memcpy((void *)child_sp, (void *)parent_sp, parent_fp - parent_sp);
     // for debugging when unwinder crashes
     // *(uintptr_t *)(child_fp) = 0xDEADBEEF46464646;
