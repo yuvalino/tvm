@@ -64,12 +64,18 @@ jobs:
       run: |
         command -v gdb >/dev/null 2>&1 || { echo "no gdb; plain run"; exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30; }
         ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || true
-        echo "===== WPENTER / WPCLAIM sequence (last 60) ====="
-        grep -E "WPENTER|WPCLAIM" /tmp/tt.out | tail -60
-        echo "===== duplicate WPCLAIM (same t claimed more than once) ====="
-        grep -oE "WPCLAIM t=0x[0-9a-f]+ pid=[0-9-]+" /tmp/tt.out | sort | uniq -c | sort -rn | head
+        echo "===== TASKDEALLOC calls (t, ar, caller ra) ====="
+        grep -E "TASKDEALLOC" /tmp/tt.out | tail -40
+        echo "===== duplicate taskdealloc (same t freed more than once) ====="
+        grep -oE "TASKDEALLOC t=0x[0-9a-f]+" /tmp/tt.out | sort | uniq -c | sort -rn | head
+        echo "===== symbolize distinct caller ra0/ra1 (PIE base 0x555555554000) ====="
+        for RA in $(grep -oE "ra[01]=0x[0-9a-f]+" /tmp/tt.out | sed 's/ra[01]=//' | sort -u); do
+          OFF=$(printf "0x%x" $(( RA - 0x555555554000 )) 2>/dev/null)
+          echo -n "$RA -> "; addr2line -f -e ./output/linux-x64/bin/tvm $OFF 2>/dev/null | tr '\n' ' '; echo
+        done
+        echo "===== WPENTER count: $(grep -c WPENTER /tmp/tt.out)  FORKCOPY count: $(grep -c FORKCOPY /tmp/tt.out) ====="
         echo "===== tail of output (crash) ====="
-        tail -20 /tmp/tt.out
+        tail -8 /tmp/tt.out
         exit 1
     - name: test_rmem
       timeout-minutes: 3

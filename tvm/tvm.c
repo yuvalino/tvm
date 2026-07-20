@@ -2021,6 +2021,9 @@ out:
 
 static void taskdealloc(struct task *t)
 {
+    INFO("TASKDEALLOC t=%p ar=%p cnt=%u ra0=%p ra1=%p tid=%d", (void *)t, (void *)t->tsk_ar,
+         t->tsk_threads_cnt, __builtin_return_address(0), __builtin_return_address(1), __gettid());
+
     if (t->tsk_threads_cnt != 0)
         panic("taskdealloc tsk_threads_cnt %u", t->tsk_threads_cnt);
 
