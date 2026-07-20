@@ -3775,11 +3775,20 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     // after uc_emu_start returns with the guest state saved and the engine idle.
     // Hardware faults are handled above.
     if (tvm_sig_blocked || tvm_in_emu || tvm_emu_call_depth || sigismember(&current_thread->thr_sigmask, signum)) {
-        // Real hardware fault while in critical section = bug in our implementation
-        // si_code > 0 distinguishes kernel-generated (real fault) from user-sent (kill/sigqueue)
-        if (tvm_sig_blocked && siginfo->si_code > 0 &&
-            (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE))
-            panic("hardware fault %d (si_code=%d) while signals blocked", signum, siginfo->si_code);
+        // A real hardware fault (kernel-generated: si_code > 0) is synchronous and
+        // CANNOT be deferred — returning just re-executes the faulting instruction,
+        // which re-faults forever. In any critical section (signals blocked, inside
+        // the emulator, or on the emulated call path) it means TVM/host code itself
+        // faulted, which is an implementation bug. Dump the stack and panic rather
+        // than silently record it as pending (which loops or dies with no trace).
+        if (siginfo->si_code > 0 &&
+            (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE)) {
+            INFO("HWFAULT signum=%d at %p si_code=%d in_emu=%d sigblk=%d emu_depth=%d",
+                 signum, siginfo->si_addr, siginfo->si_code, tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
+            dump_stacktrace();
+            panic("hardware fault %d (si_code=%d) in critical section (sigblk=%d emu_depth=%d)",
+                  signum, siginfo->si_code, tvm_sig_blocked, tvm_emu_call_depth);
+        }
 
         // Thread-directed: defer at thread level
         struct thread *thr = current_thread;

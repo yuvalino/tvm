@@ -62,34 +62,15 @@ jobs:
       # cache holds a dangling pointer to a stack TVM munmapped (fork/COW memory
       # corruption, linux-x64-specific). macOS passes. DIAGNOSTIC: gdb backtrace.
       run: |
-        # Capture the REAL (plain-timing) crash via a core dump — gdb's slow
-        # timing changes the crash. Set an in-workspace core file.
-        ulimit -c unlimited || true
-        CORE_DIR="$PWD/cores"; mkdir -p "$CORE_DIR"
-        echo "core_pattern before: $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
-        echo "$CORE_DIR/core.%e.%p" > /proc/sys/kernel/core_pattern 2>/dev/null \
-          || sudo sh -c "echo '$CORE_DIR/core.%e.%p' > /proc/sys/kernel/core_pattern" 2>/dev/null \
-          || echo "could not set core_pattern (need root); relying on default"
-        echo "core_pattern now: $(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
-        ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1
-        RC=$?
-        echo "===== exit=$RC   WPENTER=$(grep -c WPENTER /tmp/tt.out) FORKCOPY=$(grep -c FORKCOPY /tmp/tt.out) TASKDEALLOC=$(grep -c TASKDEALLOC /tmp/tt.out) ====="
-        echo "===== tail of app output ====="
-        tail -12 /tmp/tt.out
-        echo "===== core files ====="
-        ls -la "$CORE_DIR" 2>/dev/null; ls -la ./core* 2>/dev/null; ls -la /tmp/core* 2>/dev/null || true
-        CORE=$(ls -t "$CORE_DIR"/core.* ./core* /tmp/core.* 2>/dev/null | head -1)
-        echo "core=$CORE"
-        if [ -n "$CORE" ] && command -v gdb >/dev/null 2>&1; then
-          echo "===== crash backtrace (all threads) ====="
-          gdb -batch -nx -ex 'set pagination off' -ex 'set width 0' \
-            -ex 'thread apply all bt' -ex 'info registers rip rax rbx r14 rsp' \
-            ./output/linux-x64/bin/tvm "$CORE" 2>&1 \
-            | grep -E "#[0-9]+|Thread|Program terminated|signal SIG|rip|rax|rbx|r14|rsp|in \?\?" \
-            | sed -E 's#/home/[^ ]*/tvm/tvm/tvm.c#tvm.c#g' | head -100
-        else
-          echo "no core file captured; cannot backtrace the plain-timing crash"
-        fi
+        # Plain run (real timing). A hardware fault in a critical section now
+        # dumps HWFAULT + stacktrace + panics (see signal_handler), so the crash
+        # backtrace lands in the output instead of a silent core dump.
+        ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || true
+        echo "===== counts: WPENTER=$(grep -c WPENTER /tmp/tt.out) FORKCOPY=$(grep -c FORKCOPY /tmp/tt.out) TASKDEALLOC=$(grep -c TASKDEALLOC /tmp/tt.out) HWFAULT=$(grep -c HWFAULT /tmp/tt.out) ====="
+        echo "===== HWFAULT + stacktrace + panic ====="
+        grep -nE "HWFAULT|stacktrace\[|panic|PANIC|__panic|signum=" /tmp/tt.out | tail -40
+        echo "===== last 30 lines of output ====="
+        tail -30 /tmp/tt.out
         exit 1
     - name: test_rmem
       timeout-minutes: 3
