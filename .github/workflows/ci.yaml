@@ -63,10 +63,7 @@ jobs:
       # corruption, linux-x64-specific). macOS passes. DIAGNOSTIC: gdb backtrace.
       run: |
         command -v gdb >/dev/null 2>&1 || { echo "no gdb; plain run"; exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30; }
-        gdb -batch -nx -ex 'set pagination off' -ex 'run' \
-          -ex 'printf "\n===BACKTRACE===\n"' -ex 'bt' \
-          -ex 'printf "\n===r14 + mappings===\n"' -ex 'p/x $r14' -ex 'info proc mappings' \
-          --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | tail -120
+        gdb -batch -nx -ex 'set pagination off' -ex 'set breakpoint pending on' -ex 'set width 0' -ex 'dprintf munmap, "MUNMAP %p 0x%lx\n", (void*)$rdi, (long)$rsi' -ex 'run' -ex 'printf "\n===CRASH BT===\n"' -ex 'bt' -ex 'printf "\n===r14 + mappings===\n"' -ex 'p/x $r14' -ex 'info proc mappings' --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 2>&1 | grep -E "MUNMAP 0x7f|CRASH BT|===|#[0-9]|get_cached|fork|_exit|Start Addr|0x7f[0-9a-f]+ +0x7f|SIGSEGV|\\$1 =" | tail -160
         exit 1
     - name: test_rmem
       timeout-minutes: 3
