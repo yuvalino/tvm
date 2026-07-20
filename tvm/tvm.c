@@ -7854,11 +7854,6 @@ int can_enter_tvm(void *lr) {
         return 0;
     }
 
-    // threads with current_thread set are TVM-managed (e.g. forked children
-    // whose duplicated code may not be in registered address ranges)
-    if (current_thread)
-        return 1;
-
     if (!lr) {
         if (!call)
             return 0;
