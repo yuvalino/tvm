@@ -67,8 +67,8 @@ jobs:
         # backtrace lands in the output instead of a silent core dump.
         # SIGKILL (not SIGTERM — TVM catches SIGTERM and would hang) after 90s so
         # a hang cannot eat the whole 5-min step budget before diagnostics run.
-        timeout -s KILL 90 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1
-        echo "===== tvm rc=$? (124/137 => killed by timeout => HUNG; 139 => our _exit) ====="
+        RC=0; timeout -s KILL 90 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || RC=$?
+        echo "===== tvm rc=$RC (124/137 => killed by timeout => HUNG; 139 => our _exit) ====="
         echo "===== counts: WPENTER=$(grep -c WPENTER /tmp/tt.out) FORKCOPY=$(grep -c FORKCOPY /tmp/tt.out) HWFAULT=$(grep -c HWFAULT /tmp/tt.out) ====="
         echo "===== HWFAULT line(s) ====="
         grep -E "HWFAULT|signum=" /tmp/tt.out | tail -10
