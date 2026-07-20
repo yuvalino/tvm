@@ -1477,8 +1477,10 @@ TEST(SignalKillZero) {
         // Stay in same process group as parent
         close(pip[0]);
         PHASE_WAIT(1);
-        // Wait briefly for signal to arrive
-        for (int i = 0; i < 50 && !sig_pgrp_count; i++)
+        // Wait for the signal to arrive. Generous cap (2s): delivery through
+        // TVM's virtual-signal path can exceed 100ms when the machine is
+        // loaded (the CI runner shares the box), and success exits early.
+        for (int i = 0; i < 1000 && !sig_pgrp_count; i++)
             usleep(2000);
         int cnt = sig_pgrp_count;
         write(pip[1], &cnt, sizeof(cnt));
