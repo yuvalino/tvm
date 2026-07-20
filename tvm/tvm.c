@@ -12200,6 +12200,8 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     struct task *zombiet = NULL;
     int found;
 
+    INFO("WPENTER pid=%d options=%d bytid=%d ra=%p", pid, options, __gettid(), __builtin_return_address(0));
+
     tvm_sig_enter();
 
     pthread_mutex_lock(&tasks_lock);
@@ -12263,6 +12265,7 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     // claim the zombie before dropping tasks_lock: a concurrent waitpid in
     // another thread would otherwise find it too and reap it twice (second
     // pthread_join on a joined thread is UB, then double taskfreelastref)
+    INFO("WPCLAIM t=%p pid=%d state=0x%x bytid=%d", (void *)zombiet, zombiet->tsk_pid, zombiet->tsk_state, __gettid());
     zombiet->tsk_state |= TS_REAPED;
     pthread_mutex_unlock(&tasks_lock);
 

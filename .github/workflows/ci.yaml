@@ -63,33 +63,13 @@ jobs:
       # corruption, linux-x64-specific). macOS passes. DIAGNOSTIC: gdb backtrace.
       run: |
         command -v gdb >/dev/null 2>&1 || { echo "no gdb; plain run"; exec ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30; }
-        cat > /tmp/g.cmds <<'GDB'
-        set pagination off
-        set width 0
-        set breakpoint pending on
-        break rmem_arena_destroy
-        commands
-        silent
-        printf "\n===ARENA_DESTROY ar=%p===\n", ar
-        bt 12
-        continue
-        end
-        break taskdealloc
-        commands
-        silent
-        printf "\n===TASKDEALLOC t=%p===\n", t
-        bt 8
-        continue
-        end
-        run
-        printf "\n===CRASH===\n"
-        bt 6
-        GDB
-        gdb -batch -nx -x /tmp/g.cmds --args ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/gdb.out 2>&1 || true
-        echo "===== ARENA_DESTROY + TASKDEALLOC call sites (bt) ====="
-        grep -E "ARENA_DESTROY|TASKDEALLOC|CRASH|#[0-9]+ +0x[0-9a-f]+ in " /tmp/gdb.out \
-          | grep -viE " in (rmem_arena_destroy|taskdealloc) " \
-          | sed -E 's/\(.*\)//; s#/home/[^ ]*/tvm.c#tvm.c#' | head -120
+        ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 > /tmp/tt.out 2>&1 || true
+        echo "===== WPENTER / WPCLAIM sequence (last 60) ====="
+        grep -E "WPENTER|WPCLAIM" /tmp/tt.out | tail -60
+        echo "===== duplicate WPCLAIM (same t claimed more than once) ====="
+        grep -oE "WPCLAIM t=0x[0-9a-f]+ pid=[0-9-]+" /tmp/tt.out | sort | uniq -c | sort -rn | head
+        echo "===== tail of output (crash) ====="
+        tail -20 /tmp/tt.out
         exit 1
     - name: test_rmem
       timeout-minutes: 3
