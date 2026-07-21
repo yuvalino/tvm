@@ -9228,6 +9228,22 @@ void tvm_init_with_outfd(const char *init_comm, int outfd)
     tvm_init(init_comm);
 }
 
+// Embedder entry points (flutter worker). The app used to dlsym the interposed
+// execvp/chdir directly, but those dispatch by RETURN ADDRESS (can_enter_tvm),
+// and a caller in the app binary's text is outside every TVM range — the call
+// silently fell through to the HOST function (host execvp("dropbear") ->
+// ENOENT). These trampolines live in libtvm text, so the interposed functions
+// see a tvm lr and enter the VM.
+int tvm_execvp(const char *file, char *const argv[])
+{
+    return execvp(file, argv);
+}
+
+int tvm_chdir(const char *path)
+{
+    return chdir(path);
+}
+
 void tvm_init(const char *init_comm)
 {
     INFO("tvm_init()");

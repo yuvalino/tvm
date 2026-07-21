@@ -13,10 +13,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-// Resolved from libtvm.dylib at runtime. execvp and chdir must come from
-// libtvm (TVM's interposed versions) so the worker enters the VM instead of
-// the host's libc — this file is in the app binary, where a bare execvp()
-// would bind to libc and try to exec a real process.
+// Resolved from libtvm.dylib at runtime. exec/chdir must go through libtvm's
+// tvm_execvp/tvm_chdir trampolines: the interposed execvp/chdir dispatch by
+// return address (can_enter_tvm), and a caller in this app binary's text is
+// outside every TVM range — dlsym'ing them directly silently fell through to
+// the HOST functions (host execvp("dropbear") -> ENOENT).
 typedef void (*tvm_init_with_outfd_fn)(const char *init_comm, int outfd);
 typedef int (*tvm_mount_cpio_fn)(const char *pathname, const void *buf,
                                  unsigned long size);
@@ -171,8 +172,8 @@ TVM_EXPORT int tvm_start(const char *libtvm_path, int port,
     }
     fn_tvm_init = (tvm_init_with_outfd_fn)dlsym(h, "tvm_init_with_outfd");
     fn_tvm_mount_cpio = (tvm_mount_cpio_fn)dlsym(h, "tvm_mount_cpio");
-    fn_tvm_execvp = (execvp_fn)dlsym(h, "execvp");
-    fn_tvm_chdir = (chdir_fn)dlsym(h, "chdir");
+    fn_tvm_execvp = (execvp_fn)dlsym(h, "tvm_execvp");
+    fn_tvm_chdir = (chdir_fn)dlsym(h, "tvm_chdir");
     if (!fn_tvm_init || !fn_tvm_mount_cpio || !fn_tvm_execvp || !fn_tvm_chdir) {
         tvm_log("tvm_start: dlsym failed "
                 "(init=%p mount=%p execvp=%p chdir=%p): %s\n",
