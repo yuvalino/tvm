@@ -3751,16 +3751,19 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 
     // VM-enter chokepoint: a thread with no VM identity (no TLS: newborn,
     // dying, or TVM-internal; or TLS but no task yet) has no task to
-    // virtualize the signal into — apply the HOST default semantics.
+    // virtualize the signal into.
     struct tvm_tls *tls = TVM_TLS_PEEK();
     if (!tls || !tls->tls_current) {
-        int sad = default_signal_actions[signum];
-        if (sad == SAD_TERM || sad == SAD_CORE) {
-            // Fatal default: die deterministically inside the handler, by the
-            // kernel's hand (correct termination status + core dump).  Never
-            // return on a synchronous fault — re-executing the instruction is
-            // racy (the address may have become mapped meanwhile), and
-            // surviving would leave this handler uninstalled process-wide.
+        int hwfault = siginfo->si_code > 0 &&
+                      (signum == SIGSEGV || signum == SIGBUS ||
+                       signum == SIGILL || signum == SIGFPE);
+        if (hwfault) {
+            // Synchronous kernel fault: returning would re-execute the
+            // instruction and loop forever, so die deterministically inside
+            // the handler, by the kernel's hand (correct termination status +
+            // core dump).  Never return-and-reexecute — racy (the address may
+            // have become mapped meanwhile), and surviving would leave this
+            // handler uninstalled process-wide.
             struct sigaction dfl = { .sa_handler = SIG_DFL };
             CALL_FUNC(sigaction, signum, &dfl, NULL);
             sigset_t unblk;
@@ -3770,9 +3773,15 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             CALL_FUNC(raise, signum);
             CALL_FUNC(_exit, 128 + signum);
         }
-        // SAD_IGN: drop.  SAD_STOP/SAD_CONT: also drop (dying by-the-book
-        // would require uninstalling our handler for a signal the process
-        // SURVIVES, permanently breaking its virtualization afterwards).
+        // Everything else: DROP, even fatal-by-default signals.  These threads
+        // exist inside an embedding app (flutter UI/Dart threads never have a
+        // VM identity), and darwin delivers e.g. SIGPIPE process-directed (BSD
+        // semantics) — a guest's broken-pipe write lands on an arbitrary
+        // task-less thread, and applying the host default there kills the
+        // WHOLE app (seen as flutter test_sigpipe killing the backend).  Only
+        // the fault-loop class above must die; nothing else can loop, since a
+        // syscall-generated signal completes the syscall (e.g. EPIPE) after
+        // the handler returns.
         return;
     }
 
