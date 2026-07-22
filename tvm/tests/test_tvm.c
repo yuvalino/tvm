@@ -2006,7 +2006,9 @@ TEST(SigwaitDoesNotInvokeHandler) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
-#if defined(__linux__) && !defined(__ANDROID__)
+// TVM now interposes sigwaitinfo/sigtimedwait on android too (bionic has
+// them since API 23; we build at 26), so these run everywhere.
+#if defined(__linux__)
 TEST(SigwaitinfoBasic) {
     // sigwaitinfo returns signal number and fills siginfo_t
     pid_t p = fork();
@@ -2544,7 +2546,9 @@ TEST(SigwaitFromKill) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
-#if defined(__linux__) && !defined(__ANDROID__)
+// TVM now interposes sigwaitinfo/sigtimedwait on android too (bionic has
+// them since API 23; we build at 26), so these run everywhere.
+#if defined(__linux__)
 // --- sigtimedwait with siginfo ---
 
 TEST(SigtimedwaitWithInfo) {
@@ -2985,7 +2989,9 @@ TEST(KillBlockedThenUnblock) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
-#if defined(__linux__) && !defined(__ANDROID__)
+// TVM now interposes sigwaitinfo/sigtimedwait on android too (bionic has
+// them since API 23; we build at 26), so these run everywhere.
+#if defined(__linux__)
 // --- sigtimedwait: timeout accuracy (should not take way too long) ---
 
 TEST(SigtimedwaitTimeoutAccuracy) {

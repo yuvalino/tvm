@@ -538,9 +538,7 @@ DECL_FUNC(lchown);
 DECL_FUNC(fchown);
 DECL_FUNC(fchownat);
 DECL_FUNC(flock);
-#if !defined(__ANDROID__)
 DECL_FUNC(lockf);
-#endif
 DECL_FUNC(readlink);
 DECL_FUNC(readlinkat);
 DECL_FUNC(symlink);
@@ -555,9 +553,7 @@ DECL_FUNC(mkdir);
 DECL_FUNC(mkdirat);
 DECL_FUNC(rmdir);
 DECL_FUNC(mkfifo);
-#if !defined(__ANDROID__)
 DECL_FUNC(mkfifoat);
-#endif
 DECL_FUNC(mkstemp);
 
 DECL_FUNC(socket);
@@ -621,10 +617,8 @@ DECL_FUNC(sigpending);
 DECL_FUNC(sigsuspend);
 DECL_FUNC(pause);
 DECL_FUNC(sigwait);
-#if !defined(__ANDROID__)
 DECL_FUNC_OPT(sigwaitinfo);
 DECL_FUNC_OPT(sigtimedwait);
-#endif
 
 DECL_FUNC(getenv);
 DECL_FUNC(putenv);
@@ -639,9 +633,7 @@ DECL_FUNC(execv);
 DECL_FUNC(execvp);
 DECL_FUNC(system);
 
-#if !defined(__ANDROID__)
 DECL_FUNC(openpty);
-#endif
 
 DECL_FUNC(tcgetpgrp);
 DECL_FUNC(tcsetpgrp);
@@ -653,6 +645,11 @@ DECL_FUNC(ptsname_r);
 DECL_FUNC(grantpt);
 DECL_FUNC(unlockpt);
 
+// NOT on android: bionic defines the tc* family as `static __inline` in
+// <bits/termios_inlines.h>, so they cannot be interposed — and needn't be.
+// Guest code never emits a call to them; it inlines straight to
+// ioctl(fd, TCGETS/TCSETS/...), which TVM's ioctl interposition routes to
+// ttyop_ioctl (see the TCGETS/TCSETS cases in the tty driver).
 #if !defined(__ANDROID__)
 DECL_FUNC(tcgetattr);
 DECL_FUNC(tcsetattr);
@@ -11664,11 +11661,9 @@ FUNCTION_DEFINE2(int, flock, int, fd, int, operation) {
     return CURRENT_RFD(fd, CALL_FUNC(flock, __rfd, operation));
 }
 
-#if !defined(__ANDROID__)
 FUNCTION_DEFINE3(int, lockf, int, fd, int, cmd, off_t, len) {
     return CURRENT_RFD(fd, CALL_FUNC(lockf, __rfd, cmd, len));
 }
-#endif
 
 FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t, bufsiz) {
     char pathname_abs[PATH_MAX];
@@ -11896,7 +11891,6 @@ FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
     return CALL_FUNC(mkfifo, pathname, mode);
 }
 
-#if !defined(__ANDROID__)
 FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
@@ -11907,7 +11901,6 @@ FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode
 
     return CURRENT_RFD(dirfd, CALL_FUNC(mkfifoat, __rfd, pathname, mode));
 }
-#endif
 
 FUNCTION_DEFINE1(int, mkstemp, char *, template) {
     int r, f;
@@ -13452,7 +13445,6 @@ FUNCTION_DEFINE2(int, sigwait, const sigset_t *, set, int *, sig) {
     return 0;
 }
 
-#if !defined(__ANDROID__)
 FUNCTION_DEFINE2(int, sigwaitinfo, const sigset_t *, set, siginfo_t *, info) {
     siginfo_t local_info;
     int s;
@@ -13539,7 +13531,6 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
         *info = local_info;
     return s;
 }
-#endif /* !__ANDROID__ */
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
     // Before any task exists (e.g. during tvm_init) there is no per-task env;
@@ -14317,9 +14308,12 @@ FUNCTION_DEFINE1(int, system, const char *, command) {
     return status;
 }
 
-#if defined(__ANDROID__)
-static int __tvm_openpty(int *amaster, int *aslave, char *name, const struct termios *termp, const struct winsize *winp) {
-#elif defined(__linux__)
+// bionic declares openpty() with glibc's exact signature since API 23, and we
+// build at 26 — so android takes the plain linux path. It MUST be interposed:
+// as a bare static (the API-21-era workaround) the guest's openpty() fell
+// through to bionic and returned a real host PTY that TVM's file table doesn't
+// know, so isatty()/ttyname() on it failed with EBADF (test_tvm TTYBasic).
+#if defined(__linux__)
 FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, const struct termios *, termp, const struct winsize *, winp) {
 #elif defined(__APPLE__)
 FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, struct termios *, termp, struct winsize *, winp) {
@@ -14510,6 +14504,8 @@ FUNCTION_DEFINE2(int, tcsetpgrp, int, fd, pid_t, pgrp) {
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TIOCSPGRP, &pgrp));
 }
 
+// See the tc* DECL_FUNC block: bionic inlines these to ioctl, so android
+// neither can nor needs to interpose them.
 #if !defined(__ANDROID__)
 FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
     if (!islocaltty(fd))
@@ -14632,7 +14628,7 @@ FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
     return CURRENT_FILE(fd, ttyop_ioctl(__file, request, NULL));
 #endif
 }
-#endif /* !__ANDROID__ */
+#endif /* !__ANDROID__ (tc* family: bionic inlines them to ioctl) */
 
 FUNCTION_DEFINE1(void *, malloc, size_t, size) {
     return calloc(1, size);
