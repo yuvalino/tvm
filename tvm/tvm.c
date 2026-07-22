@@ -13946,13 +13946,22 @@ do_exec:
     }
     new_argv[argc] = NULL;
 
-    char **new_envp = alloca(sizeof(char *) * (envc + 1));
-    for (int i = 0; i < envc; i++) {
-        size_t len = strlen(envp[i]) + 1;
-        new_envp[i] = alloca(len);
-        memcpy(new_envp[i], envp[i], len);
+    // envp goes in the TASK ARENA, not alloca. It becomes the task's permanent
+    // environ (*tsk_relocs.__environ below), and stack-resident env strings sit
+    // interleaved with genuine stack pointers: fork()'s COW fixup translates
+    // pointers 8 bytes at a time, so a word that merely OVERLAPS a string's NUL
+    // terminator (terminator as the low byte of a real adjacent pointer) gets
+    // rewritten in the child — the new pointer's low byte is nonzero and the
+    // string loses its terminator. That silently turned getenv("X")=="val" in
+    // the parent into "val"+garbage in every forked child (e.g. dropbear read
+    // DROPBEAR_PASSWORD as "alpine"+5 junk bytes and rejected every login).
+    // Arena strings are separate zero-padded objects, so no such aliasing.
+    char **new_envp = copyenv(current->tsk_ar, (char **)envp);
+    if (!new_envp) {
+        errno = ENOMEM;
+        return -1;
     }
-    new_envp[envc] = NULL;
+    (void)envc;
 
     argv = new_argv;
     envp = new_envp;
