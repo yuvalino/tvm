@@ -75,13 +75,9 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/mksh/mksh' \"$ROOTFS/bin/sh\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/toybox/toybox' \"$ROOTFS/bin/toybox\"\n")
-        if(NOT ANDROID)
-            string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/vim/vim' \"$ROOTFS/bin/vim\"\n")
-        endif()
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/vim/vim' \"$ROOTFS/bin/vim\"\n")
     endif()
-    if(NOT ANDROID)
-        string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n\n")
-    endif()
+    string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n\n")
 
     # ── apple *_cmds ──
     foreach(module ${APPLE_CMDS_MODULES})
@@ -104,9 +100,7 @@ function(mkinitrd_target NAME)
     endforeach()
     string(APPEND SCRIPT "\n")
 
-    # ── Vim runtime ── (no vim on android yet: its ncurses cross-compile
-    # was never completed — the android2 port shipped without a working vim)
-    if(NOT ANDROID)
+    # ── Vim runtime ──
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/vim/syntax\"\n")
     foreach(f ${VIM_RUNTIME_FILES})
         string(APPEND SCRIPT "cp '${VIM_RUNTIME}/${f}' \"$ROOTFS/share/vim/\"\n")
@@ -118,7 +112,6 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/autoload/dist/ft.vim' \"$ROOTFS/share/vim/autoload/dist/\"\n")
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/vim/colors/lists\"\n")
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/colors/lists/default.vim' \"$ROOTFS/share/vim/colors/lists/\"\n\n")
-    endif() # NOT ANDROID (vim runtime)
 
     # ── Create cpio ──
     # Always pack with our own host toybox's cpio — hermetic, no dependency on a
@@ -151,12 +144,8 @@ foreach(module ${APPLE_CMDS_MODULES})
 endforeach()
 
 # CLI initrd (real binaries)
-set(INITRD_CLI_DEPS dropbear_exe mksh_exe toybox_exe toybox_host_ext)
-if(NOT ANDROID)
-    list(APPEND INITRD_CLI_DEPS vim_exe)
-endif()
 mkinitrd_target(initrd_cli
-    DEPENDS ${INITRD_CLI_DEPS} ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe toybox_host_ext ${APPLE_CMDS_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for

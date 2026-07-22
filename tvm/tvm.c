@@ -10421,6 +10421,24 @@ FUNCTION_DEFINE4(int, setvbuf, FILE *, stream, char *, buf, int, mode, size_t, s
     return ret;
 }
 
+/**
+ * Write one byte to a real (non-TVM) stream.
+ *
+ * MUST NOT use libc fputc/putc here. On bionic, libc's fputc reaches putc
+ * through the PLT, where TVM's own interposed putc preempts libc's (main
+ * executable symbols win symbol lookup — glibc dodges this by calling hidden
+ * internal aliases, bionic does not). So libc fputc bounces straight back into
+ * TVM, and if that call fails we would recurse forever. libc's fwrite does no
+ * such call-back, so route single bytes through it.
+ */
+static int real_fputc(int c, FILE *fp)
+{
+    unsigned char ch = (unsigned char)c;
+    if (1 != CALL_FUNC(fwrite, &ch, 1, 1, fp))
+        return EOF;
+    return (int)ch;
+}
+
 FUNCTION_DEFINE2(int, fputc, int, c, FILE *, stream) {
     int ret;
 
@@ -10428,13 +10446,18 @@ FUNCTION_DEFINE2(int, fputc, int, c, FILE *, stream) {
 
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
+        // Not a TVM-managed stream — this is libc re-entering us (see
+        // real_fputc) with the very FILE * we handed it. Do the real write
+        // instead of failing; returning EOF here is what silently made
+        // putchar(), and therefore printf() of any literal text, output
+        // nothing at all on android.
         tvm_sig_leave();
-        return EOF;
+        return real_fputc(c, stream);
     }
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fputc, c, real_fp(stream));
+        ret = real_fputc(c, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();

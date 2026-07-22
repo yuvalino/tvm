@@ -7,7 +7,6 @@ mount initrd.cli.cpio:/tvm
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/sh
 setenv PATH=/tvm/bin:$PATH
-# No vim on android yet (ncurses cross-compile pending).
-setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim
 
 echo TVM initialized

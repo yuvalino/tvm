@@ -26,7 +26,7 @@ IOS_BUNDLE_ID = "com.yuvalino.tvm"
 ANDROID_PLATFORM = "android-arm64"
 ADB_DIR = "/data/local/tmp/tvm-integ"          # exec-in-place dir on device
 ADB_DEVICE_PORT = 2222                          # sshd port inside the device
-ADB_NOEMU = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox"  # no vim on android
+ADB_NOEMU = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim"
 
 # android flutter app (adb-flutter backend)
 ANDROID_APK = f"./output/{ANDROID_PLATFORM}/lib/flutter/app.apk"
@@ -172,8 +172,11 @@ def _start_adb_backend(serial, host_port) -> subprocess.Popen:
     """Run tvm sshd on the device and adb-forward a local port → device sshd."""
     _adb_deploy(serial)
     adb = _adb_prefix(serial)
-    # Kill any stray tvm from a previous run, then forward a fresh local port.
-    subprocess.run(adb + ["shell", "pkill tvm"], capture_output=True)
+    # Kill any stray tvm from a previous run (an `adb shell` client dying does
+    # not kill the remote process), then forward a fresh local port.
+    subprocess.run(adb + ["shell", "pkill -9 tvm; pkill -9 -f tvm-integ"],
+                   capture_output=True)
+    time.sleep(0.5)
     host_port = _adb_forward(adb, ADB_DEVICE_PORT)
 
     logpath = tempfile.mktemp(prefix="tvm_adb_", suffix=".log")
@@ -198,13 +201,6 @@ def _start_adb_backend(serial, host_port) -> subprocess.Popen:
 _device_forkless = None
 _adb_forkless = None
 
-@pytest.fixture(autouse=True)
-def _skip_vim_without_vim(request, backend):
-    """android has no vim (its ncurses cross-compile was never finished), so
-    the initrd omits it — skip every vim test on the android backends."""
-    if backend in ("adb", "adb-flutter") and request.node.name.startswith("test_vim"):
-        pytest.skip("no vim on android (ncurses cross-compile pending)")
-
 @pytest.fixture(scope="session", autouse=True)
 def _adb_session_teardown(backend, adb_serial):
     """Kill the on-device tvm and drop port forwards when the session ends."""
@@ -221,7 +217,10 @@ def _adb_session_teardown(backend, adb_serial):
             proc.wait(timeout=5)
         except Exception:
             pass
-    subprocess.run(adb + ["shell", "pkill tvm"], capture_output=True)
+    # `adb shell` does not propagate our kill to the remote process, so the
+    # on-device tvm must be killed explicitly or it keeps holding the port.
+    subprocess.run(adb + ["shell", "pkill -9 tvm; pkill -9 -f tvm-integ"],
+                   capture_output=True)
     if backend == "adb-flutter":
         subprocess.run(adb + ["shell", "am", "force-stop", ANDROID_BUNDLE_ID],
                        capture_output=True)
@@ -392,9 +391,7 @@ def test_connect_echo(forkless: Forkless):
         assert 0 == p.wait()
 
 @pytest.mark.parametrize("legacy_scp", [False, True], ids=["sftp", "legacy"])
-def test_scp(forkless: Forkless, device, backend, legacy_scp):
-    if backend in ("adb", "adb-flutter"):
-        pytest.skip("scp needs a shared host/device filesystem")
+def test_scp(forkless: Forkless, remote_fs, legacy_scp):
     # Get a writable dir inside TVM for SCP source/dest
     with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(/\S+)")
@@ -402,7 +399,7 @@ def test_scp(forkless: Forkless, device, backend, legacy_scp):
         p.expect(EOF)
 
     f1 = f"{remote_dir}/scp_src"
-    f2 = tempfile.mktemp(prefix="scp_dst_") if device else f"{remote_dir}/scp_dst"
+    f2 = tempfile.mktemp(prefix="scp_dst_") if remote_fs else f"{remote_dir}/scp_dst"
 
     with ssh(forkless.port, f"echo hello > {f1}", address=forkless.address, user=forkless.user) as p:
         p.expect(EOF)
@@ -411,7 +408,7 @@ def test_scp(forkless: Forkless, device, backend, legacy_scp):
         p.expect(EOF)
         assert 0 == p.wait()
 
-    if device:
+    if remote_fs:
         with open(f2, "r") as f:
             assert "hello" in f.read()
         os.unlink(f2)
@@ -826,17 +823,15 @@ def test_concurrent_interactive(forkless: Forkless):
 
 # ── SCP extended ──────────────────────────────────────────────
 
-def test_scp_large_file(forkless: Forkless, device, backend):
+def test_scp_large_file(forkless: Forkless, remote_fs):
     """SCP a larger file — exercises pipe buffering and stdio with bulk data."""
-    if backend in ("adb", "adb-flutter"):
-        pytest.skip("scp needs a shared host/device filesystem")
     with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(/\S+)")
         remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
         p.expect(EOF)
 
     f1 = f"{remote_dir}/scp_large_src"
-    f2 = tempfile.mktemp(prefix="scp_large_dst_") if device else f"{remote_dir}/scp_large_dst"
+    f2 = tempfile.mktemp(prefix="scp_large_dst_") if remote_fs else f"{remote_dir}/scp_large_dst"
 
     # Generate large file inside TVM (seq produces ~50k of text)
     with ssh(forkless.port, f"seq 1 10000 > {f1}", address=forkless.address, user=forkless.user) as p:
@@ -852,7 +847,7 @@ def test_scp_large_file(forkless: Forkless, device, backend):
         p.expect(EOF)
         assert 0 == p.wait()
 
-    if device:
+    if remote_fs:
         dst_size = os.path.getsize(f2)
         os.unlink(f2)
     else:

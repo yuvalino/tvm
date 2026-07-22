@@ -273,6 +273,13 @@ set(VIM_BUILD_ENV "")
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND VIM_LINK_LIBS ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libtermcap_stubs.a)
     set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" "TVM_STUBS_DIR=${STUBS_DIR}" ${TVM_CROSS_ENV})
+elseif(ANDROID)
+    # bionic has no ncurses/termcap — use the same link-time stubs as iOS
+    # rather than cross-compiling ncurses; TVM intercepts tputs at runtime.
+    list(APPEND VIM_LINK_LIBS ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libtermcap_stubs.a)
+    set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}"
+        "TVM_STUBS_DIR=${STUBS_DIR}" "TVM_STUBS_LIB_DIR=${LIB_OUT}"
+        "TVM_ANDROID_CROSS=1")
 else()
     list(APPEND VIM_LINK_LIBS -lncurses)
 endif()
@@ -285,11 +292,15 @@ ExternalProject_Add(vim_ext
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
+if(ANDROID)
+    # configure's --with-tlib=termcap_stubs link probe needs the archive first
+    ExternalProject_Add_StepDependencies(vim_ext configure termcap_stubs)
+endif()
 add_custom_target(vim_exe DEPENDS vim_ext)
 set_target_properties(vim_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(vim "objects/*.o" ${VIM_LINK_LIBS})
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
     add_dependencies(vim_shared termcap_stubs)
 endif()
 add_launcher(vim)

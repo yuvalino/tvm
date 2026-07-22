@@ -36,6 +36,15 @@ def backend(request, device):
 
 
 @pytest.fixture(scope="session")
+def remote_fs(device, backend):
+    """True when the guest's filesystem is NOT shared with the host running
+    pytest — i.e. a real device (iOS over devicectl, android over adb). Tests
+    that move files between host and guest (scp) must then use a genuine local
+    path on one side instead of assuming both sides see the same file."""
+    return bool(device) or backend in ("adb", "adb-flutter")
+
+
+@pytest.fixture(scope="session")
 def ssh_user(device, backend):
     if backend in ("adb", "adb-flutter"):
         # dropbear-in-TVM on an android device runs as uid 2000 ("shell", the
