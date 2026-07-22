@@ -1108,7 +1108,8 @@ TEST(SystemSignalHandlersPreserved) {
     ASSERT_EQ(0, WEXITSTATUS(s));
 }
 
-#if defined(__ANDROID__)
+// Bionic gained openpty() at API 23; only shim it on older targets.
+#if defined(__ANDROID__) && __ANDROID_API__ < 23
 static int openpty(int *amaster, int *aslave, char *name, const struct termios *termp, const struct winsize *winp) {
     int ptm = open("/dev/ptmx", O_RDWR | O_NOCTTY);
     if (ptm < 0) { fprintf(stderr, "openpty: open failed: %s\n", strerror(errno)); return -1; }

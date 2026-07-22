@@ -174,9 +174,9 @@ typedef int (*ioctl_func_t)(int, unsigned long, ...);
 #include <sys/vfs.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#include <link.h>
 #if defined(__x86_64__)
 #include <asm/prctl.h>
-#include <link.h>
 #endif
 #endif
 
@@ -731,9 +731,23 @@ DECL_FUNC(fileport_makeport);
 DECL_FUNC(fileport_makefd);
 #endif
 
+#if defined(__ANDROID__)
+// Bionic has no usershell API — no symbols, no declarations. TVM still
+// interposes getusershell so guests (dropbear's shell check) see TVM's
+// usershell cache; declare the prototypes so the wrappers compile, and mark
+// the host originals OPTIONAL so dlsym-miss yields a sentinel instead of a
+// panic (usershell_cache_init never calls them on android).
+void setusershell(void);
+char *getusershell(void);
+void endusershell(void);
+DECL_FUNC_OPT(setusershell);
+DECL_FUNC_OPT(getusershell);
+DECL_FUNC_OPT(endusershell);
+#else
 DECL_FUNC(setusershell);
 DECL_FUNC(getusershell);
 DECL_FUNC(endusershell);
+#endif
 DECL_FUNC(getpwnam);
 DECL_FUNC(getpwuid);
 DECL_FUNC(getgrnam);
@@ -13668,11 +13682,15 @@ static void usershell_cache_init(void)
     char **list = kalloc(cap * sizeof(char *));
     if (!list) return;
 
+#if !defined(__ANDROID__)
+    // Bionic has no host usershell db; the android cache is TVM_SHELL +
+    // built-ins only (added below).
     CALL_FUNC(setusershell);
     char *sh;
     while ((sh = CALL_FUNC(getusershell)) != NULL)
         usershell_cache_add(&list, &n, &cap, sh);
     CALL_FUNC(endusershell);
+#endif
 
     // current is NULL here (init) — getenv falls back to libc / process env.
     const char *tvm_shell = getenv("TVM_SHELL");

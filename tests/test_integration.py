@@ -22,6 +22,16 @@ FLUTTER_APP = f"./output/macos-arm64/lib/flutter"
 IOS_APP = f"./output/ios-arm64/lib/flutter"
 IOS_BUNDLE_ID = "com.yuvalino.tvm"
 
+# ── android / adb backend ───────────────────────────────────────
+ANDROID_PLATFORM = "android-arm64"
+ADB_DIR = "/data/local/tmp/tvm-integ"          # exec-in-place dir on device
+ADB_DEVICE_PORT = 2222                          # sshd port inside the device
+ADB_NOEMU = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox"  # no vim on android
+
+# android flutter app (adb-flutter backend)
+ANDROID_APK = f"./output/{ANDROID_PLATFORM}/lib/flutter/app.apk"
+ANDROID_BUNDLE_ID = "com.yuvalino.tvm"
+
 
 
 
@@ -92,14 +102,147 @@ def _start_device_backend(device: str) -> subprocess.Popen:
     proc._logpath = logpath
     return proc
 
+def _adb_prefix(serial):
+    return ["adb"] + (["-s", serial] if serial else [])
+
+_adb_deployed = False
+
+def _adb_deploy(serial):
+    """Push the android tvm binary, initrd, and initrc to the device once."""
+    global _adb_deployed
+    if _adb_deployed:
+        return
+    adb = _adb_prefix(serial)
+    subprocess.run(adb + ["shell", f"mkdir -p {ADB_DIR}"], check=True,
+                   capture_output=True)
+    for src, dst in [
+        (f"./output/{ANDROID_PLATFORM}/bin/tvm", "tvm"),
+        (f"./output/{ANDROID_PLATFORM}/lib/initrd.cli.cpio", "initrd.cli.cpio"),
+        ("init.android.rc", "init.android.rc"),
+    ]:
+        if not os.path.exists(src):
+            raise RuntimeError(
+                f"android artifact missing: {src}\n"
+                f"build first: python3 build.py -a {ANDROID_PLATFORM} "
+                f"-t tvm_exe initrd_cli")
+        subprocess.run(adb + ["push", src, f"{ADB_DIR}/{dst}"], check=True,
+                       capture_output=True)
+    subprocess.run(adb + ["shell", f"chmod +x {ADB_DIR}/tvm"], check=True,
+                   capture_output=True)
+    _adb_deployed = True
+
+def _start_adb_flutter_backend(serial, host_port) -> subprocess.Popen:
+    """Launch the android flutter app on the device and adb-forward to it."""
+    adb = _adb_prefix(serial)
+    if not os.path.exists(ANDROID_APK):
+        raise RuntimeError(
+            f"android flutter apk missing: {ANDROID_APK}\n"
+            f"build first: python3 build.py -a {ANDROID_PLATFORM} -t flutter")
+    subprocess.run(adb + ["install", "-r", ANDROID_APK], check=True,
+                   capture_output=True)
+    subprocess.run(adb + ["shell", "am", "force-stop", ANDROID_BUNDLE_ID],
+                   capture_output=True)
+    host_port = _adb_forward(adb, ADB_DEVICE_PORT)
+    logpath = tempfile.mktemp(prefix="tvm_adbflutter_", suffix=".log")
+    logfile = open(logpath, "w+")
+    # The app mirrors TVM's log to logcat; tee it into our logfile so the
+    # readiness probe ("Not backgrounding") works like the other backends.
+    subprocess.run(adb + ["logcat", "-c"], capture_output=True)
+    subprocess.run(adb + ["shell", "am", "start", "-n",
+                          f"{ANDROID_BUNDLE_ID}/.MainActivity"], check=True,
+                   capture_output=True)
+    proc = subprocess.Popen(adb + ["logcat", "-s", "tvm:*", "flutter:*"],
+                            stdout=logfile, stderr=subprocess.STDOUT)
+    proc._logfile = logfile
+    proc._logpath = logpath
+    proc._adb_serial = serial
+    proc._adb_host_port = host_port
+    return proc
+
+def _adb_forward(adb, device_port):
+    """adb-forward an OS-chosen local port → device_port; return the local port.
+    Let adb allocate (tcp:0) rather than picking on the python side: with adb
+    over WSL the listener binds on the Windows host, so a port that looks free
+    to a linux socket may not be bindable there."""
+    r = subprocess.run(adb + ["forward", "tcp:0", f"tcp:{device_port}"],
+                       check=True, capture_output=True, text=True)
+    return int(r.stdout.strip())
+
+def _start_adb_backend(serial, host_port) -> subprocess.Popen:
+    """Run tvm sshd on the device and adb-forward a local port → device sshd."""
+    _adb_deploy(serial)
+    adb = _adb_prefix(serial)
+    # Kill any stray tvm from a previous run, then forward a fresh local port.
+    subprocess.run(adb + ["shell", "pkill tvm"], capture_output=True)
+    host_port = _adb_forward(adb, ADB_DEVICE_PORT)
+
+    logpath = tempfile.mktemp(prefix="tvm_adb_", suffix=".log")
+    logfile = open(logpath, "w+")
+    # Auth uses dropbear's compile-time DROPBEAR_EMBEDDED_PASSWORD ("alpine"),
+    # NOT the DROPBEAR_PASSWORD env var — matching the linux/macos backends and
+    # sidestepping an android getenv-after-fork bug (see BUGS/notes).
+    remote = (
+        f"cd {ADB_DIR} && TVM_NOEMU={ADB_NOEMU} "
+        f"./tvm -i init.android.rc /tvm/bin/sshd "
+        f"-r /tvm/etc/dropbear/dropbear_ed25519_host_key "
+        f"-e -F -E -p {ADB_DEVICE_PORT}"
+    )
+    proc = subprocess.Popen(adb + ["shell", remote],
+                            stdout=logfile, stderr=subprocess.STDOUT)
+    proc._logfile = logfile
+    proc._logpath = logpath
+    proc._adb_serial = serial
+    proc._adb_host_port = host_port
+    return proc
+
 _device_forkless = None
+_adb_forkless = None
+
+@pytest.fixture(autouse=True)
+def _skip_vim_without_vim(request, backend):
+    """android has no vim (its ncurses cross-compile was never finished), so
+    the initrd omits it — skip every vim test on the android backends."""
+    if backend in ("adb", "adb-flutter") and request.node.name.startswith("test_vim"):
+        pytest.skip("no vim on android (ncurses cross-compile pending)")
+
+@pytest.fixture(scope="session", autouse=True)
+def _adb_session_teardown(backend, adb_serial):
+    """Kill the on-device tvm and drop port forwards when the session ends."""
+    yield
+    if backend not in ("adb", "adb-flutter"):
+        return
+    adb = _adb_prefix(adb_serial)
+    if _adb_forkless is not None:
+        proc = _adb_forkless.proc
+        subprocess.run(adb + ["forward", "--remove",
+                              f"tcp:{proc._adb_host_port}"], capture_output=True)
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    subprocess.run(adb + ["shell", "pkill tvm"], capture_output=True)
+    if backend == "adb-flutter":
+        subprocess.run(adb + ["shell", "am", "force-stop", ANDROID_BUNDLE_ID],
+                       capture_output=True)
 
 @pytest.fixture()
-def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
-    global _device_forkless
+def forkless(device, backend, ssh_user, adb_serial) -> Iterator[Forkless]:
+    global _device_forkless, _adb_forkless
 
-    # Device mode: launch once, reuse across tests
-    if device:
+    # adb (android device) mode: launch once, reuse across tests
+    if backend in ("adb", "adb-flutter"):
+        if _adb_forkless and _adb_forkless.proc.poll() is None:
+            yield _adb_forkless
+            return
+        address = "localhost"
+        if backend == "adb":
+            proc = _start_adb_backend(adb_serial, None)
+        else:
+            proc = _start_adb_flutter_backend(adb_serial, None)
+        port = proc._adb_host_port  # adb picked the local forward port
+    # devicectl (iOS) mode: launch once, reuse across tests
+    elif device:
         if _device_forkless and _device_forkless.proc.poll() is None:
             yield _device_forkless
             return
@@ -115,7 +258,8 @@ def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
         address = "localhost"
         proc = _start_tvm_backend(port)
 
-    ready = f"Not backgrounding, port {port}"
+    reuse = device or backend in ("adb", "adb-flutter")
+    ready = f"Not backgrounding, port {ADB_DEVICE_PORT if backend in ('adb', 'adb-flutter') else port}"
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -123,7 +267,7 @@ def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
             raise RuntimeError(f"backend died on startup:\n{proc._logfile.read()}")
         proc._logfile.seek(0)
         if ready in proc._logfile.read():
-            if device:
+            if reuse:
                 time.sleep(2)
             break
         time.sleep(0.1)
@@ -134,11 +278,13 @@ def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
         raise RuntimeError(f"backend did not become ready:\n{proc._logfile.read()}")
 
     fl = Forkless(proc, address, port, ssh_user)
-    if device:
+    if backend in ("adb", "adb-flutter"):
+        _adb_forkless = fl
+    elif device:
         _device_forkless = fl
     yield fl
 
-    if not device:
+    if not reuse:
         proc.kill()
         proc.wait()
         proc._logfile.close()
@@ -246,7 +392,9 @@ def test_connect_echo(forkless: Forkless):
         assert 0 == p.wait()
 
 @pytest.mark.parametrize("legacy_scp", [False, True], ids=["sftp", "legacy"])
-def test_scp(forkless: Forkless, device, legacy_scp):
+def test_scp(forkless: Forkless, device, backend, legacy_scp):
+    if backend in ("adb", "adb-flutter"):
+        pytest.skip("scp needs a shared host/device filesystem")
     # Get a writable dir inside TVM for SCP source/dest
     with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(/\S+)")
@@ -678,8 +826,10 @@ def test_concurrent_interactive(forkless: Forkless):
 
 # ── SCP extended ──────────────────────────────────────────────
 
-def test_scp_large_file(forkless: Forkless, device):
+def test_scp_large_file(forkless: Forkless, device, backend):
     """SCP a larger file — exercises pipe buffering and stdio with bulk data."""
+    if backend in ("adb", "adb-flutter"):
+        pytest.skip("scp needs a shared host/device filesystem")
     with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(/\S+)")
         remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)

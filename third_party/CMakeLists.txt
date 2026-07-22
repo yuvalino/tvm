@@ -50,6 +50,15 @@ exec xcrun --sdk iphoneos cc -arch arm64 -miphoneos-version-min=15.0 "$@"
 ]=])
     file(CHMOD ${IOS_CC_SCRIPT} PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
     set(TVM_CC "${IOS_CC_SCRIPT}")
+elseif(ANDROID)
+    # Userland binaries run inside TVM; build them against a higher API level
+    # than the VM itself (android-21) for broader libc coverage.
+    set(ANDROID_CC_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/android-cc.sh)
+    file(WRITE ${ANDROID_CC_SCRIPT} "#!/bin/sh
+exec ${CMAKE_C_COMPILER} --target=aarch64-none-linux-android28 \"$@\"
+")
+    file(CHMOD ${ANDROID_CC_SCRIPT} PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+    set(TVM_CC "${ANDROID_CC_SCRIPT}")
 else()
     set(TVM_CC "cc")
 endif()
@@ -100,23 +109,73 @@ set(DROPBEAR_CONFIGURE_ARGS
     ac_cv_type_socklen_t=yes
     ac_cv_type_uid_t=yes
 )
+set(DROPBEAR_MAKE_LDFLAGS)
+set(DROPBEAR_MAKE_CFLAGS "")
+set(DROPBEAR_LOCALOPTIONS_CMD ${CMAKE_COMMAND} -E copy
+    ${THIRDPARTY_SRC}/dropbear/localoptions.h ${DROPBEAR_BUILD}/localoptions.h)
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND DROPBEAR_CONFIGURE_ARGS
         --host=aarch64-apple-darwin
         "CC=${TVM_CC}"
     )
+elseif(ANDROID)
+    # Bionic has no crypt()/getpass(); provide link stubs (auth uses
+    # DROPBEAR_EMBEDDED_PASSWORD, the stub result is never trusted) plus a
+    # force-included header so their declarations are visible under
+    # -Werror=implicit-function-declaration.
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/dropbear_android_stubs.c [=[
+#include <stdio.h>
+#include <string.h>
+char *crypt(const char *key, const char *salt) {
+    static char buf[128];
+    snprintf(buf, sizeof(buf), "%s%s", salt, key);
+    return buf;
+}
+char *getpass(const char *prompt) {
+    static char buf[128];
+    fprintf(stderr, "%s", prompt);
+    if (!fgets(buf, sizeof(buf), stdin)) return "";
+    buf[strcspn(buf, "\n")] = 0;
+    return buf;
+}
+]=])
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/dropbear_android_compat.h [=[
+#ifndef _DROPBEAR_ANDROID_COMPAT_H
+#define _DROPBEAR_ANDROID_COMPAT_H
+char *crypt(const char *, const char *);
+char *getpass(const char *);
+#endif
+]=])
+    list(APPEND DROPBEAR_CONFIGURE_ARGS
+        --host=aarch64-linux-android
+        --disable-openpty
+        ac_cv_func_crypt=yes
+        "CC=${TVM_CC}"
+        "LDFLAGS=-pie"
+    )
+    set(DROPBEAR_MAKE_CFLAGS "-include ${CMAKE_CURRENT_BINARY_DIR}/dropbear_android_compat.h")
+    set(DROPBEAR_MAKE_LDFLAGS "LDFLAGS=-pie ${DROPBEAR_BUILD}/dropbear_android_stubs.o")
+    # Two android-only localoptions appended to the shared file:
+    #  - USE_DEV_PTMX: Bionic PTY allocation goes through /dev/ptmx (no libutil
+    #    openpty on the target API in android2's port).
+    #  - COMPAT_USER_SHELLS: bionic has no getusershell, so dropbear uses its
+    #    bundled compat one, which reads /etc/shells (absent on the android
+    #    host) then falls back to this list. TVM's login shell is /tvm/bin/sh,
+    #    so it must be here or every login is "invalid shell, rejected".
+    set(DROPBEAR_LOCALOPTIONS_CMD sh -c
+        "cat ${THIRDPARTY_SRC}/dropbear/localoptions.h > ${DROPBEAR_BUILD}/localoptions.h && printf '#define USE_DEV_PTMX 1\\n#define COMPAT_USER_SHELLS \"/tvm/bin/sh\",\"/bin/sh\"\\n' >> ${DROPBEAR_BUILD}/localoptions.h && ${TVM_CC} -g -c ${CMAKE_CURRENT_BINARY_DIR}/dropbear_android_stubs.c -o ${DROPBEAR_BUILD}/dropbear_android_stubs.o")
 endif()
 
 ExternalProject_Add(dropbear_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/dropbear
     BINARY_DIR ${DROPBEAR_BUILD}
-    PATCH_COMMAND ${CMAKE_COMMAND} -E copy
-        ${THIRDPARTY_SRC}/dropbear/localoptions.h ${DROPBEAR_BUILD}/localoptions.h
+    PATCH_COMMAND ${DROPBEAR_LOCALOPTIONS_CMD}
     CONFIGURE_COMMAND ${THIRDPARTY_SRC}/dropbear/configure ${DROPBEAR_CONFIGURE_ARGS}
     BUILD_COMMAND make
         "PROGRAMS=dropbear dbclient dropbearkey scp sftpserver"
         MULTI=1
-        "CFLAGS=-g -gdwarf-4 -DDROPBEAR_FORKLESS"
+        "CFLAGS=-g -gdwarf-4 -DDROPBEAR_FORKLESS ${DROPBEAR_MAKE_CFLAGS}"
+        ${DROPBEAR_MAKE_LDFLAGS}
         MAKEOVERRIDES=
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
@@ -135,6 +194,11 @@ add_launcher(dropbear)
 ###############################################################################
 set(MKSH_BUILD ${THIRDPARTY_BUILD}/mksh)
 
+set(MKSH_LINK_FLAGS "-g -gdwarf-4")
+if(ANDROID)
+    string(APPEND MKSH_LINK_FLAGS " -pie")
+endif()
+
 ExternalProject_Add(mksh_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/mksh
     BINARY_DIR ${MKSH_BUILD}
@@ -142,7 +206,7 @@ ExternalProject_Add(mksh_ext
         CC=${TVM_CC} CFLAGS='-g -gdwarf-4 -fcommon -DMKSH_FORKLESS=1' \
         sh ${THIRDPARTY_SRC}/mksh/Build.sh"
     BUILD_COMMAND sh -c "cd ${MKSH_BUILD} && sh ./Rebuild.sh && \
-        ${TVM_CC} -g -gdwarf-4 -o mksh ./*.o"
+        ${TVM_CC} ${MKSH_LINK_FLAGS} -o mksh ./*.o"
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )

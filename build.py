@@ -83,7 +83,9 @@ def configure(plat):
         cmake_args += [
             f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
             "-DANDROID_ABI=arm64-v8a",
-            "-DANDROID_PLATFORM=android-21",
+            # 26+: getgrnam_r/getgrgid_r declarations, heap-tagging mallopt.
+            # Userland binaries build separately against android-28.
+            "-DANDROID_PLATFORM=android-26",
         ]
 
     run(cmake_args)

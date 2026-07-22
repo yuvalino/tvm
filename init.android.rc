@@ -1,0 +1,13 @@
+# TVM init.rc for an android device (pushed to /data/local/tmp/tvm by the
+# adb test harness, run with cwd = that directory).
+
+# Mount rootfs
+mount initrd.cli.cpio:/tvm
+
+# Environment setup
+setenv TVM_SHELL=/tvm/bin/sh
+setenv PATH=/tvm/bin:$PATH
+# No vim on android yet (ncurses cross-compile pending).
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox
+
+echo TVM initialized

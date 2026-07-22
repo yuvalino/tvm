@@ -14,6 +14,16 @@ done
 # .config is per-build
 if [ ! -f "$BUILDDIR/.config" ]; then
     cp "$SRCDIR/.config" "$BUILDDIR/.config"
+    case "${CC:-cc}" in
+        *android*)
+            # Disable toys that need APIs Bionic doesn't provide
+            # (crypt/getspnam/utmp).
+            for opt in CONFIG_SU CONFIG_PING CONFIG_SULOGIN CONFIG_LOGIN \
+                       CONFIG_PASSWD CONFIG_USERADD CONFIG_GROUPADD CONFIG_MKPASSWD; do
+                sed -i "s/^${opt}=y/# ${opt} is not set/" "$BUILDDIR/.config" 2>/dev/null || true
+            done
+            ;;
+    esac
 fi
 
 mkdir -p "$BUILDDIR/generated"
