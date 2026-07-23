@@ -182,10 +182,7 @@ def _start_adb_backend(serial, host_port) -> subprocess.Popen:
     logpath = tempfile.mktemp(prefix="tvm_adb_", suffix=".log")
     logfile = open(logpath, "w+")
     # Auth uses dropbear's compile-time DROPBEAR_EMBEDDED_PASSWORD ("alpine"),
-    # NOT the DROPBEAR_PASSWORD env var — matching the linux/macos backends.
-    # (The env var route also works now; it used to fail because execve put the
-    # environment on the stack, where fork's pointer fixup ate the strings'
-    # NUL terminators.)
+    # exactly like the linux/macos backends do.
     remote = (
         f"cd {ADB_DIR} && TVM_NOEMU={ADB_NOEMU} "
         f"./tvm -i init.android.rc /tvm/bin/sshd "

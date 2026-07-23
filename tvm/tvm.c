@@ -13938,30 +13938,43 @@ do_exec:
         for (char * const *e = envp; *e; e++)
             envc++;
 
+    /**
+     * Copy each string into an 8-byte-rounded, ZEROED alloca slot.
+     *
+     * alloca does not zero, so a string lands on whatever the stack held
+     * before — typically a stale, aligned pointer. Copying "…=alpine" (24
+     * chars) writes 25 bytes, so its NUL overwrites only the LOW byte of that
+     * stale pointer and leaves the upper 7 intact. The resulting 8-aligned
+     * word is "old stack pointer with the low byte cleared" — still a valid
+     * stack address, so fork()'s COW fixup translates it as a pointer and the
+     * new value's nonzero low byte destroys the terminator. getenv() then
+     * returns "alpine"+garbage in the child. Deterministic, and ASLR-invariant
+     * (the whole stack moves together, so the stale value stays in range).
+     *
+     * Rounding the slot up and zeroing it means every byte after the
+     * terminator is 0, so the word is 0 — and 0 is never inside any fixup
+     * range. Same reason the rmem arena is immune: its malloc is calloc.
+     */
+#define EXEC_COPY_STR(_dst, _src)                       \
+    do {                                                \
+        size_t __l = strlen(_src) + 1;                  \
+        size_t __a = (__l + 15) & ~(size_t)15;          \
+        (_dst) = alloca(__a);                           \
+        memset((_dst), 0, __a);                         \
+        memcpy((_dst), (_src), __l);                    \
+    } while (0)
+
     char **new_argv = alloca(sizeof(char *) * (argc + 1));
-    for (int i = 0; i < argc; i++) {
-        size_t len = strlen(argv[i]) + 1;
-        new_argv[i] = alloca(len);
-        memcpy(new_argv[i], argv[i], len);
-    }
+    for (int i = 0; i < argc; i++)
+        EXEC_COPY_STR(new_argv[i], argv[i]);
     new_argv[argc] = NULL;
 
-    // envp goes in the TASK ARENA, not alloca. It becomes the task's permanent
-    // environ (*tsk_relocs.__environ below), and stack-resident env strings sit
-    // interleaved with genuine stack pointers: fork()'s COW fixup translates
-    // pointers 8 bytes at a time, so a word that merely OVERLAPS a string's NUL
-    // terminator (terminator as the low byte of a real adjacent pointer) gets
-    // rewritten in the child — the new pointer's low byte is nonzero and the
-    // string loses its terminator. That silently turned getenv("X")=="val" in
-    // the parent into "val"+garbage in every forked child (e.g. dropbear read
-    // DROPBEAR_PASSWORD as "alpine"+5 junk bytes and rejected every login).
-    // Arena strings are separate zero-padded objects, so no such aliasing.
-    char **new_envp = copyenv(current->tsk_ar, (char **)envp);
-    if (!new_envp) {
-        errno = ENOMEM;
-        return -1;
-    }
-    (void)envc;
+    char **new_envp = alloca(sizeof(char *) * (envc + 1));
+    for (int i = 0; i < envc; i++)
+        EXEC_COPY_STR(new_envp[i], envp[i]);
+    new_envp[envc] = NULL;
+
+#undef EXEC_COPY_STR
 
     argv = new_argv;
     envp = new_envp;
