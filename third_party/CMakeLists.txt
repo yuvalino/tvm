@@ -229,3 +229,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_dependencies(vim_shared termcap_stubs)
 endif()
 add_launcher(vim)
+
+###############################################################################
+# darksword (iOS only)
+###############################################################################
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(DARKSWORD_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../examples/darksword.c)
+    add_custom_target(darksword_shared
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}
+        COMMAND ${TVM_CC} -dynamiclib -fPIC -g
+            -Wno-incompatible-pointer-types-discards-qualifiers
+            -Wno-deprecated-declarations
+            -o ${LIB_OUT}/libdarksword.dylib
+            ${DARKSWORD_SRC}
+            -framework CoreFoundation -framework IOSurface
+            -install_name libdarksword.dylib
+        COMMENT "Linking darksword (shared)"
+    )
+    set_target_properties(darksword_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    add_launcher(darksword)
+endif()

@@ -70,6 +70,7 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${BIN_OUT}/dropbear_launcher' \"$ROOTFS/bin/dropbear\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/toybox_launcher' \"$ROOTFS/bin/toybox\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/vim_launcher' \"$ROOTFS/bin/vim\"\n")
+        string(APPEND SCRIPT "[ -f '${BIN_OUT}/darksword_launcher' ] && cp '${BIN_OUT}/darksword_launcher' \"$ROOTFS/bin/darksword\" || true\n")
     else()
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
