@@ -3,6 +3,15 @@ import pwd
 import pytest
 
 
+def pytest_configure(config):
+    config.option.log_cli = True
+    config.option.log_cli_level = "INFO"
+    config.option.log_cli_format = "%(asctime)s.%(msecs)03d %(levelname)s %(message)s"
+    config.option.log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+    # don't re-print captured logs in the summary — they're already streamed live
+    config.option.log_level = "CRITICAL"
+
+
 def pytest_addoption(parser):
     parser.addoption("--backend", default="tvm", choices=["tvm", "flutter"],
                      help="TVM backend: 'tvm' (standalone) or 'flutter' (app)")

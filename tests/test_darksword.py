@@ -70,13 +70,16 @@ def _wait_ssh(device, timeout=30):
 def _wait_device(device, timeout=120):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        r = _run(
-            ["xcrun", "devicectl", "device", "info", "details",
-             "--device", device],
-            timeout=15,
-        )
-        if r.returncode == 0 and "iPhone" in (r.stdout or ""):
-            return True
+        try:
+            r = _run(
+                ["xcrun", "devicectl", "device", "info", "details",
+                 "--device", device],
+                timeout=30,
+            )
+            if r.returncode == 0 and "iPhone" in (r.stdout or ""):
+                return True
+        except subprocess.TimeoutExpired:
+            pass
         time.sleep(3)
     return False
 
