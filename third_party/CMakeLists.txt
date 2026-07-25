@@ -54,8 +54,12 @@ elseif(ANDROID)
     # Userland binaries run inside TVM; build them against a higher API level
     # than the VM itself (android-21) for broader libc coverage.
     set(ANDROID_CC_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/android-cc.sh)
+    # -fPIC on every userland object so the same .o's link into BOTH the -pie
+    # CLI executables and the flutter -shared libs (ELF -shared requires PIC;
+    # PIC objects link fine into a PIE exe). Mach-O is always PIC, so Apple
+    # needs no equivalent.
     file(WRITE ${ANDROID_CC_SCRIPT} "#!/bin/sh
-exec ${CMAKE_C_COMPILER} --target=aarch64-none-linux-android28 \"$@\"
+exec ${CMAKE_C_COMPILER} --target=aarch64-none-linux-android28 -fPIC \"$@\"
 ")
     file(CHMOD ${ANDROID_CC_SCRIPT} PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
     set(TVM_CC "${ANDROID_CC_SCRIPT}")
@@ -63,25 +67,58 @@ else()
     set(TVM_CC "cc")
 endif()
 
-# Launcher — tiny executable that execs a dylib via PATH
+# Shared-lib naming/flags: Mach-O (.dylib, -dynamiclib, -install_name) on
+# Apple; ELF (.so, -shared, -soname) on Android. Also the launcher's exec
+# target extension. Everything downstream (initrd, PATH, TVM_NOEMU) uses
+# ${TVM_DYLIB_EXT}.
+if(ANDROID)
+    set(TVM_DYLIB_EXT "so")
+else()
+    set(TVM_DYLIB_EXT "dylib")
+endif()
+
+# Launcher — tiny executable that execs a lib${NAME}.${TVM_DYLIB_EXT} via PATH.
+# It runs emulated inside TVM and transitions to the (native, TVM_NOEMU) shared
+# lib. On Apple it is built with the host cc (host arch == target arch); on
+# Android it must be the target aarch64, so use TVM_CC, and target the .so.
 set(LAUNCHER_SRC ${SCRIPTS_DIR}/launcher.c)
+if(ANDROID)
+    set(LAUNCHER_CC "${TVM_CC}")
+else()
+    set(LAUNCHER_CC "cc")
+endif()
 function(add_launcher NAME)
     add_custom_target(${NAME}_launcher
         COMMAND ${CMAKE_COMMAND} -E make_directory ${BIN_OUT}
-        COMMAND cc -o ${BIN_OUT}/${NAME}_launcher
-            ${LAUNCHER_SRC} -DTARGET=\\\"lib${NAME}.dylib\\\"
+        COMMAND ${LAUNCHER_CC} -o ${BIN_OUT}/${NAME}_launcher
+            ${LAUNCHER_SRC} -DTARGET=\\\"lib${NAME}.${TVM_DYLIB_EXT}\\\"
         COMMENT "Building ${NAME} launcher"
     )
     set_target_properties(${NAME}_launcher PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endfunction()
 
-# Helper to add a _shared target that links .o files into a dylib
+# Helper to add a _shared target that links .o files into a shared library
+# (lib${NAME}.dylib on Apple, lib${NAME}.so on Android). The link command is
+# emitted to a per-target script so the ${OBJGLOB} wildcard expands reliably —
+# an inline `sh -c "…*.o"` mangles when the glob is the last token (no trailing
+# libs), which bit mksh/toybox.
 function(add_shared_lib NAME OBJGLOB)
     set(BUILDDIR ${THIRDPARTY_BUILD}/${NAME})
     set(LIBS "${ARGN}")
     string(REPLACE ";" " " LIBS_STR "${LIBS}")
+    if(ANDROID)
+        set(SHARED_FLAGS "-shared -Wl,-soname,lib${NAME}.so")
+    else()
+        set(SHARED_FLAGS "-dynamiclib -install_name lib${NAME}.dylib")
+    endif()
+    set(LINK_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/link_${NAME}.sh)
+    file(GENERATE OUTPUT ${LINK_SCRIPT} CONTENT
+"#!/bin/sh
+set -e
+exec ${TVM_CC} ${SHARED_FLAGS} -fPIC -g -o ${LIB_OUT}/lib${NAME}.${TVM_DYLIB_EXT} ${BUILDDIR}/${OBJGLOB} ${LIBS_STR}
+")
     add_custom_target(${NAME}_shared
-        COMMAND sh -c "${TVM_CC} -dynamiclib -fPIC -g -o ${LIB_OUT}/lib${NAME}.dylib ${BUILDDIR}/${OBJGLOB} ${LIBS_STR} -install_name lib${NAME}.dylib"
+        COMMAND sh ${LINK_SCRIPT}
         DEPENDS ${NAME}_ext
         COMMENT "Linking ${NAME} (shared)"
     )
@@ -222,8 +259,9 @@ add_launcher(mksh)
 set(TOYBOX_BUILD ${THIRDPARTY_BUILD}/toybox)
 
 set(TOYBOX_LINK_LIBS -lm -lz)
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    # iOS: no openssl/crypt/util/resolv
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
+    # iOS / android bionic: no openssl/crypt/util/resolv (build_toybox.sh
+    # disables the toys that need them).
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     execute_process(COMMAND brew --prefix openssl
         OUTPUT_VARIABLE OPENSSL_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)

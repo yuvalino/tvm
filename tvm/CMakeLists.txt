@@ -37,21 +37,45 @@ endif()
 # libtvm.dylib — TVM runtime for Flutter app (Apple platforms).
 # Pure export of TVM core; the app-side tvm_bindings.c dlsym's
 # tvm_init_with_outfd / tvm_mount_cpio from it.
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
     add_library(tvm_shared SHARED $<TARGET_OBJECTS:tvm_static>)
     set_target_properties(tvm_shared PROPERTIES
         OUTPUT_NAME tvm
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}"
-        INSTALL_NAME_DIR "@rpath"
         C_VISIBILITY_PRESET default
     )
+    if(NOT ANDROID)
+        set_target_properties(tvm_shared PROPERTIES INSTALL_NAME_DIR "@rpath")
+    endif()
     # Objects come from tvm_static via TARGET_OBJECTS; only link the deps.
-    set(TVM_SHARED_LIBS unicorn z pthread m)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        list(APPEND TVM_SHARED_LIBS ncurses)
+    if(ANDROID)
+        # Bionic: pthread built in, no ncurses; needs log + libdl.
+        set(TVM_SHARED_LIBS unicorn z m log ${CMAKE_DL_LIBS})
+    else()
+        set(TVM_SHARED_LIBS unicorn z pthread m)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+            list(APPEND TVM_SHARED_LIBS ncurses)
+        endif()
     endif()
     target_link_libraries(tvm_shared PRIVATE ${TVM_SHARED_LIBS})
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+# Android: the FFI glue (compiled into the app binary by Xcode on Apple) is a
+# standalone libtvm_bindings.so, built here with the NDK so gradle only has to
+# package it (no externalNativeBuild). It dlopen's libtvm.so at runtime.
+if(ANDROID)
+    add_library(tvm_bindings SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/tvm/tvm_bindings.c)
+    set_target_properties(tvm_bindings PROPERTIES
+        OUTPUT_NAME tvm_bindings
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}"
+        C_VISIBILITY_PRESET default
+    )
+    target_include_directories(tvm_bindings PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../flutter/tvm)
+    target_link_libraries(tvm_bindings PRIVATE log ${CMAKE_DL_LIBS})
+    set_target_properties(tvm_bindings PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
 # tests (not for iOS)

@@ -1,3 +1,6 @@
 setenv TVM_SHELL=/tvm/bin/sh
-setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib
+# Native (non-emulated) libs. Both extensions listed so this file stays
+# platform-agnostic: .dylib matches on Apple, .so on Android; the others
+# never match. Per-entry exact-basename match (see is_noemu_binary).
+setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:libdropbear.so:libmksh.so:libtoybox.so:libvim.so
 echo TVM initialized

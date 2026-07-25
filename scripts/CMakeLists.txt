@@ -11,8 +11,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(FLUTTER_ARCH ios-arm64)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(FLUTTER_ARCH macos-arm64)
+elseif(ANDROID)
+    set(FLUTTER_ARCH android-arm64)
 else()
     set(FLUTTER_ARCH linux-x64)
+endif()
+
+# Shared-library extension the launchers exec (matches third_party/).
+if(ANDROID)
+    set(TVM_DYLIB_EXT so)
+else()
+    set(TVM_DYLIB_EXT dylib)
 endif()
 
 # ── Toybox applets ──────────────────────────────────────────────

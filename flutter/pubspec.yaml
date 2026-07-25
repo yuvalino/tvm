@@ -32,3 +32,6 @@ flutter:
     - path: assets/initrd.flutter.macos-arm64.cpio
       platforms:
         - macos
+    - path: assets/initrd.flutter.android-arm64.cpio
+      platforms:
+        - android

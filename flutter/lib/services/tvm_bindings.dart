@@ -40,12 +40,20 @@ class TvmBindings {
 
   void init() {
     try {
-      if (!(Platform.isIOS || Platform.isMacOS)) {
+      final DynamicLibrary lib;
+      if (Platform.isIOS || Platform.isMacOS) {
+        // tvm_bindings.c is compiled into the app binary, so tvm_start lives
+        // in the process image.
+        lib = DynamicLibrary.process();
+      } else if (Platform.isAndroid) {
+        // tvm_bindings.c is compiled into a standalone libtvm_bindings.so
+        // (gradle externalNativeBuild); load it by name.
+        lib = DynamicLibrary.open('libtvm_bindings.so');
+      } else {
         throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
       }
-      final lib = DynamicLibrary.process();
       if (!lib.providesSymbol('tvm_start')) {
-        throw Exception('tvm_start not found — tvm_bindings.c may not be linked');
+        throw Exception('tvm_start not found — tvm_bindings not linked');
       }
       _lib = lib;
       _start = lib.lookupFunction<_StartNative, _StartDart>('tvm_start');

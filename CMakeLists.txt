@@ -17,12 +17,15 @@ set(FLUTTER_ENV "")
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(FLUTTER_ENV ${CMAKE_COMMAND} -E env TVM_IOS_CROSS=1
         DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer)
+elseif(ANDROID)
+    set(FLUTTER_ENV ${CMAKE_COMMAND} -E env TVM_ANDROID_FLUTTER=1)
 endif()
 add_custom_target(flutter
     COMMAND ${FLUTTER_ENV} sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_flutter.sh
         ${CMAKE_CURRENT_SOURCE_DIR}/flutter
         ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}
     DEPENDS tvm_shared dropbear_shared mksh_shared toybox_shared vim_shared initrd_flutter
+        $<$<BOOL:${ANDROID}>:tvm_bindings>
     COMMENT "Building Flutter app"
 )
 set_target_properties(flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)

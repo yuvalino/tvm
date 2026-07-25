@@ -13,6 +13,22 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+// On android a GUI app's stdout/stderr go to /dev/null, so the Dart-side
+// stderr mirror is invisible. Emit TVM output to logcat under the "tvm" tag as
+// well — that is what the adb-flutter test backend tails for readiness.
+static void tvm_logcat(const char *buf, int len) {
+    char line[1024];
+    int n = len < (int)sizeof(line) - 1 ? len : (int)sizeof(line) - 1;
+    memcpy(line, buf, n);
+    line[n] = '\0';
+    __android_log_write(ANDROID_LOG_INFO, "tvm", line);
+}
+#else
+static void tvm_logcat(const char *buf, int len) { (void)buf; (void)len; }
+#endif
+
 // Resolved from libtvm.dylib at runtime. exec/chdir must go through libtvm's
 // tvm_execvp/tvm_chdir trampolines: the interposed execvp/chdir dispatch by
 // return address (can_enter_tvm), and a caller in this app binary's text is
@@ -64,6 +80,7 @@ static void tvm_log(const char *fmt, ...)
         return;
     size_t len = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
 
+    tvm_logcat(buf, (int)len);
     if (pipe_write >= 0) {
         (void)write(pipe_write, buf, len);
     } else if (worker_cb) {
@@ -86,6 +103,7 @@ static void *reader_entry(void *arg)
         ssize_t n = read(pipe_read, tmp, sizeof(tmp));
         if (n <= 0)
             break;
+        tvm_logcat(tmp, (int)n);
         if (worker_cb) {
             char *copy = malloc(n);
             if (copy) {
