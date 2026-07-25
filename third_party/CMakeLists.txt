@@ -9,6 +9,19 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # Reduce TCG buffer from 1GB default — multiple emulator instances
 # on iOS would exceed the process virtual memory limit.
 add_definitions(-DDEFAULT_CODE_GEN_BUFFER_SIZE_1=8388608)
+# unicorn otherwise forces a universal (x86_64;arm64) binary on every Apple
+# platform. Build it non-fat for the single target arch -- the unused slice is
+# wasted work, and on iOS the x86_64 slice no longer compiles (the iPhoneOS SDK
+# dropped x86_64 headers). unicorn honours ARCHFLAGS; use the explicit target
+# arch (set for iOS) or the host arch (native macOS). Non-Apple hosts need
+# nothing -- unicorn's fat logic is Apple-only, so linux-x64 is native already.
+if(APPLE)
+    if(CMAKE_OSX_ARCHITECTURES)
+        set(ENV{ARCHFLAGS} "-arch ${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        set(ENV{ARCHFLAGS} "-arch ${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    endif()
+endif()
 add_subdirectory(unicorn EXCLUDE_FROM_ALL)
 
 set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../scripts)
@@ -76,7 +89,7 @@ ExternalProject_Add(dropbear_ext
         ${THIRDPARTY_SRC}/dropbear/localoptions.h ${DROPBEAR_BUILD}/localoptions.h
     CONFIGURE_COMMAND ${THIRDPARTY_SRC}/dropbear/configure ${DROPBEAR_CONFIGURE_ARGS}
     BUILD_COMMAND make
-        "PROGRAMS=dropbear dbclient dropbearkey scp"
+        "PROGRAMS=dropbear dbclient dropbearkey scp sftpserver"
         MULTI=1
         "CFLAGS=-g -gdwarf-4 -DDROPBEAR_FORKLESS"
         MAKEOVERRIDES=
