@@ -1,21 +1,21 @@
 """
 Darksword kernel exploit integration test.
 
-Runs only on iOS devices. Orchestrates:
-  1. Build darksword dylib (if needed)
-  2. Restart device for clean state
-  3. Install + launch TVM app
-  4. Transfer darksword binary
-  5. Execute and stream output
-  6. Verify sandbox escape succeeded
+Runs only on iOS devices. The exploit runs as a signed dylib
+(libdarksword.signed.dylib) in the app bundle via TVM_NOEMU —
+no transfer needed, native execution, code-signed.
+
+Orchestrates:
+  1. Restart device for clean kernel state
+  2. Install + launch TVM app
+  3. Execute darksword.signed and stream output
+  4. Verify sandbox escape succeeded + clean exit
 
 Usage:
     pytest tests/test_darksword.py --device pan1c
 """
 
-import base64
 import logging
-import os
 import subprocess
 import time
 
@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 IOS_APP = "./output/ios-arm64/lib/flutter"
 IOS_BUNDLE_ID = "com.yuvalino.tvm"
-DARKSWORD_DYLIB = "./output/ios-arm64/lib/libdarksword.dylib"
 SSH_PORT = 2222
 SSH_PASS = "alpine"
+DARKSWORD_CMD = "darksword.signed"
 
 
 def _run(cmd, **kwargs):
@@ -103,25 +103,6 @@ def _launch_app(device):
     assert _wait_ssh(device, timeout=30), "SSH did not come up after app launch"
 
 
-def _transfer_darksword(device):
-    """Transfer darksword binary via base64 (raw cat truncates at 48KB)."""
-    darksword_path = os.path.join(
-        os.path.dirname(__file__), "..", "output", "ios-arm64", "bin", "darksword"
-    )
-    if not os.path.exists(darksword_path):
-        pytest.skip("darksword binary not found — run: "
-                     "xcrun --sdk iphoneos cc -arch arm64 ... -o output/ios-arm64/bin/darksword")
-
-    with open(darksword_path, "rb") as f:
-        data = f.read()
-    encoded = base64.b64encode(data).decode()
-
-    r = _ssh(device, f"echo '{encoded}' | base64 -d > darksword && chmod +x darksword && wc -c darksword",
-             timeout=15)
-    assert r.returncode == 0, f"Transfer failed: {r.stderr}"
-    logger.info("Transferred darksword (%d bytes)", len(data))
-
-
 def _run_darksword(device, timeout=90):
     """Run darksword and stream output line by line. Returns (lines, alive)."""
     addr = device if "." in device else f"{device}.local"
@@ -130,7 +111,7 @@ def _run_darksword(device, timeout=90):
          "-o", "StrictHostKeyChecking=no",
          "-o", "ConnectTimeout=10",
          "-p", str(SSH_PORT),
-         f"mobile@{addr}", "./darksword"],
+         f"mobile@{addr}", DARKSWORD_CMD],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True,
     )
@@ -192,12 +173,6 @@ def ensure_app_running(ios_device):
     """Ensure TVM app is launched and SSH is accessible before each test."""
     if not _wait_ssh(ios_device, timeout=5):
         _launch_app(ios_device)
-
-
-@pytest.fixture(autouse=True)
-def transfer_binary(ios_device, ensure_app_running):
-    """Transfer darksword binary before each test."""
-    _transfer_darksword(ios_device)
 
 
 # ── Tests ─────────────────────────────────────────────────────

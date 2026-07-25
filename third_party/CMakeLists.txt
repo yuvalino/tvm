@@ -240,12 +240,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         COMMAND ${TVM_CC} -dynamiclib -fPIC -g
             -Wno-incompatible-pointer-types-discards-qualifiers
             -Wno-deprecated-declarations
-            -o ${LIB_OUT}/libdarksword.dylib
+            -o ${LIB_OUT}/libdarksword.signed.dylib
             ${DARKSWORD_SRC}
             -framework CoreFoundation -framework IOSurface
-            -install_name libdarksword.dylib
-        COMMENT "Linking darksword (shared)"
+            -install_name libdarksword.signed.dylib
+        COMMENT "Linking darksword.signed (shared)"
     )
     set_target_properties(darksword_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
-    add_launcher(darksword)
+    add_launcher(darksword.signed)
 endif()

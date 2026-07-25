@@ -279,7 +279,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "TVM_ROOT=\"${PROJECT_DIR}/../..\"\nTVM_LIB=\"${TVM_ROOT}/output/ios-arm64/lib\"\nDEST=\"${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}\"\nSIGN_ID=\"${EXPANDED_CODE_SIGN_IDENTITY:-'-'}\"\nmkdir -p \"${DEST}\"\nfor lib in libtvm.dylib libdropbear.dylib libmksh.dylib libtoybox.dylib libvim.dylib libdarksword.dylib; do\n    SRC=\"${TVM_LIB}/${lib}\"\n    [ -f \"${SRC}\" ] && cp -f \"${SRC}\" \"${DEST}/\" && chmod +x \"${DEST}/${lib}\" && codesign --force --sign \"${SIGN_ID}\" \"${DEST}/${lib}\" || true\ndone\n";
+			shellScript = "TVM_ROOT=\"${PROJECT_DIR}/../..\"\nTVM_LIB=\"${TVM_ROOT}/output/ios-arm64/lib\"\nDEST=\"${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}\"\nSIGN_ID=\"${EXPANDED_CODE_SIGN_IDENTITY:-'-'}\"\nmkdir -p \"${DEST}\"\nfor lib in libtvm.dylib libdropbear.dylib libmksh.dylib libtoybox.dylib libvim.dylib libdarksword.signed.dylib; do\n    SRC=\"${TVM_LIB}/${lib}\"\n    [ -f \"${SRC}\" ] && cp -f \"${SRC}\" \"${DEST}/\" && chmod +x \"${DEST}/${lib}\" && codesign --force --sign \"${SIGN_ID}\" \"${DEST}/${lib}\" || true\ndone\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

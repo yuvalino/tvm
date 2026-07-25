@@ -1,3 +1,3 @@
 setenv TVM_SHELL=/tvm/bin/sh
-setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:libdarksword.dylib
+setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:libdarksword.signed.dylib
 echo TVM initialized
