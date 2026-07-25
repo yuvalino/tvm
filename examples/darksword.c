@@ -826,11 +826,13 @@ void pe_v1(void)
 				break;
 			}
 		}
-		if (!success) sockets_release(&socketPorts);
-		for (uint64_t s = 0; s < searchMappingNum; s++) {
-			mach_vm_address_t searchMappingAddress = u64_array_last(&searchMappings);
-			u64_array_pop(&searchMappings);
-			kr = mach_vm_deallocate(mach_task_self(), searchMappingAddress, searchMappingSize);
+		if (!success) {
+			sockets_release(&socketPorts);
+			for (uint64_t s = 0; s < searchMappingNum; s++) {
+				mach_vm_address_t searchMappingAddress = u64_array_last(&searchMappings);
+				u64_array_pop(&searchMappings);
+				kr = mach_vm_deallocate(mach_task_self(), searchMappingAddress, searchMappingSize);
+			}
 		}
 		u64_array_free(&searchMappings);
 		if (isA18Device) {
