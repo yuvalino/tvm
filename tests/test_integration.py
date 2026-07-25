@@ -145,7 +145,7 @@ def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
         os.unlink(proc._logpath)
 
 @contextmanager
-def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localhost", user: str = "") -> Iterator[spawn]:
+def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localhost", user: str = "", legacy_scp: bool = False) -> Iterator[spawn]:
 
     if command:
         if address != "localhost" and exe == "ssh":
@@ -156,7 +156,10 @@ def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localh
         command = ""
     portarg = "-p"
     if exe == "scp":
-        portarg = "-O -P"
+        # Plain scp speaks the SFTP subsystem (OpenSSH >= 9.0), which dropbear
+        # serves via our sftp-server applet. legacy_scp forces the old rcp
+        # protocol instead, so both paths stay covered.
+        portarg = "-O -P" if legacy_scp else "-P"
 
     userhost = f"{user}@{address}" if user else address
     if exe == "scp":
@@ -242,7 +245,8 @@ def test_connect_echo(forkless: Forkless):
         p.expect(EOF)
         assert 0 == p.wait()
 
-def test_scp(forkless: Forkless, device):
+@pytest.mark.parametrize("legacy_scp", [False, True], ids=["sftp", "legacy"])
+def test_scp(forkless: Forkless, device, legacy_scp):
     # Get a writable dir inside TVM for SCP source/dest
     with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
         p.expect(r"(/\S+)")
@@ -255,7 +259,7 @@ def test_scp(forkless: Forkless, device):
     with ssh(forkless.port, f"echo hello > {f1}", address=forkless.address, user=forkless.user) as p:
         p.expect(EOF)
 
-    with ssh(forkless.port, f"{forkless.user}@{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address, user=forkless.user) as p:
+    with ssh(forkless.port, f"{forkless.user}@{forkless.address}:{f1} {f2}", exe="scp", address=forkless.address, user=forkless.user, legacy_scp=legacy_scp) as p:
         p.expect(EOF)
         assert 0 == p.wait()
 
@@ -267,6 +271,41 @@ def test_scp(forkless: Forkless, device):
         with ssh(forkless.port, f"cat {f2}", address=forkless.address, user=forkless.user) as p:
             p.expect("hello")
             p.expect(EOF)
+
+def test_sftp(forkless: Forkless):
+    """The sftp client exercises the subsystem directly: realpath, opendir,
+    readdir, open/write, open/read and remove."""
+    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
+        p.expect(r"(/\S+)")
+        remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
+        p.expect(EOF)
+
+    local_src = tempfile.mktemp(prefix="sftp_src_")
+    local_dst = tempfile.mktemp(prefix="sftp_dst_")
+    with open(local_src, "w") as f:
+        f.write("sftp payload\n")
+
+    userhost = f"{forkless.user}@{forkless.address}" if forkless.user else forkless.address
+    command = (
+        f"sftp -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null "
+        f"-oPubkeyAuthentication=no -P {forkless.port} {userhost}"
+    )
+    with spawn(command, timeout=TIMEOUT_SECONDS, encoding="utf-8",
+               codec_errors="replace") as p:
+        assert p.expect([TIMEOUT, "[Pp]assword: ", EOF]) == 1
+        p.sendline(PASSWORD)
+        p.expect("sftp> ")
+        for line in (f"cd {remote_dir}", "pwd", f"put {local_src} sftp_put",
+                     "ls", f"get sftp_put {local_dst}", "rm sftp_put"):
+            p.sendline(line)
+            p.expect("sftp> ")
+        p.sendline("quit")
+        p.expect(EOF)
+
+    with open(local_dst) as f:
+        assert f.read() == "sftp payload\n"
+    os.unlink(local_src)
+    os.unlink(local_dst)
 
 def test_interactive(sshi: spawn):
     sshi.sendline("echo hello")
