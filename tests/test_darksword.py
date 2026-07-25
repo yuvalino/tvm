@@ -134,6 +134,9 @@ def _run_darksword(device, timeout=90):
                 continue
             lines.append(line)
             logger.info("darksword: %s", line)
+            if "DONE" in line:
+                proc.kill()
+                break
             if time.time() > deadline:
                 proc.kill()
                 break
