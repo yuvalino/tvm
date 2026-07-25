@@ -17,9 +17,12 @@ Usage:
 
 import logging
 import subprocess
+import tempfile
 import time
 
 import pytest
+
+from panic_parser import parse_panic_ips, format_panic_summary
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +155,62 @@ def _run_darksword(device, timeout=90):
     return lines, alive
 
 
+def _pull_latest_panic(device, timeout=60):
+    """Wait for panic log to appear after reboot, pull and parse it.
+
+    Panic logs can take up to ~60s to be written after the device reboots.
+    Returns parsed panic dict or None.
+    """
+    logger.info("Waiting for panic log on device (up to %ds)...", timeout)
+    if not _wait_device(device, timeout=90):
+        logger.warning("Device did not come back")
+        return None
+
+    # poll for new panic log (may take a while after reboot)
+    latest_name = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = _run(
+                ["xcrun", "devicectl", "device", "info", "files",
+                 "--device", device, "--domain-type", "systemCrashLogs"],
+                timeout=30,
+            )
+            if r.returncode == 0 and r.stdout:
+                panics = [l.split()[0] for l in r.stdout.splitlines()
+                          if "panic-full" in l]
+                if panics:
+                    latest_name = panics[-1]
+                    break
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+        time.sleep(5)
+
+    if not latest_name:
+        logger.warning("No panic log found")
+        return None
+
+    # pull the file
+    with tempfile.NamedTemporaryFile(suffix=".ips", delete=False) as tmp:
+        dst = tmp.name
+    try:
+        r = _run(
+            ["xcrun", "devicectl", "device", "copy", "from",
+             "--device", device, "--domain-type", "systemCrashLogs",
+             "--source", latest_name, "--destination", dst],
+            timeout=30,
+        )
+        if r.returncode != 0:
+            logger.warning("Failed to pull panic log: %s", r.stderr)
+            return None
+
+        parsed = parse_panic_ips(dst)
+        return parsed
+    except Exception as e:
+        logger.warning("Failed to parse panic log: %s", e)
+        return None
+
+
 # ── Fixtures ──────────────────────────────────────────────────
 
 @pytest.fixture(scope="module")
@@ -196,20 +255,16 @@ def test_darksword_sandbox_escape(ios_device):
 
     # check device survived (no kernel panic)
     if not alive:
-        # device panicked — get crash log for diagnostics
-        _wait_device(ios_device, timeout=120)
-        try:
-            r = _run(
-                ["xcrun", "devicectl", "device", "info", "files",
-                 "--device", ios_device, "--domain-type", "systemCrashLogs"],
-                timeout=30,
-            )
-            panics = [l for l in (r.stdout or "").splitlines() if "panic-full" in l]
-            if panics:
-                latest = panics[-1].split()[0]
-                logger.error("Latest panic log: %s", latest)
-        except Exception:
-            pass
-        pytest.fail(f"Device panicked after exploit. Output:\n{output}")
+        panic_info = _pull_latest_panic(ios_device, timeout=60)
+        panic_summary = ""
+        if panic_info:
+            panic_summary = format_panic_summary(panic_info)
+            for line in panic_summary.splitlines():
+                logger.error("PANIC: %s", line)
+        pytest.fail(
+            f"Device panicked after exploit.\n"
+            f"--- Exploit output ---\n{output}\n"
+            f"--- Panic log ---\n{panic_summary or '(not available)'}"
+        )
 
     assert "DONE" in output, f"Exploit did not complete. Output:\n{output}"
