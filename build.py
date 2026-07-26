@@ -40,17 +40,7 @@ def run(cmd, **kwargs):
     subprocess.check_call(cmd, **kwargs)
 
 
-def set_platform_env(plat):
-    """Environment the sub-builds expect. Must be applied on every invocation,
-    not just when configuring: ninja re-runs the shell-script builds (vim,
-    toybox) long after configure, and without these they build for the host."""
-    if plat == "ios-arm64":
-        os.environ["ARCHFLAGS"] = "-arch arm64"
-        os.environ["TVM_IOS_CROSS"] = "1"
-
-
 def configure(plat):
-    set_platform_env(plat)
     bd = build_dir(plat)
     bd.mkdir(parents=True, exist_ok=True)
 
@@ -66,6 +56,8 @@ def configure(plat):
     ]
 
     if plat == "ios-arm64":
+        os.environ["ARCHFLAGS"] = "-arch arm64"
+        os.environ["TVM_IOS_CROSS"] = "1"
         cmake_args += [
             "-DCMAKE_SYSTEM_NAME=iOS",
             "-DCMAKE_OSX_ARCHITECTURES=arm64",
@@ -83,7 +75,6 @@ def configure(plat):
 
 def build(plat, targets, verbose=False):
     bd = build_dir(plat)
-    set_platform_env(plat)
     if not (bd / "build.ninja").exists():
         configure(plat)
 
