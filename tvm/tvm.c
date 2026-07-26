@@ -37,6 +37,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <sys/fileport.h>
 #include <sys/time.h>
 
 #include <limits.h>
@@ -371,6 +372,10 @@ DECL_FUNC(write);
 DECL_FUNC(close);
 DECL_FUNC(readv);
 DECL_FUNC(writev);
+DECL_FUNC(pread);
+DECL_FUNC(pwrite);
+DECL_FUNC(preadv);
+DECL_FUNC(pwritev);
 DECL_FUNC(lseek);
 DECL_FUNC(fsync);
 DECL_FUNC(dup);
@@ -379,6 +384,8 @@ DECL_FUNC(pipe);
 DECL_FUNC(select);
 DECL_FUNC(poll);
 DECL_FUNC(fcntl);
+DECL_FUNC(fileport_makeport);
+DECL_FUNC(fileport_makefd);
 DECL_FUNC(ftruncate);
 DECL_FUNC(stat);
 DECL_FUNC(lstat);
@@ -10592,6 +10599,66 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
     return ret;
 }
 
+FUNCTION_DEFINE4(ssize_t, pread, int, fd, void *, buf, size_t, count, off_t, offset) {
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+    int rfd = file->f_rfd;
+    file_unlock(file, 1);
+    ssize_t ret = CALL_FUNC(pread, rfd, buf, count, offset);
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE4(ssize_t, pwrite, int, fd, const void *, buf, size_t, count, off_t, offset) {
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+    int wfd = file->f_rfd;
+    file_unlock(file, 1);
+    ssize_t ret = CALL_FUNC(pwrite, wfd, buf, count, offset);
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE4(ssize_t, preadv, int, fd, const struct iovec *, iov, int, iovcnt, off_t, offset) {
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+    int rfd = file->f_rfd;
+    file_unlock(file, 1);
+    ssize_t ret = CALL_FUNC(preadv, rfd, iov, iovcnt, offset);
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE4(ssize_t, pwritev, int, fd, const struct iovec *, iov, int, iovcnt, off_t, offset) {
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+    int wfd = file->f_rfd;
+    file_unlock(file, 1);
+    ssize_t ret = CALL_FUNC(pwritev, wfd, iov, iovcnt, offset);
+    tvm_sig_leave();
+    return ret;
+}
+
 FUNCTION_DEFINE3(off_t, lseek, int, fd, off_t, offset, int, whence) {
     tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
@@ -10614,6 +10681,26 @@ FUNCTION_DEFINE3(off_t, lseek, int, fd, off_t, offset, int, whence) {
 
 FUNCTION_DEFINE1(int, fsync, int, fd) {
     return CURRENT_RFD(fd, CALL_FUNC(fsync, __rfd));
+}
+
+FUNCTION_DEFINE2(int, fileport_makeport, int, fd, fileport_t *, port) {
+    return CURRENT_RFD(fd, CALL_FUNC(fileport_makeport, __rfd, port));
+}
+
+FUNCTION_DEFINE1(int, fileport_makefd, fileport_t, port) {
+    tvm_sig_enter();
+    int rfd = CALL_FUNC(fileport_makefd, port);
+    if (rfd < 0) {
+        tvm_sig_leave();
+        return -1;
+    }
+    int vfd = task_new_fd(current, rfd);
+    if (vfd < 0) {
+        CALL_FUNC(close, rfd);
+        errno = EMFILE;
+    }
+    tvm_sig_leave();
+    return vfd;
 }
 
 FUNCTION_DEFINE1(int, dup, int, oldfd) {
