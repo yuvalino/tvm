@@ -518,9 +518,10 @@ def test_toybox_xargs(sshi: spawn):
 # unprivileged, sandboxed process: anything needing root or a real block device
 # (quotaon, vipw, mkfile on /, fstyp) would only prove that it fails.
 #
-# Darwin-only: the apple *_cmds modules are not built or bundled on Linux.
+# Apple *_cmds are only built and bundled when the target is a Darwin platform.
 pytestmark_apple = pytest.mark.skipif(
-    os.uname().sysname != "Darwin", reason="apple *_cmds are Darwin-only")
+    not PLATFORM.startswith(("macos-", "ios-")),
+    reason="apple *_cmds are only in Darwin target initrds")
 
 @pytestmark_apple
 def test_apple_dispatch_listing(sshi: spawn):
