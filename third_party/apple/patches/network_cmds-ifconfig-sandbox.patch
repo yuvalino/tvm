@@ -1,0 +1,28 @@
+--- a/ifconfig.tproj/ifconfig.c
++++ b/ifconfig.tproj/ifconfig.c
+@@ -2447,8 +2447,14 @@
+ 	mib[3] = IFMIB_IFDATA;
+ 	mib[4] = if_nametoindex(name);
+ 	mib[5] = IFDATA_SUPPLEMENTAL;
+-	if (sysctl(mib, 6, &ifmsupp, &miblen, (void *)0, 0) == -1)
++	if (sysctl(mib, 6, &ifmsupp, &miblen, (void *)0, 0) == -1) {
++#ifdef APPLE_CMDS_MULTICALL
++		warn("sysctl IFDATA_SUPPLEMENTAL");
++		goto skip_supplemental;
++#else
+ 		err(1, "sysctl IFDATA_SUPPLEMENTAL");
++#endif
++	}
+
+ 	if (ifmsupp.ifmd_data_extended.ifi_alignerrs != 0) {
+ 		printf("\tunaligned pkts: %llu\n",
+@@ -2459,6 +2465,9 @@
+ 		    bytes_to_str(ifmsupp.ifmd_data_extended.ifi_dt_bytes));
+ 	}
+
++#ifdef APPLE_CMDS_MULTICALL
++skip_supplemental:
++#endif
+ 	bzero(&ifdr, sizeof (ifdr));
+ 	strlcpy(ifdr.ifdr_name, name, sizeof (ifdr.ifdr_name));
+ 	if (ioctl(s, SIOCGIFDESC, &ifdr) != -1 && ifdr.ifdr_len) {

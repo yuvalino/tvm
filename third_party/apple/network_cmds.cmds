@@ -1,0 +1,24 @@
+# network_cmds — needs the private-header prelude (see apple_prelude.h) plus
+# __APPLE_USE_RFC_3542 and INET6, which is what Apple's own xcconfig passes.
+# Excluded: traceroute/traceroute6 (libpcap is not available on iOS).
+#
+# -DIPSEC is set for netstat only: it needs the pfkey protocol table, but
+# module-wide it would also make ping/ping6 call ipsec_set_policy() and so
+# pull in libipsec. TVM's ulinker resolves libSystem only, so a module with
+# a second dylib dependency fails to exec.
+#common|network_cmds_lib/network_cmds_lib.c network_cmds_lib/gmt2local.c
+#cflags|-include @APPLE@/apple_prelude.h -I@SRC@/network_cmds_lib -D__APPLE_USE_RFC_3542=1 -DINET6=1
+
+# command|subdir|sources (blank = all *.c)|extra cflags|platform (blank = both)
+arp|arp.tproj||
+dnctl|dnctl||
+ifconfig|ifconfig.tproj||
+kdumpd|kdumpd.tproj||
+ndp|ndp.tproj||
+netstat|netstat.tproj||-DIPSEC=1
+ping|ping.tproj||
+ping6|ping6.tproj||
+rarpd|rarpd.tproj||
+route|route.tproj||
+rtsol|rtsol.tproj||
+spray|spray.tproj||

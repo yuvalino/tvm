@@ -14217,7 +14217,22 @@ FUNCTION_DEFINE3(int, getopt, int, argc, char * const *, argv, const char *, opt
 	int k, l;
 	char *optchar;
 
-	if (!*current->tsk_relocs.optind || current->tsk_data->optreset) {
+	/*
+	 * Reset on optreset only — NOT on optind == 0.
+	 *
+	 * This implementation is musl's, where optind == 0 is the GNU "restart
+	 * scanning" request. Darwin's plain getopt(3) is the BSD one, where optind
+	 * is only an index and 0 legitimately means "start at argv[0]"; a restart
+	 * is asked for with optreset instead. We emulate Darwin and run Darwin
+	 * binaries, so BSD is the behaviour that matters here: netstat(1) does
+	 * `argv++; argc--; optind--;` before parsing, and under the musl rule that
+	 * turned into a reset to optind = 1, which skipped past every flag it was
+	 * given (`netstat -rn` silently printed connections instead of routes).
+	 *
+	 * __getopt_long below keeps the optind == 0 reset: Darwin's getopt_long(3)
+	 * is a different implementation that really does honour the GNU idiom.
+	 */
+	if (current->tsk_data->optreset) {
 		current->tsk_data->optreset = 0;
 		current->tsk_data->optpos = 0;
 		*current->tsk_relocs.optind = 1;

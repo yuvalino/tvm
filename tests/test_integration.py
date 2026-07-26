@@ -508,6 +508,104 @@ def test_toybox_xargs(sshi: spawn):
     sshi.expect("/tvm/bin/sh")
     sshi.expect(r"\$ ")
 
+# ── Apple *_cmds ──────────────────────────────────────────────
+# The real BSD userland from apple-oss-distributions, built as multi-call
+# modules and dropped into the initrd as unsigned executables (see
+# third_party/apple/CMakeLists.txt). These run under the emulator on iOS, so
+# they also cover a much larger unsigned binary than toybox does.
+#
+# Deliberately limited to commands that produce checkable output as an
+# unprivileged, sandboxed process: anything needing root or a real block device
+# (quotaon, vipw, mkfile on /, fstyp) would only prove that it fails.
+
+def test_apple_dispatch_listing(sshi: spawn):
+    """A module invoked by its own name lists its commands — confirms the
+    generated dispatcher and the argv[0] basename lookup are wired up."""
+    sshi.sendline("adv_cmds 2>&1 | head -1")
+    sshi.expect(r"commands:.*\bps\b")
+    sshi.expect(r"\$ ")
+
+def test_apple_hostinfo(sshi: spawn):
+    """hostinfo — Mach host_info() RPC from an emulated guest binary."""
+    sshi.sendline("hostinfo")
+    sshi.expect("Mach kernel version")
+    sshi.expect(r"\$ ")
+
+def test_apple_sysctl(sshi: spawn):
+    """sysctl reading a known-stable MIB. On iOS the sandbox blocks some MIBs,
+    so we accept both the real output and the 'not permitted' error."""
+    sshi.sendline("sysctl kern.ostype")
+    sshi.expect(r"kern\.ostype: Darwin|Operation not permitted")
+    sshi.expect(r"\$ ")
+
+def test_apple_vm_stat(sshi: spawn):
+    """vm_stat — host_statistics64(), and a page-size-dependent header."""
+    sshi.sendline("vm_stat")
+    sshi.expect("Mach Virtual Memory Statistics")
+    sshi.expect(r"\$ ")
+
+def test_apple_lsvfs(sshi: spawn):
+    """lsvfs — getvfsbyname()/sysctl over the loaded filesystems."""
+    sshi.sendline("lsvfs")
+    sshi.expect("Filesystem")
+    sshi.expect(r"\$ ")
+
+def test_apple_ps(sshi: spawn):
+    """ps — libproc + mach_vm, the heaviest adv_cmds command. On iOS the
+    sandbox blocks the process-list sysctl, so accept either output."""
+    sshi.sendline("ps -o pid,comm")
+    sshi.expect(r"PID\s+COMM|Operation not permitted|Failure calling sysctl")
+    sshi.expect(r"\$ ")
+
+def test_apple_ifconfig_loopback(sshi: spawn):
+    """ifconfig on the loopback — exercises the reconstructed net/if.h ioctl
+    surface (SIOCGIFFLAGS and friends)."""
+    sshi.sendline("ifconfig lo0")
+    sshi.expect("lo0")
+    sshi.expect("127.0.0.1")
+    sshi.expect(r"\$ ")
+
+def test_apple_ifconfig_list(sshi: spawn):
+    """ifconfig -l — plain interface-name enumeration."""
+    sshi.sendline("ifconfig -l")
+    sshi.expect("lo0")
+    sshi.expect(r"\$ ")
+
+def test_apple_netstat_routes(sshi: spawn):
+    """netstat -rn — reads the routing table over PF_ROUTE sysctl. This is the
+    command that needed the private in_pcb/socketvar/mbuf headers."""
+    sshi.sendline("netstat -rn")
+    sshi.expect("Routing tables")
+    sshi.expect("Destination")
+    sshi.expect(r"\$ ")
+
+def test_apple_netstat_stats(sshi: spawn):
+    """netstat -s -p tcp — protocol statistics, a different sysctl path.
+    On iOS the sandbox blocks this sysctl, so we just check it returns."""
+    sshi.sendline("netstat -s -p tcp; echo nss_done")
+    sshi.expect("nss_done")
+    sshi.expect(r"\$ ")
+
+def test_apple_sync(sshi: spawn):
+    """sync — trivial, but proves a bare syscall wrapper exits 0."""
+    sshi.sendline("sync && echo sync_ok")
+    sshi.expect("sync_ok")
+    sshi.expect(r"\$ ")
+
+def test_apple_mkfile(sshi: spawn):
+    """mkfile in a writable dir — creates a sparse file of an exact size."""
+    sshi.sendline("mkfile -n 4k $TMPDIR/apple_mkfile && wc -c < $TMPDIR/apple_mkfile")
+    sshi.expect("4096")
+    sshi.expect(r"\$ ")
+
+def test_apple_repeated_invocation(sshi: spawn):
+    """Same module run several times — guards against per-task getopt/global
+    state leaking between execs of a multi-call binary."""
+    for _ in range(3):
+        sshi.sendline("hostinfo | head -1")
+        sshi.expect("Mach kernel version")
+        sshi.expect(r"\$ ")
+
 # ── Environment and getopt ────────────────────────────────────
 
 def test_env_vars(sshi: spawn):

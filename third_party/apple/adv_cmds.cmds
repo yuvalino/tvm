@@ -1,0 +1,14 @@
+# adv_cmds — commands that build against the public SDK + third_party/apple/include.
+# Excluded (need Apple-internal sources with no open-source equivalent):
+#   gencat/localedef  generated parser headers   last  libxo
+#   pkill/pgrep       sysmon.h (not open source)
+#   tabs              needs setupterm/putp; iOS has no ncurses
+
+# command|subdir|sources (blank = all *.c)|extra cflags|platform (blank = both)
+cap_mkdb|cap_mkdb||
+finger|finger||
+lsvfs|lsvfs||
+ps|ps||
+stty|stty||
+tty|tty||
+whois|whois||

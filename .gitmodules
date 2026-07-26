@@ -13,3 +13,15 @@
 [submodule "third_party/vim"]
 	path = third_party/vim
 	url = https://github.com/vim/vim.git
+[submodule "third_party/apple/adv_cmds"]
+	path = third_party/apple/adv_cmds
+	url = https://github.com/apple-oss-distributions/adv_cmds.git
+[submodule "third_party/apple/network_cmds"]
+	path = third_party/apple/network_cmds
+	url = https://github.com/apple-oss-distributions/network_cmds.git
+[submodule "third_party/apple/system_cmds"]
+	path = third_party/apple/system_cmds
+	url = https://github.com/apple-oss-distributions/system_cmds.git
+[submodule "third_party/apple/diskdev_cmds"]
+	path = third_party/apple/diskdev_cmds
+	url = https://github.com/apple-oss-distributions/diskdev_cmds.git
