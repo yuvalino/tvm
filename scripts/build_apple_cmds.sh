@@ -90,16 +90,6 @@ LEGACY_C_FLAGS="-Wno-error=int-conversion -Wno-error=implicit-function-declarati
 
 BASE_CFLAGS="-g -gdwarf-4 -fno-common -w -DPRIVATE=1 -DAPPLE_CMDS_MULTICALL=1 $LEGACY_C_FLAGS $APPLE_INCLUDES $APPLE_FALLBACK"
 
-# Apply any patches from third_party/apple/patches/<module>-*.patch.
-# Patches are applied with -N (skip if already applied) so re-builds are safe.
-PATCHES_DIR="$APPLE_DIR/patches"
-if [ -d "$PATCHES_DIR" ]; then
-    for p in "$PATCHES_DIR/${MODULE}"-*.patch; do
-        [ -f "$p" ] || continue
-        patch -d "$SRCDIR" -p1 -N --silent < "$p" 2>/dev/null || true
-    done
-fi
-
 OBJDIR="$BUILDDIR/obj"
 TMPDIR_="$BUILDDIR/tmp"
 rm -rf "$OBJDIR" "$TMPDIR_"
