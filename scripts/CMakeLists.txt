@@ -79,6 +79,20 @@ function(mkinitrd_target NAME)
     endif()
     string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n\n")
 
+    # ── apple *_cmds ──
+    # Real, unsigned multi-call executables in both initrds — no launcher stub
+    # and no dylib in the app bundle, so nothing here needs codesigning. TVM
+    # runs them under the emulator like any other unsigned guest code.
+    foreach(module ${APPLE_CMDS_MODULES})
+        string(APPEND SCRIPT
+            "cp '${APPLE_CMDS_BUILD}/${module}/${module}' \"$ROOTFS/bin/${module}\"\n")
+        foreach(applet ${APPLE_CMDS_${module}})
+            string(APPEND SCRIPT
+                "ln -sf ${module} \"$ROOTFS/bin/${applet}\"\n")
+        endforeach()
+        string(APPEND SCRIPT "\n")
+    endforeach()
+
     # ── Dropbear symlinks ──
     foreach(applet ${DROPBEAR_APPLETS})
         string(APPEND SCRIPT "ln -sf dropbear \"$ROOTFS/bin/${applet}\"\n")
@@ -128,12 +142,20 @@ endfunction()
 
 # ── initrd targets ──────────────────────────────────────────────
 
+# The apple *_cmds modules go into both initrds as real executables, so both
+# targets depend on them. Empty on Linux, where the subdirectory is not added.
+set(APPLE_CMDS_DEPS "")
+foreach(module ${APPLE_CMDS_MODULES})
+    list(APPEND APPLE_CMDS_DEPS ${module}_exe)
+endforeach()
+
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe toybox_host_ext
+    DEPENDS dropbear_exe mksh_exe toybox_exe vim_exe toybox_host_ext ${APPLE_CMDS_DEPS}
 )
 
-# Flutter initrd (launcher stubs)
+# Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
+# the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher mksh_launcher toybox_launcher vim_launcher toybox_host_ext
+    DEPENDS dropbear_launcher mksh_launcher toybox_launcher vim_launcher toybox_host_ext ${APPLE_CMDS_DEPS}
 )

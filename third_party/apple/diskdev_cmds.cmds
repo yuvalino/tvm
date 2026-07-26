@@ -1,0 +1,21 @@
+# diskdev_cmds. fstyp.tproj holds four independent programs in one directory,
+# so those four spell out their own sources instead of taking the whole dir.
+# Excluded: mount, fsck, edt_fstab (APFS.framework headers are not public);
+#           mount_devfs, mount_fdesc (mntopts.h is Apple-internal);
+#           fdisk (calls system(), unavailable on iOS).
+
+# command|subdir|sources (blank = all *.c)|extra cflags|platform (blank = both)
+dev_mkdb|dev_mkdb.tproj||
+dirs_cleaner|dirs_cleaner||
+edquota|edquota.tproj||
+fstyp|fstyp.tproj|fstyp.c|
+fstyp_msdos|fstyp.tproj|fstyp_msdos.c|
+fstyp_ntfs|fstyp.tproj|fstyp_ntfs.c|
+fstyp_udf|fstyp.tproj|fstyp_udf.c|
+quota|quota.tproj||
+quotacheck|quotacheck.tproj|quotacheck.c hfs_quotacheck.c ../disklib/preen.c|-I@SRC@/disklib|macos
+quotaon|quotaon.tproj||
+repquota|repquota.tproj||
+setclass|setclass.tproj||
+umount|umount.tproj|umount.c ../disklib/vfslist.c|-I@SRC@/disklib
+vsdbutil|vsdbutil.tproj|vsdbutil_main.c ../mount_flags_dir/mount_flags.c|-I@SRC@/mount_flags_dir

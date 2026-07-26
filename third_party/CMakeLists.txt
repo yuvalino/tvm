@@ -17,6 +17,19 @@ set(THIRDPARTY_BUILD ${CMAKE_CURRENT_BINARY_DIR})
 set(LIB_OUT ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
 set(BIN_OUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 
+# Cross-compile marker for the shell-script builds (build_toybox.sh,
+# build_vim.sh). These used to read TVM_IOS_CROSS straight out of the ambient
+# environment, which build.py exports — but only while it is *configuring*.
+# A later `ninja` run that rebuilds vim or toybox (a touched CMakeLists is
+# enough) then ran them without it, and vim's configure would try to run an
+# arm64 test binary on the build host and fail with "cannot run C compiled
+# programs". Pin it into the build commands instead, the way the top-level
+# flutter target already does, so it no longer depends on how ninja was reached.
+set(TVM_CROSS_ENV "")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(TVM_CROSS_ENV TVM_IOS_CROSS=1)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(IOS_CC_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/ios-cc.sh)
     file(WRITE ${IOS_CC_SCRIPT} [=[#!/bin/sh
@@ -51,6 +64,17 @@ function(add_shared_lib NAME OBJGLOB)
     )
     set_target_properties(${NAME}_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endfunction()
+
+###############################################################################
+# apple *_cmds (macOS / iOS only)
+#
+# The real BSD userland from apple-oss-distributions. Nothing here builds on
+# Linux — the sources are Mach/Darwin-specific throughout — so the whole
+# subdirectory is Apple-only.
+###############################################################################
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    add_subdirectory(apple)
+endif()
 
 ###############################################################################
 # dropbear
@@ -137,7 +161,7 @@ ExternalProject_Add(toybox_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/toybox
     BINARY_DIR ${TOYBOX_BUILD}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" sh ${SCRIPTS_DIR}/build_toybox.sh ${THIRDPARTY_SRC}/toybox ${TOYBOX_BUILD}
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_toybox.sh ${THIRDPARTY_SRC}/toybox ${TOYBOX_BUILD}
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
@@ -170,7 +194,7 @@ set(VIM_LINK_LIBS -lm)
 set(VIM_BUILD_ENV "")
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND VIM_LINK_LIBS ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libtermcap_stubs.a)
-    set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" "TVM_STUBS_DIR=${STUBS_DIR}")
+    set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" "TVM_STUBS_DIR=${STUBS_DIR}" ${TVM_CROSS_ENV})
 else()
     list(APPEND VIM_LINK_LIBS -lncurses)
 endif()
