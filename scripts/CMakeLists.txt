@@ -80,17 +80,11 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n\n")
 
     # ── apple *_cmds ──
-    # Real, unsigned multi-call executables in both initrds — no launcher stub
-    # and no dylib in the app bundle, so nothing here needs codesigning. TVM
-    # runs them under the emulator like any other unsigned guest code.
     foreach(module ${APPLE_CMDS_MODULES})
-        string(APPEND SCRIPT
-            "cp '${APPLE_CMDS_BUILD}/${module}/${module}' \"$ROOTFS/bin/${module}\"\n")
-        foreach(applet ${APPLE_CMDS_${module}})
+        foreach(cmd ${APPLE_CMDS_${module}})
             string(APPEND SCRIPT
-                "ln -sf ${module} \"$ROOTFS/bin/${applet}\"\n")
+                "cp '${APPLE_CMDS_BUILD}/${module}/bin/${cmd}' \"$ROOTFS/bin/${cmd}\"\n")
         endforeach()
-        string(APPEND SCRIPT "\n")
     endforeach()
 
     # ── Dropbear symlinks ──

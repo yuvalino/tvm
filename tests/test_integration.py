@@ -485,11 +485,10 @@ pytestmark_apple = pytest.mark.skipif(
     reason="apple *_cmds are only in Darwin target initrds")
 
 @pytestmark_apple
-def test_apple_dispatch_listing(sshi: spawn):
-    """A module invoked by its own name lists its commands — confirms the
-    generated dispatcher and the argv[0] basename lookup are wired up."""
-    sshi.sendline("adv_cmds 2>&1 | head -1")
-    sshi.expect(r"commands:.*\bps\b")
+def test_apple_binary_exists(sshi: spawn):
+    """Verify that apple commands are individual binaries in the initrd."""
+    sshi.sendline("file /tvm/bin/hostinfo")
+    sshi.expect("Mach-O")
     sshi.expect(r"\$ ")
 
 @pytestmark_apple
