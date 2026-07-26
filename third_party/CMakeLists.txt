@@ -58,6 +58,7 @@ endif()
 set(LAUNCHER_SRC ${SCRIPTS_DIR}/launcher.c)
 function(add_launcher NAME)
     add_custom_target(${NAME}_launcher
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${BIN_OUT}
         COMMAND cc -o ${BIN_OUT}/${NAME}_launcher
             ${LAUNCHER_SRC} -DTARGET=\\\"lib${NAME}.dylib\\\"
         COMMENT "Building ${NAME} launcher"
