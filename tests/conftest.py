@@ -10,6 +10,7 @@ def pytest_configure(config):
     config.option.log_cli_date_format = "%Y-%m-%d %H:%M:%S"
     # don't re-print captured logs in the summary — they're already streamed live
     config.option.log_level = "CRITICAL"
+    config.option.timeout = 300
 
 
 def pytest_addoption(parser):

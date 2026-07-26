@@ -16,6 +16,7 @@ Usage:
 """
 
 import logging
+import select
 import subprocess
 import tempfile
 import time
@@ -68,34 +69,43 @@ def _wait_ssh(device, timeout=30):
 
 
 def _wait_device(device, timeout=120):
+    """Wait until the device is up, the app launches, and SSH is reachable."""
     deadline = time.time() + timeout
+    # phase 1: wait for device to appear
     while time.time() < deadline:
         try:
             r = _run(
                 ["xcrun", "devicectl", "device", "info", "details",
                  "--device", device],
-                timeout=30,
+                timeout=10,
             )
             if r.returncode == 0 and "iPhone" in (r.stdout or ""):
-                return True
+                break
         except subprocess.TimeoutExpired:
             pass
         time.sleep(3)
+    else:
+        return False
+    # phase 2: launch app and wait for SSH
+    while time.time() < deadline:
+        try:
+            r = _run(
+                ["xcrun", "devicectl", "device", "process", "launch",
+                 "--terminate-existing", "--device", device, IOS_BUNDLE_ID],
+                timeout=30,
+            )
+            if r.returncode == 0 and _wait_ssh(device, timeout=min(15, deadline - time.time())):
+                return True
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(5)
     return False
 
 
-def _device_reboot(device, timeout=120):
-    """Restart device for clean kernel state."""
-    logger.info("Rebooting device %s for clean state...", device)
-    _run(
-        ["xcrun", "devicectl", "device", "process", "launch",
-         "--terminate-existing", "--device", device, IOS_BUNDLE_ID],
-        timeout=15,
-    )
-    # There's no clean reboot command via devicectl, but we can
-    # terminate all apps and let the device settle
-    time.sleep(5)
-    assert _wait_device(device, timeout), f"Device {device} did not come back"
+def _device_reboot(device, timeout=240):
+    """Restart app for clean state."""
+    logger.info("Restarting app on %s...", device)
+    assert _wait_device(device, timeout), f"Device {device} not reachable"
     logger.info("Device %s ready", device)
 
 
@@ -104,13 +114,20 @@ def _launch_app(device):
     _run(
         ["xcrun", "devicectl", "device", "process", "launch",
          "--terminate-existing", "--device", device, IOS_BUNDLE_ID],
-        timeout=15,
+        timeout=30,
     )
     assert _wait_ssh(device, timeout=30), "SSH did not come up after app launch"
 
 
+DARKSWORD_SILENCE_TIMEOUT = 30
+
 def _run_darksword(device, timeout=90):
-    """Run darksword and stream output line by line. Returns (lines, alive)."""
+    """Run darksword and stream output line by line. Returns (lines, alive).
+
+    Detects likely panic/crash if no output arrives for DARKSWORD_SILENCE_TIMEOUT
+    seconds — the exploit prints progress continuously, so silence means the
+    device died or the process exited.
+    """
     addr = device if "." in device else f"{device}.local"
     proc = subprocess.Popen(
         ["sshpass", "-p", SSH_PASS, "ssh",
@@ -124,20 +141,28 @@ def _run_darksword(device, timeout=90):
 
     lines = []
     try:
+        last_line_time = time.time()
         deadline = time.time() + timeout
-        for line in proc.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-            # skip SSH warnings
-            if "WARNING" in line or "quantum" in line or "upgraded" in line or "openssh" in line:
-                continue
-            lines.append(line)
-            logger.info("darksword: %s", line)
-            if "DONE" in line:
-                proc.kill()
-                break
-            if time.time() > deadline:
+        while time.time() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if ready:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                last_line_time = time.time()
+                line = line.rstrip()
+                if not line:
+                    continue
+                if "WARNING" in line or "quantum" in line or "upgraded" in line or "openssh" in line:
+                    continue
+                lines.append(line)
+                logger.info("darksword: %s", line)
+                if "DONE" in line:
+                    proc.kill()
+                    break
+            elif time.time() - last_line_time >= DARKSWORD_SILENCE_TIMEOUT:
+                logger.warning("No output for %ds — likely panic or crash",
+                               int(time.time() - last_line_time))
                 proc.kill()
                 break
     except Exception:
@@ -255,9 +280,15 @@ def test_darksword_sandbox_escape(ios_device):
     # check sandbox escape
     assert "SANDBOX ESCAPED" in output, f"Sandbox escape failed. Output:\n{output}"
 
-    # check filesystem access
-    assert "opendir(/var/mobile/Library/AddressBook): OK" in output, \
-        f"Filesystem access not verified. Output:\n{output}"
+    # check filesystem access beyond app container
+    for path in ["/var/mobile/Library/AddressBook", "/var/root", "/var/db"]:
+        assert f"opendir({path}): OK" in output, \
+            f"Filesystem access denied for {path}. Output:\n{output}"
+
+    # SMS and Safari are TCC-protected — extension zeroing can't reach them
+    for path in ["/var/mobile/Library/SMS", "/var/mobile/Library/Safari"]:
+        if f"opendir({path}): OK" in output:
+            logger.info("Bonus: %s also unlocked", path)
 
     # check device survived (no kernel panic)
     if not alive:
