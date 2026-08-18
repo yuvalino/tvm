@@ -49,6 +49,7 @@
 
 #if defined(__APPLE__)
 #include <util.h>
+#include <sys/fileport.h>
 #include <mach-o/getsect.h>
 #include <CoreFoundation/CoreFoundation.h>
 #elif defined(__linux__)
@@ -371,6 +372,10 @@ DECL_FUNC(write);
 DECL_FUNC(close);
 DECL_FUNC(readv);
 DECL_FUNC(writev);
+DECL_FUNC(pread);
+DECL_FUNC(pwrite);
+DECL_FUNC(preadv);
+DECL_FUNC(pwritev);
 DECL_FUNC(lseek);
 DECL_FUNC(fsync);
 DECL_FUNC(dup);
@@ -561,6 +566,8 @@ DECL_FUNC(ftruncate64);
 DECL_FUNC(get_current_dir_name);
 #elif defined(__APPLE__)
 DECL_FUNC_OPT(CFDictionaryApplyFunction);
+DECL_FUNC(fileport_makeport);
+DECL_FUNC(fileport_makefd);
 #endif
 
 DECL_FUNC(setusershell);
@@ -10592,6 +10599,162 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
     return ret;
 }
 
+FUNCTION_DEFINE4(ssize_t, pread, int, fd, void *, buf, size_t, count, off_t, offset) {
+    tvm_sig_interrupted = 0;
+retry:
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+
+    size_t ret;
+    if (!file->f_ops || !file->f_ops->f_read) {
+        int rfd = file->f_rfd;
+        file_unlock(file, 0);
+        ret = CALL_FUNC(pread, rfd, buf, count, offset);
+        file_lock(file, 0);
+    }
+    else
+        ret = file->f_ops->f_read(file, buf, count, offset);
+
+    file_unlock(file, 1);
+    tvm_sig_leave();
+
+    if (ret == (size_t)-1 && errno == EINTR) {
+        if (!tvm_sig_interrupted)
+            goto retry; // signal was handled internally (e.g. IGN'd), guest never sees it
+        if (current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
+            goto retry;
+    }
+
+    return ret;
+}
+
+FUNCTION_DEFINE4(ssize_t, pwrite, int, fd, const void *, buf, size_t, count, off_t, offset) {
+    tvm_sig_interrupted = 0;
+retry:
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+
+    size_t ret;
+    if (!file->f_ops || !file->f_ops->f_write) {
+        int wfd = file->f_rfd;
+        file_unlock(file, 0);
+        ret = CALL_FUNC(pwrite, wfd, buf, count, offset);
+        file_lock(file, 0);
+    }
+    else
+        ret = file->f_ops->f_write(file, buf, count, offset);
+
+    file_unlock(file, 1);
+    tvm_sig_leave();
+
+    if (ret == (size_t)-1 && errno == EINTR) {
+        if (!tvm_sig_interrupted)
+            goto retry;
+        if (current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
+            goto retry;
+    }
+
+    return ret;
+}
+
+FUNCTION_DEFINE4(ssize_t, preadv, int, fd, const struct iovec *, iov, int, iovcnt, off_t, offset) {
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+
+    size_t ret;
+    if (!file->f_ops || !file->f_ops->f_read) {
+        file_unlock(file, 0);
+        ret = CALL_FUNC(preadv, file->f_rfd, iov, iovcnt, offset);
+        file_lock(file, 0);
+    }
+    else {
+        // TODO: see readv()
+        ret = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            ssize_t curr = file->f_ops->f_read(file, iov[i].iov_base, iov[i].iov_len, offset + ret);
+            if (curr == 0)
+                break;
+            if (curr < 0) {
+                if (ret == 0) {
+                    file_unlock(file, 1);
+                    tvm_sig_leave();
+                    return -1;
+                }
+                break;
+            }
+
+            ret += curr;
+
+            if (curr < iov[i].iov_len)
+                break;
+        }
+    }
+
+    file_unlock(file, 1);
+    tvm_sig_leave();
+
+    return ret;
+}
+
+FUNCTION_DEFINE4(ssize_t, pwritev, int, fd, const struct iovec *, iov, int, iovcnt, off_t, offset) {
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+
+    size_t ret;
+    if (!file->f_ops || !file->f_ops->f_write) {
+        file_unlock(file, 0);
+        ret = CALL_FUNC(pwritev, file->f_rfd, iov, iovcnt, offset);
+        file_lock(file, 0);
+    }
+    else {
+        // TODO: see readv()
+        ret = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            ssize_t curr = file->f_ops->f_write(file, iov[i].iov_base, iov[i].iov_len, offset + ret);
+            if (curr == 0)
+                break;
+            if (curr < 0) {
+                if (ret == 0) {
+                    file_unlock(file, 1);
+                    tvm_sig_leave();
+                    return -1;
+                }
+                break;
+            }
+
+            ret += curr;
+
+            if (curr < iov[i].iov_len)
+                break;
+        }
+    }
+
+    file_unlock(file, 1);
+    tvm_sig_leave();
+
+    return ret;
+}
+
 FUNCTION_DEFINE3(off_t, lseek, int, fd, off_t, offset, int, whence) {
     tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
@@ -15057,6 +15220,26 @@ FUNCTION_DEFINE_VOID3(CFDictionaryApplyFunction, CFDictionaryRef, theDict, CFDic
     CFDictionaryApplyFunction_function = applier;
     CALL_FUNC(CFDictionaryApplyFunction, theDict, CFDictionaryApplyFunction_emulator, context);
     CFDictionaryApplyFunction_function = NULL;
+}
+
+FUNCTION_DEFINE2(int, fileport_makeport, int, fd, fileport_t *, port) {
+    return CURRENT_RFD(fd, CALL_FUNC(fileport_makeport, __rfd, port));
+}
+
+FUNCTION_DEFINE1(int, fileport_makefd, fileport_t, port) {
+    tvm_sig_enter();
+    int rfd = CALL_FUNC(fileport_makefd, port);
+    if (rfd < 0) {
+        tvm_sig_leave();
+        return -1;
+    }
+    int vfd = task_new_fd(current, rfd);
+    if (vfd < 0) {
+        VERIFY(0 == CALL_FUNC(close, rfd));
+        errno = EMFILE;
+    }
+    tvm_sig_leave();
+    return vfd;
 }
 
 #endif
