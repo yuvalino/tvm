@@ -124,6 +124,22 @@ static void *worker_entry(void *arg)
     (void)arg;
 
     tvm_log("tvm_start: init\n");
+
+#if defined(__ANDROID__)
+    // Android GUI apps have fd 1/2 -> /dev/null and `am start` does not
+    // reconnect them (unlike iOS `devicectl --console`). Point them at the log
+    // pipe so the native programs' own stdout/stderr — e.g. dropbear's
+    // "Not backgrounding, port N" readiness line, which the adb-flutter test
+    // backend greps out of logcat — reach the reader thread and get mirrored to
+    // logcat. Do this before tvm_init so the init task inherits the redirected
+    // fds. (The Dart _log deliberately does NOT echo to stderr on android, so
+    // reader -> Dart -> stderr -> pipe cannot loop.)
+    if (pipe_write >= 0) {
+        dup2(pipe_write, STDOUT_FILENO);
+        dup2(pipe_write, STDERR_FILENO);
+    }
+#endif
+
     fn_tvm_init("tvm", pipe_write);
 
     int ifd = open(worker_initrd, O_RDONLY);

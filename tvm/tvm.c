@@ -2007,6 +2007,17 @@ struct task_relocations {
 #define MAX_FILES 1024
 #define MAX_SIGNALS 32
 #define MAX_TIMERS_PER_TASK 8
+
+// Snapshot of the host process's signal handlers as they were when tvm_init()
+// ran, i.e. before TVM installed its own. Used only to chain hardware faults
+// that arrive on threads with no VM identity (the embedding runtime's own
+// threads — ART/Dart/Flutter) back to whoever owned the signal first. ART in
+// particular takes controlled SIGSEGVs (GC / JIT implicit null checks) that its
+// handler resolves; treating those as fatal would kill the whole host app.
+// Kept separate from any task's tsk_sighandlers[], which guest sigaction() calls
+// mutate, so this stays the immutable original host disposition.
+static struct sigaction host_sighandlers[MAX_SIGNALS];
+static int host_sighandlers_captured;
 #define MAX_VIRTUAL_TIMERS 256
 
 #define TS_ZOMBIE  0x1
@@ -3413,15 +3424,19 @@ void init_file_stream_fp()
     int devnull = CALL_FUNC(open, "/dev/null", O_RDONLY);
     VERIFY(devnull != -1);
 
-    int fd123;
-    VERIFY(123 == (fd123 = CALL_FUNC(fcntl, devnull, F_DUPFD, 123)));
+    // Dup to a high fd so the probe value below is distinctive, but do NOT
+    // assume it lands on exactly 123: F_DUPFD returns the lowest free fd >=
+    // the hint, and 123 may already be in use when TVM is embedded in a busy
+    // host process (e.g. the flutter app). Use whatever fd we actually get.
+    int probefd;
+    VERIFY(-1 != (probefd = CALL_FUNC(fcntl, devnull, F_DUPFD, 123)));
 
-    FILE *fp123;
-    VERIFY(NULL != (fp123 = CALL_FUNC(fdopen, fd123, "r")));
-    VERIFY(CALL_FUNC(fileno, fp123) == 123);
+    FILE *fpp;
+    VERIFY(NULL != (fpp = CALL_FUNC(fdopen, probefd, "r")));
+    VERIFY(CALL_FUNC(fileno, fpp) == probefd);
 
     for (int i = 0; i < 128; i += sizeof(FILE_FD_TYPE)) {
-        if (*(FILE_FD_TYPE *)((uintptr_t)fp123 + i) == 123) {
+        if (*(FILE_FD_TYPE *)((uintptr_t)fpp + i) == probefd) {
             filep_fd_offset = i;
             break;
         }
@@ -3430,12 +3445,12 @@ void init_file_stream_fp()
     //INFO("filep_fd_offset %d (size %zu)", filep_fd_offset, sizeof(FILE_FD_TYPE));
     // make sure we found offset of FILE->fd
     VERIFY(filep_fd_offset != -1);
-    fp_setfileno(fp123, 21235);
-    VERIFY(CALL_FUNC(fileno, fp123) == 21235);
-    fp_setfileno(fp123, 123);
-    VERIFY(CALL_FUNC(fileno, fp123) == 123);
+    fp_setfileno(fpp, 21235);
+    VERIFY(CALL_FUNC(fileno, fpp) == 21235);
+    fp_setfileno(fpp, probefd);
+    VERIFY(CALL_FUNC(fileno, fpp) == probefd);
 
-    VERIFY(0 == CALL_FUNC(fclose, fp123));
+    VERIFY(0 == CALL_FUNC(fclose, fpp));
     VERIFY(0 == CALL_FUNC(close, devnull));
 }
 
@@ -3450,18 +3465,32 @@ void dp_setfileno(DIR *dp, int fd) {
 
 void init_file_stream_dp()
 {
-    int dev = CALL_FUNC(open, "/", O_RDONLY | O_DIRECTORY);
+    // Any openable directory works — we only need it to probe the DIR fd
+    // offset. "/" is fine on Linux/macOS/iOS, but an Android app runs in the
+    // untrusted_app SELinux domain, which denies opening the rootfs directory.
+    // Fall back to dirs the process is guaranteed to reach (its own sandbox via
+    // HOME/TMPDIR, then /proc/self). "/" stays first so nothing else changes.
+    const char *dcands[] = {"/", getenv("TMPDIR"), getenv("HOME"), "/proc/self"};
+    int dev = -1;
+    for (unsigned di = 0; di < sizeof(dcands) / sizeof(dcands[0]); di++) {
+        if (!dcands[di] || !dcands[di][0])
+            continue;
+        dev = CALL_FUNC(open, dcands[di], O_RDONLY | O_DIRECTORY);
+        if (dev != -1)
+            break;
+    }
     VERIFY(dev != -1);
 
-    int fd123;
-    VERIFY(123 == (fd123 = CALL_FUNC(fcntl, dev, F_DUPFD, 123)));
+    // See init_file_stream_fp: don't assume the dup lands on exactly 123.
+    int probefd;
+    VERIFY(-1 != (probefd = CALL_FUNC(fcntl, dev, F_DUPFD, 123)));
 
-    DIR *dp123;
-    VERIFY(NULL != (dp123 = CALL_FUNC(fdopendir, fd123)));
-    VERIFY(CALL_FUNC(dirfd, dp123) == 123);
+    DIR *dpp;
+    VERIFY(NULL != (dpp = CALL_FUNC(fdopendir, probefd)));
+    VERIFY(CALL_FUNC(dirfd, dpp) == probefd);
 
     for (int i = 0; i < 128; i += sizeof(DIR_FD_TYPE)) {
-        if (*(FILE_FD_TYPE *)((uintptr_t)dp123 + i) == 123) {
+        if (*(FILE_FD_TYPE *)((uintptr_t)dpp + i) == probefd) {
             dirp_fd_offset = i;
             break;
         }
@@ -3470,12 +3499,12 @@ void init_file_stream_dp()
     //INFO("dirp_fd_offset %d (size %zu)", dirp_fd_offset, sizeof(DIR_FD_TYPE));
     // make sure we found offset of DIR->fd
     VERIFY(dirp_fd_offset != -1);
-    dp_setfileno(dp123, 21235);
-    VERIFY(CALL_FUNC(dirfd, dp123) == 21235);
-    dp_setfileno(dp123, 123);
-    VERIFY(CALL_FUNC(dirfd, dp123) == 123);
+    dp_setfileno(dpp, 21235);
+    VERIFY(CALL_FUNC(dirfd, dpp) == 21235);
+    dp_setfileno(dpp, probefd);
+    VERIFY(CALL_FUNC(dirfd, dpp) == probefd);
 
-    VERIFY(0 == CALL_FUNC(closedir, dp123));
+    VERIFY(0 == CALL_FUNC(closedir, dpp));
     VERIFY(0 == CALL_FUNC(close, dev));
 }
 
@@ -4056,12 +4085,31 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
                       (signum == SIGSEGV || signum == SIGBUS ||
                        signum == SIGILL || signum == SIGFPE);
         if (hwfault) {
-            // Synchronous kernel fault: returning would re-execute the
-            // instruction and loop forever, so die deterministically inside
-            // the handler, by the kernel's hand (correct termination status +
-            // core dump).  Never return-and-reexecute — racy (the address may
-            // have become mapped meanwhile), and surviving would leave this
-            // handler uninstalled process-wide.
+            // The faulting thread belongs to the embedding runtime, not TVM.
+            // If that runtime installed the handler for this signal before
+            // tvm_init (ART/Dart use SIGSEGV for GC / JIT implicit null checks
+            // and resolve the fault in their own handler), chain to it — TVM
+            // overwrote it, but the fault is theirs to service. Without this a
+            // routine ART SIGSEGV during GC/JIT warmup kills the whole app.
+            if (host_sighandlers_captured) {
+                struct sigaction *h = &host_sighandlers[signum];
+                void *fn = (h->sa_flags & SA_SIGINFO) ? (void *)h->sa_sigaction
+                                                      : (void *)h->sa_handler;
+                if (fn && fn != (void *)SIG_DFL && fn != (void *)SIG_IGN) {
+                    if (h->sa_flags & SA_SIGINFO)
+                        h->sa_sigaction(signum, siginfo, ucontext);
+                    else
+                        h->sa_handler(signum);
+                    return;
+                }
+            }
+            // No host handler owned it: synchronous kernel fault, returning
+            // would re-execute the instruction and loop forever, so die
+            // deterministically inside the handler, by the kernel's hand
+            // (correct termination status + core dump).  Never
+            // return-and-reexecute — racy (the address may have become mapped
+            // meanwhile), and surviving would leave this handler uninstalled
+            // process-wide.
             struct sigaction dfl = { .sa_handler = SIG_DFL };
             CALL_FUNC(sigaction, signum, &dfl, NULL);
             sigset_t unblk;
@@ -4133,7 +4181,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             // or glibc's stack_cache_lock). Print the faulting instruction
             // pointer + a few caller return addresses read straight from the
             // trapped frame (via safeio, fault-safe) and _exit immediately.
-            unsigned long fault_pc = 0, fault_bp = 0, fault_sp = 0;
+            unsigned long fault_pc = 0, fault_bp = 0, fault_sp = 0, fault_lr = 0;
 #if defined(__linux__) && defined(__x86_64__)
             if (ucontext) {
                 // glibc x86_64 gregs indices (avoid REG_* macros / greg_t which
@@ -4143,10 +4191,32 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
                 fault_sp = (unsigned long)gr[15];
                 fault_pc = (unsigned long)gr[16];
             }
+#elif defined(__linux__) && defined(__aarch64__)
+            if (ucontext) {
+                mcontext_t *mc = &((ucontext_t *)ucontext)->uc_mcontext;
+                fault_pc = (unsigned long)mc->pc;
+                fault_sp = (unsigned long)mc->sp;
+                fault_bp = (unsigned long)mc->regs[29];
+                fault_lr = (unsigned long)mc->regs[30];
+            }
+            {
+                // Walk the AAPCS frame chain (x29 -> [saved fp, saved lr]) for a
+                // few callers so we can symbolize which TVM code jumped through a
+                // corrupted pointer. Bounded + fault-tolerant (fp==0 stops).
+                unsigned long fp = fault_bp;
+                for (int d = 0; d < 8 && fp; d++) {
+                    unsigned long *frame = (unsigned long *)fp;
+                    unsigned long lr = frame[1];
+                    INFO("HWFRAME[%d] lr=0x%lx", d, lr);
+                    unsigned long nfp = frame[0];
+                    if (nfp <= fp) break;
+                    fp = nfp;
+                }
+            }
 #endif
             (void)fault_sp;
-            INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d in_emu=%d sigblk=%d emu_depth=%d",
-                 signum, siginfo->si_addr, fault_pc, fault_bp, fault_sp, siginfo->si_code,
+            INFO("HWFAULT signum=%d at %p pc=0x%lx lr=0x%lx bp=0x%lx sp=0x%lx si_code=%d in_emu=%d sigblk=%d emu_depth=%d",
+                 signum, siginfo->si_addr, fault_pc, fault_lr, fault_bp, fault_sp, siginfo->si_code,
                  tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
             CALL_FUNC(_exit, 139);
             __builtin_unreachable();
@@ -9742,12 +9812,17 @@ void tvm_init(const char *init_comm)
 
     for (int i = 0; i < MAX_SIGNALS; i++) {
         if (0 == CALL_FUNC(sigaction, i, NULL, current->tsk_sighandlers + i)) {
+            // Immutable snapshot of the host's original disposition, for
+            // chaining faults from the embedding runtime's own threads (see
+            // host_sighandlers). Captured before TVM overwrites the handler.
+            host_sighandlers[i] = current->tsk_sighandlers[i];
             if (i == SIGKILL || i == SIGSTOP)
                 continue;
             if (0 != CALL_FUNC(sigaction, i, &act, NULL))
                 panic("sigaction(%d): %s", i, strerror(errno));
         }
     }
+    host_sighandlers_captured = 1;
 
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
 

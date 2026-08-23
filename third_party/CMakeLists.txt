@@ -192,15 +192,21 @@ char *getpass(const char *);
     )
     set(DROPBEAR_MAKE_CFLAGS "-include ${CMAKE_CURRENT_BINARY_DIR}/dropbear_android_compat.h")
     set(DROPBEAR_MAKE_LDFLAGS "LDFLAGS=-pie ${DROPBEAR_BUILD}/dropbear_android_stubs.o")
-    # Two android-only localoptions appended to the shared file:
+    # Three android-only localoptions appended to the shared file:
     #  - USE_DEV_PTMX: Bionic PTY allocation goes through /dev/ptmx (no libutil
     #    openpty on the target API in android2's port).
     #  - COMPAT_USER_SHELLS: bionic has no getusershell, so dropbear uses its
     #    bundled compat one, which reads /etc/shells (absent on the android
     #    host) then falls back to this list. TVM's login shell is /tvm/bin/sh,
     #    so it must be here or every login is "invalid shell, rejected".
+    #  - DROPBEAR_SVR_MULTIUSER 0: privilege separation via seteuid/setegid (to
+    #    read authorized_keys as the auth user, svr-authpubkey.c) is impossible
+    #    here — the android app sandbox is single-uid, and its seccomp filter
+    #    SIGSYS-traps seteuid outright, so every pubkey attempt would "Exit
+    #    before auth: Failed to set euid". Session-exec setuid is already gated
+    #    on getuid()==0; disabling MULTIUSER drops the remaining seteuid dance.
     set(DROPBEAR_LOCALOPTIONS_CMD sh -c
-        "cat ${THIRDPARTY_SRC}/dropbear/localoptions.h > ${DROPBEAR_BUILD}/localoptions.h && printf '#define USE_DEV_PTMX 1\\n#define COMPAT_USER_SHELLS \"/tvm/bin/sh\",\"/bin/sh\"\\n' >> ${DROPBEAR_BUILD}/localoptions.h && ${TVM_CC} -g -c ${CMAKE_CURRENT_BINARY_DIR}/dropbear_android_stubs.c -o ${DROPBEAR_BUILD}/dropbear_android_stubs.o")
+        "cat ${THIRDPARTY_SRC}/dropbear/localoptions.h > ${DROPBEAR_BUILD}/localoptions.h && printf '#define USE_DEV_PTMX 1\\n#define COMPAT_USER_SHELLS \"/tvm/bin/sh\",\"/bin/sh\"\\n#define DROPBEAR_SVR_MULTIUSER 0\\n' >> ${DROPBEAR_BUILD}/localoptions.h && ${TVM_CC} -g -c ${CMAKE_CURRENT_BINARY_DIR}/dropbear_android_stubs.c -o ${DROPBEAR_BUILD}/dropbear_android_stubs.o")
 endif()
 
 ExternalProject_Add(dropbear_ext
@@ -220,7 +226,15 @@ ExternalProject_Add(dropbear_ext
 add_custom_target(dropbear_exe DEPENDS dropbear_ext)
 set_target_properties(dropbear_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+# On android the crypt()/getpass() stubs are their own object (linked into the
+# -pie executable via LDFLAGS); the shared lib globs only obj/*.o, so add the
+# stub explicitly or ulinker fails to resolve getpass when loading libdropbear.so.
+set(DROPBEAR_SHARED_EXTRA)
+if(ANDROID)
+    set(DROPBEAR_SHARED_EXTRA ${DROPBEAR_BUILD}/dropbear_android_stubs.o)
+endif()
 add_shared_lib(dropbear "obj/*.o"
+    ${DROPBEAR_SHARED_EXTRA}
     ${DROPBEAR_BUILD}/libtomcrypt/libtomcrypt.a
     ${DROPBEAR_BUILD}/libtommath/libtommath.a -lz
 )

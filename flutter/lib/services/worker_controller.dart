@@ -162,11 +162,15 @@ class WorkerController {
     throw UnsupportedError('unsupported abi: $abi');
   }
 
-  // Single log sink: the in-app console UI, plus real stderr (fd 2). On Apple
-  // `devicectl --console` captures fd 2 on a fresh launch; on android the same
-  // stderr shows in logcat, which the adb-flutter test backend tails.
+  // Single log sink: the in-app console UI, plus real stderr (fd 2) on Apple,
+  // where `devicectl --console` captures fd 2 on a fresh launch. On android the
+  // native side mirrors output to logcat directly (__android_log_write, tag
+  // "tvm"), and it also redirects the process fd 1/2 onto the log pipe so the
+  // programs' own stdout/stderr reach logcat — so writing here to stderr would
+  // both be redundant and feed straight back into the reader, an infinite loop.
   void _log(String line) {
     logs.value = [...logs.value, line];
+    if (Platform.isAndroid) return;
     try {
       stderr.writeln(line);
     } catch (_) {}

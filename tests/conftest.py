@@ -86,17 +86,23 @@ def _android_app_user(serial, pkg="com.yuvalino.tvm"):
     dropbear-in-TVM runs as the app's uid, and single-user mode only permits
     logging in as that user."""
     adb = ["adb"] + (["-s", serial] if serial else [])
-    try:
-        out = subprocess.run(adb + ["shell", "dumpsys", "package", pkg],
-                             capture_output=True, text=True, timeout=15).stdout
-    except Exception:
-        return None
     import re
-    m = re.search(r"userId=(\d+)", out)
-    if not m:
-        return None
-    uid = int(m.group(1))
-    if 10000 <= uid <= 19999:
+
+    def _uid_from(args, pat):
+        try:
+            out = subprocess.run(adb + args, capture_output=True, text=True,
+                                 timeout=15).stdout
+        except Exception:
+            return None
+        m = re.search(pat, out)
+        return int(m.group(1)) if m else None
+
+    # `pm list packages -U` is the most portable ("package:<pkg> uid:<n>");
+    # some OEM builds (e.g. Samsung) omit "userId=" from `dumpsys package`.
+    uid = (_uid_from(["shell", "pm", "list", "packages", "-U", pkg],
+                     rf"{re.escape(pkg)}\s+uid:(\d+)")
+           or _uid_from(["shell", "dumpsys", "package", pkg], r"userId=(\d+)"))
+    if uid is not None and 10000 <= uid <= 19999:
         return f"u0_a{uid - 10000}"
     return None
 
