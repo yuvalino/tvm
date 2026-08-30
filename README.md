@@ -77,12 +77,12 @@ iOS, `tvm.app` on macOS) — use that path, consistent with the rest of the
 ### Running on an iOS device
 
 The device must be paired/trusted (over USB once, then usable over the network
-tunnel). Use `xcrun devicectl` with the device name (e.g. `pan1c`):
+tunnel). Use `xcrun devicectl` with the device name:
 
 ```sh
-xcrun devicectl device install app --device pan1c output/ios-arm64/lib/flutter
-xcrun devicectl device process launch --device pan1c com.yuvalino.tvm
-# then: ssh -p 2222 mobile@pan1c.local   (default password: alpine)
+xcrun devicectl device install app --device <device-name> output/ios-arm64/lib/flutter
+xcrun devicectl device process launch --device <device-name> com.yuvalino.tvm
+# then: ssh -p 2222 mobile@<device-name>.local   (default password: alpine)
 ```
 
 Signing note: the Runner target is pinned to a development team, and
@@ -97,7 +97,7 @@ to real `stderr` (fd 2). To see them from your Mac, launch with
 
 ```sh
 xcrun devicectl device process launch --terminate-existing --console \
-    --device pan1c com.yuvalino.tvm
+    --device <device-name> com.yuvalino.tvm
 ```
 
 **`--terminate-existing` is required.** devicectl only connects the app's
@@ -108,7 +108,7 @@ A plain launch, or `--console` while the app is already up, shows nothing.
 
 ```sh
 # Runs the integration suite against the app's SSH server on the device.
-pytest tests/test_integration.py --device pan1c --backend flutter
+pytest tests/test_integration.py --device <device-name> --backend flutter
 ```
 
 ## Programs

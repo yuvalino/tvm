@@ -4,13 +4,13 @@ Flutter frontend for TVM (TembleOS Virtual Machine). Provides a console UI with 
 
 ## Building
 
-All builds use `ghcr.io/yuvalino/flutter-xc2-ndk:latest` — a self-contained image with Flutter 3.41.7, xcbuild2, Xcode SDK, LLVM toolchain, Swift, Android SDK/NDK, and signing credentials.
+All builds use `ghcr.io/yuvalino/flutter-xc2-ndk:latest` — a self-contained image with Flutter 3.41.7, xcbuild2, Xcode SDK, LLVM toolchain, Swift, and Android SDK/NDK.
 
 ### iOS
 
 ```bash
 # From WSL (copy to Linux filesystem for speed)
-cp -r /mnt/c/Users/Yuval/Development/tvm-flutter ~/Development/tvm-flutter
+cp -r /path/to/tvm-flutter ~/Development/tvm-flutter
 cd ~/Development/tvm-flutter
 
 docker run --rm --user "$(id -u):$(id -g)" \
