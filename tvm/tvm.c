@@ -450,6 +450,7 @@ DECL_FUNC(verrx);
 
 DECL_FUNC(getpid);
 DECL_FUNC(getppid);
+DECL_FUNC(umask);
 
 DECL_FUNC(fork);
 DECL_FUNC(wait);
@@ -1756,6 +1757,7 @@ struct task {
     int tsk_timers[MAX_TIMERS_PER_TASK]; // indices into vtimers[], -1 = unused
     int tsk_itimer_real; // tsk_timers[] index for ITIMER_REAL, -1 = unset
     struct thread *tsk_exiting_thread; // thread running terminate_current_locked; written under tasks_lock+tsk_lock, read with __atomic (lock-free checks in tvm_sig_leave/waitpid)
+    mode_t tsk_umask; // per-task umask (real umask is process-wide, can't share across tasks)
 };
 
 struct thread {
@@ -2172,6 +2174,7 @@ static struct task *taskalloc()
 
     t->tsk_cwd[0] = 0;
     strncpy(t->tsk_cwd, current->tsk_cwd, sizeof(t->tsk_cwd));
+    t->tsk_umask = current->tsk_umask;
 
     ret = t;
 
@@ -8945,6 +8948,16 @@ static void initrc_cmd_mkdir(const char *arg)
     }
 }
 
+static void initrc_cmd_umask(const char *arg)
+{
+    char expanded[64];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+    unsigned mask = 0;
+    for (const char *p = expanded; *p >= '0' && *p <= '7'; p++)
+        mask = (mask << 3) | (*p - '0');
+    current->tsk_umask = mask;
+}
+
 static struct {
     const char *name;
     void (*handler)(const char *arg);
@@ -8954,6 +8967,7 @@ static struct {
     { "setenv?", initrc_cmd_setenv_default },
     { "echo",    initrc_cmd_echo },
     { "mkdir",   initrc_cmd_mkdir },
+    { "umask",   initrc_cmd_umask },
     { NULL, NULL }
 };
 
@@ -9321,6 +9335,8 @@ void tvm_init(const char *init_comm)
     main_task = current;
     current->tsk_pid = __gettid();
     current->tsk_sid = current->tsk_pgid = current->tsk_pid;
+    current->tsk_umask = 022;
+    CALL_FUNC(umask, 0); // real umask=0; per-task tsk_umask applied in interposed open/mkdir
 
     current->tsk_data = rmem_arena_alloc(current->tsk_ar, sizeof(*current->tsk_data));
     if (!current->tsk_data)
@@ -10403,7 +10419,10 @@ FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags)
     mode_t mode = va_arg(__ap, int);
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(openat, dirfd, pathname, flags, mode);
-    
+
+    if (flags & O_CREAT)
+        mode &= ~current->tsk_umask;
+
     char pathname_abs[PATH_MAX];
     if (dirfd == AT_FDCWD) {
         if (!normalize_path(NULL, pathname, pathname_abs))
@@ -11510,7 +11529,7 @@ FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
         return -1;
     pathname = pathname_abs;
 
-    return CALL_FUNC(mkdir, pathname, mode);
+    return CALL_FUNC(mkdir, pathname, mode & ~current->tsk_umask);
 }
 
 FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode) {
@@ -12546,6 +12565,12 @@ FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
 
 FUNCTION_DEFINE0(pid_t, getpid) {
     return current->tsk_pid;
+}
+
+FUNCTION_DEFINE1(mode_t, umask, mode_t, mask) {
+    mode_t old = current->tsk_umask;
+    current->tsk_umask = mask & 0777;
+    return old;
 }
 
 FUNCTION_DEFINE0(pid_t, getppid) {
