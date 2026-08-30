@@ -16,3 +16,11 @@ scp_src
 scp_dst
 scp_large_src
 scp_large_dst
+*.ipsw
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.imcp

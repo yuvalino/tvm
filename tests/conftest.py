@@ -7,7 +7,7 @@ def pytest_addoption(parser):
     parser.addoption("--backend", default="tvm", choices=["tvm", "flutter"],
                      help="TVM backend: 'tvm' (standalone) or 'flutter' (app)")
     parser.addoption("--device", default=None,
-                     help="Target device hostname (e.g. pan1c.local). "
+                     help="Target device hostname (e.g. my-device.local). "
                           "If set, defaults backend to 'flutter' and deploys via devicectl.")
 
 
