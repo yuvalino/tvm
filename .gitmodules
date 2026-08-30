@@ -6,10 +6,10 @@
 	url = git@github.com:yuvalino/dropbear-forkless.git
 [submodule "third_party/mksh"]
 	path = third_party/mksh
-	url = git@github.com:yuvalino/mksh-forkless.git
+	url = https://github.com/MirBSD/mksh.git
 [submodule "third_party/toybox"]
 	path = third_party/toybox
-	url = git@github.com:yuvalino/toybox-forkless.git
+	url = https://github.com/landley/toybox.git
 [submodule "third_party/vim"]
 	path = third_party/vim
 	url = https://github.com/vim/vim.git
