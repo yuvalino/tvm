@@ -1,3 +1,4 @@
 setenv TVM_SHELL=/tvm/bin/sh
-setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib
+setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:libsftpserver.dylib
+mkdir $HOME/.dropbear
 echo TVM initialized

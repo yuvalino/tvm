@@ -8930,6 +8930,21 @@ static void initrc_cmd_echo(const char *arg)
     INFO("initrc: %s", expanded);
 }
 
+static void initrc_cmd_mkdir(const char *arg)
+{
+    char expanded[4096];
+    initrc_expand_vars(arg, expanded, sizeof(expanded));
+    char *p = expanded;
+    while (*p) {
+        p += strspn(p, "/");
+        p += strcspn(p, "/");
+        char saved = *p;
+        *p = '\0';
+        mkdir(expanded, 0755);
+        *p = saved;
+    }
+}
+
 static struct {
     const char *name;
     void (*handler)(const char *arg);
@@ -8938,6 +8953,7 @@ static struct {
     { "setenv",  initrc_cmd_setenv },
     { "setenv?", initrc_cmd_setenv_default },
     { "echo",    initrc_cmd_echo },
+    { "mkdir",   initrc_cmd_mkdir },
     { NULL, NULL }
 };
 
