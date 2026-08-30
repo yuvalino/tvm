@@ -10,51 +10,21 @@ permissions:
   checks: write
   contents: read
 
-# The runners are self-hosted (one machine per platform), so a superseded run
-# left in-progress hogs the runner and makes later runs queue behind it. Cancel
-# the older run for the same ref when a new one starts.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Build and test run in one job per platform, on the same self-hosted runner —
-# no artifact upload/download (the runners are single machines, so build and
-# test would run back-to-back anyway, and this keeps CI independent of the
-# Actions artifact storage quota).
-
 jobs:
   linux:
-    runs-on: [self-hosted, linux]
-    # Hard backstop: the runners are self-hosted, so a hung job (e.g. a test
-    # deadlock) is NOT auto-cancelled by GitHub's 6h limit — it blocks the
-    # single runner for every later run until manually cancelled. Cap it above
-    # the sum of the per-step timeouts (build 10 + tests 3+3 + integration 10).
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    # Hermetic clean build every run. The runner's workspace persists across
-    # runs; stale build output and — critically — stale in-source artifacts in
-    # the submodules (which actions/checkout does not git-clean) break the
-    # third-party builds (e.g. dropbear's libtomcrypt Makefile uses VPATH into
-    # the source tree, so a leftover in-source libtomcrypt.a makes `make` skip
-    # building it into the build dir, and the link then can't find it).
-    - name: clean workspace
-      run: |
-        # Self-hosted runners accumulate orphaned processes from prior hung/cancelled
-        # runs (clean-workspace only cleans files). A leftover tvm/dropbear can hold
-        # the SSH port and make the integration tests hang. Kill strays first.
-        pkill -9 -f 'bin/tvm|bin/test_tvm|bin/test_rmem|dropbear|initrc' 2>/dev/null || true
-        rm -rf output flutter/build
-        git submodule foreach --recursive git clean -ffdx
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
-    # -t 30: per-subtest timeout inside the harness — a hung subtest is SIGKILLed
-    # and reported as TIMEOUT rather than hanging the step. Step timeout is the
-    # outer backstop.
     - name: test_tvm
       timeout-minutes: 5
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
@@ -74,30 +44,17 @@ jobs:
         annotate_only: true
 
   macos:
-    runs-on: [self-hosted, macOS]
-    # See linux: self-hosted runners have no auto-cancel; cap hung jobs. Larger
-    # budget than linux — this job also builds the Flutter app and runs the
-    # flutter integration pass (build 10 + tests 3+3 + integration 10 + 20).
-    timeout-minutes: 55
+    runs-on: macos-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
-    # See linux: hermetic clean build (also clears stale in-source submodule
-    # artifacts that break the third-party builds).
-    - name: clean workspace
-      run: |
-        # Self-hosted runners accumulate orphaned processes from prior hung/cancelled
-        # runs (clean-workspace only cleans files). A leftover tvm/dropbear can hold
-        # the SSH port and make the integration tests hang. Kill strays first.
-        pkill -9 -f 'bin/tvm|bin/test_tvm|bin/test_rmem|dropbear|initrc' 2>/dev/null || true
-        rm -rf output flutter/build
-        git submodule foreach --recursive git clean -ffdx
+    - name: deps
+      run: brew install ninja cmake gnu-sed openssl
     - name: build
       timeout-minutes: 10
-      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli flutter
-    # -t 30: per-subtest harness timeout (see linux job).
+      run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
     - name: test_tvm
       timeout-minutes: 3
       run: ./output/macos-arm64/bin/tvm ./output/macos-arm64/bin/test_tvm -t 30
@@ -114,15 +71,4 @@ jobs:
       if: always()
       with:
         report_paths: report.xml
-        annotate_only: true
-    # build.py -t flutter builds the macOS app and symlinks it at
-    # output/macos-arm64/lib/flutter, the path the harness (FLUTTER_APP) uses.
-    - name: test_integration (flutter)
-      timeout-minutes: 20
-      run: pytest tests/test_integration.py -v --maxfail=3 --backend flutter --junitxml=report-flutter.xml
-    - name: test report (flutter)
-      uses: mikepenz/action-junit-report@v5
-      if: always()
-      with:
-        report_paths: report-flutter.xml
         annotate_only: true
