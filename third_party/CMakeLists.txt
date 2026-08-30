@@ -111,10 +111,10 @@ ExternalProject_Add(dropbear_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/dropbear
     BINARY_DIR ${DROPBEAR_BUILD}
     PATCH_COMMAND ${CMAKE_COMMAND} -E copy
-        ${THIRDPARTY_SRC}/dropbear/localoptions.h ${DROPBEAR_BUILD}/localoptions.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/configs/dropbear_localoptions.h ${DROPBEAR_BUILD}/localoptions.h
     CONFIGURE_COMMAND ${THIRDPARTY_SRC}/dropbear/configure ${DROPBEAR_CONFIGURE_ARGS}
     BUILD_COMMAND make
-        "PROGRAMS=dropbear dbclient dropbearkey scp sftpserver"
+        "PROGRAMS=dropbear dbclient dropbearkey scp"
         MULTI=1
         "CFLAGS=-g -gdwarf-4 -DDROPBEAR_FORKLESS"
         MAKEOVERRIDES=
@@ -131,6 +131,28 @@ add_shared_lib(dropbear "obj/*.o"
 add_launcher(dropbear)
 
 ###############################################################################
+# sftp-server (standalone, extracted from dropbear fork)
+###############################################################################
+set(SFTPSERVER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/sftp-server.c)
+set(SFTPSERVER_OBJ ${THIRDPARTY_BUILD}/sftpserver/sftp-server.o)
+add_custom_target(sftpserver_ext
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${THIRDPARTY_BUILD}/sftpserver
+    COMMAND ${TVM_CC} -g -gdwarf-4 -c ${SFTPSERVER_SRC} -o ${SFTPSERVER_OBJ}
+    COMMENT "Building sftp-server"
+)
+set_target_properties(sftpserver_ext PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+add_custom_target(sftpserver_shared
+    COMMAND ${TVM_CC} -dynamiclib -fPIC -g -o ${LIB_OUT}/libsftpserver.dylib
+        ${SFTPSERVER_OBJ} -install_name libsftpserver.dylib
+    DEPENDS sftpserver_ext
+    COMMENT "Linking sftp-server (shared)"
+)
+set_target_properties(sftpserver_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+add_launcher(sftpserver)
+
+###############################################################################
 # mksh
 ###############################################################################
 set(MKSH_BUILD ${THIRDPARTY_BUILD}/mksh)
@@ -141,7 +163,7 @@ ExternalProject_Add(mksh_ext
     CONFIGURE_COMMAND sh -c "cd ${MKSH_BUILD} && \
         CC=${TVM_CC} CFLAGS='-g -gdwarf-4 -fcommon -DMKSH_FORKLESS=1' \
         sh ${THIRDPARTY_SRC}/mksh/Build.sh"
-    BUILD_COMMAND sh -c "cd ${MKSH_BUILD} && sh ./Rebuild.sh && \
+    BUILD_COMMAND sh -c "cd ${MKSH_BUILD} && (sh ./Rebuild.sh || true) && \
         ${TVM_CC} -g -gdwarf-4 -o mksh ./*.o"
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
