@@ -9528,19 +9528,15 @@ static void __panic(const char *msg, const char *file, int line)
     struct tvm_tls *__tls = TVM_TLS_PEEK();
     struct task *cur = __tls ? __tls->tls_current : NULL;
 
-    CALL_FUNC(fprintf, stderr, "\n");
-    CALL_FUNC(fprintf, stderr, "panic(caller pid %d tid %d): \"%s\"\n", (cur?cur->tsk_pid:-1), __gettid(), msg);
-    CALL_FUNC(fprintf, stderr, "%s:%d\n\n", file, line);
-
-    CALL_FUNC(fprintf, stderr, "Thread Info:\n");
-    CALL_FUNC(fprintf, stderr, " ppid: %d\n", (cur?(cur->tsk_parent?cur->tsk_parent->tsk_pid:1):-1));
-    CALL_FUNC(fprintf, stderr, " host pid: %d\n", CALL_FUNC(getpid));
-    CALL_FUNC(fprintf, stderr, " current: %p\n", cur);
-    CALL_FUNC(fprintf, stderr, " main_task: %p\n", main_task);
-    CALL_FUNC(fprintf, stderr, " errno: %d (%s)\n", errno, strerror(errno));
-    CALL_FUNC(fprintf, stderr, "\n");
-
-    CALL_FUNC(fprintf, stderr, "Stacktrace:\n");
+    INFO("panic(caller pid %d tid %d): \"%s\"", (cur?cur->tsk_pid:-1), __gettid(), msg);
+    INFO("%s:%d", file, line);
+    INFO("Thread Info:");
+    INFO(" ppid: %d", (cur?(cur->tsk_parent?cur->tsk_parent->tsk_pid:1):-1));
+    INFO(" host pid: %d", CALL_FUNC(getpid));
+    INFO(" current: %p", cur);
+    INFO(" main_task: %p", main_task);
+    INFO(" errno: %d (%s)", errno, strerror(errno));
+    INFO("Stacktrace:");
     dump_stacktrace();
 
     CALL_FUNC(raise, SIGABRT);
