@@ -9683,23 +9683,16 @@ FUNCTION_DEFINE1(int, dirfd, DIR *, dir) {
 /**
  * returns 0 on error
  */
-static int fmode_to_flags(const char *mode)
+static int fmode_to_flags(const char *mode, int *out)
 {
-    if (strcmp(mode, "r") == 0)
-        return O_RDONLY;
-    if (strcmp(mode, "r+") == 0)
-        return O_RDWR;
-    if (strcmp(mode, "w") == 0)
-        return O_CREAT | O_WRONLY | O_TRUNC;
-    if (strcmp(mode, "w+") == 0)
-        return O_CREAT | O_RDWR | O_TRUNC;
-    if (strcmp(mode, "a") == 0)
-        return O_CREAT | O_WRONLY | O_APPEND;
-    if (strcmp(mode, "a+") == 0)
-        return O_CREAT | O_RDWR | O_APPEND;
-
+    if (strcmp(mode, "r") == 0)  { *out = O_RDONLY; return 0; }
+    if (strcmp(mode, "r+") == 0) { *out = O_RDWR; return 0; }
+    if (strcmp(mode, "w") == 0)  { *out = O_CREAT | O_WRONLY | O_TRUNC; return 0; }
+    if (strcmp(mode, "w+") == 0) { *out = O_CREAT | O_RDWR | O_TRUNC; return 0; }
+    if (strcmp(mode, "a") == 0)  { *out = O_CREAT | O_WRONLY | O_APPEND; return 0; }
+    if (strcmp(mode, "a+") == 0) { *out = O_CREAT | O_RDWR | O_APPEND; return 0; }
     errno = EINVAL;
-    return 0;
+    return -1;
 }
 
 FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
@@ -9711,8 +9704,8 @@ FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
 
     pathname = pathname_abs;
 
-    int flags = fmode_to_flags(mode);
-    if (!flags)
+    int flags;
+    if (fmode_to_flags(mode, &flags))
         return NULL;
 
     int fd = open(pathname, flags, 0666);
@@ -9794,8 +9787,8 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     if (!pathname)
         return NULL;
 
-    int flags = fmode_to_flags(mode);
-    if (!flags)
+    int flags;
+    if (fmode_to_flags(mode, &flags))
         return NULL;
 
     struct file_stream *fs = (struct file_stream *)stream;
