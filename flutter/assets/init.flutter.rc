@@ -1,5 +1,6 @@
 umask 022
 setenv TVM_SHELL=/tvm/bin/sh
+setenv ENV=$HOME/.forklessrc
 setenv? TVM_NOEMU=libdropbear.dylib:libmksh.dylib:libtoybox.dylib:libvim.dylib:libsftpserver.dylib
 mkdir $HOME/.dropbear
 echo TVM initialized
