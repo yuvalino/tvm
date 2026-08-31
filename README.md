@@ -129,10 +129,13 @@ pytest tests/test_integration.py --device <device-name> --backend flutter
 
 | Program | Description |
 |---|---|
-| [dropbear](https://github.com/mkj/dropbear) | SSH server and `scp` |
+| [dropbear](https://github.com/mkj/dropbear) | SSH server, client, and `scp` |
+| sftp-server | Standalone SFTPv3 server (exec'd by dropbear for sftp/scp subsystem) |
 | [mksh](https://github.com/MirBSD/mksh) | MirBSD Korn Shell |
 | [toybox](http://landley.net/toybox/) | Unix utilities (`ls`, `cat`, `grep`, `id`, etc.) |
 | [vim](https://github.com/vim/vim) | Text editor |
+| [unicorn](https://www.unicorn-engine.org/) | CPU emulator (TCI interpreter mode for iOS) |
+| Apple *_cmds | BSD userland from apple-oss-distributions (`ifconfig`, `netstat`, `ps`, `sysctl`, etc.) |
 
 ### Examples (`examples/`)
 
@@ -156,6 +159,8 @@ Commands:
 mount <hostpath>:<guestpath>   # Mount a CPIO archive into the VFS
 setenv <name>=<value>          # Set environment variable (overwrites)
 setenv? <name>=<value>         # Set only if not already set
+mkdir <path>                   # Create directory (mkdir -p semantics)
+umask <mode>                   # Set per-task umask (octal, e.g. 022)
 echo <message>                 # Print to kernel log
 ```
 
