@@ -2103,6 +2103,8 @@ struct dlinfo_macho64 {
     int         dlm64_chainedfixups_imports_format;
     size_t      dlm64_chainedfixups_imports_count;
     void       *dlm64_chainedfixups_imports;
+
+    struct jit_code_entry dlm64_jit_entry;
 };
 
 struct dlinfo_external {
@@ -2535,6 +2537,123 @@ out:
             uo.uo_free(DLPRIVATE(dl), data);
             data = NULL;
         }      
+    }
+    if (fd != -1) {
+        uo.uo_close(DLPRIVATE(dl), fd);
+        fd = -1;
+    }
+    return ret;
+}
+
+int create_macho64_jit_entry(struct dlinfo_macho64 *dl, const char *filename)
+{
+    int ret = -1;
+    int fd = -1;
+    char *data = NULL;
+
+    fd = uo.uo_open(DLPRIVATE(dl), filename);
+    if (-1 == fd) {
+        ERROR("failed to open Mach-O \"%s\": -%d (%s)", filename, errno, strerror(errno));
+        goto out;
+    }
+
+    struct stat statbuf;
+    if (-1 == uo.uo_fstat(DLPRIVATE(dl), fd, &statbuf)) {
+        ERROR("failed to stat Mach-O \"%s\": -%d (%s)", filename, errno, strerror(errno));
+        goto out;
+    }
+
+    data = uo.uo_malloc(DLPRIVATE(dl), statbuf.st_size);
+    if (!data) {
+        ERROR("failed to allocate debug data for Mach-O \"%s\": -%d (%s)", filename, ENOMEM, strerror(ENOMEM));
+        goto out;
+    }
+
+    size_t total_read = 0;
+    while (total_read < statbuf.st_size) {
+        ssize_t current_read = uo.uo_read(DLPRIVATE(dl), fd, data + total_read, statbuf.st_size - total_read);
+        if (current_read == -1 || current_read == 0) {
+            ERROR("failed to read Mach-O \"%s\": -%d (%s)", filename, errno, strerror(errno));
+            goto out;
+        }
+        total_read += current_read;
+    }
+
+    struct mach_header_64 *hdr = (struct mach_header_64 *)data;
+    int64_t bias = (int64_t)dl->dlm64_load_bias;
+
+    // LLDB reads symtab from the buffer for MH_OBJECT, but from process
+    // memory for MH_EXECUTE/MH_DYLIB — same reason ELF uses ET_REL
+    hdr->filetype = MH_OBJECT;
+
+    struct section_64 *debug_line = NULL, *debug_aranges = NULL;
+    struct section_64 *debug_info = NULL, *debug_abbrev = NULL;
+    struct section_64 *debug_ranges = NULL;
+
+    struct load_command *lc = (struct load_command *)(data + sizeof(struct mach_header_64));
+    for (size_t i = 0; i < hdr->ncmds; ++i, lc = (struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *sc = (struct segment_command_64 *)lc;
+
+            if (sc->initprot == 0 && sc->maxprot == 0 && sc->vmaddr == 0)
+                continue;
+
+            sc->vmaddr += bias;
+
+            struct section_64 *sect = (struct section_64 *)((uintptr_t)sc + sizeof(struct segment_command_64));
+            for (uint32_t j = 0; j < sc->nsects; ++j, ++sect) {
+                sect->addr += bias;
+
+                if (0 == strncmp(sect->segname, "__DWARF", 16)) {
+                    if (0 == strncmp(sect->sectname, "__debug_line", 16))
+                        debug_line = sect;
+                    else if (0 == strncmp(sect->sectname, "__debug_aranges", 16))
+                        debug_aranges = sect;
+                    else if (0 == strncmp(sect->sectname, "__debug_info", 16))
+                        debug_info = sect;
+                    else if (0 == strncmp(sect->sectname, "__debug_abbrev", 16))
+                        debug_abbrev = sect;
+                    else if (0 == strncmp(sect->sectname, "__debug_ranges", 16))
+                        debug_ranges = sect;
+                }
+            }
+        }
+
+        if (lc->cmd == LC_SYMTAB) {
+            struct symtab_command *symc = (struct symtab_command *)lc;
+            struct nlist_64 *syms = (struct nlist_64 *)(data + symc->symoff);
+            for (uint32_t j = 0; j < symc->nsyms; ++j) {
+                if (syms[j].n_sect != 0)
+                    syms[j].n_value += bias;
+            }
+        }
+    }
+
+    if (debug_line)
+        dwarf_fixup_debug_line((uint8_t *)(data + debug_line->offset),
+                               debug_line->size, bias);
+    if (debug_aranges)
+        dwarf_fixup_debug_aranges((uint8_t *)(data + debug_aranges->offset),
+                                  debug_aranges->size, bias);
+    if (debug_info && debug_abbrev)
+        dwarf_fixup_debug_info((uint8_t *)(data + debug_info->offset),
+                               debug_info->size,
+                               (uint8_t *)(data + debug_abbrev->offset),
+                               debug_abbrev->size, bias);
+    if (debug_ranges)
+        dwarf_fixup_debug_ranges((uint8_t *)(data + debug_ranges->offset),
+                                 debug_ranges->size, bias, 8);
+
+    dl->dlm64_jit_entry.symfile_addr = data;
+    dl->dlm64_jit_entry.symfile_size = statbuf.st_size;
+    ret = 0;
+
+out:
+    if (ret) {
+        if (data) {
+            uo.uo_free(DLPRIVATE(dl), data);
+            data = NULL;
+        }
     }
     if (fd != -1) {
         uo.uo_close(DLPRIVATE(dl), fd);
@@ -3195,6 +3314,12 @@ out:
 
 static void free_macho64_library(struct dlinfo_macho64 *dl)
 {
+    if (dl->dlm64_jit_entry.symfile_addr) {
+        gdb_jit_unregister(&dl->dlm64_jit_entry);
+        uo.uo_free(DLPRIVATE(dl), (void *)dl->dlm64_jit_entry.symfile_addr);
+        dl->dlm64_jit_entry.symfile_addr = NULL;
+        dl->dlm64_jit_entry.symfile_size = 0;
+    }
     if (DLBASE(dl)->dl_base) {
         uo.uo_munmap(DLPRIVATE(dl), DLBASE(dl)->dl_base, DLBASE(dl)->dl_size);
         DLBASE(dl)->dl_base = NULL;
@@ -3507,6 +3632,9 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             dl->dlm64_chainedfixups_imports_format = dcfhdr->imports_format;
         }
     }
+
+    if (0 == create_macho64_jit_entry(dl, filename))
+        gdb_jit_register(&dl->dlm64_jit_entry);
 
 out:
     if (hdr_mmap != MAP_FAILED) {
