@@ -4000,6 +4000,28 @@ static struct tty *ttyalloc()
     if (-1 == CALL_FUNC(fstat, tt->t_mfd, &st)) {
         goto fail;
     }
+
+#if defined(__APPLE__)
+    // XNU has a bug in their fstat implementation for UNIX sockets (as of Sep, 2026).
+    // Their code allocates an inode when stat is run on the socket for the first time:
+    // ``` bsd/kern/uipc_usrreq.c
+    //   static int
+    //   uipc_sense(struct socket *so, void *ub, int isstat64)
+    //   {
+    //       // ...
+    //       if (unp->unp_ino == 0) {
+    //           unp->unp_ino = unp_ino++;      // XXX: should be `++unp_ino`.
+    //       }
+    // ```
+    // First socket gets `unp_ino`, then increments `unp_ino`. On next call to stat on the same socket, **THE INODE CHANGES**.
+    // It only happens on the first socket after reboot, but its so odd to do it that it happened to me on every stage I demo'd it on a real iPhone.
+    // So for now, we stat twice on Apple products if we get a zero inode and that should fix it.
+
+    if (st.st_ino == 0 && -1 == CALL_FUNC(fstat, tt->t_mfd, &st)) {
+        goto fail;
+    }
+#endif
+    
     tt->t_mfd_ino = st.st_ino;
 
     if (-1 == CALL_FUNC(fstat, tt->t_sfd, &st)) {
