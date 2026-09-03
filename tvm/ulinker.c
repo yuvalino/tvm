@@ -2836,6 +2836,84 @@ static void *lookup_symbol(struct dlinfo *dl, const char *s, int all, struct dli
     return NULL;
 }
 
+static void reverse_lookup_symbol_elf64(struct dlinfo_elf64 *dl, const void *addr,
+                                        const char **out_name, void **out_addr)
+{
+    uintptr_t target = (uintptr_t)addr;
+    uintptr_t best = 0;
+    const char *best_name = NULL;
+
+    if (dl->dle64_shsymtab && dl->dle64_shstrtab) {
+        for (size_t i = 0; i < dl->dle64_shsymtab_size; i++) {
+            Elf64_Sym *sym = &dl->dle64_shsymtab[i];
+            if (sym->st_shndx == SHN_UNDEF || sym->st_value == 0)
+                continue;
+            unsigned char type = ELF64_ST_TYPE(sym->st_info);
+            if (type != STT_FUNC && type != STT_OBJECT && type != STT_NOTYPE)
+                continue;
+            if (sym->st_name >= dl->dle64_shstrtab_size)
+                continue;
+            uintptr_t saddr = dl->dle64_load_bias + sym->st_value;
+            if (saddr <= target && saddr > best) {
+                best = saddr;
+                best_name = dl->dle64_shstrtab + sym->st_name;
+            }
+        }
+    } else if (dl->dle64_gnu_bucket && dl->dle64_gnu_chain) {
+        for (uint32_t b = 0; b < dl->dle64_gnu_nbucket; b++) {
+            uint32_t idx = dl->dle64_gnu_bucket[b];
+            if (idx == 0)
+                continue;
+            do {
+                Elf64_Sym *sym = &dl->dle64_symtab[idx];
+                if (sym->st_shndx != SHN_UNDEF && sym->st_value != 0) {
+                    uintptr_t saddr = dl->dle64_load_bias + sym->st_value;
+                    if (saddr <= target && saddr > best) {
+                        best = saddr;
+                        best_name = string_elf64(dl, sym->st_name);
+                    }
+                }
+            } while ((dl->dle64_gnu_chain[idx++] & 1) == 0);
+        }
+    }
+
+    *out_name = best_name;
+    *out_addr = best_name ? (void *)best : NULL;
+}
+
+static void reverse_lookup_symbol_macho64(struct dlinfo_macho64 *dl, const void *addr,
+                                          const char **out_name, void **out_addr)
+{
+    uintptr_t target = (uintptr_t)addr;
+    uintptr_t best = 0;
+    const char *best_name = NULL;
+
+    if (!dl->dlm64_symtab || !dl->dlm64_strtab)
+        goto out;
+
+    for (size_t i = 0; i < dl->dlm64_symtabsize; i++) {
+        struct nlist_64 *n = &dl->dlm64_symtab[i];
+        if ((n->n_type & 0xe0) != 0)
+            continue;
+        if ((n->n_type & 0x0e) != 0x0e)
+            continue;
+        if (n->n_value == 0 || !n->n_un.n_strx)
+            continue;
+        if (n->n_un.n_strx >= dl->dlm64_strtabsize)
+            continue;
+        uintptr_t saddr = dl->dlm64_load_bias + n->n_value;
+        if (saddr <= target && saddr > best) {
+            best = saddr;
+            const char *name = &dl->dlm64_strtab[n->n_un.n_strx];
+            best_name = (name[0] == '_') ? name + 1 : name;
+        }
+    }
+
+out:
+    *out_name = best_name;
+    *out_addr = best_name ? (void *)best : NULL;
+}
+
 static size_t address_in_library(struct dlinfo *dl, const void *addr) {
     if ((uintptr_t)addr >= (uintptr_t)dl->dl_base &&
         (uintptr_t)addr < (uintptr_t)dl->dl_base + dl->dl_size) {
@@ -4272,6 +4350,14 @@ int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dla
     info->udli_farch = dl->dl_arch;
     info->udli_fabi  = dl->dl_abi;
     info->udli_femu  = dl->dl_emu;
+    info->udli_sname = NULL;
+    info->udli_saddr = NULL;
+
+    if (dl->dl_type == DLT_ELF64)
+        reverse_lookup_symbol_elf64((struct dlinfo_elf64 *)dl, addr, &info->udli_sname, &info->udli_saddr);
+    else if (dl->dl_type == DLT_MACHO64)
+        reverse_lookup_symbol_macho64((struct dlinfo_macho64 *)dl, addr, &info->udli_sname, &info->udli_saddr);
+
     return 1;
 }
 

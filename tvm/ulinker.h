@@ -79,12 +79,14 @@ enum {
 };
 
 struct ulinker_dladdr_info {
-    const char *udli_fname; 
+    const char *udli_fname;
     void       *udli_fbase;
     size_t      udli_fsize;
     int         udli_farch;
     int         udli_fabi;
     int         udli_femu;  // != 0 means no PROT_EXEC mappings, made to run under emulator
+    const char *udli_sname;
+    void       *udli_saddr;
 };
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
 

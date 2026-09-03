@@ -3558,38 +3558,34 @@ out:
 static void dump_stacktrace()
 {
     void *stack[16];
-    Dl_info dlinfo;
     size_t nstack = get_stacktrace(stack, sizeof(stack)/sizeof(*stack));
 
+    struct tvm_tls *__tls = TVM_TLS_PEEK();
+    struct task *cur = __tls ? __tls->tls_current : NULL;
+    struct ulinker *linker = cur ? cur->tsk_linker : NULL;
+
     for (int i = 0; i < nstack; i++) {
+        struct ulinker_dladdr_info uldli;
+        if (linker && ulinker_dladdr(linker, stack[i], &uldli)) {
+            if (uldli.udli_sname)
+                INFO("  stacktrace[% 2d] = %s : %s + %lx", i, uldli.udli_fname, uldli.udli_sname, (long)stack[i] - (long)uldli.udli_saddr);
+            else
+                INFO("  stacktrace[% 2d] = %s + %lx", i, uldli.udli_fname, (long)stack[i] - (long)(uintptr_t)uldli.udli_fbase);
+            continue;
+        }
+
+        Dl_info dlinfo;
         memset(&dlinfo, 0, sizeof(dlinfo));
         if (0 == dladdr(stack[i], &dlinfo) || (!dlinfo.dli_fname)) {
             INFO("  stacktrace[% 2d] = %08lx", i, (long)stack[i]);
             continue;
         }
 
-        ////// for extended debugging, see source
-        // char a2l[256] = {0};
-        // char cmd[512];
-        // snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C -p %lx 2>/dev/null", dlinfo.dli_fname, stack[i] - (long)dlinfo.dli_fbase);
-        // FILE *fp = popen(cmd, "r");
-        // if (fp) {
-        //     if (CALL_FUNC(fgets, a2l, sizeof(a2l) - 1, fp)) {
-        //         size_t len = strlen(a2l);
-        //         if (len > 0 && a2l[len-1] == '\n') a2l[len-1] = '\0';
-        //     }
-        //     pclose(fp);
-        // }
-        // if (a2l[0] && !strstr(a2l, "??")) {
-        //     INFO("  stacktrace[% 2d] = %s", i, a2l);
-        //     continue;
-        // }
-        
         if (dlinfo.dli_sname) {
             INFO("  stacktrace[% 2d] = %s : %s + %lx", i, dlinfo.dli_fname, dlinfo.dli_sname, (long)stack[i] - (long)dlinfo.dli_saddr);
             continue;
         }
-        
+
         INFO("  stacktrace[% 2d] = %s + %lx", i, dlinfo.dli_fname, (long)stack[i] - (long)dlinfo.dli_fbase);
     }
 }
@@ -4330,7 +4326,6 @@ static int ttyop_dup(struct file *oldfile, struct file *newfile) {
     if (ttymode == TTM_MASTER)
         tt->t_master_refcnt++;
     newfile->f_data = (void *)tt;
-
     tty_unlock(tt, 1);
     return 0;
 }
@@ -5250,7 +5245,6 @@ static struct file *ptm_open()
     file->f_type = DEV_TTY;
     file->f_data = tt;
     file->f_ops = ttyops();
-
     pthread_mutex_lock(&ttys_lock);
     list_add_tail(&tt->t_list, &ttys);
     pthread_mutex_unlock(&ttys_lock);
@@ -5262,7 +5256,7 @@ static struct file *pts_open_locked(struct tty *tt) {
     int sfd = CALL_FUNC(dup, tt->t_sfd);
     if (-1 == sfd)
         return NULL;
-    
+
     struct file *file = filealloc_from_rfd(sfd);
     if (!file) {
         VERIFY(0 == CALL_FUNC(close, sfd));
@@ -5274,7 +5268,6 @@ static struct file *pts_open_locked(struct tty *tt) {
     file->f_type = DEV_TTY;
     file->f_data = tt;
     file->f_ops = ttyops();
-
     return file;
 }
 
