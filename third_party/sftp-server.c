@@ -5,7 +5,7 @@
  * sftp-server binary (SFTPSERVER_PATH); it contains no SFTP code of its own
  * and upstream expects OpenSSH's sftp-server to be present. TVM has no
  * OpenSSH to borrow that binary from, so this is a self-contained
- * implementation wired in as another dropbearmulti applet, "sftp-server".
+ * implementation.
  *
  * It matters because OpenSSH's scp(1) has used the SFTP subsystem rather than
  * the legacy rcp protocol since 9.0 -- without this, plain "scp" to a Dropbear
