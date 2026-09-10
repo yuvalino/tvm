@@ -111,6 +111,26 @@ A plain launch, or `--console` while the app is already up, shows nothing.
 pytest tests/test_integration.py --device <device-name> --backend flutter
 ```
 
+### Cross-platform Docker builds
+
+All platforms can be built from Linux using `ghcr.io/yuvalino/flutter-xc2-ndk:latest` — a self-contained image with Flutter, xcbuild2, Xcode SDK, LLVM, Swift, and Android SDK/NDK.
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD":"$PWD" -w "$PWD" \
+  ghcr.io/yuvalino/flutter-xc2-ndk:latest \
+  bash -c "flutter pub get && flutter build ios --release"
+# Android: flutter build apk --release
+# Both:    flutter build ios --release && flutter build apk --release
+```
+
+### iOS project notes
+
+- **Bundle ID:** `com.yuvalino.tvm`
+- **No storyboards** — `AppDelegate.swift` creates `UIWindow` and `FlutterViewController` programmatically (xcbuild2 doesn't have `ibtool`).
+- **No CocoaPods** — uses Flutter's SPM integration (`FlutterGeneratedPluginSwiftPackage`).
+- **`PBXFileSystemSynchronizedRootGroup`** — xcbuild2 discovers sources by scanning `Runner/` on disk.
+
 ## Programs
 
 ### Builtin
