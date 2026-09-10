@@ -8970,7 +8970,7 @@ static void initrc_cmd_umask(const char *arg)
     unsigned mask = 0;
     for (const char *p = expanded; *p >= '0' && *p <= '7'; p++)
         mask = (mask << 3) | (*p - '0');
-    current->tsk_umask = mask;
+    current->tsk_umask = mask & 0777;
 }
 
 static struct {
@@ -9692,7 +9692,7 @@ FUNCTION_DEFINE1(int, dirfd, DIR *, dir) {
 }
 
 /**
- * returns 0 on error
+ * returns -1 on error, 0 on success
  */
 static int fmode_to_flags(const char *mode, int *out)
 {
@@ -11544,7 +11544,7 @@ FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode)
         pathname = pathname_abs;
     }
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(mkdirat, __rfd, pathname, mode));
+    return CURRENT_RFD(dirfd, CALL_FUNC(mkdirat, __rfd, pathname, mode & ~current->tsk_umask));
 }
 
 FUNCTION_DEFINE1(int, rmdir, const char *, pathname) {
@@ -11562,7 +11562,7 @@ FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
         return -1;
     pathname = pathname_abs;
 
-    return CALL_FUNC(mkfifo, pathname, mode);
+    return CALL_FUNC(mkfifo, pathname, mode & ~current->tsk_umask);
 }
 
 FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode) {
@@ -11573,7 +11573,7 @@ FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode
         pathname = pathname_abs;
     }
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(mkfifoat, __rfd, pathname, mode));
+    return CURRENT_RFD(dirfd, CALL_FUNC(mkfifoat, __rfd, pathname, mode & ~current->tsk_umask));
 }
 
 FUNCTION_DEFINE1(int, mkstemp, char *, template) {
@@ -15086,7 +15086,7 @@ FUNCTION_DEFINE3(int, mknod, const char *, pathname, mode_t, mode, dev_t, dev) {
         return -1;
     pathname = pathname_abs;
 
-    return CALL_FUNC(mknod, pathname, mode, dev);
+    return CALL_FUNC(mknod, pathname, mode & ~current->tsk_umask, dev);
 }
 
 FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode, dev_t, dev) {
@@ -15097,7 +15097,7 @@ FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode,
         pathname = pathname_abs;
     }
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(mknodat, __rfd, pathname, mode, dev));
+    return CURRENT_RFD(dirfd, CALL_FUNC(mknodat, __rfd, pathname, mode & ~current->tsk_umask, dev));
 }
 
 FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {
