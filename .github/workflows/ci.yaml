@@ -33,7 +33,7 @@ jobs:
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
     - name: pip
-      run: pip3 install -r python_requirements.txt
+      run: pip3 install --break-system-packages -r python_requirements.txt
     - name: test_integration
       timeout-minutes: 10
       run: pytest tests/test_integration.py -v --maxfail=3 --junitxml=report.xml
@@ -64,7 +64,7 @@ jobs:
       timeout-minutes: 3
       run: ./output/macos-arm64/bin/test_rmem
     - name: pip
-      run: pip3 install -r python_requirements.txt
+      run: pip3 install --break-system-packages -r python_requirements.txt
     - name: test_integration
       timeout-minutes: 10
       run: pytest tests/test_integration.py -v --maxfail=3 --junitxml=report.xml
