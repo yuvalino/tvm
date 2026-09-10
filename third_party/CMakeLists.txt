@@ -135,9 +135,11 @@ add_launcher(dropbear)
 ###############################################################################
 set(SFTPSERVER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/sftp-server.c)
 set(SFTPSERVER_OBJ ${THIRDPARTY_BUILD}/sftpserver/sftp-server.o)
+set(SFTPSERVER_EXE ${THIRDPARTY_BUILD}/sftpserver/sftp-server)
 add_custom_target(sftpserver_ext
     COMMAND ${CMAKE_COMMAND} -E make_directory ${THIRDPARTY_BUILD}/sftpserver
     COMMAND ${TVM_CC} -g -gdwarf-4 -c ${SFTPSERVER_SRC} -o ${SFTPSERVER_OBJ}
+    COMMAND ${TVM_CC} -g -o ${SFTPSERVER_EXE} ${SFTPSERVER_OBJ}
     COMMENT "Building sftp-server"
 )
 set_target_properties(sftpserver_ext PROPERTIES EXCLUDE_FROM_ALL TRUE)

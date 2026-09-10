@@ -6,6 +6,6 @@ mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/sh
 setenv PATH=/tvm/bin:$PATH
-setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server
 
 echo TVM initialized

@@ -2869,8 +2869,11 @@ static void reverse_lookup_symbol_elf64(struct dlinfo_elf64 *dl, const void *add
                 if (sym->st_shndx != SHN_UNDEF && sym->st_value != 0) {
                     uintptr_t saddr = dl->dle64_load_bias + sym->st_value;
                     if (saddr <= target && saddr > best) {
+                        const char *name = string_elf64(dl, sym->st_name);
+                        if (!name)
+                            continue;
                         best = saddr;
-                        best_name = string_elf64(dl, sym->st_name);
+                        best_name = name;
                     }
                 }
             } while ((dl->dle64_gnu_chain[idx++] & 1) == 0);
