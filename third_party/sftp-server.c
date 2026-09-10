@@ -783,6 +783,10 @@ static void process_read(struct buf *m, uint32_t id) {
 		send_status_errno(id, errno);
 		return;
 	}
+	if (len == 0) {
+		send_data(id, "", 0);
+		return;
+	}
 	data = xmalloc(len);
 	n = read(h->fd, data, len);
 	if (n < 0) {
@@ -840,14 +844,15 @@ static void process_stat(struct buf *m, uint32_t id, int follow) {
 }
 
 static void process_fstat(struct buf *m, uint32_t id) {
-	struct handle *h = handle_from_msg(m, HANDLE_FILE);
+	struct handle *h = handle_from_msg_any(m);
 	struct stat st;
 
 	if (h == NULL) {
 		send_status(id, SSH2_FX_FAILURE);
 		return;
 	}
-	if (fstat(h->fd, &st) < 0) {
+	int fd = (h->kind == HANDLE_DIR) ? dirfd(h->dirp) : h->fd;
+	if (fstat(fd, &st) < 0) {
 		send_status_errno(id, errno);
 	} else {
 		send_attrs(id, &st);
@@ -899,7 +904,7 @@ static void process_setstat(struct buf *m, uint32_t id) {
 }
 
 static void process_fsetstat(struct buf *m, uint32_t id) {
-	struct handle *h = handle_from_msg(m, HANDLE_FILE);
+	struct handle *h = handle_from_msg_any(m);
 	struct sftp_attrs a;
 	uint32_t status = SSH2_FX_OK;
 
@@ -908,19 +913,20 @@ static void process_fsetstat(struct buf *m, uint32_t id) {
 		return;
 	}
 	attrs_get(m, &a);
+	int fd = (h->kind == HANDLE_DIR) ? dirfd(h->dirp) : h->fd;
 	/* As in process_setstat: attempt all, fchown before fchmod. */
 	if (a.flags & SSH2_FILEXFER_ATTR_SIZE) {
-		if (ftruncate(h->fd, (off_t)a.size) < 0) {
+		if (ftruncate(fd, (off_t)a.size) < 0) {
 			status = errno_to_portable(errno);
 		}
 	}
 	if (a.flags & SSH2_FILEXFER_ATTR_UIDGID) {
-		if (fchown(h->fd, (uid_t)a.uid, (gid_t)a.gid) < 0) {
+		if (fchown(fd, (uid_t)a.uid, (gid_t)a.gid) < 0) {
 			status = errno_to_portable(errno);
 		}
 	}
 	if (a.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) {
-		if (fchmod(h->fd, (mode_t)(a.perm & 07777)) < 0) {
+		if (fchmod(fd, (mode_t)(a.perm & 07777)) < 0) {
 			status = errno_to_portable(errno);
 		}
 	}
