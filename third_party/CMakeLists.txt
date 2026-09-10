@@ -131,7 +131,7 @@ add_shared_lib(dropbear "obj/*.o"
 add_launcher(dropbear)
 
 ###############################################################################
-# sftp-server (standalone, extracted from dropbear fork)
+# sftp-server (standalone)
 ###############################################################################
 set(SFTPSERVER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/sftp-server.c)
 set(SFTPSERVER_OBJ ${THIRDPARTY_BUILD}/sftpserver/sftp-server.o)
