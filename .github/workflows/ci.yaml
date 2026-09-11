@@ -32,29 +32,17 @@ jobs:
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/linux-x64/bin/test_rmem
-    - name: check initrd symlinks
+    - name: check initrd vfs
       run: |
-        python3 -c "
-        with open('output/linux-x64/lib/initrd.cli.cpio', 'rb') as f:
-            data = f.read()
-        pos = 0
-        syms = 0
-        while pos + 110 < len(data):
-            if data[pos:pos+6] != b'070701': break
-            mode = int(data[pos+14:pos+22], 16)
-            filesize = int(data[pos+54:pos+62], 16)
-            namesize = int(data[pos+94:pos+102], 16)
-            name = data[pos+110:pos+110+namesize-1].decode('ascii', errors='replace')
-            padded = ((110 + namesize + 3) // 4) * 4
-            if (mode & 0o170000) == 0o120000:
-                target = data[pos+padded:pos+padded+filesize].decode('ascii', errors='replace')
-                print(f'SYMLINK {name} -> {target} (filesize={filesize})')
-                syms += 1
-                if filesize == 0: print(f'  ERROR: zero filesize!')
-            if name == 'TRAILER!!!': break
-            pos += padded + ((filesize + 3) // 4) * 4
-        print(f'Total symlinks: {syms}')
-        "
+        ./output/linux-x64/bin/tvm sh -c '
+          echo "=== VFS test ==="
+          test -e /tvm/bin/toybox && echo "toybox: exists" || echo "toybox: MISSING"
+          test -L /tvm/bin/cat && echo "cat: is symlink" || echo "cat: NOT symlink"
+          test -e /tvm/bin/cat && echo "cat: exists" || echo "cat: MISSING"
+          readlink /tvm/bin/cat 2>&1 || echo "readlink failed"
+          /tvm/bin/toybox echo "toybox direct: OK" 2>&1 || echo "toybox direct: FAILED ($?)"
+          /tvm/bin/cat /dev/null 2>&1 && echo "cat: OK" || echo "cat: FAILED"
+        ' 2>&1 || echo "VFS test exited with $?"
     - name: pip
       run: pip3 install --break-system-packages -r python_requirements.txt
     - name: test_integration
