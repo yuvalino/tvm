@@ -13473,12 +13473,18 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     char hdr[256];
     int sfd = open(pathname, O_RDONLY);
     if (sfd < 0) {
-        INFO("  failed(ENOENT)");
+        INFO("  failed(ENOENT) errno=%d", errno);
         errno = ENOENT;
         return -1;
     }
     ssize_t n = read(sfd, hdr, sizeof(hdr) - 1);
+    int read_errno = errno;
     close(sfd);
+
+    INFO("  open=%d read=%zd errno=%d magic=%02x%02x%02x%02x",
+         sfd, n, read_errno,
+         n > 0 ? (unsigned char)hdr[0] : 0, n > 1 ? (unsigned char)hdr[1] : 0,
+         n > 2 ? (unsigned char)hdr[2] : 0, n > 3 ? (unsigned char)hdr[3] : 0);
 
     if (n < 4) {
         INFO("  failed(ENOEXEC)");
