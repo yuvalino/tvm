@@ -564,6 +564,12 @@ DECL_FUNC(openat64);
 DECL_FUNC(fstatat64);
 DECL_FUNC(lseek64);
 DECL_FUNC(ftruncate64);
+DECL_FUNC(readdir64);
+DECL_FUNC(fopen64);
+DECL_FUNC(freopen64);
+DECL_FUNC(stat64);
+DECL_FUNC(lstat64);
+DECL_FUNC(fstat64);
 DECL_FUNC(get_current_dir_name);
 #elif defined(__APPLE__)
 DECL_FUNC_OPT(CFDictionaryApplyFunction);
@@ -15246,6 +15252,30 @@ FUNCTION_DEFINE3(off_t, lseek64, int, fd, off64_t, offset, int, whence) {
 
 FUNCTION_DEFINE2(int, ftruncate64, int, fd, off64_t, length) {
     return CURRENT_RFD(fd, CALL_FUNC(ftruncate64, __rfd, length));
+}
+
+FUNCTION_DEFINE1(struct dirent64 *, readdir64, DIR *, dir) {
+    return (struct dirent64 *)readdir(dir);
+}
+
+FUNCTION_DEFINE2(FILE *, fopen64, const char *, pathname, const char *, mode) {
+    return fopen(pathname, mode);
+}
+
+FUNCTION_DEFINE3(FILE *, freopen64, const char *, pathname, const char *, mode, FILE *, stream) {
+    return freopen(pathname, mode, stream);
+}
+
+FUNCTION_DEFINE2(int, stat64, const char *, pathname, struct stat64 *, statbuf) {
+    return stat(pathname, (struct stat *)statbuf);
+}
+
+FUNCTION_DEFINE2(int, lstat64, const char *, pathname, struct stat64 *, statbuf) {
+    return lstat(pathname, (struct stat *)statbuf);
+}
+
+FUNCTION_DEFINE2(int, fstat64, int, fd, struct stat64 *, statbuf) {
+    return fstat(fd, (struct stat *)statbuf);
 }
 
 FUNCTION_DEFINE0(char *, get_current_dir_name) {
