@@ -41,6 +41,14 @@ export V=1
 
 bash scripts/make.sh || true
 
+# make.sh strips with -s which removes .symtab. The ulinker needs "main" to
+# be visible; on Linux PIE binaries "main" is local and only in .symtab.
+# Re-strip from the unstripped binary with --strip-unneeded to keep it.
+if [ "$(uname)" != "Darwin" ] && [ -f "$BUILDDIR/generated/unstripped/toybox" ]; then
+    strip --strip-unneeded -o "$BUILDDIR/toybox" "$BUILDDIR/generated/unstripped/toybox"
+    chmod 555 "$BUILDDIR/toybox"
+fi
+
 # Link the binary ourselves — vanilla make.sh may or may not have linked
 if [ ! -x "$BUILDDIR/toybox" ] || file "$BUILDDIR/toybox" | grep -q "text"; then
     rm -f "$BUILDDIR/toybox"
