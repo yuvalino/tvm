@@ -115,6 +115,13 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/vim/colors/lists\"\n")
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/colors/lists/default.vim' \"$ROOTFS/share/vim/colors/lists/\"\n\n")
 
+    # ── Empty /etc/profile ──
+    # Prevents the host's /etc/profile (and /etc/profile.d/*) from leaking into
+    # TVM's login shell. Without this, Ubuntu's locale-fix script tries to exec
+    # /usr/bin/locale-check which doesn't exist in TVM.
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc\"\n")
+    string(APPEND SCRIPT "touch \"$ROOTFS/etc/profile\"\n\n")
+
     # ── Create cpio ──
     # Always pack with our own host toybox's cpio — hermetic, no dependency on a
     # host cpio, and it runs on the build machine for every target (the host
