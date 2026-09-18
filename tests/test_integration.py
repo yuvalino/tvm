@@ -1184,7 +1184,7 @@ def test_background_job(sshi: spawn):
     """Background job with & — exercises setpgid and job control basics."""
     sshi.sendline("sleep 999 &")
     sshi.expect(r"\$ ")
-    sshi.sendline("kill %1 2>/dev/null || kill $(jobs -p) 2>/dev/null; echo done")
+    sshi.sendline("kill %1 2>/dev/null || kill $(jobs -p) 2>/dev/null; wait; echo done")
     sshi.expect("done")
     sshi.expect(r"\$ ")
 
