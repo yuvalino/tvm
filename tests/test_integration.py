@@ -47,6 +47,7 @@ def _start_tvm_backend(port: int) -> subprocess.Popen:
     env = dict(os.environ)
     env.setdefault("TVM_NOEMU", TVM_NOEMU_DEFAULT)
     env.setdefault("PLATFORM", PLATFORM)
+    env.setdefault("ENV", "/dev/null")
     proc = subprocess.Popen(cmd.split(), stdout=logfile, stderr=subprocess.STDOUT, env=env)
     proc._logfile = logfile
     proc._logpath = logpath
