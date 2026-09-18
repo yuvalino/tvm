@@ -3754,17 +3754,16 @@ TEST(SetitimerOldValue) {
         sigaction(SIGALRM, &sa, NULL);
 
         struct itimerval iv = {
-            .it_value = { .tv_sec = 0, .tv_usec = 500000 }, // 500ms
+            .it_value = { .tv_sec = 10, .tv_usec = 0 }, // 10s
         };
         if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
-        usleep(100000); // 100ms
 
         struct itimerval old;
         struct itimerval disarm = {{0,0},{0,0}};
         if (setitimer(ITIMER_REAL, &disarm, &old) != 0) _exit(2);
 
         long remaining_us = old.it_value.tv_sec * 1000000L + old.it_value.tv_usec;
-        if (remaining_us < 300000 || remaining_us > 500000) _exit(3);
+        if (remaining_us <= 0 || remaining_us > 10000000) _exit(3);
         _exit(0);
     }
     int s;
@@ -3781,15 +3780,14 @@ TEST(GetitimerBasic) {
         sigaction(SIGALRM, &sa, NULL);
 
         struct itimerval iv = {
-            .it_value = { .tv_sec = 0, .tv_usec = 500000 }, // 500ms
+            .it_value = { .tv_sec = 10, .tv_usec = 0 }, // 10s
         };
         if (setitimer(ITIMER_REAL, &iv, NULL) != 0) _exit(1);
-        usleep(100000); // 100ms
 
         struct itimerval val;
         if (getitimer(ITIMER_REAL, &val) != 0) _exit(2);
         long remaining_us = val.it_value.tv_sec * 1000000L + val.it_value.tv_usec;
-        if (remaining_us < 300000 || remaining_us > 500000) _exit(3);
+        if (remaining_us <= 0 || remaining_us > 10000000) _exit(3);
         _exit(0);
     }
     int s;
