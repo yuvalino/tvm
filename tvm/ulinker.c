@@ -4339,8 +4339,7 @@ char *ulinker_dlerror(void) {
     return errormsg;
 }
 
-int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
-    DLINFO_LOCK(ulinker);
+static int ulinker_dladdr_internal(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
     struct dlinfo *dl = library_for_address_locked(ulinker, addr);
     DLINFO_UNLOCK(ulinker);
 
@@ -4362,6 +4361,17 @@ int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dla
         reverse_lookup_symbol_macho64((struct dlinfo_macho64 *)dl, addr, &info->udli_sname, &info->udli_saddr);
 
     return 1;
+}
+
+int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
+    DLINFO_LOCK(ulinker);
+    return ulinker_dladdr_internal(ulinker, addr, info);
+}
+
+int ulinker_dladdr_safe(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
+    if (0 != pthread_mutex_trylock(&ulinker->ul_dlinfo_mtx))
+        return 0;
+    return ulinker_dladdr_internal(ulinker, addr, info);
 }
 
 struct dup_arg {

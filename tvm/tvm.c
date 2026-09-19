@@ -3572,7 +3572,7 @@ static void dump_stacktrace()
 
     for (int i = 0; i < nstack; i++) {
         struct ulinker_dladdr_info uldli;
-        if (linker && ulinker_dladdr(linker, stack[i], &uldli)) {
+        if (linker && ulinker_dladdr_safe(linker, stack[i], &uldli)) {
             if (uldli.udli_sname)
                 INFO("  stacktrace[% 2d] = %s : %s + %lx", i, uldli.udli_fname, uldli.udli_sname, (long)stack[i] - (long)uldli.udli_saddr);
             else
@@ -8973,8 +8973,14 @@ static void initrc_cmd_umask(const char *arg)
 {
     char expanded[64];
     initrc_expand_vars(arg, expanded, sizeof(expanded));
+    const char *p = expanded;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p < '0' || *p > '7') {
+        INFO("initrc: bad umask \"%s\"", expanded);
+        return;
+    }
     unsigned mask = 0;
-    for (const char *p = expanded; *p >= '0' && *p <= '7'; p++)
+    for (; *p >= '0' && *p <= '7'; p++)
         mask = (mask << 3) | (*p - '0');
     current->tsk_umask = mask & 0777;
 }
@@ -9702,14 +9708,30 @@ FUNCTION_DEFINE1(int, dirfd, DIR *, dir) {
  */
 static int fmode_to_flags(const char *mode, int *out)
 {
-    if (strcmp(mode, "r") == 0)  { *out = O_RDONLY; return 0; }
-    if (strcmp(mode, "r+") == 0) { *out = O_RDWR; return 0; }
-    if (strcmp(mode, "w") == 0)  { *out = O_CREAT | O_WRONLY | O_TRUNC; return 0; }
-    if (strcmp(mode, "w+") == 0) { *out = O_CREAT | O_RDWR | O_TRUNC; return 0; }
-    if (strcmp(mode, "a") == 0)  { *out = O_CREAT | O_WRONLY | O_APPEND; return 0; }
-    if (strcmp(mode, "a+") == 0) { *out = O_CREAT | O_RDWR | O_APPEND; return 0; }
-    errno = EINVAL;
-    return -1;
+    int flags;
+    const char *p = mode;
+
+    switch (*p++) {
+    case 'r': flags = O_RDONLY; break;
+    case 'w': flags = O_CREAT | O_WRONLY | O_TRUNC; break;
+    case 'a': flags = O_CREAT | O_WRONLY | O_APPEND; break;
+    default:  errno = EINVAL; return -1;
+    }
+
+    if (*p == '+') { flags = (flags & ~O_ACCMODE) | O_RDWR; p++; }
+
+    for (; *p; p++) {
+        switch (*p) {
+        case '+': flags = (flags & ~O_ACCMODE) | O_RDWR; break;
+        case 'b': break;
+        case 'e': flags |= O_CLOEXEC; break;
+        case 'x': flags |= O_EXCL; break;
+        default:  break;
+        }
+    }
+
+    *out = flags;
+    return 0;
 }
 
 FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
@@ -11641,6 +11663,7 @@ FUNCTION_DEFINE3(int, accept, int, sockfd, struct sockaddr *, addr, socklen_t *,
 }
 
 FUNCTION_DEFINE3(int, bind, int, sockfd, const struct sockaddr *, addr, socklen_t, addrlen) {
+    // TODO: apply tsk_umask for AF_UNIX sockets (real umask is 0)
     return CURRENT_RFD(sockfd, CALL_FUNC(bind, __rfd, addr, addrlen));
 }
 
@@ -13592,6 +13615,7 @@ do_exec:
         INFO("   failed(ENOMEM)");
         errno = ENOMEM;
         tvm_sig_leave();
+        return -1;
     }
 
     struct ulinker *old_linker = current->tsk_linker;
