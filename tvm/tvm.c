@@ -3572,7 +3572,7 @@ static void dump_stacktrace()
 
     for (int i = 0; i < nstack; i++) {
         struct ulinker_dladdr_info uldli;
-        if (linker && ulinker_dladdr_safe(linker, stack[i], &uldli)) {
+        if (linker && ulinker_dladdr(linker, stack[i], &uldli)) {
             if (uldli.udli_sname)
                 INFO("  stacktrace[% 2d] = %s : %s + %lx", i, uldli.udli_fname, uldli.udli_sname, (long)stack[i] - (long)uldli.udli_saddr);
             else
