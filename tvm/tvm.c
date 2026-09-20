@@ -7957,9 +7957,20 @@ int in_tvm_range(void *lr) {
     if ((uintptr_t)lr >= text_start && (uintptr_t)lr < text_end)
         return 1;
 
+    // Defer guest signal dispatch while holding the ranges lock. This runs in
+    // every interposer prologue, i.e. OUTSIDE the wrapper's own tvm_sig_enter
+    // section, so a signal landing here used to run the guest handler
+    // synchronously on top of the held mutex; the handler's first syscall
+    // (dropbear's SIGCHLD handler writes to its self-pipe) re-entered
+    // can_enter_tvm -> in_tvm_range and self-deadlocked on this non-recursive
+    // lock, leaving the task hung forever (seen as random 30s integration
+    // timeouts: session never closes, comsub never returns). tvm_sig_leave
+    // drains the deferred signal right after the unlock.
+    tvm_sig_enter();
     pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
     int r = (NULL != find_containing_ulinker_loaded_range_locked(lr));
     pthread_mutex_unlock(&all_ulinker_loaded_ranges_lock);
+    tvm_sig_leave();
 
     return r;
 }
