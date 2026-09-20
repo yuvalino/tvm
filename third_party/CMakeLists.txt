@@ -163,7 +163,7 @@ ExternalProject_Add(mksh_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/mksh
     BINARY_DIR ${MKSH_BUILD}
     CONFIGURE_COMMAND sh -c "cd ${MKSH_BUILD} && \
-        CC=${TVM_CC} CFLAGS='-g -gdwarf-4 -fcommon -DMKSH_FORKLESS=1' \
+        CC=${TVM_CC} CFLAGS='-g -gdwarf-4 -fcommon -DMKSH_FORKLESS=1 -DMKSH_DEFAULT_PROFILEDIR=\\\"/tvm/etc\\\"' \
         sh ${THIRDPARTY_SRC}/mksh/Build.sh"
     BUILD_COMMAND sh -c "cd ${MKSH_BUILD} && (sh ./Rebuild.sh || true) && \
         ${TVM_CC} -g -gdwarf-4 -o mksh ./*.o"

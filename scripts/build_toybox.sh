@@ -41,9 +41,8 @@ export V=1
 
 bash scripts/make.sh || true
 
-# make.sh strips with -s (Linux) or strip (macOS), which can remove .symtab.
-# The ulinker needs "main" in .symtab to exec the binary. Re-strip from the
-# unstripped binary keeping all symbols (only strip debug sections).
+# make.sh strips with -s which removes .symtab. The ulinker needs "main" in
+# .symtab to exec the binary. Re-strip keeping symbols (debug sections only).
 if [ -f "$BUILDDIR/generated/unstripped/toybox" ]; then
     strip -S -o "$BUILDDIR/toybox" "$BUILDDIR/generated/unstripped/toybox"
     chmod 555 "$BUILDDIR/toybox"

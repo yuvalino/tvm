@@ -115,6 +115,13 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/vim/colors/lists\"\n")
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/colors/lists/default.vim' \"$ROOTFS/share/vim/colors/lists/\"\n\n")
 
+    # ── Empty /etc/profile ──
+    # mksh is compiled with MKSH_DEFAULT_PROFILEDIR="/tvm/etc", so it looks for
+    # /tvm/etc/profile instead of /etc/profile. This avoids sourcing the host's
+    # profile scripts (e.g. Ubuntu's locale-fix runs /usr/bin/locale-check).
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc\"\n")
+    string(APPEND SCRIPT "touch \"$ROOTFS/etc/profile\"\n\n")
+
     # ── Create cpio ──
     # Always pack with our own host toybox's cpio — hermetic, no dependency on a
     # host cpio, and it runs on the build machine for every target (the host
@@ -123,15 +130,6 @@ function(mkinitrd_target NAME)
     get_filename_component(OUTDIR "${OUTFILE}" DIRECTORY)
     string(APPEND SCRIPT "mkdir -p '${OUTDIR}'\n")
     string(APPEND SCRIPT "cd \"$ROOTFS\" && find . | ${CPIO} -o -H newc > '${OUTFILE}'\n")
-
-    # ── Create /etc overlay CPIO ──
-    # Mounted at /etc to mask the host's /etc/profile. Without this, Ubuntu's
-    # /etc/profile.d/01-locale-fix.sh runs /usr/bin/locale-check (which doesn't
-    # exist in TVM), crashing login shell sessions.
-    set(ETC_ROOTFS "${ROOTFS}/../etc_rootfs")
-    string(APPEND SCRIPT "rm -rf '${ETC_ROOTFS}' && mkdir -p '${ETC_ROOTFS}/profile.d'\n")
-    string(APPEND SCRIPT "touch '${ETC_ROOTFS}/profile'\n")
-    string(APPEND SCRIPT "cd '${ETC_ROOTFS}' && find . | ${CPIO} -o -H newc > '${OUTDIR}/initrd.etc.cpio'\n")
 
     # Write and register target
     set(SCRIPT_FILE ${CMAKE_CURRENT_BINARY_DIR}/mkinitrd_${NAME}.sh)
