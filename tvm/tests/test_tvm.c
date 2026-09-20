@@ -1267,7 +1267,11 @@ TEST(SignalZombie) {
     ASSERT_NEQ(p, -1);
     if (!p) {
         close(pip[0]);
-        close(pip[1]); // closing write end signals EOF to parent
+        // Do NOT close pip[1] explicitly: _exit closes it as part of task
+        // teardown, after which the child is a zombie. An explicit close here
+        // hands the parent its EOF while the child is still alive, so the
+        // parent's kill(SIGUSR1) below could land before _exit and terminate
+        // the child by signal (WIFEXITED == 0) — a test race, not a TVM bug.
         _exit(0);
     }
     close(pip[1]);
