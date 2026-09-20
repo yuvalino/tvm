@@ -71,7 +71,6 @@ jobs:
     - name: test_tvm
       timeout-minutes: 3
       run: ./output/macos-arm64/bin/tvm ./output/macos-arm64/bin/test_tvm -t 30
-      continue-on-error: true
     - name: test_rmem
       timeout-minutes: 3
       run: ./output/macos-arm64/bin/test_rmem
