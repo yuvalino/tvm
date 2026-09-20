@@ -2929,7 +2929,12 @@ static volatile int xkill_got = 0;
 static void xkill_handler(int sig) { xkill_got = 1; }
 
 TEST(KillBlockedThenUnblock) {
-    // Parent sends signal to child that has it blocked; child unblocks later
+    // Parent sends signal to child that has it blocked; child unblocks later.
+    // Sequenced with pipes instead of usleep races: the old version gave the
+    // parent a ~10ms window to land its kill between the child blocking and
+    // the child giving up, which a loaded CI VM can miss (seen once on macOS
+    // CI as exit 2). Exit codes: 1 = delivered while blocked, 2 = never
+    // delivered after unblock, 3 = handshake I/O failure.
     xkill_got = 0;
     struct sigaction sa = { .sa_handler = xkill_handler };
     ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
@@ -2937,27 +2942,42 @@ TEST(KillBlockedThenUnblock) {
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
+        int ready[2], sent[2];   // child -> parent "blocked", parent -> child "kill sent"
+        if (pipe(ready) || pipe(sent)) _exit(3);
         pid_t c = fork();
         if (!c) {
+            close(ready[0]); close(sent[1]);
             // Child: block SIGUSR1
             sigset_t set;
             sigemptyset(&set);
             sigaddset(&set, SIGUSR1);
             sigprocmask(SIG_BLOCK, &set, NULL);
 
-            // Tell parent we're ready
-            usleep(20000);
+            // Tell parent we're blocked; wait until it has sent the signal
+            char ch = 'r';
+            if (write(ready[1], &ch, 1) != 1) _exit(3);
+            ssize_t n;
+            while ((n = read(sent[0], &ch, 1)) == -1 && errno == EINTR) ;
+            if (n != 1) _exit(3);
 
-            // Now check it's pending
-            if (xkill_got) _exit(1); // shouldn't have delivered yet
+            // Must not have been delivered while blocked
+            if (xkill_got) _exit(1);
 
-            // Unblock
+            // Unblock: the pending signal is delivered here (or, if the OS has
+            // not yet run our handler for the pthread_kill, shortly after)
             sigprocmask(SIG_UNBLOCK, &set, NULL);
-            usleep(10000);
+            for (int i = 0; i < 2000 && !xkill_got; i++)
+                usleep(1000);
             _exit(xkill_got ? 0 : 2);
         }
-        usleep(10000);
+        close(ready[1]); close(sent[0]);
+        char ch;
+        ssize_t n;
+        while ((n = read(ready[0], &ch, 1)) == -1 && errno == EINTR) ;
+        if (n != 1) _exit(3);
         kill(c, SIGUSR1);
+        ch = 's';
+        if (write(sent[1], &ch, 1) != 1) _exit(3);
         int cs;
         waitpid(c, &cs, 0);
         _exit(WIFEXITED(cs) ? WEXITSTATUS(cs) : 99);
