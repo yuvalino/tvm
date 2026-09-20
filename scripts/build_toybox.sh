@@ -45,11 +45,7 @@ bash scripts/make.sh || true
 # The ulinker needs "main" in .symtab to exec the binary. Re-strip from the
 # unstripped binary keeping all symbols (only strip debug sections).
 if [ -f "$BUILDDIR/generated/unstripped/toybox" ]; then
-    if [ "$(uname)" = "Darwin" ]; then
-        strip -S -o "$BUILDDIR/toybox" "$BUILDDIR/generated/unstripped/toybox"
-    else
-        strip --strip-debug -o "$BUILDDIR/toybox" "$BUILDDIR/generated/unstripped/toybox"
-    fi
+    strip -S -o "$BUILDDIR/toybox" "$BUILDDIR/generated/unstripped/toybox"
     chmod 555 "$BUILDDIR/toybox"
 fi
 
