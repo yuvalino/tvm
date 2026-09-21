@@ -1529,6 +1529,27 @@ def test_write_to_readonly(sshi: spawn):
     sshi.expect("rc=1")
     sshi.expect(r"\$ ")
 
+def test_vfs_missing_path_errno(sshi: spawn):
+    """Lookups under the initrd VFS must report a real errno. vfs_lookup used
+    to return NULL without setting errno, so the guest saw whatever the caller
+    had left behind (ls said ENOTTY, cat EBADEXEC, cd EINTR)."""
+    sshi.sendline("ls -d /tvm/nope 2>&1; echo rc=$?")
+    sshi.expect("No such file or directory")
+    sshi.expect("rc=1")
+    sshi.expect(r"\$ ")
+    sshi.sendline("cat /tvm/bin/nope 2>&1; echo rc=$?")
+    sshi.expect("No such file or directory")
+    sshi.expect("rc=1")
+    sshi.expect(r"\$ ")
+    sshi.sendline("ls -d /tvm/bin/sh/x 2>&1; echo rc=$?")
+    sshi.expect("Not a directory")
+    sshi.expect("rc=1")
+    sshi.expect(r"\$ ")
+    sshi.sendline("cd /tvm/nope 2>&1; echo rc=$?")
+    sshi.expect("No such file or directory")
+    sshi.expect("rc=[12]")
+    sshi.expect(r"\$ ")
+
 def test_open_directory_as_file(sshi: spawn):
     """cat a directory — exercises EISDIR handling."""
     sshi.sendline("cat /tmp 2>/dev/null; echo rc=$?")
