@@ -13463,9 +13463,20 @@ FUNCTION_DEFINE1(char *, ctime, const time_t *, timep) {
 }
 
 FUNCTION_DEFINE1(char *, strerror, int, errnum) {
-    strerror_r(errnum, current->tsk_data->strerror_buf,
-               sizeof(current->tsk_data->strerror_buf));
-    return current->tsk_data->strerror_buf;
+    char *buf = current->tsk_data->strerror_buf;
+    size_t sz = sizeof(current->tsk_data->strerror_buf);
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
+    // GNU strerror_r returns the message, which may live in a static string
+    // rather than buf, leaving buf untouched. Returning buf unconditionally
+    // gave every Linux guest an empty string ("ls: /x: ").
+    const char *s = strerror_r(errnum, buf, sz);
+    if (s != buf)
+        snprintf(buf, sz, "%s", s);
+#else
+    if (0 != strerror_r(errnum, buf, sz))
+        snprintf(buf, sz, "Unknown error %d", errnum);
+#endif
+    return buf;
 }
 
 FUNCTION_DEFINE_VOID0(setusershell) {
