@@ -5357,8 +5357,10 @@ static struct vfs_node * vnalloc(const char *name, mode_t mode, uid_t uid, gid_t
     }
 
     struct vfs_node *vn = kalloc(sizeof(*vn));
-    if (!vn)
+    if (!vn) {
+        errno = ENOMEM;
         return NULL;
+    }
 
     memcpy(vn->vn_name, name, namelen);
     vn->vn_name[namelen] = 0;
@@ -5504,6 +5506,13 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
             } else {
                 if (cur != root)
                     vn_unlock(cur, 1);
+                // Set errno explicitly: every vfsop_* returns -1 straight from
+                // this NULL, and the device dispatch loops (file_open/file_stat/
+                // ...) treat any errno other than ENOTSUP as the VFS's verdict.
+                // Leaving errno untouched leaked the caller's stale value (ls
+                // reported ENOTTY, cat EBADEXEC, cd EINTR), and a stale ENOTSUP
+                // would fall through to the host filesystem for a /tvm path.
+                errno = ENOENT;
                 return NULL;
             }
         }
@@ -5567,6 +5576,7 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
             vn_unlock(child, 1);
             if (cur != root)
                 vn_unlock(cur, 1);
+            errno = ENOTDIR;
             return NULL;
         }
 
