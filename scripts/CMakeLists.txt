@@ -115,13 +115,6 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/vim/colors/lists\"\n")
     string(APPEND SCRIPT "cp '${VIM_RUNTIME}/colors/lists/default.vim' \"$ROOTFS/share/vim/colors/lists/\"\n\n")
 
-    # ── Empty /etc/profile ──
-    # mksh is compiled with MKSH_DEFAULT_PROFILEDIR="/tvm/etc", so it looks for
-    # /tvm/etc/profile instead of /etc/profile. This avoids sourcing the host's
-    # profile scripts (e.g. Ubuntu's locale-fix runs /usr/bin/locale-check).
-    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc\"\n")
-    string(APPEND SCRIPT "touch \"$ROOTFS/etc/profile\"\n\n")
-
     # ── Create cpio ──
     # Always pack with our own host toybox's cpio — hermetic, no dependency on a
     # host cpio, and it runs on the build machine for every target (the host
