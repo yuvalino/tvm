@@ -27,7 +27,7 @@ endif()
 
 # libtvm.dylib — TVM runtime for Flutter app (Apple platforms).
 # Pure export of TVM core; the app-side tvm_bindings.c dlsym's
-# tvm_init_with_outfd / tvm_mount_cpio from it.
+# tvm_start from it.
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_library(tvm_shared SHARED $<TARGET_OBJECTS:tvm_static>)
     set_target_properties(tvm_shared PROPERTIES

@@ -44,11 +44,11 @@ class TvmBindings {
         throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
       }
       final lib = DynamicLibrary.process();
-      if (!lib.providesSymbol('tvm_start')) {
-        throw Exception('tvm_start not found — tvm_bindings.c may not be linked');
+      if (!lib.providesSymbol('tvm_app_start')) {
+        throw Exception('tvm_app_start not found — tvm_bindings.c may not be linked');
       }
       _lib = lib;
-      _start = lib.lookupFunction<_StartNative, _StartDart>('tvm_start');
+      _start = lib.lookupFunction<_StartNative, _StartDart>('tvm_app_start');
       // .listener runs the callback on this isolate's event loop, so it is
       // safe to touch Dart state / the UI from it.
       _callback = NativeCallable<_OutputCbNative>.listener(_onNativeOutput);

@@ -2,7 +2,7 @@
 
 ## Overview
 
-TVM initrc is a simple line-based configuration language for TVM initialization. It is executed during `tvm_init()` before the main program runs.
+TVM initrc is a simple line-based configuration language for TVM initialization. It is executed during `tvm_start()` before the main program runs.
 
 ## Loading behavior
 
@@ -12,7 +12,7 @@ TVM initrc is a simple line-based configuration language for TVM initialization.
 | `TVM_INITRC=<path>` | Load from given path, log error if not found |
 | `TVM_NOINITRC=1` | Skip initrc loading entirely |
 
-CLI flags `-i <path>` / `--initrc <path>` and `-n` / `--no-initrc` set these environment variables before `tvm_init()` is called.
+CLI flags `-i <path>` / `--initrc <path>` and `-n` / `--no-initrc` set these guest environment variables before `tvm_start()` is called.
 
 ## Syntax
 

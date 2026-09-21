@@ -1781,7 +1781,6 @@ struct thread {
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
 };
 
-static Dl_info main_dlinfo = {0};
 static struct rmem_arena *global_arena = NULL;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -8720,7 +8719,7 @@ static int tvm_cpio(int argc, char **argv)
     return 0;
 }
 
-int tvm_mount_cpio(const char *pathname, const void *buf, unsigned long size) {
+static int tvm_mount_cpio(const char *pathname, const void *buf, unsigned long size) {
     struct vfs_node *root = vnalloc(pathname, S_IFDIR | 0766, getuid(), getgid());
     if (!root)
         return -1;
@@ -9316,39 +9315,83 @@ static int is_noemu_binary(const char *pathname)
 
 static void usershell_cache_init(void);
 
-void tvm_init_with_outfd(const char *init_comm, int outfd)
+static int tvm_started = 0;
+
+// Past the point of no return: the calling thread is the init task's thread
+// and must not return. Report and leave the host process, matching what the
+// CLI launcher did on a failed execvp (exit status 127).
+__attribute__((noreturn))
+static void tvm_start_fail(const char *what, const char *arg)
 {
-    g_outfd = outfd;
-    tvm_init(init_comm);
+    int err = errno;
+    char msg[PATH_MAX + 128];
+    int n = snprintf(msg, sizeof(msg), "tvm_start: %s(%s): %s\n", what, arg, strerror(err));
+    INFO("%s(%s): %s", what, arg, strerror(err));
+    CALL_FUNC(write, STDERR_FILENO, msg, n);
+    CALL_FUNC(_exit, 127);
+    __builtin_unreachable();
 }
 
-// Embedder entry points (flutter worker). The app used to dlsym the interposed
-// execvp/chdir directly, but those dispatch by RETURN ADDRESS (can_enter_tvm),
-// and a caller in the app binary's text is outside every TVM range — the call
-// silently fell through to the HOST function (host execvp("dropbear") ->
-// ENOENT). These trampolines live in libtvm text, so the interposed functions
-// see a tvm lr and enter the VM.
-int tvm_execvp(const char *file, char *const argv[])
+/**
+ * Boot the VM on the calling thread and exec `file` inside it. See tvm.h.
+ */
+int tvm_start(const char *file, char *const argv[], char *const envp[], const struct tvm_config *cfg)
 {
-    return execvp(file, argv);
-}
+    static const struct tvm_config default_cfg = {0};
+    if (!cfg)
+        cfg = &default_cfg;
 
-int tvm_chdir(const char *path)
-{
-    return chdir(path);
-}
+    //
+    // 1. Validate. Nothing here touches global state, so every failure leaves
+    //    the process exactly as it was.
+    //
 
-void tvm_init(const char *init_comm)
-{
-    INFO("tvm_init()");
+    if (!file || !argv) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (tvm_started) {
+        errno = EBUSY;
+        return -1;
+    }
+
+    for (size_t i = 0; i < cfg->nmounts; i++) {
+        const struct tvm_mount *m = &cfg->mounts[i];
+        char abs[PATH_MAX];
+        // vfs_lookup() prefix-matches a root's name verbatim, so the mount
+        // point must be absolute and normalized ("/tvm", never "/tvm/" or
+        // "//tvm"). normalize_path() with an explicit dirname needs no task.
+        if (!m->path || m->path[0] != '/' || !m->data || !m->size ||
+            !normalize_path("/", m->path, abs) || 0 == strcmp(abs, "/")) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    if (cfg->cwd) {
+        struct stat st;
+        if (0 != CALL_FUNC(fstatat, AT_FDCWD, cfg->cwd, &st, 0))
+            return -1;
+        if (!S_ISDIR(st.st_mode)) {
+            errno = ENOTDIR;
+            return -1;
+        }
+    }
+
+    tvm_started = 1;
+    g_outfd = cfg->log_fd ? cfg->log_fd : STDOUT_FILENO;
+
+    INFO("tvm_start(\"%s\")", file);
+
+    //
+    // 2. Kernel globals: allocator, TLS, linker callbacks.
+    //
 
     init_file_stream();
 
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
     rmem_setopt(RMEM_OPS, (void *)&rmem_ops);
-
-    if (0 == dladdr(tvm_init, &main_dlinfo))
-        panic("dladdr(tvm_init) failed");
 
     global_arena = rmem_arena_create(NULL);
     if (!global_arena)
@@ -9368,11 +9411,26 @@ void tvm_init(const char *init_comm)
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
 
+    //
+    // 3. Config mounts. The VFS needs only the global arena, so a bad archive
+    //    is still reported to the caller before any task exists. A later
+    //    initrc `mount` of the same path shadows these (vfs_add_root prepends).
+    //
 
-    usershell_cache_init();
+    for (size_t i = 0; i < cfg->nmounts; i++) {
+        const struct tvm_mount *m = &cfg->mounts[i];
+        char abs[PATH_MAX];
+        normalize_path("/", m->path, abs);
+        if (0 != tvm_mount_cpio(abs, m->data, m->size)) {
+            INFO("tvm_start: mount %s failed", abs);
+            errno = EINVAL;
+            return -1;
+        }
+    }
 
-    // FROM HERE ON WE ENTER TVM ON CURRENT THREAD
-
+    //
+    // 4. FROM HERE ON WE ENTER TVM ON CURRENT THREAD. No more returning.
+    //
 
     // we dont bother lockin current
 
@@ -9390,7 +9448,7 @@ void tvm_init(const char *init_comm)
     if (!current->tsk_data)
         panic("tsk_data");
     memset(current->tsk_data, 0, sizeof(*current->tsk_data));
-    
+
     // __environ on linux, environ on apple
     current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0)
                                  ?: ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "environ", 0)
@@ -9399,7 +9457,7 @@ void tvm_init(const char *init_comm)
     current->tsk_relocs.opterr = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "opterr", 0) ?: &current->tsk_data->opterr;
     current->tsk_relocs.optopt = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optopt", 0) ?: &current->tsk_data->optopt;
     current->tsk_relocs.optarg = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optarg", 0) ?: &current->tsk_data->optarg;
-    
+
     *current->tsk_relocs.optind = 1;
     *current->tsk_relocs.opterr = 1;
     current->tsk_data->optreset = 0;
@@ -9408,17 +9466,17 @@ void tvm_init(const char *init_comm)
     for (int i = 0; i < 3; i++) {
         int rfd = CALL_FUNC(dup, i);
         if (-1 == rfd)
-            panic("tvm_init::dup %d", i);
-        
+            panic("tvm_start::dup %d", i);
+
         struct file *f = filealloc_from_rfd(rfd);
         if (!f)
-            panic("tvm_init::filealloc_from_rfd %d", rfd);
-        
+            panic("tvm_start::filealloc_from_rfd %d", rfd);
+
         f->f_refcnt++;
 
         int nfd = task_assign_file_locked(current, f, i);
         if (nfd != i)
-            panic("tvm_init::task_assign_file %d %d", i, nfd);
+            panic("tvm_start::task_assign_file %d %d", i, nfd);
     }
 
     // allocate stdin, stdout, stderr filestreams
@@ -9443,13 +9501,15 @@ void tvm_init(const char *init_comm)
         VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
     }
 
-    *current->tsk_relocs.__environ = copyenv(current->tsk_ar, environ);
+    // The guest environment. Everything TVM reads about itself from here on
+    // (TVM_INITRC, TVM_NOEMU, TVM_SHELL, PLATFORM, ...) comes from this copy.
+    *current->tsk_relocs.__environ = copyenv(current->tsk_ar, envp ? (char **)envp : environ);
     if (!*current->tsk_relocs.__environ)
-        panic("tvm_init::copyenv");
+        panic("tvm_start::copyenv");
 
     current_thread = threadalloc(current);
     if (!current_thread)
-        panic("tvm_init::threadalloc");
+        panic("tvm_start::threadalloc");
 
     current_thread->thr_pthread = pthread_self();
     current_thread->thr_task = current;
@@ -9462,11 +9522,10 @@ void tvm_init(const char *init_comm)
 
     current->tsk_cwd[0] = 0;
     if (!CALL_FUNC(getcwd, current->tsk_cwd, sizeof(current->tsk_cwd)))
-        panic("tvm_init::getcwd");
+        panic("tvm_start::getcwd");
 
-    strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
-
-
+    // execve() replaces this with the program's basename
+    strncpy(current->tsk_comm, "tvm", sizeof(current->tsk_comm));
 
     vtimer_init(); // must be before signal handler installation
 
@@ -9494,41 +9553,27 @@ void tvm_init(const char *init_comm)
     setenv("PLATFORM", "linux-arm64", 0);
 #endif
 
+    //
+    // 5. Guest-side setup. These are direct calls from libtvm text, so the
+    //    interposed functions see a TVM return address and enter the VM.
+    //
+
+    if (cfg->cwd && 0 != chdir(cfg->cwd))
+        tvm_start_fail("chdir", cfg->cwd);
+
     tvm_load_initrc();
 
     tvm_parse_noemu();
-}
 
-int tvm_setopt(int opt, void *val) {
-    if (opt == TVMOPT_OUTFD) {
-        g_outfd = (int)(long)val;
-        return 0;
-    }
-    if (opt == TVMOPT_SETFD) {
-        int f = ((int *)val)[0];
-        int r = ((int *)val)[1];
-        int r2, f2;
+    // after the initrc, so a `setenv TVM_SHELL=...` there is honored
+    usershell_cache_init();
 
-        // internalize r as r2, f2
-        if (-1 == (r2 = CALL_FUNC(dup, r)))
-            return -1;
-        if (-1 == (f2 = task_new_fd(current, r2))) {
-            VERIFY(0 == CALL_FUNC(close, r2));
-            return -1;
-        }
+    //
+    // 6. Exec. Never returns on success (ends in the in-VM exit()).
+    //
 
-        // r2 is internalized as f2, so use close() instead of CALL_FUNC(close, ...) to close it
-
-        // dup to target `f`
-        if (-1 == dup2(f2, f)) {
-            VERIFY(0 == close(f2));
-            return -1;
-        }
-
-        VERIFY(0 == close(f2));
-        return 0;
-    }
-    return 1;
+    execvp(file, argv);
+    tvm_start_fail("execvp", file);
 }
 
 char ***_tvm_environ()
@@ -13218,7 +13263,7 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
 }
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
-    // Before any task exists (e.g. during tvm_init) there is no per-task env;
+    // Before any task exists (e.g. early in tvm_start) there is no per-task env;
     // fall back to the real libc getenv (process environ) instead of a NULL
     // deref. This lets callers use bare getenv() uniformly.
     if (!current)
@@ -13334,7 +13379,7 @@ FUNCTION_DEFINE1(int, unsetenv, const char *, name) {
 // MARK: Thread-safe wrappers for non-reentrant libc
 /////////////
 
-// getusershell cache — populated once at tvm_init (single-threaded)
+// getusershell cache — populated once at tvm_start, after the initrc ran (single-threaded)
 static char **usershell_cache = NULL;
 static int    usershell_cache_count = 0;
 
@@ -13364,7 +13409,8 @@ static void usershell_cache_init(void)
         usershell_cache_add(&list, &n, &cap, sh);
     CALL_FUNC(endusershell);
 
-    // current is NULL here (init) — getenv falls back to libc / process env.
+    // Runs after the init task and the initrc exist, so this reads the guest
+    // environment (including a `setenv TVM_SHELL=...` from the rc file).
     const char *tvm_shell = getenv("TVM_SHELL");
     if (tvm_shell && *tvm_shell)
         usershell_cache_add(&list, &n, &cap, tvm_shell);

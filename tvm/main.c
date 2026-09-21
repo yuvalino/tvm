@@ -12,26 +12,26 @@
 
 #include "tvm.h"
 
-static int mount_cpio(const char *target, const char *cpio_path)
+static void *read_file(const char *path, size_t *out_size)
 {
-    int fd = open(cpio_path, O_RDONLY);
+    int fd = open(path, O_RDONLY);
     if (fd == -1) {
-        perror(cpio_path);
-        return -1;
+        perror(path);
+        return NULL;
     }
 
     struct stat st;
     if (fstat(fd, &st) == -1) {
-        perror(cpio_path);
+        perror(path);
         close(fd);
-        return -1;
+        return NULL;
     }
 
     void *buf = malloc(st.st_size);
     if (!buf) {
         perror("malloc");
         close(fd);
-        return -1;
+        return NULL;
     }
 
     size_t total = 0;
@@ -41,20 +41,14 @@ static int mount_cpio(const char *target, const char *cpio_path)
             perror("read");
             free(buf);
             close(fd);
-            return -1;
+            return NULL;
         }
         total += n;
     }
     close(fd);
 
-    if (tvm_mount_cpio(target, buf, total) != 0) {
-        fprintf(stderr, "tvm_mount_cpio: failed to mount %s at %s\n", cpio_path, target);
-        free(buf);
-        return -1;
-    }
-
-    free(buf);
-    return 0;
+    *out_size = total;
+    return buf;
 }
 
 int main(int argc, char **argv)
@@ -77,6 +71,8 @@ int main(int argc, char **argv)
         }
     }
 
+    // -i/-n become guest environment variables. The launcher's own environ is
+    // the guest environ (tvm_start envp=NULL), so plain setenv is enough.
     int i = 1;
     while (i < argc) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -119,35 +115,52 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (verbose)
-        tvm_init("tvm");
-    else {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull == -1) {
+    // -v mounts are read up front and handed to tvm_start, which mounts them
+    // before the initrc runs.
+    struct tvm_mount *mounts = calloc(argc, sizeof(*mounts));
+    if (!mounts) {
+        perror("calloc");
+        return 1;
+    }
+    size_t nmounts = 0;
+    for (int j = 1; j < i; j++) {
+        if (strcmp(argv[j], "-v") != 0)
+            continue;
+        j++;
+        char *sep = strchr(argv[j], ':');
+        if (!sep) {
+            fprintf(stderr, "%s: -v argument must be PATH:CPIO (got '%s')\n", argv[0], argv[j]);
+            return 1;
+        }
+        *sep = '\0';
+        size_t size;
+        void *data = read_file(sep + 1, &size);
+        if (!data)
+            return 1;
+        mounts[nmounts].path = argv[j];
+        mounts[nmounts].data = data;
+        mounts[nmounts].size = size;
+        nmounts++;
+    }
+
+    int log_fd = STDOUT_FILENO;
+    if (!verbose) {
+        log_fd = open("/dev/null", O_WRONLY);
+        if (log_fd == -1) {
             perror("/dev/null");
             return 1;
         }
-        tvm_init_with_outfd("tvm", devnull);
     }
 
-    // process -v mounts after tvm_init (initrc may have mounted things already)
-    int j = 1;
-    while (j < i) {
-        if (strcmp(argv[j], "-v") == 0) {
-            j++;
-            char *sep = strchr(argv[j], ':');
-            if (!sep) {
-                fprintf(stderr, "%s: -v argument must be PATH:CPIO (got '%s')\n", argv[0], argv[j]);
-                return 1;
-            }
-            *sep = '\0';
-            if (mount_cpio(argv[j], sep + 1) != 0)
-                return 1;
-        }
-        j++;
-    }
+    struct tvm_config cfg = {
+        .log_fd = log_fd,
+        .cwd = NULL,
+        .mounts = mounts,
+        .nmounts = nmounts,
+    };
 
-    execvp(argv[i], &argv[i]);
-    perror(argv[i]);
-    return 127;
+    // Never returns on success; the program's exit() ends the process.
+    tvm_start(argv[i], &argv[i], NULL, &cfg);
+    perror("tvm_start");
+    return 1;
 }
