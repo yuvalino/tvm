@@ -165,7 +165,7 @@ Build with `python3 build.py -t examples`.
 
 ## initrc
 
-TVM runs an init script during `tvm_init()` before the main program starts. By default it looks for `./init.rc` in the current directory.
+TVM runs an init script during `tvm_start()` before the main program starts. By default it looks for `./init.rc` in the current directory.
 
 | Environment variable | Behavior |
 |---|---|
