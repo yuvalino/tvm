@@ -128,7 +128,7 @@ int sigtimedwait(const sigset_t *restrict, siginfo_t *restrict, const struct tim
  */
 
 #define panic(Msg, ...) do { char __MSG[0x1000] = {0}; snprintf(__MSG, sizeof(__MSG), Msg, ##__VA_ARGS__); __panic(__MSG, __FILE__, __LINE__); } while (0)
-static void __panic(const char *m, const char *f, int l);
+__attribute__((noreturn)) static void __panic(const char *m, const char *f, int l);
 
 #define VERIFY(Expression) do { if (!(Expression)) { panic("VERIFY( " #Expression " )"); } } while (0)
 
@@ -2533,6 +2533,9 @@ static void terminate_current_locked(int result)
     current->tsk_state |= TS_EXITING;
     __atomic_store_n(&current->tsk_exiting_thread, current_thread, __ATOMIC_RELEASE);
 
+    // Decide now; `current` may be cleared before the exit below.
+    int is_init = (current == main_task);
+
     // Destroy this task's timers so the vtimer manager spawns no new callbacks.
     // Any already-running SIGEV_THREAD callbacks are regular task threads and
     // will be drained by the tsk_threads_cnt loop below.
@@ -2656,6 +2659,27 @@ static void terminate_current_locked(int result)
     // UB). The task is already list_del'd, so nothing can re-lock it.
     if (auto_reap)
         task_unlock(current);
+
+    // The init task is the host process. Once it is torn down nothing is left
+    // to run, so leave the process with the matching status — the same way
+    // the interposed _exit() does for main_task — instead of pthread_exit'ing
+    // the main thread and leaving the process alive on the vtimer thread.
+    // This is also how panic() on the init thread ends: its SIGABRT lands
+    // here via signal_dispatch.
+    if (is_init) {
+        if (WIFSIGNALED(result)) {
+            int sig = WTERMSIG(result);
+            struct sigaction dfl = { .sa_handler = SIG_DFL };
+            CALL_FUNC(sigaction, sig, &dfl, NULL);
+            sigset_t unblk;
+            sigemptyset(&unblk);
+            sigaddset(&unblk, sig);
+            CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &unblk, NULL);
+            CALL_FUNC(raise, sig);
+            CALL_FUNC(_exit, 128 + sig);
+        }
+        CALL_FUNC(_exit, WEXITSTATUS(result));
+    }
 
     CALL_FUNC(pthread_exit, 0);
     __builtin_unreachable();
@@ -9317,21 +9341,6 @@ static void usershell_cache_init(void);
 
 static int tvm_started = 0;
 
-// Past the point of no return: the calling thread is the init task's thread
-// and must not return. Report and leave the host process, matching what the
-// CLI launcher did on a failed execvp (exit status 127).
-__attribute__((noreturn))
-static void tvm_start_fail(const char *what, const char *arg)
-{
-    int err = errno;
-    char msg[PATH_MAX + 128];
-    int n = snprintf(msg, sizeof(msg), "tvm_start: %s(%s): %s\n", what, arg, strerror(err));
-    INFO("%s(%s): %s", what, arg, strerror(err));
-    CALL_FUNC(write, STDERR_FILENO, msg, n);
-    CALL_FUNC(_exit, 127);
-    __builtin_unreachable();
-}
-
 /**
  * Boot the VM on the calling thread and exec `file` inside it. See tvm.h.
  */
@@ -9559,7 +9568,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     //
 
     if (cfg->cwd && 0 != chdir(cfg->cwd))
-        tvm_start_fail("chdir", cfg->cwd);
+        panic("tvm_start::chdir(%s): %s", cfg->cwd, strerror(errno));
 
     tvm_load_initrc();
 
@@ -9573,7 +9582,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     //
 
     execvp(file, argv);
-    tvm_start_fail("execvp", file);
+    panic("tvm_start::execvp(%s): %s", file, strerror(errno));
 }
 
 char ***_tvm_environ()
@@ -9614,6 +9623,7 @@ void tvm_dump(int mode)
 
 #define MAX_BT 16
 
+__attribute__((noreturn))
 static void __panic(const char *msg, const char *file, int line)
 {
     // Peek, don't tvm_tls(): panic must work on keyless threads (tvm_tls()
@@ -9632,7 +9642,25 @@ static void __panic(const char *msg, const char *file, int line)
     INFO("Stacktrace:");
     dump_stacktrace();
 
+    // Normal path: TVM's own signal_handler dispatches the SIGABRT as a fatal
+    // signal to the current task (terminate_current_locked), which never
+    // returns — the thread is gone, or for the init task the process is.
     CALL_FUNC(raise, SIGABRT);
+
+    // raise() returned, so the handler did not dispatch it: either it deferred
+    // the signal (tvm_sig_blocked, in-emu, or the guest masked SIGABRT) or the
+    // thread has no VM identity and the handler drops non-fault signals. A
+    // panic is fatal regardless, so die by SIGABRT with the default disposition,
+    // bypassing the handler, and never return to the caller.
+    struct sigaction dfl = { .sa_handler = SIG_DFL };
+    CALL_FUNC(sigaction, SIGABRT, &dfl, NULL);
+    sigset_t unblk;
+    sigemptyset(&unblk);
+    sigaddset(&unblk, SIGABRT);
+    CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &unblk, NULL);
+    CALL_FUNC(raise, SIGABRT);
+    CALL_FUNC(_exit, 128 + SIGABRT);
+    __builtin_unreachable();
 }
 
 /////////////
