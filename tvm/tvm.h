@@ -9,7 +9,7 @@ struct tvm_mount {
 };
 
 struct tvm_config {
-    int                     log_fd;   // kernel log destination; 0 = stdout
+    int                     log_fd;   // kernel log fd; -1 disables logging
     const char             *cwd;      // init task working directory; NULL = host cwd
     const char             *initrc;   // init script to run before exec; NULL = none
     const struct tvm_mount *mounts;   // cpio archives to mount before anything runs

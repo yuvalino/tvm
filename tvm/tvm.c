@@ -179,14 +179,15 @@ static void format_time(char *buf, size_t buflen)
         (int)y, mon, day, hour, min, sec, ms);
 }
 
-static int g_outfd = STDOUT_FILENO;
+static int g_outfd = STDOUT_FILENO;  // kernel log fd; -1 = logging disabled
+static void log_write(const char *buf, int n);
 
 #define INFO(Msg, ...) do { \
     char __ts[32]; \
     format_time(__ts, sizeof(__ts)); \
     char __msgbuf[0x1000]; \
     int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
-    CALL_FUNC(write, g_outfd, __msgbuf, __num); \
+    log_write(__msgbuf, __num); \
 } while (0)
 
 #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
@@ -588,6 +589,12 @@ DECL_FUNC(localtime);
 DECL_FUNC(gmtime);
 DECL_FUNC(ctime);
 DECL_FUNC(strerror);
+
+static void log_write(const char *buf, int n)
+{
+    if (g_outfd >= 0)
+        CALL_FUNC(write, g_outfd, buf, n);
+}
 
 __attribute__((constructor))
 static void init_funcs()
@@ -9111,7 +9118,7 @@ static void rmem_print_cb(char *msg) {
     format_time(__ts, sizeof(__ts));
     char __msgbuf[0x1000];
     int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
-    CALL_FUNC(write, g_outfd, __msgbuf, __num);
+    log_write(__msgbuf, __num);
 }
 
 static void ulinker_print_cb(char *msg) {
@@ -9119,7 +9126,7 @@ static void ulinker_print_cb(char *msg) {
     format_time(__ts, sizeof(__ts));
     char __msgbuf[0x1000];
     int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
-    CALL_FUNC(write, g_outfd, __msgbuf, __num);
+    log_write(__msgbuf, __num);
 }
 
 void *rmem_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
@@ -9332,14 +9339,14 @@ static int tvm_started = 0;
  */
 int tvm_start(const char *file, char *const argv[], char *const envp[], const struct tvm_config *cfg)
 {
-    static const struct tvm_config default_cfg = {0};
+    static const struct tvm_config default_cfg = { .log_fd = STDOUT_FILENO };
     if (!cfg)
         cfg = &default_cfg;
 
     // Validate. Nothing here touches global state, so every failure leaves
     // the process exactly as it was.
 
-    if (!file || !argv) {
+    if (!file || !argv || cfg->log_fd < -1) {
         errno = EINVAL;
         return -1;
     }
@@ -9373,7 +9380,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     }
 
     tvm_started = 1;
-    g_outfd = cfg->log_fd ? cfg->log_fd : STDOUT_FILENO;
+    g_outfd = cfg->log_fd;
 
     INFO("tvm_start(\"%s\")", file);
 
@@ -9599,7 +9606,7 @@ void tvm_log(const char *function, const char *msg, ...)
 
     n += snprintf(msgbuf + n, sizeof(msgbuf) - n, "\n");
 
-    CALL_FUNC(write, g_outfd, msgbuf, n);
+    log_write(msgbuf, n);
 }
 
 void tvm_dump(int mode)

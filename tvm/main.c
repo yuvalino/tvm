@@ -150,14 +150,7 @@ int main(int argc, char **argv)
         nmounts++;
     }
 
-    int log_fd = STDOUT_FILENO;
-    if (!verbose) {
-        log_fd = open("/dev/null", O_WRONLY);
-        if (log_fd == -1) {
-            perror("/dev/null");
-            return 1;
-        }
-    }
+    int log_fd = verbose ? STDOUT_FILENO : -1;
 
     struct tvm_config cfg = {
         .log_fd = log_fd,
