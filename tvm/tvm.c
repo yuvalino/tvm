@@ -9042,12 +9042,11 @@ static struct {
     { NULL, NULL }
 };
 
-static void tvm_exec_initrc(const char *path, int must_exist)
+static void tvm_exec_initrc(const char *path)
 {
     int fd = open(path, O_RDONLY);
     if (fd == -1) {
-        if (must_exist)
-            INFO("initrc: cannot open '%s': %s", path, strerror(errno));
+        INFO("initrc: cannot open '%s': %s", path, strerror(errno));
         return;
     }
 
@@ -9097,19 +9096,6 @@ static void tvm_exec_initrc(const char *path, int must_exist)
     }
 
     free(buf);
-}
-
-static void tvm_load_initrc(void)
-{
-    if (getenv("TVM_NOINITRC"))
-        return;
-
-    const char *path = getenv("TVM_INITRC");
-    if (path) {
-        tvm_exec_initrc(path, 1);
-    } else {
-        tvm_exec_initrc("init.rc", 0);
-    }
 }
 
 /////////////
@@ -9350,10 +9336,8 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     if (!cfg)
         cfg = &default_cfg;
 
-    //
-    // 1. Validate. Nothing here touches global state, so every failure leaves
-    //    the process exactly as it was.
-    //
+    // Validate. Nothing here touches global state, so every failure leaves
+    // the process exactly as it was.
 
     if (!file || !argv) {
         errno = EINVAL;
@@ -9393,9 +9377,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     INFO("tvm_start(\"%s\")", file);
 
-    //
-    // 2. Kernel globals: allocator, TLS, linker callbacks.
-    //
+    // Kernel globals: allocator, TLS, linker callbacks.
 
     init_file_stream();
 
@@ -9420,11 +9402,9 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
 
-    //
-    // 3. Config mounts. The VFS needs only the global arena, so a bad archive
-    //    is still reported to the caller before any task exists. A later
-    //    initrc `mount` of the same path shadows these (vfs_add_root prepends).
-    //
+    // Config mounts. The VFS needs only the global arena, so a bad archive
+    // is still reported to the caller before any task exists. A later
+    // initrc `mount` of the same path shadows these (vfs_add_root prepends).
 
     for (size_t i = 0; i < cfg->nmounts; i++) {
         const struct tvm_mount *m = &cfg->mounts[i];
@@ -9437,9 +9417,25 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
         }
     }
 
-    //
-    // 4. FROM HERE ON WE ENTER TVM ON CURRENT THREAD. No more returning.
-    //
+    // The initrc must exist, on the host or inside a config mount (hence after
+    // the mounts). Resolved the way the interposed open() will resolve it
+    // later: against cfg->cwd, or the host cwd. file_access() walks the VFS
+    // first and falls back to the host, and needs no task.
+    if (cfg->initrc) {
+        char base[PATH_MAX], abs[PATH_MAX];
+        const char *dir = cfg->cwd;
+        if (!dir) {
+            if (!CALL_FUNC(getcwd, base, sizeof(base)))
+                return -1;
+            dir = base;
+        }
+        if (!normalize_path(dir, cfg->initrc, abs) || 0 != file_access(abs, R_OK, 0)) {
+            INFO("tvm_start: initrc %s: %s", cfg->initrc, strerror(errno));
+            return -1;
+        }
+    }
+
+    // FROM HERE ON WE ENTER TVM ON CURRENT THREAD. No more returning.
 
     // we dont bother lockin current
 
@@ -9511,7 +9507,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     }
 
     // The guest environment. Everything TVM reads about itself from here on
-    // (TVM_INITRC, TVM_NOEMU, TVM_SHELL, PLATFORM, ...) comes from this copy.
+    // (TVM_NOEMU, TVM_SHELL, PLATFORM, ...) comes from this copy.
     *current->tsk_relocs.__environ = copyenv(current->tsk_ar, envp ? (char **)envp : environ);
     if (!*current->tsk_relocs.__environ)
         panic("tvm_start::copyenv");
@@ -9562,24 +9558,21 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     setenv("PLATFORM", "linux-arm64", 0);
 #endif
 
-    //
-    // 5. Guest-side setup. These are direct calls from libtvm text, so the
-    //    interposed functions see a TVM return address and enter the VM.
-    //
+    // Guest-side setup. These are direct calls from libtvm text, so the
+    // interposed functions see a TVM return address and enter the VM.
 
     if (cfg->cwd && 0 != chdir(cfg->cwd))
         panic("tvm_start::chdir(%s): %s", cfg->cwd, strerror(errno));
 
-    tvm_load_initrc();
+    if (cfg->initrc)
+        tvm_exec_initrc(cfg->initrc);
 
     tvm_parse_noemu();
 
     // after the initrc, so a `setenv TVM_SHELL=...` there is honored
     usershell_cache_init();
 
-    //
-    // 6. Exec. Never returns on success (ends in the in-VM exit()).
-    //
+    // Exec. Never returns on success (ends in the in-VM exit()).
 
     execvp(file, argv);
     panic("tvm_start::execvp(%s): %s", file, strerror(errno));

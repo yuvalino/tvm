@@ -28,6 +28,7 @@ static int pipe_read = -1;
 static int pipe_write = -1;
 static int worker_port = 0;
 static char worker_initrd[PATH_MAX];
+static char worker_initrc[PATH_MAX];
 static char worker_home[PATH_MAX];
 static char **worker_envp;
 static tvm_output_cb worker_cb;
@@ -160,6 +161,7 @@ static void *worker_entry(void *arg)
     struct tvm_config cfg = {
         .log_fd = pipe_write,
         .cwd = worker_home,
+        .initrc = worker_initrc,
         .mounts = &initrd,
         .nmounts = 1,
     };
@@ -236,19 +238,16 @@ TVM_EXPORT int tvm_app_start(const char *libtvm_path, int port,
 
     static char env_home[PATH_MAX + 8];
     static char env_tmpdir[PATH_MAX + 8];
-    static char env_initrc[PATH_MAX + 16];
     static char env_password[256];
     static char env_path[PATH_MAX * 2 + 8];
     snprintf(env_home, sizeof(env_home), "HOME=%s", worker_home);
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s", home_tmp);
-    snprintf(env_initrc, sizeof(env_initrc), "TVM_INITRC=%s", initrc_path);
     snprintf(env_path, sizeof(env_path), "PATH=%s:/tvm/bin:%s", fwdir, old_path);
 
-    const char *overrides[6];
+    const char *overrides[5];
     int no = 0;
     overrides[no++] = env_home;
     overrides[no++] = env_tmpdir;
-    overrides[no++] = env_initrc;
     overrides[no++] = env_path;
     if (password) {
         snprintf(env_password, sizeof(env_password), "DROPBEAR_PASSWORD=%s", password);
@@ -265,6 +264,8 @@ TVM_EXPORT int tvm_app_start(const char *libtvm_path, int port,
     worker_port = port;
     strncpy(worker_initrd, initrd_path, sizeof(worker_initrd) - 1);
     worker_initrd[sizeof(worker_initrd) - 1] = '\0';
+    strncpy(worker_initrc, initrc_path, sizeof(worker_initrc) - 1);
+    worker_initrc[sizeof(worker_initrc) - 1] = '\0';
 
     int fds[2];
     if (pipe(fds) != 0) {
