@@ -1,12 +1,35 @@
-# TVM - Thread Virtual Machine
+<div align="center">
 
-![TembleOS](./rsc/logo.jpg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="rsc/logo.jpg" />
+  <img alt="tvm" src="rsc/logo.jpg" width="96" height="96" />
+</picture>
 
-Thread-based process virtualization framework. Lets sandboxed applications with no `fork()` permissions run POSIX-compliant programs by implementing processes as thread groups.
+# tvm
 
-`fork()` creates a new thread group (task) that shares resources like file descriptors and signal handlers. Memory ranges are duplicated with pointer fixup to imitate copy-on-write. A dedicated heap (`rmem.c`) and linker (`ulinker.c`) optimize this to be as fast as possible.
+**Bypass security sandbox restrictions without use of vulnerabilities.**
 
-Unsigned code execution is supported via the [Unicorn](https://www.unicorn-engine.org/) CPU emulator. When the emulator hits a signed region, it traps and lets the real CPU take over. The `TVM_NOEMU` environment variable controls which programs skip emulation.
+An open-source, userspace framework that allows running unsigned code and multi-process workflows in highly sandboxed environments (iOS).
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/yuvalino/tvm?sort=semver)](https://github.com/yuvalino/tvm/releases)
+
+[Website](https://yuvalino.com) ·
+[Research paper](https://yuvalino.com/rage-against-the-sandbox)
+
+<a href="https://x.com/jachashx"><img alt="Follow Yuval on X" src="https://img.shields.io/badge/X-000000?logo=x&amp;logoColor=white" /></a>
+
+</div>
+
+![tvm demo screenshot](rsc/tvm-demo-screenshot.jpg)
+
+## What's TVM ?
+
+Thread-based process virtualization framework. Lets sandboxed applications with no `fork()` permissions run POSIX-compliant and multi-process reliant software by implementing processes as thread groups.
+
+With TVM, `fork()` creates a new thread group (task) that shares resources like file descriptors and signal handlers. Memory ranges are duplicated with pointer fixup to imitate copy-on-write. A dedicated heap (`rmem.c`) and linker (`ulinker.c`) optimize this to be as fast as possible.
+
+Unsigned code execution is supported via the [Unicorn](https://www.unicorn-engine.org/) CPU emulator. When the emulator hits a signed region, it traps and lets the real CPU take over.
 
 ## Building
 
@@ -15,23 +38,14 @@ Requirements: CMake 3.16+, Ninja, Python 3, a C compiler.
 On macOS, also install: `brew install gnu-sed openssl`
 
 ```sh
-# Build TVM executable (default)
+# Build TVM CLI executable (default)
 python3 build.py
 
-# Build specific targets
-python3 build.py -t dropbear mksh toybox vim
-
-# Build the initrd (rootfs CPIO archive with all third-party programs)
-python3 build.py -t initrd
+# Build TVM flutter app for iOS
+python3 build.py -a ios-arm64 -t flutter
 
 # Build tests
 python3 build.py -t tests
-
-# Build examples
-python3 build.py -t examples
-
-# Clean and rebuild
-python3 build.py --clean
 ```
 
 Output goes to `output/<platform>/bin/` (auto-detected: `linux-x64` or `macos-arm64`).
@@ -48,9 +62,6 @@ Output goes to `output/<platform>/bin/` (auto-detected: `linux-x64` or `macos-ar
 # Custom initrc
 ./output/linux-x64/bin/tvm -i path/to/init.rc <program>
 
-# Skip initrc
-./output/macos-arm64/bin/tvm -n <program>
-
 # Mount a CPIO archive
 ./output/linux-x64/bin/tvm -v /tvm:path/to/initrd.cpio <program>
 ```
@@ -65,7 +76,7 @@ the calling thread and execs the program inside it:
 
 struct tvm_mount initrd = { .path = "/tvm", .data = cpio_bytes, .size = cpio_len };
 struct tvm_config cfg = {
-    .log_fd  = STDOUT_FILENO,       // 0 = stdout
+    .log_fd  = STDOUT_FILENO,       // -1 disables kernel logging
     .cwd     = "/some/dir",         // NULL = host cwd
     .initrc  = "/tvm/etc/init.rc",  // NULL = none; may live inside a mount
     .mounts  = &initrd,
@@ -76,23 +87,11 @@ tvm_start("sh", argv, envp, &cfg);  // envp NULL = inherit; cfg NULL = all defau
 perror("tvm_start");                // only reached on a pre-boot failure
 ```
 
-Contract:
-
-- Never returns on success. The calling thread becomes the init task's thread
-  and ends in the program's `exit()`. Call it from a thread you can give away:
-  the CLI launcher uses `main`, the Flutter app a 64 MB-stack worker.
-- Returns -1 with `errno` set only before any task exists: bad argument, bad
-  mount path or archive, bad `cwd`, missing `initrc`. Past that point a
-  failure is a kernel panic.
-- One call per process.
-- Config mounts happen first, then the initrc, then the exec. Runtime knobs
-  (`TVM_NOEMU`, `TVM_SHELL`, `PATH`, `HOME`, ...) are read from `envp`.
-
 ## Flutter app (iOS / macOS)
 
 `flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
 on-device, letting you `ssh` into a full POSIX environment. The TVM core is
-built as `libtvm.dylib`; dropbear/mksh/toybox/vim ship as sidecar dylibs; the
+built as `libtvm.dylib`; dropbear/mksh/toybox/vim as dylibs; the
 rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
 native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
 `tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
@@ -149,7 +148,7 @@ pytest tests/test_integration.py --device <device-name> --backend flutter
 
 ### Builtin
 
-`tvm` - diagnostics tool (registered at `/usr/bin/tvm`):
+`tvm` - diagnostics tool (registered at fake `/usr/bin/tvm` path):
 - `tvm ps` - task list
 - `tvm lsof` - file descriptor tables
 - `tvm pwd` - working directory
@@ -179,7 +178,7 @@ Build with `python3 build.py -t examples`.
 
 ## initrc
 
-TVM runs an init script during `tvm_start()` before the main program starts. The script path is the `initrc` field of `struct tvm_config` (NULL = none); a relative path resolves against the init task's cwd and may live inside a config mount. A missing file makes `tvm_start()` fail before the VM boots.
+TVM runs an init script during `tvm_start()` before the main program starts. The script path is the `initrc` field of `struct tvm_config` (NULL = none); a relative path resolves against the init task's cwd and may live inside a config mount.
 
 The CLI launcher maps its flags onto that field:
 
