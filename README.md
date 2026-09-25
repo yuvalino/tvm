@@ -55,14 +55,48 @@ Output goes to `output/<platform>/bin/` (auto-detected: `linux-x64` or `macos-ar
 ./output/linux-x64/bin/tvm -v /tvm:path/to/initrd.cpio <program>
 ```
 
+## Embedding
+
+`libtvm` exposes one entry point, declared in `tvm/tvm.h`. It boots the VM on
+the calling thread and execs the program inside it:
+
+```c
+#include "tvm.h"
+
+struct tvm_mount initrd = { .path = "/tvm", .data = cpio_bytes, .size = cpio_len };
+struct tvm_config cfg = {
+    .log_fd  = STDOUT_FILENO,       // 0 = stdout
+    .cwd     = "/some/dir",         // NULL = host cwd
+    .initrc  = "/tvm/etc/init.rc",  // NULL = none; may live inside a mount
+    .mounts  = &initrd,
+    .nmounts = 1,
+};
+char *argv[] = { "sh", "-l", NULL };
+tvm_start("sh", argv, envp, &cfg);  // envp NULL = inherit; cfg NULL = all defaults
+perror("tvm_start");                // only reached on a pre-boot failure
+```
+
+Contract:
+
+- Never returns on success. The calling thread becomes the init task's thread
+  and ends in the program's `exit()`. Call it from a thread you can give away:
+  the CLI launcher uses `main`, the Flutter app a 64 MB-stack worker.
+- Returns -1 with `errno` set only before any task exists: bad argument, bad
+  mount path or archive, bad `cwd`, missing `initrc`. Past that point a
+  failure is a kernel panic.
+- One call per process.
+- Config mounts happen first, then the initrc, then the exec. Runtime knobs
+  (`TVM_NOEMU`, `TVM_SHELL`, `PATH`, `HOME`, ...) are read from `envp`.
+
 ## Flutter app (iOS / macOS)
 
 `flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
 on-device, letting you `ssh` into a full POSIX environment. The TVM core is
 built as `libtvm.dylib`; dropbear/mksh/toybox/vim ship as sidecar dylibs; the
 rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
-native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm and runs it on a
-worker thread.
+native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
+`tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
+thread.
 
 ```sh
 # Build the app (always release). Pick the platform with -a.
