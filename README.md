@@ -165,13 +165,15 @@ Build with `python3 build.py -t examples`.
 
 ## initrc
 
-TVM runs an init script during `tvm_start()` before the main program starts. By default it looks for `./init.rc` in the current directory.
+TVM runs an init script during `tvm_start()` before the main program starts. The script path is the `initrc` field of `struct tvm_config` (NULL = none); a relative path resolves against the init task's cwd and may live inside a config mount. A missing file makes `tvm_start()` fail before the VM boots.
 
-| Environment variable | Behavior |
+The CLI launcher maps its flags onto that field:
+
+| Launcher flags | Behavior |
 |---|---|
-| (neither set) | Try `./init.rc`, silently skip if not found |
-| `TVM_INITRC=<path>` | Load from given path, error if not found |
-| `TVM_NOINITRC=1` | Skip initrc entirely |
+| (none) | Use `./init.rc` if it exists, silently skip otherwise |
+| `-i <path>` / `--initrc <path>` | Use the given path, fail if not found |
+| `-n` / `--no-initrc` | No initrc |
 
 Commands:
 

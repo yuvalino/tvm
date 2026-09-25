@@ -6,13 +6,15 @@ TVM initrc is a simple line-based configuration language for TVM initialization.
 
 ## Loading behavior
 
-| Environment variable | Behavior |
-|---|---|
-| (neither set) | Try `./init.rc` in cwd, silently skip if not found |
-| `TVM_INITRC=<path>` | Load from given path, log error if not found |
-| `TVM_NOINITRC=1` | Skip initrc loading entirely |
+The script path is the `initrc` field of `struct tvm_config` passed to `tvm_start()`; NULL means no initrc. A relative path resolves against the init task's cwd (`cfg->cwd`, or the host cwd) and may point inside one of the config mounts, which are mounted first. `tvm_start()` verifies the file exists before booting and returns -1 with `ENOENT` otherwise.
 
-CLI flags `-i <path>` / `--initrc <path>` and `-n` / `--no-initrc` set these guest environment variables before `tvm_start()` is called.
+The CLI launcher maps its flags onto that field:
+
+| Launcher flags | Behavior |
+|---|---|
+| (none) | Use `./init.rc` if it exists in cwd, silently skip otherwise |
+| `-i <path>` / `--initrc <path>` | Use the given path, fail if not found |
+| `-n` / `--no-initrc` | No initrc |
 
 ## Syntax
 

@@ -11,6 +11,7 @@ struct tvm_mount {
 struct tvm_config {
     int                     log_fd;   // kernel log destination; 0 = stdout
     const char             *cwd;      // init task working directory; NULL = host cwd
+    const char             *initrc;   // init script to run before exec; NULL = none
     const struct tvm_mount *mounts;   // cpio archives to mount before anything runs
     size_t                  nmounts;
 };
@@ -19,15 +20,18 @@ struct tvm_config {
  * Boot the VM on the calling thread and exec `file` inside it.
  *
  * `file` is PATH-searched like execvp(), against the guest environment.
- * `envp` is the guest environment; NULL inherits the host environ. Everything
- * TVM configures itself from (TVM_INITRC, TVM_NOINITRC, TVM_NOEMU, TVM_SHELL,
- * HOME, PATH, ...) is read from that environment.
- * `cfg` may be NULL: log to stdout, keep the host cwd, mount nothing.
+ * `envp` is the guest environment; NULL inherits the host environ. Runtime
+ * knobs TVM reads about itself (TVM_NOEMU, TVM_SHELL, HOME, PATH, ...) come
+ * from that environment.
+ * `cfg` may be NULL: log to stdout, keep the host cwd, no initrc, mount
+ * nothing. A relative `initrc` resolves against `cwd` (or the host cwd) and
+ * may live inside one of the config mounts.
  *
  * Never returns on success: the calling thread becomes the init task's thread
  * and ends in the in-VM exit(). Returns -1 with errno set only for failures
- * detected before any task exists (bad argument, bad mount, bad cwd), in
- * which case the calling thread may return normally. One call per process.
+ * detected before any task exists (bad argument, bad mount, bad cwd, missing
+ * initrc), in which case the calling thread may return normally. One call
+ * per process.
  *
  * Mount order: config mounts first, then the initrc; an initrc `mount` of the
  * same path shadows the config mount.

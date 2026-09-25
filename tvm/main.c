@@ -71,8 +71,9 @@ int main(int argc, char **argv)
         }
     }
 
-    // -i/-n become guest environment variables. The launcher's own environ is
-    // the guest environ (tvm_start envp=NULL), so plain setenv is enough.
+    const char *initrc = NULL;
+    int noinitrc = 0;
+
     int i = 1;
     while (i < argc) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -93,10 +94,10 @@ int main(int argc, char **argv)
                 return 1;
             }
             i++;
-            setenv("TVM_INITRC", argv[i], 1);
+            initrc = argv[i];
             i++;
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-initrc") == 0) {
-            setenv("TVM_NOINITRC", "1", 1);
+            noinitrc = 1;
             i++;
         } else if (strcmp(argv[i], "-v") == 0) {
             if (i + 1 >= argc) {
@@ -114,6 +115,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: no command specified\n", argv[0]);
         return 1;
     }
+
+    // Launcher default: ./init.rc if present, silently skipped otherwise.
+    if (noinitrc)
+        initrc = NULL;
+    else if (!initrc && access("init.rc", F_OK) == 0)
+        initrc = "init.rc";
 
     // -v mounts are read up front and handed to tvm_start, which mounts them
     // before the initrc runs.
@@ -155,6 +162,7 @@ int main(int argc, char **argv)
     struct tvm_config cfg = {
         .log_fd = log_fd,
         .cwd = NULL,
+        .initrc = initrc,
         .mounts = mounts,
         .nmounts = nmounts,
     };
