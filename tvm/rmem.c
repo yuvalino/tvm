@@ -36,6 +36,10 @@ static void (*print_cb)(char *, int) = NULL;
     PRINT0(__msgbuf, __len); \
     abort(); \
 } while (0)
+// Same, for code paths that hold an arena lock: the abort is delivered as a
+// signal that tears the task down, and the teardown frees into that arena.
+#define ABORT_UNLOCK(_lock, ...) do { pthread_mutex_unlock(_lock); ABORT(__VA_ARGS__); } while (0)
+#define ABORT_LOCKED(_ar, ...) ABORT_UNLOCK(&(_ar)->ar_lock, __VA_ARGS__)
 
 
 struct rmem_ops rops = {
@@ -395,23 +399,24 @@ static void rmem_slab_destroy(struct rmem_slab *sl) {
     rops.ro_munmap(sl, sl->sl_size);
 }
 
-static void rmem_slab_free(struct rmem_slab *sl, void *p)
+// called with the arena lock held; `lock` is released before any abort
+static void rmem_slab_free(pthread_mutex_t *lock, struct rmem_slab *sl, void *p)
 {
     uintptr_t addr = (uintptr_t)p;
 
     if (addr < (uintptr_t)sl->sl_base ||
         addr >= (uintptr_t)sl->sl_base + sl->sl_nobj * sl->sl_objsize)
-        ABORT("invalid pointer %p", p);
+        ABORT_UNLOCK(lock, "invalid pointer %p", p);
 
     uintptr_t off = addr - (uintptr_t)sl->sl_base;
     if (off % sl->sl_objsize != 0)
-        ABORT("p %p objsize 0x%zx remainder 0x%zx",
+        ABORT_UNLOCK(lock, "p %p objsize 0x%zx remainder 0x%zx",
               p, sl->sl_objsize, off % sl->sl_objsize);
 
     size_t idx = off / sl->sl_objsize;
 
     if (!bitmap_test_range(sl->sl_bitmap, idx, 1))
-        ABORT("detected double free on %p (objsize 0x%zx)",
+        ABORT_UNLOCK(lock, "detected double free on %p (objsize 0x%zx)",
               p, sl->sl_objsize);
 
     bitmap_set_range(sl->sl_bitmap, idx, 1, 0);
@@ -566,11 +571,11 @@ void rmem_arena_free(struct rmem_arena *ar, void *p) {
         if ((uintptr_t)p < (uintptr_t)sl->sl_base || (uintptr_t)p >= ((uintptr_t)sl->sl_base + sl->sl_nobj * sl->sl_objsize))
             continue;
 
-        rmem_slab_free(sl, p);
+        rmem_slab_free(&ar->ar_lock, sl, p);
         pthread_mutex_unlock(&ar->ar_lock);
         return;
     }
-    ABORT("invalid pointer %p", p);
+    ABORT_LOCKED(ar, "invalid pointer %p", p);
 }
 
 void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
@@ -594,11 +599,11 @@ void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
 
         uintptr_t off = (uintptr_t)p - (uintptr_t)sl->sl_base;
         if (off % sl->sl_objsize != 0)
-            ABORT("p %p objsize 0x%zx remainder 0x%zx", p, sl->sl_objsize, off % sl->sl_objsize);
+            ABORT_LOCKED(ar, "p %p objsize 0x%zx remainder 0x%zx", p, sl->sl_objsize, off % sl->sl_objsize);
 
         idx = off / sl->sl_objsize;
         if (!bitmap_test_range(sl->sl_bitmap, idx, 1))
-            ABORT("detected double free on %p (objsize 0x%zx)", p, sl->sl_objsize);
+            ABORT_LOCKED(ar, "detected double free on %p (objsize 0x%zx)", p, sl->sl_objsize);
 
         // short circuit, keep in same slab
         if (objsize == sl->sl_objsize) {
@@ -613,7 +618,7 @@ void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
     }
 
     if (!prev_sl)
-        ABORT("invalid pointer %p", p);
+        ABORT_LOCKED(ar, "invalid pointer %p", p);
 
     void *newp = rmem_arena_alloc_locked(ar, size);
     if (!newp) {
@@ -622,7 +627,7 @@ void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
     }
 
     memcpy(newp, p, (prev_sl->sl_objsize < size ? prev_sl->sl_objsize : size));
-    rmem_slab_free(prev_sl, p);
+    rmem_slab_free(&ar->ar_lock, prev_sl, p);
     pthread_mutex_unlock(&ar->ar_lock);
     return newp;
 }
