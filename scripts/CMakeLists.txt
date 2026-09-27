@@ -66,7 +66,7 @@ function(mkinitrd_target NAME)
 
     # ── Binaries ──
     if(ARG_FLUTTER)
-        string(APPEND SCRIPT "cp '${BIN_OUT}/mksh_launcher' \"$ROOTFS/bin/sh\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/bash_launcher' \"$ROOTFS/bin/bash\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/dropbear_launcher' \"$ROOTFS/bin/dropbear\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/sftpserver_launcher' \"$ROOTFS/bin/sftp-server\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/toybox_launcher' \"$ROOTFS/bin/toybox\"\n")
@@ -76,12 +76,26 @@ function(mkinitrd_target NAME)
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/sftpserver/sftp-server' \"$ROOTFS/bin/sftp-server\"\n")
-        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/mksh/mksh' \"$ROOTFS/bin/sh\"\n")
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/bash/bash' \"$ROOTFS/bin/bash\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/toybox/toybox' \"$ROOTFS/bin/toybox\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/vim/vim' \"$ROOTFS/bin/vim\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/curl_tool/curl' \"$ROOTFS/bin/curl\"\n")
     endif()
-    string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n\n")
+    string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n")
+    # /bin/sh is bash invoked as `sh`: POSIX mode, reads $ENV when interactive
+    # (scripts, system(3) and dropbear's `sh -c` all go through it).
+    string(APPEND SCRIPT "ln -sf bash \"$ROOTFS/bin/sh\"\n\n")
+
+    # ── Shell startup files ──
+    # bash reads SYS_PROFILE (=/tvm/etc/profile, see scripts/build_bash.sh) for
+    # login shells and SYS_BASHRC (=/tvm/etc/bash.bashrc) for interactive
+    # non-login shells. Missing files are skipped silently.
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc\"\n")
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/bash_profile' \"$ROOTFS/etc/profile\"\n")
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/bash_bashrc' \"$ROOTFS/etc/bash.bashrc\"\n")
+    # Termcap database for readline on iOS (bash's bundled GNU termcap reads
+    # TERMCAP_FILE=/tvm/etc/termcap there; unused on macOS, which has terminfo).
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/termcap' \"$ROOTFS/etc/termcap\"\n\n")
 
     # ── CA bundle (Linux only) ──
     # curl verifies through the OS trust store on macOS/iOS (USE_APPLE_SECTRUST);
@@ -157,11 +171,11 @@ endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext mksh_exe toybox_exe vim_exe curl_exe toybox_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe toybox_host_ext ${APPLE_CMDS_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher mksh_launcher toybox_launcher vim_launcher curl_launcher toybox_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher toybox_host_ext ${APPLE_CMDS_DEPS}
 )

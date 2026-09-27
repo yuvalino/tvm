@@ -21,7 +21,7 @@ set(TVM_LIB_DIR "${TVM_ROOT}/lib/android/${ANDROID_ABI}")
 # target_link_libraries(tvm_bridge
 #     ${TVM_LIB_DIR}/libtvm.a
 #     ${TVM_LIB_DIR}/libdropbear.a
-#     ${TVM_LIB_DIR}/libmksh.a
+#     ${TVM_LIB_DIR}/libbash.a
 #     ${TVM_LIB_DIR}/libtoybox.a
 #     ${TVM_LIB_DIR}/libminivim.a
 #     ${TVM_LIB_DIR}/libunicorn.a

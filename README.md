@@ -91,7 +91,7 @@ perror("tvm_start");                // only reached on a pre-boot failure
 
 `flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
 on-device, letting you `ssh` into a full POSIX environment. The TVM core is
-built as `libtvm.dylib`; dropbear/mksh/toybox/vim/curl as dylibs; the
+built as `libtvm.dylib`; dropbear/bash/toybox/vim/curl as dylibs; the
 rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
 native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
 `tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
@@ -164,13 +164,24 @@ pytest tests/test_integration.py --device <device-name> --backend flutter
 |---|---|
 | [dropbear](https://github.com/mkj/dropbear) | SSH server, client, and `scp` |
 | sftp-server | Standalone SFTPv3 server (exec'd by dropbear for sftp/scp subsystem) |
-| [mksh](https://github.com/MirBSD/mksh) | MirBSD Korn Shell |
+| [bash](https://www.gnu.org/software/bash/) | GNU Bourne-Again Shell 5.3, the login shell and `/tvm/bin/sh` (unpatched upstream, configured via cache variables and `-D` overrides only; see `scripts/build_bash.sh`). License: GPLv3 |
 | [toybox](http://landley.net/toybox/) | Unix utilities (`ls`, `cat`, `grep`, `id`, etc.) |
 | [vim](https://github.com/vim/vim) | Text editor |
 | [curl](https://curl.se/) | HTTP(S) client, TLS via OpenSSL; certificate verification through the OS trust store on macOS/iOS (Apple SecTrust), Mozilla's CA bundle on Linux. License: curl |
 | [OpenSSL](https://www.openssl.org/) | TLS/crypto library, statically linked into curl. License: Apache-2.0 |
 | [unicorn](https://www.unicorn-engine.org/) | CPU emulator (TCI interpreter mode for iOS) |
 | Apple *_cmds | BSD userland from apple-oss-distributions (`ifconfig`, `netstat`, `ps`, `sysctl`, etc.) |
+
+Licensing note: bash is GPLv3 (unicorn is already GPLv2); everything else is
+permissively licensed. Nothing links against bash — it is shipped as a separate
+program (`/tvm/bin/bash`, `libbash.dylib` in the apps) — so the GPL covers the
+bash binary and its sources only.
+
+The login shell is `-bash`: it reads `/tvm/etc/profile` (a login shell does not
+read `$ENV`), which sources `$ENV` (e.g. `ENV=$HOME/.forklessrc` in the app's
+rc) so per-user rc files keep working; `/tvm/bin/sh` is bash invoked as `sh`
+(POSIX mode, reads `$ENV` when interactive) and is what `system(3)` and
+`#!/bin/sh` scripts get.
 
 ### Examples (`examples/`)
 

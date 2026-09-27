@@ -28,7 +28,7 @@ set(TVM_LIB_DIR "${TVM_ROOT}/lib/windows/x64")
 target_link_libraries(tvm_bridge
   ${TVM_LIB_DIR}/tvm.lib
   ${TVM_LIB_DIR}/dropbear.lib
-  ${TVM_LIB_DIR}/mksh.lib
+  ${TVM_LIB_DIR}/bash.lib
   ${TVM_LIB_DIR}/toybox.lib
   ${TVM_LIB_DIR}/minivim.lib
   ${TVM_LIB_DIR}/unicorn.lib

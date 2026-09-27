@@ -1,0 +1,5 @@
+# /tvm/etc/profile — read by bash for login shells (-bash, bash -l, sh -l).
+#
+# TVM's rc files export ENV (e.g. ENV=$HOME/.forklessrc); bash only honours
+# $ENV itself when invoked as `sh`, so source it here for login shells too.
+[ -n "$ENV" ] && [ -f "$ENV" ] && . "$ENV"
