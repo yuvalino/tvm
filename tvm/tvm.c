@@ -2416,11 +2416,31 @@ static int task_set_pgid(struct task *t, int pgid)
  * needs tasks_lock and t locked.
  * Prefers delivering to a thread that isn't in a signal-deferred section.
  */
+// SIGSTOP cannot be caught, so pthread_kill()ing it never reaches
+// signal_handler: the kernel stops the whole host process — every task, every
+// session, the embedding app's UI — and only an outside SIGCONT resumes it.
+// Task stop/continue is not implemented (see SAD_STOP in signal_dispatch, which
+// ignores the catchable stop signals), so drop it here for the same reason.
+static int stop_signal_dropped(int signum, pid_t pid)
+{
+    if (signum != SIGSTOP)
+        return 0;
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        INFO("SIGSTOP for pid %d dropped: task stop/continue not implemented", pid);
+    }
+    return 1;
+}
+
 static int task_kill_locked(struct task *t, int signum) {
     int r;
 
     if (list_empty(&t->tsk_threads))
         return ESRCH;
+
+    if (stop_signal_dropped(signum, t->tsk_pid))
+        return 0;
 
     // Try to find a thread that isn't blocking signals
     struct thread *fallback = NULL;
@@ -3686,8 +3706,21 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
         return;
     }
     if (whatdo == SAD_STOP) {
+        // Stopping a task (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU with the default
+        // disposition) is not implemented: tasks are threads of one host
+        // process and there is no stop/continue machinery yet. Ignore the
+        // signal like SAD_IGN. This used to panic(), which took the whole VM
+        // (and the embedding app) down on any Ctrl-Z or `kill -STOP` that
+        // reached a task with the default disposition — routine with bash's
+        // job control. Logged once so a silently-ignored stop is still visible.
+        static int stop_warned = 0;
+        if (!stop_warned) {
+            stop_warned = 1;
+            INFO("stop signal %d for pid %d ignored: task stop/continue not implemented", signum, current->tsk_pid);
+        }
         task_unlock(current);
-        panic("signal_handler STOP"); // TODO what do we do
+        tvm_sig_depth--;
+        return;
     }
     if (whatdo == SAD_CONT) {
         task_unlock(current);
@@ -12968,6 +13001,11 @@ FUNCTION_DEFINE3(int, sigaction, int, signum, const struct sigaction *, act, str
 
 FUNCTION_DEFINE1(int, raise, int, sig) {
     tvm_sig_enter();
+
+    if (stop_signal_dropped(sig, current->tsk_pid)) {
+        tvm_sig_leave();
+        return 0;
+    }
 
     int r = pthread_kill(pthread_self(), sig);
     if (r != 0) {
