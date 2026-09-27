@@ -409,7 +409,7 @@ def test_sigint_loop(sshi: spawn):
 def test_sigterm_child(sshi: spawn):
     """Kill a child by pid — exercises task_kill_locked signal delivery."""
     sshi.sendline("sleep 999 & echo bg=$!")
-    sshi.expect(r"bg=(\d+)")
+    sshi.expect(r"bg=(\d+)\r?\n")
     pid = sshi.match.group(1).decode()
     sshi.expect(r"\$ ")
 
@@ -1365,9 +1365,9 @@ def test_getpid_getppid(sshi: spawn):
 def test_child_pid_differs(sshi: spawn):
     """Fork creates new pid — exercises per-task tsk_pid."""
     sshi.sendline("echo parent=$$ && sh -c 'echo child=$$'")
-    sshi.expect(r"parent=(\d+)")
+    sshi.expect(r"parent=(\d+)\r?\n")
     parent = sshi.match.group(1).decode()
-    sshi.expect(r"child=(\d+)")
+    sshi.expect(r"child=(\d+)\r?\n")
     child = sshi.match.group(1).decode()
     assert parent != child, f"parent {parent} == child {child}"
     sshi.expect(r"\$ ")
