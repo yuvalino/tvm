@@ -17,7 +17,7 @@ endif()
 
 # ── Toybox applets ──────────────────────────────────────────────
 set(TOYBOX_APPLETS
-    ascii base32 base64 basename bzcat cal cat chgrp chmod chown
+    ascii awk base32 base64 basename bzcat cal cat chgrp chmod chown
     cksum clear cmp comm count cp cpio crc32 cut date df dirname
     dos2unix du echo egrep env expand factor fallocate false fgrep
     file find flock fmt fold ftpget ftpput getconf grep groups head
