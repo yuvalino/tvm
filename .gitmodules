@@ -25,3 +25,9 @@
 [submodule "third_party/apple/diskdev_cmds"]
 	path = third_party/apple/diskdev_cmds
 	url = https://github.com/apple-oss-distributions/diskdev_cmds.git
+[submodule "third_party/openssl"]
+	path = third_party/openssl
+	url = https://github.com/openssl/openssl.git
+[submodule "third_party/curl"]
+	path = third_party/curl
+	url = https://github.com/curl/curl.git
