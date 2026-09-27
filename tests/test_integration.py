@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl"
 # build.py -t flutter symlinks the built app here (→ tvm.app / Runner.app).
 FLUTTER_APP = f"./output/macos-arm64/lib/flutter"
 IOS_APP = f"./output/ios-arm64/lib/flutter"
@@ -210,7 +210,7 @@ def ssh_interactive(port: int, address: str = "localhost", user: str = "") -> It
         #    (EPERM), but provides a sandbox-accessible TMPDIR ($HOME/Documents/
         #    tmp). Hardcoding /tmp broke every file-writing flutter test.
         # So use /tmp iff writable, else keep the provided/HOME tmpdir.
-        # (Guard `. $ENV`: empty $ENV is a no-arg `.` that eats the line in mksh.)
+        # (Guard `. $ENV`: bash's `.` with an empty $ENV is a usage error.)
         p.sendline('[ -f "$ENV" ] && . "$ENV"; if touch /tmp/.tvmwt 2>/dev/null; '
                    'then rm -f /tmp/.tvmwt; export TMPDIR=/tmp; '
                    'else export TMPDIR="${TMPDIR:-$HOME/tmp}"; fi; mkdir -p "$TMPDIR"')
@@ -229,7 +229,7 @@ def sshi(forkless: Forkless) -> Iterator[spawn]:
         #    (EPERM), but provides a sandbox-accessible TMPDIR ($HOME/Documents/
         #    tmp). Hardcoding /tmp broke every file-writing flutter test.
         # So use /tmp iff writable, else keep the provided/HOME tmpdir.
-        # (Guard `. $ENV`: empty $ENV is a no-arg `.` that eats the line in mksh.)
+        # (Guard `. $ENV`: bash's `.` with an empty $ENV is a usage error.)
         p.sendline('[ -f "$ENV" ] && . "$ENV"; if touch /tmp/.tvmwt 2>/dev/null; '
                    'then rm -f /tmp/.tvmwt; export TMPDIR=/tmp; '
                    'else export TMPDIR="${TMPDIR:-$HOME/tmp}"; fi; mkdir -p "$TMPDIR"')
@@ -485,8 +485,9 @@ def test_toybox_sort_uniq(sshi: spawn):
 
 def test_toybox_find(sshi: spawn):
     """find — exercises recursive directory traversal."""
-    sshi.sendline("find /tvm/bin -name 'sh' -type f")
-    sshi.expect("/tvm/bin/sh")
+    # /tvm/bin/sh is a symlink to bash; the regular file is bash itself.
+    sshi.sendline("find /tvm/bin -name 'bash' -type f")
+    sshi.expect("/tvm/bin/bash")
     sshi.expect(r"\$ ")
 
 def test_toybox_grep(sshi: spawn):
@@ -1279,15 +1280,28 @@ def test_symlink_readlink(sshi: spawn):
     sshi.expect("/tvm/bin/sh")
     sshi.expect(r"\$ ")
 
+# Symlink tests. The /tvm initrd mount is not writable (ln into /tvm/bin fails
+# with ENOENT on every platform) and a host-fs symlink pointing into the mount
+# cannot be opened or executed (the host resolves it), so the old variants that
+# did `ln -sf toybox /tvm/bin/my_echo && /tvm/bin/my_echo ...` never ran
+# anything: they passed by matching the marker in their own echoed command
+# line. These exercise what exists: symlinks shipped inside the initrd, and a
+# chain of host-fs symlinks. The markers are split with '' so the echoed
+# command cannot satisfy the expect — only real output can.
+
 def test_symlink_follow(sshi: spawn):
-    """Execute through a symlink — exercises VFS path resolution."""
-    sshi.sendline("ln -sf toybox /tvm/bin/my_echo && /tvm/bin/my_echo echo symlink_exec_ok")
-    sshi.expect("symlink_exec_ok")
+    """Execute through a symlink inside the initrd (/tvm/bin/sh -> bash) —
+    exercises VFS symlink resolution in execve and readlink."""
+    sshi.sendline("readlink /tvm/bin/sh; /tvm/bin/sh -c 'echo symlink_ex''ec_ok $0'")
+    sshi.expect("bash")
+    sshi.expect("symlink_exec_ok /tvm/bin/sh")
     sshi.expect(r"\$ ")
 
 def test_symlink_chain(sshi: spawn):
-    """Symlink to symlink — exercises chained resolution."""
-    sshi.sendline("ln -sf sh /tvm/bin/link1 && ln -sf link1 /tvm/bin/link2 && /tvm/bin/link2 -c 'echo chain_ok'")
+    """Symlink to symlink on the host fs, executed as a #!-less text file —
+    exercises chained resolution in execve's open()."""
+    sshi.sendline("printf 'echo ch\"\"ain_ok\\n' > $TMPDIR/chain_target && chmod 755 $TMPDIR/chain_target && "
+                  "ln -sf chain_target $TMPDIR/link1 && ln -sf link1 $TMPDIR/link2 && $TMPDIR/link2")
     sshi.expect("chain_ok")
     sshi.expect(r"\$ ")
 
@@ -1388,8 +1402,22 @@ def test_signal_mask_inheritance(sshi: spawn):
     sshi.expect(r"\$ ")
 
 def test_sigtstp_ignored(sshi: spawn):
-    """Ctrl-Z (SIGTSTP) in a pipeline shouldn't crash the shell."""
-    sshi.sendline("cat /dev/null")
+    """Ctrl-Z during a foreground command must not kill the VM.
+
+    TVM has no task stop/continue: a stop signal reaching a task with the
+    default disposition used to panic("signal_handler STOP") and abort the
+    whole backend. It is ignored instead, so the foreground command runs to
+    completion and the prompt comes back. Exercised both ways: a real ^Z
+    through the tty line discipline (VSUSP -> SIGTSTP to the foreground
+    process group) and explicit kill -TSTP / kill -STOP on a child.
+    """
+    sshi.sendline("sleep 3; echo after_sleep")
+    time.sleep(1)
+    sshi.send("\x1a")
+    sshi.expect("after_sleep")
+    sshi.expect(r"\$ ")
+    sshi.sendline("sleep 2 & kill -TSTP $!; kill -STOP $!; wait; echo after_stop")
+    sshi.expect("after_stop")
     sshi.expect(r"\$ ")
     sshi.sendline("echo still_here")
     sshi.expect("still_here")
