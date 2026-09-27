@@ -13,9 +13,12 @@ for item in Config.in Makefile configure kconfig lib main.c scripts toys toys.h;
     ln -sfn "$SRCDIR/$item" "$BUILDDIR/$item"
 done
 
-# .config is per-build — use TVM's config, not the submodule's
-if [ ! -f "$BUILDDIR/.config" ]; then
+# .config is per-build — use TVM's config, not the submodule's. Refresh it
+# whenever the tracked config changed, so enabling an applet takes effect
+# without a clean build.
+if ! cmp -s "$THIRDPARTY/configs/toybox.config" "$BUILDDIR/.config"; then
     cp "$THIRDPARTY/configs/toybox.config" "$BUILDDIR/.config"
+    rm -rf "$BUILDDIR/generated"
 fi
 
 mkdir -p "$BUILDDIR/generated"
@@ -28,6 +31,8 @@ if [ "$(uname)" = "Darwin" ] && [ -z "$TVM_IOS_CROSS" ]; then
     CFLAGS_EXTRA="-I$OPENSSL_PREFIX/include"
 elif [ "$(uname)" = "Darwin" ]; then
     export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+    # iOS SDK marks system(3) unavailable; awk needs it (see the header)
+    CFLAGS_EXTRA="-include $THIRDPARTY/include-shim/tvm_ios_libc.h"
 fi
 
 # Shim headers for iOS SDK gaps (e.g. sys/disk.h)

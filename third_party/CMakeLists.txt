@@ -223,6 +223,12 @@ ExternalProject_Add(toybox_ext
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
+# Re-run the build step when the applet config or the build script changes;
+# ExternalProject otherwise considers the step done forever once its stamp
+# exists, so enabling an applet in toybox.config never reached an existing
+# build tree.
+ExternalProject_Add_StepDependencies(toybox_ext build
+    ${THIRDPARTY_SRC}/configs/toybox.config ${SCRIPTS_DIR}/build_toybox.sh)
 add_custom_target(toybox_exe DEPENDS toybox_ext)
 set_target_properties(toybox_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -241,6 +247,8 @@ ExternalProject_Add(toybox_host_ext
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
+ExternalProject_Add_StepDependencies(toybox_host_ext build
+    ${THIRDPARTY_SRC}/configs/toybox.config ${SCRIPTS_DIR}/build_toybox.sh)
 
 ###############################################################################
 # vim
