@@ -3280,6 +3280,9 @@ void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
     if (fs->fs_type == FS_FILE) {
         if (fs->fs_fp) {
             int last_errno = errno;
+            // Flush while the fd is still attached: the real fclose() below
+            // would otherwise flush to fd -1 and silently drop the buffer.
+            (void)CALL_FUNC(fflush, fs->fs_fp);
             fp_setfileno(fs->fs_fp, -1);
             (void)CALL_FUNC(fclose, fs->fs_fp);
             errno = last_errno;
