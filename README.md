@@ -91,7 +91,7 @@ perror("tvm_start");                // only reached on a pre-boot failure
 
 `flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
 on-device, letting you `ssh` into a full POSIX environment. The TVM core is
-built as `libtvm.dylib`; dropbear/mksh/toybox/vim as dylibs; the
+built as `libtvm.dylib`; dropbear/mksh/toybox/vim/curl as dylibs; the
 rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
 native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
 `tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
@@ -167,6 +167,8 @@ pytest tests/test_integration.py --device <device-name> --backend flutter
 | [mksh](https://github.com/MirBSD/mksh) | MirBSD Korn Shell |
 | [toybox](http://landley.net/toybox/) | Unix utilities (`ls`, `cat`, `grep`, `id`, etc.) |
 | [vim](https://github.com/vim/vim) | Text editor |
+| [curl](https://curl.se/) | HTTP(S) client, TLS via OpenSSL; certificate verification through the OS trust store on macOS/iOS (Apple SecTrust), Mozilla's CA bundle on Linux. License: curl |
+| [OpenSSL](https://www.openssl.org/) | TLS/crypto library, statically linked into curl. License: Apache-2.0 |
 | [unicorn](https://www.unicorn-engine.org/) | CPU emulator (TCI interpreter mode for iOS) |
 | Apple *_cmds | BSD userland from apple-oss-distributions (`ifconfig`, `netstat`, `ps`, `sysctl`, etc.) |
 

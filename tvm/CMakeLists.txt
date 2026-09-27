@@ -21,7 +21,13 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         target_link_libraries(tvm_exe PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt ncurses)
         target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        target_link_libraries(tvm_exe PRIVATE unicorn z pthread m ncurses)
+        # The ulinker resolves a guest's undefined symbols against what is
+        # already loaded in this process, so host libraries the tools need
+        # are linked here: z (dropbear/toybox), ncurses (vim), and the
+        # frameworks curl's Apple SecTrust verification uses.
+        target_link_libraries(tvm_exe PRIVATE unicorn z pthread m ncurses
+            "-framework Security" "-framework CoreFoundation"
+            "-framework SystemConfiguration")
     endif()
 endif()
 
@@ -37,9 +43,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
         C_VISIBILITY_PRESET default
     )
     # Objects come from tvm_static via TARGET_OBJECTS; only link the deps.
-    set(TVM_SHARED_LIBS unicorn z pthread m)
+    # As for tvm_exe: the tool dylibs resolve their host symbols through
+    # this process, so curl's frameworks (Security/CoreFoundation, plus
+    # SystemConfiguration on macOS only, as in curl's own build) go here.
+    set(TVM_SHARED_LIBS unicorn z pthread m
+        "-framework Security" "-framework CoreFoundation")
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        list(APPEND TVM_SHARED_LIBS ncurses)
+        list(APPEND TVM_SHARED_LIBS ncurses "-framework SystemConfiguration")
     endif()
     target_link_libraries(tvm_shared PRIVATE ${TVM_SHARED_LIBS})
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)

@@ -253,3 +253,113 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_dependencies(vim_shared termcap_stubs)
 endif()
 add_launcher(vim)
+
+###############################################################################
+# openssl (static libssl/libcrypto for curl)
+###############################################################################
+set(OPENSSL_BUILD ${THIRDPARTY_BUILD}/openssl)
+set(TVM_OPENSSL_PREFIX ${OPENSSL_BUILD}/prefix)
+
+# Configure target. ios64-xcrun already compiles with `xcrun -sdk iphoneos cc
+# -arch arm64`; the extra -miphoneos-version-min matches ios-cc.sh.
+set(OPENSSL_CONFIGURE_EXTRA "")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(OPENSSL_TARGET ios64-xcrun)
+    set(OPENSSL_CONFIGURE_EXTRA -miphoneos-version-min=15.0)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(OPENSSL_TARGET darwin64-arm64-cc)
+else()
+    set(OPENSSL_TARGET linux-x86_64)
+endif()
+
+cmake_host_system_information(RESULT TVM_NPROC QUERY NUMBER_OF_LOGICAL_CORES)
+
+ExternalProject_Add(openssl_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/openssl
+    BINARY_DIR ${OPENSSL_BUILD}
+    CONFIGURE_COMMAND perl ${THIRDPARTY_SRC}/openssl/Configure ${OPENSSL_TARGET}
+        --prefix=${TVM_OPENSSL_PREFIX} --libdir=lib
+        no-shared no-dso no-module no-engine no-dynamic-engine no-legacy no-fips
+        no-async no-thread-pool no-default-thread-pool no-secure-memory no-atexit
+        no-apps no-tests no-docs no-sctp no-ktls --with-rand-seed=os
+        ${OPENSSL_CONFIGURE_EXTRA} -g -gdwarf-4
+    BUILD_COMMAND make -j${TVM_NPROC} build_libs
+    INSTALL_COMMAND make install_dev
+    EXCLUDE_FROM_ALL TRUE
+)
+
+###############################################################################
+# curl
+#
+# Its own CMake builds libcurl.a and compiles the tool objects; the tool is
+# then relinked by scripts/build_curl_tool.sh with the TVM main() wrapper
+# (third_party/curl_main.c), as a static executable for the CLI initrd and as
+# libcurl.dylib (exporting main) for the Flutter initrd.
+###############################################################################
+set(CURL_BUILD ${THIRDPARTY_BUILD}/curl)
+set(CURL_TOOL_BUILD ${THIRDPARTY_BUILD}/curl_tool)
+
+set(CURL_CMAKE_ARGS
+    "-DCMAKE_C_FLAGS=-g -gdwarf-4"
+    -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_STATIC_CURL=ON
+    -DBUILD_CURL_EXE=ON
+    -DCURL_USE_OPENSSL=ON
+    -DOPENSSL_ROOT_DIR=${TVM_OPENSSL_PREFIX}
+    -DOPENSSL_USE_STATIC_LIBS=TRUE
+    -DOPENSSL_INCLUDE_DIR=${TVM_OPENSSL_PREFIX}/include
+    -DOPENSSL_SSL_LIBRARY=${TVM_OPENSSL_PREFIX}/lib/libssl.a
+    -DOPENSSL_CRYPTO_LIBRARY=${TVM_OPENSSL_PREFIX}/lib/libcrypto.a
+    -DCURL_CA_PATH=none
+    -DCURL_DISABLE_OPENSSL_AUTO_LOAD_CONFIG=ON
+    -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF -DUSE_APPLE_IDN=OFF -DUSE_NGHTTP2=OFF
+    -DCURL_USE_LIBSSH2=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DCURL_ZLIB=ON
+    -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON
+    -DCURL_DISABLE_RTSP=ON -DCURL_DISABLE_MQTT=ON -DCURL_DISABLE_TELNET=ON
+    -DCURL_DISABLE_TFTP=ON -DCURL_DISABLE_DICT=ON -DCURL_DISABLE_GOPHER=ON
+    -DCURL_DISABLE_IMAP=ON -DCURL_DISABLE_POP3=ON -DCURL_DISABLE_SMTP=ON
+    -DENABLE_THREADED_RESOLVER=ON -DENABLE_IPV6=ON -DENABLE_UNIX_SOCKETS=OFF
+    -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF
+    -DBUILD_LIBCURL_DOCS=OFF -DENABLE_CURL_MANUAL=OFF
+)
+if(APPLE)
+    # Certificate verification through the OS trust store: no CA bundle needed
+    # on macOS/iOS. (curl only enables SecTrust when no CA file is configured,
+    # so nothing may set a CA bundle on Apple.)
+    list(APPEND CURL_CMAKE_ARGS -DUSE_APPLE_SECTRUST=ON -DCURL_CA_BUNDLE=none)
+else()
+    # Linux: Mozilla's bundle (third_party/configs/cacert.pem) is shipped in
+    # the initrd; make it curl's compile-time default.
+    list(APPEND CURL_CMAKE_ARGS -DCURL_CA_BUNDLE=/tvm/etc/ssl/cacert.pem)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    list(APPEND CURL_CMAKE_ARGS
+        -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64
+        -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_OSX_SYSROOT=iphoneos)
+endif()
+
+ExternalProject_Add(curl_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/curl
+    BINARY_DIR ${CURL_BUILD}
+    CMAKE_ARGS ${CURL_CMAKE_ARGS}
+    INSTALL_COMMAND ""
+    DEPENDS openssl_ext
+    EXCLUDE_FROM_ALL TRUE
+)
+
+add_custom_target(curl_exe
+    COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_curl_tool.sh
+        exe ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${CURL_TOOL_BUILD} ${CURL_TOOL_BUILD}/curl
+    DEPENDS curl_ext
+    COMMENT "Linking curl (TVM main wrapper)"
+)
+set_target_properties(curl_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+add_custom_target(curl_shared
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}
+    COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_curl_tool.sh
+        dylib ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${CURL_TOOL_BUILD} ${LIB_OUT}/libcurl.dylib
+    DEPENDS curl_ext
+    COMMENT "Linking curl (shared)"
+)
+set_target_properties(curl_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_launcher(curl)

@@ -71,6 +71,7 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${BIN_OUT}/sftpserver_launcher' \"$ROOTFS/bin/sftp-server\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/toybox_launcher' \"$ROOTFS/bin/toybox\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/vim_launcher' \"$ROOTFS/bin/vim\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/curl_launcher' \"$ROOTFS/bin/curl\"\n")
     else()
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
@@ -78,8 +79,17 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/mksh/mksh' \"$ROOTFS/bin/sh\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/toybox/toybox' \"$ROOTFS/bin/toybox\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/vim/vim' \"$ROOTFS/bin/vim\"\n")
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/curl_tool/curl' \"$ROOTFS/bin/curl\"\n")
     endif()
     string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n\n")
+
+    # ── CA bundle (Linux only) ──
+    # curl verifies through the OS trust store on macOS/iOS (USE_APPLE_SECTRUST);
+    # Linux gets Mozilla's bundle, curl's compile-time CURL_CA_BUNDLE default.
+    if(NOT APPLE)
+        string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/ssl\"\n")
+        string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/cacert.pem' \"$ROOTFS/etc/ssl/cacert.pem\"\n\n")
+    endif()
 
     # ── apple *_cmds ──
     foreach(module ${APPLE_CMDS_MODULES})
@@ -147,11 +157,11 @@ endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext mksh_exe toybox_exe vim_exe toybox_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext mksh_exe toybox_exe vim_exe curl_exe toybox_host_ext ${APPLE_CMDS_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher mksh_launcher toybox_launcher vim_launcher toybox_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher mksh_launcher toybox_launcher vim_launcher curl_launcher toybox_host_ext ${APPLE_CMDS_DEPS}
 )
