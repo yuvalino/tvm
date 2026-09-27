@@ -24,3 +24,4 @@ scp_large_dst
 *.nam
 *.til
 *.imcp
+.bash_history

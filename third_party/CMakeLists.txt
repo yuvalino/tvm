@@ -155,26 +155,46 @@ set_target_properties(sftpserver_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_launcher(sftpserver)
 
 ###############################################################################
-# mksh
+# bash
+#
+# Unpatched GNU bash, autotools out-of-tree build driven by
+# scripts/build_bash.sh (configure cache vars + -D overrides on CFLAGS, no
+# source patches). The exe is bash's own `bash`; the Flutter dylib relinks the
+# objects of bash's link line (exported to objects/ by the script) with its
+# static sub-libraries in bash's own order.
 ###############################################################################
-set(MKSH_BUILD ${THIRDPARTY_BUILD}/mksh)
+set(BASH_BUILD ${THIRDPARTY_BUILD}/bash)
 
-ExternalProject_Add(mksh_ext
-    SOURCE_DIR ${THIRDPARTY_SRC}/mksh
-    BINARY_DIR ${MKSH_BUILD}
-    CONFIGURE_COMMAND sh -c "cd ${MKSH_BUILD} && \
-        CC=${TVM_CC} CFLAGS='-g -gdwarf-4 -fcommon -DMKSH_FORKLESS=1 -DMKSH_DEFAULT_PROFILEDIR=\\\"/tvm/etc\\\"' \
-        sh ${THIRDPARTY_SRC}/mksh/Build.sh"
-    BUILD_COMMAND sh -c "cd ${MKSH_BUILD} && (sh ./Rebuild.sh || true) && \
-        ${TVM_CC} -g -gdwarf-4 -o mksh ./*.o"
+# Termcap: ncurses via the SDK's libtermcap.tbd on macOS, bash's bundled GNU
+# termcap on iOS (no terminfo database on the device; see build_bash.sh).
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(BASH_TERMCAP_LIB ${BASH_BUILD}/lib/termcap/libtermcap.a)
+else()
+    set(BASH_TERMCAP_LIB -ltermcap)
+endif()
+set(BASH_LINK_LIBS
+    ${BASH_BUILD}/builtins/libbuiltins.a
+    ${BASH_BUILD}/lib/glob/libglob.a
+    ${BASH_BUILD}/lib/sh/libsh.a
+    ${BASH_BUILD}/lib/readline/libreadline.a
+    ${BASH_BUILD}/lib/readline/libhistory.a
+    ${BASH_TERMCAP_LIB}
+    ${BASH_BUILD}/lib/tilde/libtilde.a
+)
+
+ExternalProject_Add(bash_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/bash
+    BINARY_DIR ${BASH_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_bash.sh ${THIRDPARTY_SRC}/bash ${BASH_BUILD}
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
-add_custom_target(mksh_exe DEPENDS mksh_ext)
-set_target_properties(mksh_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_custom_target(bash_exe DEPENDS bash_ext)
+set_target_properties(bash_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(mksh "*.o")
-add_launcher(mksh)
+add_shared_lib(bash "objects/*.o" ${BASH_LINK_LIBS})
+add_launcher(bash)
 
 ###############################################################################
 # toybox

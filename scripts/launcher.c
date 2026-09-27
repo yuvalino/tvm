@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 #ifndef TARGET
-#error "Define TARGET as the dylib name, e.g. -DTARGET='\"libmksh.dylib\"'"
+#error "Define TARGET as the dylib name, e.g. -DTARGET='\"libbash.dylib\"'"
 #endif
 
 int main(int argc, char **argv, char **envp)

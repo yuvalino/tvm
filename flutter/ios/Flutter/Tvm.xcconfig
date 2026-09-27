@@ -3,4 +3,4 @@
 // TVM_ROOT=$(PROJECT_DIR)/../tvm
 // HEADER_SEARCH_PATHS=$(inherited) $(TVM_ROOT)/include $(PROJECT_DIR)/../native
 // LIBRARY_SEARCH_PATHS=$(inherited) $(TVM_ROOT)/lib/ios
-// OTHER_LDFLAGS=$(inherited) -ltvm -ldropbear -lmksh -ltoybox -lminivim -lunicorn -lz
+// OTHER_LDFLAGS=$(inherited) -ltvm -ldropbear -lbash -ltoybox -lminivim -lunicorn -lz
