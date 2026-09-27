@@ -2378,13 +2378,22 @@ static int task_set_pgid(struct task *t, int pgid)
         return -1;
     }
 
+    // Already a member of that group: success, nothing to do. Job-control
+    // shells (bash) call setpgid(child, pgid) from both the parent and the
+    // child to close the fork race, so whichever runs second must see a
+    // no-op, not EPERM ("child setpgid: Operation not permitted" on every
+    // command, seen on iOS where the parent usually wins the race).
+    if (t->tsk_pgid == pgid)
+        return 0;
+
     struct task *ct;
     list_for_each_entry(ct, &main_task->tsk_list, tsk_list)
     {
         // TODO lock ct?
-        if (pgid == ct->tsk_pgid)
+        if (ct != t && pgid == ct->tsk_pgid)
         {
-            if (t->tsk_pid == ct->tsk_pid || t->tsk_sid != ct->tsk_sid) {
+            // Joining an existing group: it must belong to our session.
+            if (t->tsk_sid != ct->tsk_sid) {
                 errno = EPERM;
                 return -1;
             }
@@ -13611,8 +13620,10 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     char hdr[256];
     int sfd = open(pathname, O_RDONLY);
     if (sfd < 0) {
-        INFO("  failed(ENOENT) errno=%d", errno);
-        errno = ENOENT;
+        // Keep open()'s errno: EACCES (mode 000), ENOENT, ENOTDIR, ELOOP are
+        // all valid execve errors and shells map them to different exit
+        // statuses (126 vs 127) and messages.
+        INFO("  failed(open) errno=%d", errno);
         return -1;
     }
     ssize_t n = read(sfd, hdr, sizeof(hdr) - 1);
@@ -13624,10 +13635,54 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
          n > 0 ? (unsigned char)hdr[0] : 0, n > 1 ? (unsigned char)hdr[1] : 0,
          n > 2 ? (unsigned char)hdr[2] : 0, n > 3 ? (unsigned char)hdr[3] : 0);
 
+    // Execute permission, as the guest's stat() reports it (on iOS stat()
+    // adds the execute bits, see there). A real kernel refuses a mode-644
+    // file with EACCES before looking at its contents; the shells rely on
+    // that for their "Permission denied" / 126 status. TVM's access() drops
+    // X_OK on purpose, so check here.
+    struct stat st;
+    if (0 == stat(pathname, &st)) {
+        if (S_ISDIR(st.st_mode)) {
+            INFO("  failed(EACCES): directory");
+            errno = EACCES;
+            return -1;
+        }
+        if (S_ISREG(st.st_mode) && !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+            INFO("  failed(EACCES): mode %o", (unsigned)st.st_mode & 07777);
+            errno = EACCES;
+            return -1;
+        }
+    }
+
     if (n < 4) {
         INFO("  failed(ENOEXEC)");
         errno = ENOEXEC;
         return -1;
+    }
+
+    // A text file without a #! line: a kernel says ENOEXEC and lets the
+    // calling shell run it as a script itself. bash does that in-process
+    // (shell_execve -> sh_longjmp(subshell_top_level)), which cannot work in
+    // a TVM fork child: the fork copied the parent's stack frames to a new
+    // stack but subshell_top_level was setjmp'd on the parent's stack (shell.c
+    // main), so the longjmp lands on the parent's live stack and the child
+    // dies with a corrupted heap (rmem "invalid pointer" abort). Run such
+    // files through the shell here instead, the way tvm_execvpe() already
+    // does for execvp(). "Text" is what bash's check_binary_file() would
+    // also treat as a script: no NUL byte in the sample; anything else (and
+    // any non-Mach-O binary) still gets ENOEXEC, which bash reports as
+    // "cannot execute binary file" without longjmp'ing.
+    if (!(hdr[0] == '#' && hdr[1] == '!') && memchr(hdr, 0, n) == NULL
+        && memcmp(hdr, "\xcf\xfa\xed\xfe", 4) != 0 /* MH_MAGIC_64 */
+        && memcmp(hdr, "\x7f" "ELF", 4) != 0) {
+        const char *sh = getenv("TVM_SHELL");
+        if (!sh || !*sh) sh = "/bin/sh";
+        INFO("execve: text file without #!, running it with %s", sh);
+        n = snprintf(hdr, sizeof(hdr), "#!%s", sh);
+        if (n >= (ssize_t)sizeof(hdr)) {
+            errno = ENOEXEC;
+            return -1;
+        }
     }
 
     if (hdr[0] == '#' && hdr[1] == '!') {
