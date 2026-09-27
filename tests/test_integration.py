@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl"
 # build.py -t flutter symlinks the built app here (→ tvm.app / Runner.app).
 FLUTTER_APP = f"./output/macos-arm64/lib/flutter"
 IOS_APP = f"./output/ios-arm64/lib/flutter"
@@ -778,6 +778,161 @@ def test_ssh_keygen(sshi: spawn):
     sshi.sendline("test -f $TMPDIR/sshkg_test && echo key_exists")
     sshi.expect("key_exists")
     sshi.expect(r"\$ ")
+
+# ── curl ──────────────────────────────────────────────────────
+
+# The guest shares the runner's network, so reachability is probed from the
+# runner and the whole group skips cleanly when offline. Every request carries
+# `-m 20` so a stalled connection fails with curl's own diagnostic (rc=28 plus
+# a message) instead of a bare pexpect timeout. The expect timeout is generous
+# because the device backend runs at real speed on a phone's Wi-Fi.
+CURL_TIMEOUT = 120
+
+def _reachable(host: str, port: int = 443) -> bool:
+    try:
+        socket.create_connection((host, port), timeout=5).close()
+        return True
+    except OSError:
+        return False
+
+_HAS_NETWORK = _reachable("example.com")
+network_required = pytest.mark.skipif(
+    not _HAS_NETWORK, reason="no network access to example.com:443 from the runner")
+
+def _sh(sshi: spawn, cmd: str, timeout: float = CURL_TIMEOUT) -> tuple[str, int]:
+    """Run cmd in the interactive session and return (output, exit code).
+    The output is everything printed up to the `rc=` marker (ANSI-stripped),
+    which the assertions below include in their messages so a failure shows
+    what curl actually said."""
+    sshi.sendline(f"{cmd}; echo rc=$?")
+    # Anchor on the line end: pexpect matches against the bytes received so
+    # far, so an unanchored rc=(\d+) can match "rc=6" before the "0" of
+    # "rc=60" arrives.
+    sshi.expect(r"rc=(\d+)\r?\n", timeout=timeout)
+    out = clean_ansi(sshi.before.decode(errors="replace"))
+    rc = int(sshi.match.group(1))
+    sshi.expect(r"\$ ", timeout=10)
+    return out, rc
+
+def _lines(out: str) -> list[str]:
+    return [l.strip() for l in out.splitlines() if l.strip()]
+
+@network_required
+def test_curl_version(sshi: spawn):
+    """curl --version — the tool links libcurl 8.x against OpenSSL 3.x and
+    was built with SSL, IPv6, zlib and the threaded resolver. On Darwin the
+    trust store is Apple SecTrust rather than a CA bundle."""
+    out, rc = _sh(sshi, "curl --version")
+    assert rc == 0, out
+    lines = _lines(out)
+    # The tty echoes the command line first, so key on the version line's
+    # libcurl/ token rather than on "curl " at the start.
+    first = next((l for l in lines if l.startswith("curl ") and "libcurl/" in l), "")
+    assert "libcurl/8." in first and "OpenSSL/3." in first, out
+    features = next((l for l in lines if l.startswith("Features:")), "")
+    for feat in ("SSL", "IPv6", "libz", "AsynchDNS"):
+        assert re.search(rf"\b{feat}\b", features), f"missing {feat}: {out}"
+    if PLATFORM.startswith(("macos-", "ios-")):
+        assert "AppleSecTrust" in features, out
+
+@network_required
+def test_curl_https_get(sshi: spawn):
+    """curl over HTTPS — OpenSSL handshake plus certificate verification
+    (Apple SecTrust on Darwin, Mozilla bundle on Linux)."""
+    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null -w '%{http_code} %{ssl_verify_result}\\n' https://example.com")
+    assert rc == 0, out
+    assert "200 0" in _lines(out), out
+
+@network_required
+def test_curl_http_get(sshi: spawn):
+    """Plain HTTP — the socket/resolver path with no TLS involved."""
+    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' http://example.com")
+    assert rc == 0, out
+    assert "200" in _lines(out), out
+
+@network_required
+def test_curl_verify_self_signed_fails(sshi: spawn):
+    """An untrusted chain must be rejected: curl exits 60 (peer cert failed
+    verification), proving verification is really on."""
+    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://self-signed.badssl.com/")
+    assert rc == 60, f"rc={rc}: {out}"
+
+@network_required
+def test_curl_insecure_self_signed_ok(sshi: spawn):
+    """The same host with -k succeeds, so the previous failure was the
+    verifier's decision and not a broken connection."""
+    out, rc = _sh(sshi, "curl -sS -k -m 20 -o /dev/null -w '%{http_code}\\n' https://self-signed.badssl.com/")
+    assert rc == 0, out
+    assert "200" in _lines(out), out
+
+@network_required
+def test_curl_expired_fails(sshi: spawn):
+    """Validity period is checked, not just chain trust."""
+    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://expired.badssl.com/")
+    assert rc == 60, f"rc={rc}: {out}"
+
+@network_required
+def test_curl_wrong_host_fails(sshi: spawn):
+    """Hostname is matched against the certificate's SANs."""
+    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://wrong.host.badssl.com/")
+    assert rc == 60, f"rc={rc}: {out}"
+
+@network_required
+def test_curl_download_to_file(sshi: spawn):
+    """-o into the guest's writable TMPDIR — the response body goes through
+    the VFS write path, not the pty."""
+    out, rc = _sh(sshi, 'curl -sS -m 20 -o "$TMPDIR/curl_out.html" https://example.com && wc -c < "$TMPDIR/curl_out.html"')
+    assert rc == 0, out
+    sizes = [int(l) for l in _lines(out) if l.isdigit()]
+    assert sizes and sizes[-1] > 0, out
+    _sh(sshi, 'rm -f "$TMPDIR/curl_out.html"')
+
+# Echo services for the POST test, in order of preference. httpbin is
+# occasionally flaky (5xx), so postman-echo is tried when httpbin does not
+# echo the body back. httpbin pretty-prints ("a": 1), postman-echo does not
+# ("a":1), hence the regex.
+_ECHO_HOSTS = ("httpbin.org", "postman-echo.com")
+
+@network_required
+def test_curl_post_json(sshi: spawn):
+    """POST with a JSON body and header — request-body upload and the
+    response is read back through the pipe/pty."""
+    hosts = [h for h in _ECHO_HOSTS if _reachable(h)]
+    if not hosts:
+        pytest.skip("neither httpbin.org nor postman-echo.com reachable from the runner")
+    attempts = []
+    for host in hosts:
+        out, rc = _sh(sshi, f"curl -sS -m 20 -H 'Content-Type: application/json' -d '{{\"a\":1}}' https://{host}/post")
+        # Match the parsed-JSON echo, not the raw body or the echoed command
+        # line (both contain the literal {"a":1}).
+        if rc == 0 and re.search(r'"json":\s*\{\s*"a":\s*1', out):
+            return
+        attempts.append(f"--- {host}: rc={rc}\n{out}")
+    pytest.fail("no echo service returned the posted JSON:\n" + "\n".join(attempts))
+
+@network_required
+def test_curl_repeated(sshi: spawn):
+    """Five HTTPS GETs back to back in one shell. Each curl is a fresh guest
+    task, so this exercises OpenSSL's per-thread state being set up and torn
+    down repeatedly (the thread-exit hazard the curl_main wrapper handles)."""
+    out, rc = _sh(sshi, "for i in 1 2 3 4 5; do curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' https://example.com; done")
+    assert rc == 0, out
+    codes = [l for l in _lines(out) if l == "200"]
+    assert len(codes) == 5, f"got {len(codes)} x 200: {out}"
+
+@network_required
+def test_curl_pipeline(sshi: spawn):
+    """curl's stdout through a TVM pipe into toybox grep."""
+    out, rc = _sh(sshi, "curl -sS -m 20 https://example.com | grep -c '<html'")
+    assert rc == 0, out
+    assert _lines(out)[-1] == "1", out
+
+@network_required
+def test_curl_in_background_job(sshi: spawn):
+    """curl as a background job, reaped with wait — job control around a
+    task that spawns its own resolver thread."""
+    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://example.com & wait $!")
+    assert rc == 0, out
 
 # ── Vim (ex mode) ────────────────────────────────────────────
 
