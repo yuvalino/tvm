@@ -361,7 +361,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "TVM_LIB=\"${PROJECT_DIR}/../../output/macos-arm64/lib\"\nDEST=\"${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}\"\nmkdir -p \"${DEST}\"\nfor lib in libtvm.dylib libdropbear.dylib libsftpserver.dylib libmksh.dylib libtoybox.dylib libvim.dylib; do\n    SRC=\"${TVM_LIB}/${lib}\"\n    [ -f \"${SRC}\" ] && cp -f \"${SRC}\" \"${DEST}/\" && codesign --force --sign - \"${DEST}/${lib}\" || true\ndone\n";
+			shellScript = "TVM_LIB=\"${PROJECT_DIR}/../../output/macos-arm64/lib\"\nDEST=\"${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}\"\nmkdir -p \"${DEST}\"\nfor lib in libtvm.dylib libdropbear.dylib libsftpserver.dylib libmksh.dylib libtoybox.dylib libvim.dylib libcurl.dylib; do\n    SRC=\"${TVM_LIB}/${lib}\"\n    [ -f \"${SRC}\" ] && cp -f \"${SRC}\" \"${DEST}/\" && codesign --force --sign - \"${DEST}/${lib}\" || true\ndone\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
