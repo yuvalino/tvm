@@ -24,6 +24,13 @@
 #include <poll.h>
 #include <unistd.h>
 #include <err.h>
+#include <sys/resource.h>
+#ifdef __APPLE__
+#include <mach/mach_init.h>
+#include <mach/mach_port.h>
+#include <mach/thread_act.h>
+#include <mach/thread_info.h>
+#endif
 #include <errno.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -325,6 +332,16 @@ DECL_FUNC(dirfd);
 
 DECL_FUNC(fopen);
 DECL_FUNC(fdopen);
+DECL_FUNC(popen);
+DECL_FUNC(pclose);
+DECL_FUNC(wait4);
+DECL_FUNC(wait3);
+DECL_FUNC(vwarn);
+DECL_FUNC(vwarnx);
+DECL_FUNC(vwarnc);
+DECL_FUNC(verrc);
+DECL_FUNC(getprogname);
+DECL_FUNC(setprogname);
 DECL_FUNC(freopen);
 DECL_FUNC(fclose);
 DECL_FUNC(fwrite);
@@ -1438,12 +1455,57 @@ struct file *filealloc() {
     return file;
 }
 
+/**
+ * Take ownership of a real fd on behalf of a task.
+ *
+ * On darwin a write to a broken pipe raises SIGPIPE process-wide: xnu's
+ * dofilewrite() calls plain psignal(), and get_signalthread() hands the
+ * signal to the first thread in the process whose mask allows it, not to the
+ * thread that wrote. Every task shares this one process, so the signal lands
+ * on whichever task owns the oldest unmasked thread (the init task), which
+ * then dies of another task's broken pipe. Seen as `vm_stat | head -2`
+ * killing the parent shell with status 141 once vm_stat was slow enough
+ * (emulated) for head to exit between its writes.
+ *
+ * So the kernel is told never to raise SIGPIPE for a task-owned fd
+ * (F_SETNOSIGPIPE, which is SO_NOSIGPIPE for sockets), and epipe_signal()
+ * raises it on the writing thread itself when a write fails with EPIPE, where
+ * signal_handler maps it to the writing task. Linux delivers SIGPIPE to the
+ * writing thread already, so neither half exists there.
+ */
+static int rfd_adopt(int rfd)
+{
+#ifdef F_SETNOSIGPIPE
+    if (rfd >= 0)
+        (void)CALL_FUNC(fcntl, rfd, F_SETNOSIGPIPE, 1);
+#endif
+    return rfd;
+}
+
+/**
+ * A write on the calling task's fd just failed; if with EPIPE, deliver the
+ * SIGPIPE the kernel was told not to raise (see rfd_adopt). Thread-directed,
+ * so it reaches signal_handler on this thread; inside a tvm_sig_enter()
+ * section it is deferred to the matching tvm_sig_leave() like any other.
+ * errno is preserved for the caller.
+ */
+static void epipe_signal(void)
+{
+#ifdef F_SETNOSIGPIPE
+    if (errno == EPIPE) {
+        int last_errno = errno;
+        pthread_kill(pthread_self(), SIGPIPE);
+        errno = last_errno;
+    }
+#endif
+}
+
 struct file *filealloc_from_rfd(int rfd) {
     struct file *file = filealloc();
     if (!file)
         return NULL;
 
-    file->f_rfd = rfd;
+    file->f_rfd = rfd_adopt(rfd);
     return file;
 }
 
@@ -1525,7 +1587,7 @@ struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode, 
         return NULL;
     }
 
-    file->f_rfd = rfd;
+    file->f_rfd = rfd_adopt(rfd);
     return file;
 }
 
@@ -1746,6 +1808,8 @@ struct task {
     unsigned tsk_refcount;
     pid_t tsk_pid;
     int tsk_result;  // wstatus as returned from `waitpid()`
+    struct rusage tsk_rusage;       // CPU time of the exiting thread, for wait4()/wait3()
+    struct rusage tsk_rusage_base;  // that thread's CPU time when the task started on it
     pthread_mutex_t tsk_lock;
     struct file *tsk_files[MAX_FILES];
     struct list_head tsk_filestreams;  // file_stream_container
@@ -2270,7 +2334,7 @@ static struct file *task_new_regular_file_locked(struct task *t, int rfd) {
         return NULL;   
     }
 
-    file->f_rfd = rfd;
+    file->f_rfd = rfd_adopt(rfd);
 
     return file;
 }
@@ -2308,7 +2372,7 @@ static void task_lock_with_file_locked(struct task *task, struct file *file)
  * tasks_lock must be locked (or dolocktasks=1)
  * returns locked task
  */
-static struct task *task_for_pid(pid_t pid, int dolocktasks) {
+static struct task *task_lookup_pid(pid_t pid, int dolocktasks) {
     if (main_task->tsk_pid == pid) {
         // callers task_unlock() the result — returning it unlocked would make
         // them release a mutex they don't own (possibly held by another thread)
@@ -2555,6 +2619,60 @@ static void thread_exit_for_task_exit_locked(void)
     detach_current_thread_and_exit(NULL);
 }
 
+// CPU time consumed so far by the calling thread, as rusage user/system time.
+static void thread_cputime(struct rusage *ru)
+{
+    memset(ru, 0, sizeof(*ru));
+#ifdef __APPLE__
+    thread_basic_info_data_t bi;
+    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+    mach_port_t self = mach_thread_self();
+    if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) == KERN_SUCCESS) {
+        ru->ru_utime.tv_sec  = bi.user_time.seconds;
+        ru->ru_utime.tv_usec = bi.user_time.microseconds;
+        ru->ru_stime.tv_sec  = bi.system_time.seconds;
+        ru->ru_stime.tv_usec = bi.system_time.microseconds;
+    }
+    mach_port_deallocate(mach_task_self(), self);
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        ru->ru_utime.tv_sec  = ts.tv_sec;
+        ru->ru_utime.tv_usec = ts.tv_nsec / 1000;
+    }
+#endif
+}
+
+static void timeval_sub(struct timeval *a, const struct timeval *b)
+{
+    a->tv_sec -= b->tv_sec;
+    a->tv_usec -= b->tv_usec;
+    if (a->tv_usec < 0) {
+        a->tv_sec--;
+        a->tv_usec += 1000000;
+    }
+    if (a->tv_sec < 0)
+        a->tv_sec = a->tv_usec = 0;
+}
+
+// Called on the thread a task starts on (fork child, init task): the CPU
+// time the thread had already used is not the task's.
+static void task_rusage_start(struct task *t)
+{
+    thread_cputime(&t->tsk_rusage_base);
+}
+
+// The CPU time this (exiting) thread consumed since the task started on it,
+// as the task's rusage. Tasks are threads, so there is no kernel per-process
+// accounting to read; the exiting thread is the task's main thread for every
+// single-threaded tool.
+static void task_record_rusage(struct task *t)
+{
+    thread_cputime(&t->tsk_rusage);
+    timeval_sub(&t->tsk_rusage.ru_utime, &t->tsk_rusage_base.ru_utime);
+    timeval_sub(&t->tsk_rusage.ru_stime, &t->tsk_rusage_base.ru_stime);
+}
+
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
@@ -2568,6 +2686,18 @@ static void terminate_current_locked(int result)
         thread_exit_for_task_exit_locked();
     current->tsk_state |= TS_EXITING;
     __atomic_store_n(&current->tsk_exiting_thread, current_thread, __ATOMIC_RELEASE);
+
+    // Block OS-level signals for the entire teardown. tasks_lock and the task
+    // lock are held from here on; an OS signal landing on this thread would
+    // re-enter signal_handler -> signal_dispatch, which takes tasks_lock
+    // again and deadlocks the thread against itself (seen as a hang with
+    // signal_dispatch stuck in pthread_mutex_lock under rmem_arena_free
+    // inside taskfreelastref). This thread never returns, so the mask is
+    // never restored; the init-task exit path unblocks only the signal it
+    // re-raises.
+    sigset_t all_sigs;
+    sigfillset(&all_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, NULL);
 
     // Decide now; `current` may be cleared before the exit below.
     int is_init = (current == main_task);
@@ -2651,6 +2781,7 @@ static void terminate_current_locked(int result)
 
         current->tsk_state |= TS_ZOMBIE;
         current->tsk_result = result;
+        task_record_rusage(current);
 
         task_unlock(current);
     }
@@ -2659,11 +2790,8 @@ static void terminate_current_locked(int result)
     if (parent)
         task_lock(parent);
 
-    // Block OS-level signals before clearing current: the signal handler
-    // panics if any signal arrives on this thread while current is NULL.
-    sigset_t all_sigs, old_sigs;
-    sigfillset(&all_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
+    // OS-level signals have been blocked since entry (see above), so nothing
+    // can arrive on this thread once current is cleared below.
 
     // zombie: clear current/current_thread so tvm_thread_destructor skips
     //         teardown — parent's waitpid handles it via taskfreelastref.
@@ -3283,6 +3411,7 @@ struct file_stream {
     };
 
     char fs_mode[5]; // for files only
+    pid_t fs_pid;    // popen(): the child running the command, reaped by pclose()
 
     struct dirent fs_dirent; // for dirs only
     char fs_dirent_name[NAME_MAX+1]; // incase dirent->d_name is defined as zero-length array
@@ -3311,7 +3440,11 @@ void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
             int last_errno = errno;
             // Flush while the fd is still attached: the real fclose() below
             // would otherwise flush to fd -1 and silently drop the buffer.
-            (void)CALL_FUNC(fflush, fs->fs_fp);
+            // A broken pipe here is SIGPIPE for the closing task, as in
+            // fclose(3), but not during teardown: the task is already exiting.
+            if (CALL_FUNC(fflush, fs->fs_fp) == EOF && errno == EPIPE &&
+                t == current && !(t->tsk_state & TS_EXITING))
+                epipe_signal();
             fp_setfileno(fs->fs_fp, -1);
             (void)CALL_FUNC(fclose, fs->fs_fp);
             errno = last_errno;
@@ -4402,7 +4535,7 @@ static int ttyop_open(const char *pathname, int flags, mode_t mode, uid_t uid, g
 
     file_lock(out, 0);
 
-    out->f_rfd = r_sfd;
+    out->f_rfd = rfd_adopt(r_sfd);
     out->f_type = DEV_TTY;
     out->f_data = (void *)tt;
     out->f_ops = ttyops();
@@ -5837,7 +5970,7 @@ static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, g
     vn_unlock(vn, 1);
 
     file_lock(out, 0);
-    out->f_rfd = rfd;
+    out->f_rfd = rfd_adopt(rfd);
     out->f_type = DEV_VFS;
     out->f_data = (void *)vf;
     out->f_ops = vfsops();
@@ -8215,6 +8348,23 @@ _rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
 FUNCTION_METADATA(_name, &_name); \
 _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 
+#define __FUNCTION_DEFINE_VOID_VAx(_x, _name, ...) \
+void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
+void _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
+    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
+    struct tvm_call __call = { __tls ? __tls->tls_call : NULL, __builtin_return_address(0) }; \
+    if (__tls) \
+        __tls->tls_call = &__call; \
+    va_list __ap; \
+    va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
+    __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
+    va_end(__ap); \
+    if (__tls) \
+        __tls->tls_call = __call.prev; \
+} \
+FUNCTION_METADATA(_name, &_name); \
+void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
+
 #define __FUNCTION_DEFINE_NORET_VAx(_x, _name, ...) \
 void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
 void _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
@@ -8262,6 +8412,10 @@ void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 #define FUNCTION_DEFINE_VA4(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(4, _rettype, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE_VA5(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(5, _rettype, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE_VA6(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(6, _rettype, _name, __VA_ARGS__)
+
+#define FUNCTION_DEFINE_VOID_VA1(_name, ...) __FUNCTION_DEFINE_VOID_VAx(1, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VOID_VA2(_name, ...) __FUNCTION_DEFINE_VOID_VAx(2, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE_VOID_VA3(_name, ...) __FUNCTION_DEFINE_VOID_VAx(3, _name, __VA_ARGS__)
 
 #define FUNCTION_DEFINE_NORET_VA1(_name, ...) __FUNCTION_DEFINE_NORET_VAx(1, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE_NORET_VA2(_name, ...) __FUNCTION_DEFINE_NORET_VAx(2, _name, __VA_ARGS__)
@@ -9376,6 +9530,23 @@ static int is_noemu_binary(const char *pathname)
 
 
 static void usershell_cache_init(void);
+static int tvm_path_search(const char *file, char *out);
+
+// True if `path` is an image TVM's linker can load: a thin 64-bit Mach-O or
+// an ELF. Fat Mach-O binaries (the host's /bin/*, /usr/bin/* on macOS),
+// shared-cache stubs (iOS) and anything else are not.
+static int tvm_loadable_image(const char *path)
+{
+    unsigned char magic[4] = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    ssize_t n = read(fd, magic, sizeof(magic));
+    close(fd);
+    return n == 4 &&
+        (memcmp(magic, "\xcf\xfa\xed\xfe", 4) == 0 ||   /* MH_MAGIC_64 */
+         memcmp(magic, "\x7f" "ELF", 4) == 0);
+}
 
 static int tvm_started = 0;
 
@@ -9583,6 +9754,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     // execve() replaces this with the program's basename
     strncpy(current->tsk_comm, "tvm", sizeof(current->tsk_comm));
+    task_rusage_start(current);
 
     vtimer_init(); // must be before signal handler installation
 
@@ -9942,6 +10114,83 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     return (FILE *)fs;
 }
 
+/**
+ * popen(3)/pclose(3): a pipe to `command` run by the guest shell (TVM_SHELL),
+ * the way system() runs it. These were not interposed: the host libc popen
+ * spawned a real host process outside the VM and returned a host FILE on an
+ * fd this task does not own, which is where toybox awk's `"cmd" | getline`
+ * and `print | "cmd"` crashed.
+ */
+FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
+    int reading;
+    if (mode && mode[0] == 'r')
+        reading = 1;
+    else if (mode && mode[0] == 'w')
+        reading = 0;
+    else {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    const char *sh = getenv("TVM_SHELL");
+    if (!sh || !*sh)
+        sh = "/bin/sh";
+
+    int fds[2];
+    if (pipe(fds) == -1)
+        return NULL;
+    int parent_end = reading ? fds[0] : fds[1];
+    int child_end  = reading ? fds[1] : fds[0];
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        int last_errno = errno;
+        close(fds[0]);
+        close(fds[1]);
+        errno = last_errno;
+        return NULL;
+    }
+    if (pid == 0) {
+        close(parent_end);
+        if (dup2(child_end, reading ? STDOUT_FILENO : STDIN_FILENO) == -1)
+            _exit(127);
+        close(child_end);
+        execl(sh, "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+
+    close(child_end);
+    FILE *fp = fdopen(parent_end, reading ? "r" : "w");
+    if (!fp) {
+        int last_errno = errno;
+        close(parent_end);
+        int status;
+        while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
+            ;
+        errno = last_errno;
+        return NULL;
+    }
+    ((struct file_stream *)fp)->fs_pid = pid;
+    return fp;
+}
+
+FUNCTION_DEFINE1(int, pclose, FILE *, stream) {
+    struct file_stream *fs = (struct file_stream *)stream;
+    if (!fs || fs->fs_type != FS_FILE || fs->fs_pid <= 0) {
+        errno = EBADF;
+        return -1;
+    }
+    pid_t pid = fs->fs_pid;
+    fclose(stream);
+
+    int status;
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return status;
+}
+
 FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     if (!stream)
         return EOF;
@@ -10044,6 +10293,8 @@ FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb,
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
+        if (ret < nmemb)
+            epipe_signal();
         return ret;
     }
     
@@ -10165,6 +10416,8 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
         }
         task_unlock(current);
         tvm_sig_leave();
+        if (ret)
+            epipe_signal();
         return ret;
     }
 
@@ -10179,6 +10432,8 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
+    if (ret == EOF)
+        epipe_signal();
     return ret;
 }
 
@@ -10294,6 +10549,8 @@ FUNCTION_DEFINE2(int, fputc, int, c, FILE *, stream) {
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
+        if (ret == EOF)
+            epipe_signal();
         return ret;
     }
     
@@ -10322,6 +10579,8 @@ FUNCTION_DEFINE2(int, fputs, const char *, s, FILE *, stream) {
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
+        if (ret == EOF)
+            epipe_signal();
         return ret;
     }
     
@@ -10489,6 +10748,8 @@ FUNCTION_DEFINE3(int, vfprintf, FILE *, stream, const char *, format, va_list, a
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
+        if (ret < 0)
+            epipe_signal();
         return ret;
     }
 
@@ -10511,6 +10772,8 @@ FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
         ret = CALL_FUNC(vdprintf, file->f_rfd, format, ap);
+        if (ret < 0)
+            epipe_signal();
         file_lock(file, 0);
     }
     else {
@@ -10690,6 +10953,9 @@ retry:
             goto retry;
     }
 
+    if (ret == (size_t)-1)
+        epipe_signal();
+
     return ret;
 }
 
@@ -10787,6 +11053,7 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
                 if (ret == 0) {
                     file_unlock(file, 1);
                     tvm_sig_leave();
+                    epipe_signal();
                     return -1;
                 }
                 break;
@@ -10801,7 +11068,10 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
     
     file_unlock(file, 1);
     tvm_sig_leave();
-    
+
+    if (ret == (size_t)-1)
+        epipe_signal();
+
     return ret;
 }
 
@@ -10869,6 +11139,9 @@ retry:
         if (current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)
             goto retry;
     }
+
+    if (ret == (size_t)-1)
+        epipe_signal();
 
     return ret;
 }
@@ -10943,6 +11216,7 @@ FUNCTION_DEFINE4(ssize_t, pwritev, int, fd, const struct iovec *, iov, int, iovc
                 if (ret == 0) {
                     file_unlock(file, 1);
                     tvm_sig_leave();
+                    epipe_signal();
                     return -1;
                 }
                 break;
@@ -10957,6 +11231,9 @@ FUNCTION_DEFINE4(ssize_t, pwritev, int, fd, const struct iovec *, iov, int, iovc
 
     file_unlock(file, 1);
     tvm_sig_leave();
+
+    if (ret == (size_t)-1)
+        epipe_signal();
 
     return ret;
 }
@@ -11831,15 +12108,24 @@ FUNCTION_DEFINE5(int, setsockopt, int, sockfd, int, level, int, optname, const v
 }
 
 FUNCTION_DEFINE4(ssize_t, send, int, sockfd, const void *, buf, size_t, len, int, flags) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(send, __rfd, buf, len, flags));
+    ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(send, __rfd, buf, len, flags));
+    if (ret == -1)
+        epipe_signal();
+    return ret;
 }
 
 FUNCTION_DEFINE6(ssize_t, sendto, int, sockfd, const void *, buf, size_t, len, int, flags, const struct sockaddr *, dest_addr, socklen_t, addrlen) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(sendto, __rfd, buf, len, flags, dest_addr, addrlen));
+    ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(sendto, __rfd, buf, len, flags, dest_addr, addrlen));
+    if (ret == -1)
+        epipe_signal();
+    return ret;
 }
 
 FUNCTION_DEFINE3(ssize_t, sendmsg, int, sockfd, const struct msghdr *, msg, int, flags) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(sendmsg, __rfd, msg, flags));
+    ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(sendmsg, __rfd, msg, flags));
+    if (ret == -1)
+        epipe_signal();
+    return ret;
 }
 
 FUNCTION_DEFINE4(ssize_t, recv, int, sockfd, void *, buf, size_t, len, int, flags) {
@@ -12041,6 +12327,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     current_thread = arg->thr;
     current->tsk_pid = __gettid();
     current_thread->thr_pthread = pthread_self();
+    task_rusage_start(current);
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
     current->tsk_threads_cnt++;
 
@@ -12633,6 +12920,10 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
         }
     }
 
+    // Flush with signals deliverable: a broken pipe here is a fatal SIGPIPE
+    // for the exiting task, as in exit(3). Under the tvm_sig_enter() above it
+    // would only be deferred, and _exit() never drains it. _exit() re-enters.
+    tvm_sig_leave();
     fflush(NULL);
 
     _exit(status);
@@ -12735,6 +13026,76 @@ FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
     exit(eval);
 }
 
+// warn(3) family. The host libc's versions write straight to the host's
+// stderr with the host process name ("tvm: ..."), bypassing the task's fd 2
+// entirely; these go through the task's stderr with its own name, as the
+// err()/errx() interposers above already do. `code` < 0 means no strerror.
+static void tvm_vwarnc(int code, const char *fmt, va_list ap)
+{
+    if (*current->tsk_comm)
+        fprintf(stderr, "%s: ", current->tsk_comm);
+    if (fmt) {
+        vfprintf(stderr, fmt, ap);
+        if (code >= 0)
+            fprintf(stderr, ": ");
+    }
+    if (code >= 0)
+        fprintf(stderr, "%s", strerror(code));
+    fprintf(stderr, "\n");
+}
+
+FUNCTION_DEFINE_VOID2(vwarn, const char *, fmt, va_list, args) {
+    int last_errno = errno;
+    tvm_vwarnc(last_errno, fmt, args);
+    errno = last_errno;
+}
+
+FUNCTION_DEFINE_VOID2(vwarnx, const char *, fmt, va_list, args) {
+    int last_errno = errno;
+    tvm_vwarnc(-1, fmt, args);
+    errno = last_errno;
+}
+
+FUNCTION_DEFINE_VOID3(vwarnc, int, code, const char *, fmt, va_list, args) {
+    int last_errno = errno;
+    tvm_vwarnc(code, fmt, args);
+    errno = last_errno;
+}
+
+FUNCTION_DEFINE_VOID_VA1(warn, const char *, fmt) {
+    vwarn(fmt, __ap);
+}
+
+FUNCTION_DEFINE_VOID_VA1(warnx, const char *, fmt) {
+    vwarnx(fmt, __ap);
+}
+
+FUNCTION_DEFINE_VOID_VA2(warnc, int, code, const char *, fmt) {
+    vwarnc(code, fmt, __ap);
+}
+
+FUNCTION_DEFINE_NORET4(verrc, int, eval, int, code, const char *, fmt, va_list, args) {
+    tvm_sig_enter();
+    tvm_vwarnc(code, fmt, args);
+    exit(eval);
+}
+
+FUNCTION_DEFINE_NORET_VA3(errc, int, eval, int, code, const char *, fmt) {
+    verrc(eval, code, fmt, __ap);
+}
+
+// The BSD program name is per task, not the host process's ("tvm").
+FUNCTION_DEFINE0(const char *, getprogname) {
+    return current->tsk_comm;
+}
+
+FUNCTION_DEFINE_VOID1(setprogname, const char *, name) {
+    const char *base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
+    strncpy(current->tsk_comm, base, sizeof(current->tsk_comm) - 1);
+}
+
 FUNCTION_DEFINE0(pid_t, getpid) {
     return current->tsk_pid;
 }
@@ -12762,7 +13123,8 @@ FUNCTION_DEFINE1(pid_t, wait, int *, wstatus) {
     return waitpid(-1, wstatus, 0);
 }
 
-FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
+static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
+{
     struct task *zombiet = NULL;
     int found;
 
@@ -12848,6 +13210,8 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     pid_t childpid = zombiet->tsk_pid;
     if (wstatus)
         *wstatus = zombiet->tsk_result;
+    if (ru)
+        *ru = zombiet->tsk_rusage;
 
     // lock ordering: tasks_lock before task
     task_unlock(zombiet);
@@ -12860,6 +13224,20 @@ FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     tvm_sig_leave();
 
     return childpid;
+}
+
+FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
+    return tvm_wait4(pid, wstatus, options, NULL);
+}
+
+// Not interposed before: toybox time's wait4() went to the host libc, which
+// has no such child, and printed whatever was on the stack as user/sys time.
+FUNCTION_DEFINE4(pid_t, wait4, pid_t, pid, int *, wstatus, int, options, struct rusage *, rusage) {
+    return tvm_wait4(pid, wstatus, options, rusage);
+}
+
+FUNCTION_DEFINE3(pid_t, wait3, int *, wstatus, int, options, struct rusage *, rusage) {
+    return tvm_wait4(-1, wstatus, options, rusage);
 }
 
 FUNCTION_DEFINE0(pid_t, setsid) {
@@ -12892,7 +13270,7 @@ FUNCTION_DEFINE1(pid_t, getsid, pid_t, pid) {
     if (!pid)
         pid = current->tsk_pid;
 
-    struct task *t = task_for_pid(pid, 1);
+    struct task *t = task_lookup_pid(pid, 1);
     if (!t) {
         tvm_sig_leave();
         return CALL_FUNC(getsid, pid);
@@ -12921,7 +13299,7 @@ FUNCTION_DEFINE2(int, setpgid, pid_t, pid, pid_t, pgid) {
     if (!pgid)
         pgid = pid;
 
-    struct task *t = task_for_pid(pid, 0);
+    struct task *t = task_lookup_pid(pid, 0);
     if (!t) {
         pthread_mutex_unlock(&tasks_lock);
         tvm_sig_leave();
@@ -12941,7 +13319,7 @@ FUNCTION_DEFINE1(pid_t, getpgid, pid_t, pid) {
     if (!pid)
         pid = current->tsk_pid;
     
-    struct task *t = task_for_pid(pid, 1);
+    struct task *t = task_lookup_pid(pid, 1);
     if (!t) {
         tvm_sig_leave();
         return CALL_FUNC(getpgid, pid);
@@ -13746,6 +14124,32 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             return -1;
         }
 
+        // "#!/usr/bin/env prog [arg]": resolve prog through PATH the way
+        // env(1) would. The host's /usr/bin/env is not loadable here (fat
+        // binary on macOS, shared cache on iOS), and this is how most
+        // portable scripts name their interpreter.
+        char envprog[PATH_MAX];
+        const char *ibase = strrchr(interp, '/');
+        ibase = ibase ? ibase + 1 : interp;
+        if (interp_arg && 0 == strcmp(ibase, "env")) {
+            char *prog = interp_arg;
+            char *rest = prog;
+            while (*rest && *rest != ' ' && *rest != '\t') rest++;
+            if (*rest) {
+                *rest++ = '\0';
+                while (*rest == ' ' || *rest == '\t') rest++;
+            }
+            interp_arg = *rest ? rest : NULL;
+            if (strchr(prog, '/')) {
+                interp = prog;
+            } else if (0 == tvm_path_search(prog, envprog)) {
+                interp = envprog;
+            } else {
+                INFO("execve shebang: env: %s not found in PATH", prog);
+                return -1;
+            }
+        }
+
         INFO("execve shebang: interp=\"%s\" arg=\"%s\" script=\"%s\"",
              interp, interp_arg ? interp_arg : "(none)", pathname);
 
@@ -13757,6 +14161,28 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         if (!normalize_path(NULL, interp, pathname_abs)) {
             errno = ENOENT;
             return -1;
+        }
+
+        // The interpreter must be something TVM can load: a thin Mach-O or
+        // ELF. The host's /bin/bash, /bin/sh, /usr/bin/python3 ... are fat
+        // binaries on macOS and shared-cache stubs on iOS, so a plain
+        // "#!/bin/bash" script would fail with ENOEXEC — which bash then
+        // handles by running the file in-process via longjmp, corrupting a
+        // TVM fork child (see the #!-less case above). Fall back to the same
+        // interpreter name through PATH (e.g. /tvm/bin/bash); if that fails
+        // too, report a missing interpreter (ENOENT), as Linux does.
+        if (!tvm_loadable_image(pathname_abs)) {
+            const char *ibn = strrchr(interp, '/');
+            ibn = ibn ? ibn + 1 : interp;
+            char alt[PATH_MAX];
+            if (0 == tvm_path_search(ibn, alt) && 0 != strcmp(alt, pathname_abs) && tvm_loadable_image(alt)) {
+                INFO("execve shebang: %s not loadable, using %s", pathname_abs, alt);
+                snprintf(pathname_abs, sizeof(pathname_abs), "%s", alt);
+            } else {
+                INFO("execve shebang: interpreter %s not loadable (ENOENT)", pathname_abs);
+                errno = ENOENT;
+                return -1;
+            }
         }
         pathname = pathname_abs;
 
@@ -13896,7 +14322,7 @@ do_exec:
         basename++;
     task_lock(current);
     memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
-    strncpy(current->tsk_comm, basename, sizeof(current->tsk_comm));
+    strncpy(current->tsk_comm, basename, sizeof(current->tsk_comm) - 1);
     memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
     task_unlock(current);
 
@@ -13914,9 +14340,15 @@ do_exec:
     }
     errno = last_errno;
 
+    // POSIX execve: caught signals go back to the default, ignored signals
+    // stay ignored (so `trap '' PIPE`, nohup and shells backgrounding a job
+    // with SIGINT/SIGQUIT ignored behave as on a real system).
     struct sigaction act = { .sa_handler = SIG_DFL };
     for (int i = 1; i < MAX_SIGNALS; i++) {
         if (i == SIGKILL || i == SIGSTOP)
+            continue;
+        struct sigaction *cur = current->tsk_sighandlers + i;
+        if (!(cur->sa_flags & SA_SIGINFO) && cur->sa_handler == SIG_IGN)
             continue;
         if (0 != sigaction(i, &act, NULL))
             panic("sigaction(%d)", i);
@@ -14062,6 +14494,39 @@ FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
     return execve(pathname, argv, *current->tsk_relocs.__environ);
 }
 
+/**
+ * Resolve a bare program name the way execvp() does: registered programs
+ * first, then each PATH entry (guest environment). On success `out` holds
+ * the pathname; on failure returns -1 with errno EACCES or ENOENT.
+ */
+static int tvm_path_search(const char *file, char *out)
+{
+    const char *pathname = find_program_pathname(file);
+    if (pathname) {
+        snprintf(out, PATH_MAX, "%s", pathname);
+        return 0;
+    }
+    const char *path = getenv("PATH");
+    if (!path) path = "/usr/local/bin:/bin:/usr/bin";
+    int eacces = 0;
+    while (*path) {
+        const char *end = strchr(path, ':');
+        size_t len = end ? (size_t)(end - path) : strlen(path);
+        if (len > 0 && len + 1 + strlen(file) < PATH_MAX) {
+            memcpy(out, path, len);
+            out[len] = '/';
+            strcpy(out + len + 1, file);
+            if (0 == access(out, X_OK))
+                return 0;
+            if (errno == EACCES)
+                eacces = 1;
+        }
+        path = end ? end + 1 : path + strlen(path);
+    }
+    errno = eacces ? EACCES : ENOENT;
+    return -1;
+}
+
 // PATH search + ENOEXEC-shell fallback, shared by execvp (all platforms) and
 // execvpe (Linux only — that libc function doesn't exist on Apple). The two
 // differ only in the environment handed to execve.
@@ -14071,38 +14536,11 @@ static int tvm_execvpe(const char *file, char * const *argv,
     if (strchr(file, '/')) {
         if (!normalize_path(NULL, file, file_abs))
             return -1;
-        file = file_abs;
     }
-    else {
-        const char *pathname = find_program_pathname(file);
-        if (pathname) {
-            file = pathname;
-        } else {
-            const char *path = getenv("PATH");
-            if (!path) path = "/usr/local/bin:/bin:/usr/bin";
-            int eacces = 0;
-            char trypath[PATH_MAX];
-            while (*path) {
-                const char *end = strchr(path, ':');
-                size_t len = end ? (size_t)(end - path) : strlen(path);
-                if (len > 0 && len + 1 + strlen(file) < PATH_MAX) {
-                    memcpy(trypath, path, len);
-                    trypath[len] = '/';
-                    strcpy(trypath + len + 1, file);
-                    if (0 == access(trypath, X_OK)) {
-                        file = trypath;
-                        goto found;
-                    }
-                    if (errno == EACCES)
-                        eacces = 1;
-                }
-                path = end ? end + 1 : path + strlen(path);
-            }
-            errno = eacces ? EACCES : ENOENT;
-            return -1;
-        }
+    else if (0 != tvm_path_search(file, file_abs)) {
+        return -1;
     }
-found:;
+    file = file_abs;
     int rc = execve(file, argv, envp);
     if (errno == ENOEXEC) {
         const char *sh = getenv("TVM_SHELL");
