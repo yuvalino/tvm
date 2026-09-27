@@ -5,6 +5,7 @@ mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/bash
+setenv SHELL=/tvm/bin/bash
 setenv PATH=/tvm/bin:$PATH
 setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server:/tvm/bin/curl
 umask 022
