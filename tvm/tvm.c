@@ -57,6 +57,8 @@
 
 #if defined(__APPLE__)
 #include <util.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <sys/fileport.h>
 #include <mach-o/getsect.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -351,6 +353,7 @@ DECL_FUNC(fseek);
 DECL_FUNC(fseeko);
 DECL_FUNC(ftell);
 DECL_FUNC(ftello);
+DECL_FUNC(rewind);
 DECL_FUNC(fflush);
 DECL_FUNC(setbuf);
 DECL_FUNC(setbuffer);
@@ -408,6 +411,8 @@ DECL_FUNC(stat);
 DECL_FUNC(lstat);
 DECL_FUNC(fstat);
 DECL_FUNC(fstatat);
+DECL_FUNC(statfs);
+DECL_FUNC(fstatfs);
 DECL_FUNC(access);
 DECL_FUNC(faccessat);
 DECL_FUNC(chmod);
@@ -1837,6 +1842,7 @@ struct task {
     int tsk_itimer_real; // tsk_timers[] index for ITIMER_REAL, -1 = unset
     struct thread *tsk_exiting_thread; // thread running terminate_current_locked; written under tasks_lock+tsk_lock, read with __atomic (lock-free checks in tvm_sig_leave/waitpid)
     mode_t tsk_umask; // per-task umask (real umask is process-wide, can't share across tasks)
+    unsigned tsk_rlocks; // POSIX record locks held (entries in rlocks owned by this task, see fcntl_rlock)
 };
 
 struct thread {
@@ -2147,6 +2153,188 @@ static void taskdealloc(struct task *t)
     kfree(t);
 }
 
+/////////////
+// MARK: POSIX record locks
+/////////////
+
+// fcntl() byte-range locks (F_SETLK/F_SETLKW/F_GETLK) are owned by a process:
+// they conflict only between processes, and a process loses every lock it
+// holds on a file when it closes *any* descriptor of that file. All TVM tasks
+// live in the one host process, so passing the calls straight to the kernel
+// made every task a single owner: no request of one task ever conflicted with
+// a lock another task held, and task B merely opening and closing a file
+// dropped task A's locks on it. sqlite3 is built on these locks (SHARED /
+// RESERVED / PENDING / EXCLUSIVE are byte ranges of the database file): a
+// second sqlite3 inserting into a database on which a first one held `BEGIN
+// IMMEDIATE` was not told SQLITE_BUSY, its write went through, and the first
+// one's COMMIT then failed with "disk I/O error" because its kernel locks had
+// gone away with the second one's close().
+//
+// The table below gives each task its own owner identity: a request is
+// checked against, and recorded in, the table first, and only then handed to
+// the kernel, so processes outside TVM still see it. Entries are keyed by
+// (st_dev, st_ino), so every descriptor of a file, dup'd or reopened, shares
+// them; a task's locks on a file go when it closes any descriptor of the
+// file (POSIX) or exits. The kernel side keeps its per-process semantics --
+// an unlock or close by one task also drops what the kernel held for another
+// -- which only a process outside TVM can observe. Host-backed regular files
+// only: the read-only cpio VFS, ttys, pipes and sockets pass through as
+// before.
+
+struct rlock {
+    struct list_head rl_list;
+    dev_t rl_dev;
+    ino_t rl_ino;
+    struct task *rl_owner;
+    short rl_type;      // F_RDLCK or F_WRLCK
+    off_t rl_start;
+    off_t rl_end;       // inclusive; RLOCK_EOF for "to the end of the file and beyond"
+};
+
+#define RLOCK_EOF ((off_t)INT64_MAX)
+
+static LIST_HEAD(rlocks);
+static pthread_mutex_t rlocks_lock = PTHREAD_MUTEX_INITIALIZER; // leaf: never held while taking another lock
+static pthread_cond_t rlocks_cond = PTHREAD_COND_INITIALIZER;   // broadcast on every release, for F_SETLKW waiters
+
+// The byte range [*start, *end] a struct flock denotes, SEEK_CUR/SEEK_END
+// resolved against the real descriptor. -1 with errno on a bad range.
+static int rlock_range(int rfd, const struct flock *fl, off_t *start, off_t *end)
+{
+    off_t base;
+    switch (fl->l_whence) {
+    case SEEK_SET:
+        base = 0;
+        break;
+    case SEEK_CUR:
+        if (-1 == (base = CALL_FUNC(lseek, rfd, 0, SEEK_CUR)))
+            return -1;
+        break;
+    case SEEK_END: {
+        struct stat st;
+        if (-1 == CALL_FUNC(fstat, rfd, &st))
+            return -1;
+        base = st.st_size;
+        break;
+    }
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+
+    off_t s = base + fl->l_start, e;
+    if (fl->l_len > 0)
+        e = s + fl->l_len - 1;
+    else if (fl->l_len == 0)
+        e = RLOCK_EOF;
+    else {
+        e = s - 1;
+        s += fl->l_len;
+    }
+    if (s < 0 || e < s) {
+        errno = EINVAL;
+        return -1;
+    }
+    *start = s;
+    *end = e;
+    return 0;
+}
+
+// A lock of another task that `type` on [start, end] of the file cannot
+// coexist with (two read locks can, anything with a write lock cannot).
+static struct rlock *rlock_conflict_locked(dev_t dev, ino_t ino, struct task *owner, short type, off_t start, off_t end)
+{
+    struct rlock *rl;
+    list_for_each_entry(rl, &rlocks, rl_list) {
+        if (rl->rl_dev != dev || rl->rl_ino != ino || rl->rl_owner == owner)
+            continue;
+        if (rl->rl_end < start || rl->rl_start > end)
+            continue;
+        if (type == F_WRLCK || rl->rl_type == F_WRLCK)
+            return rl;
+    }
+    return NULL;
+}
+
+// Replace whatever `owner` holds on [start, end] of the file by `type`
+// (F_UNLCK: by nothing), splitting an entry that sticks out on both sides.
+static int rlock_apply_locked(dev_t dev, ino_t ino, struct task *owner, short type, off_t start, off_t end)
+{
+    struct rlock *rl, *next;
+    for (rl = list_first_entry(&rlocks, struct rlock, rl_list);
+         !list_entry_is_head(rl, &rlocks, rl_list); rl = next) {
+        next = list_next_entry(rl, rl_list);
+        if (rl->rl_dev != dev || rl->rl_ino != ino || rl->rl_owner != owner)
+            continue;
+        if (rl->rl_end < start || rl->rl_start > end)
+            continue;
+        if (rl->rl_start < start && rl->rl_end > end) {
+            struct rlock *tail = kalloc(sizeof(*tail));
+            if (!tail) {
+                errno = ENOLCK;
+                return -1;
+            }
+            *tail = *rl;
+            tail->rl_start = end + 1;
+            rl->rl_end = start - 1;
+            list_add(&tail->rl_list, &rl->rl_list);
+            owner->tsk_rlocks++;
+        }
+        else if (rl->rl_start < start)
+            rl->rl_end = start - 1;
+        else if (rl->rl_end > end)
+            rl->rl_start = end + 1;
+        else {
+            list_del(&rl->rl_list);
+            kfree(rl);
+            owner->tsk_rlocks--;
+        }
+    }
+
+    if (type == F_UNLCK)
+        return 0;
+
+    rl = kalloc(sizeof(*rl));
+    if (!rl) {
+        errno = ENOLCK;
+        return -1;
+    }
+    rl->rl_dev = dev;
+    rl->rl_ino = ino;
+    rl->rl_owner = owner;
+    rl->rl_type = type;
+    rl->rl_start = start;
+    rl->rl_end = end;
+    list_add(&rl->rl_list, &rlocks);
+    owner->tsk_rlocks++;
+    return 0;
+}
+
+// Drop every lock `t` holds on the file behind `rfd` (a close of any of the
+// file's descriptors, POSIX) or, with rfd -1, on every file (task exit).
+static void rlock_release(struct task *t, int rfd)
+{
+    struct stat st;
+    if (rfd >= 0 && (-1 == CALL_FUNC(fstat, rfd, &st) || !S_ISREG(st.st_mode)))
+        return;
+
+    pthread_mutex_lock(&rlocks_lock);
+    struct rlock *rl, *next;
+    for (rl = list_first_entry(&rlocks, struct rlock, rl_list);
+         !list_entry_is_head(rl, &rlocks, rl_list); rl = next) {
+        next = list_next_entry(rl, rl_list);
+        if (rl->rl_owner != t)
+            continue;
+        if (rfd >= 0 && (rl->rl_dev != st.st_dev || rl->rl_ino != st.st_ino))
+            continue;
+        list_del(&rl->rl_list);
+        kfree(rl);
+        t->tsk_rlocks--;
+    }
+    pthread_cond_broadcast(&rlocks_cond);
+    pthread_mutex_unlock(&rlocks_lock);
+}
+
 /**
  * tasks_lock must either be locked or dolocktasks=1
  * locks children
@@ -2176,6 +2364,11 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
 
     for (int i = 0; i < 3; i++)
         t->tsk_io_filestreams[i] = NULL;
+
+    // POSIX record locks die with the task (the files below are released
+    // without going through close(), which is where they would otherwise go).
+    if (t->tsk_rlocks)
+        rlock_release(t, -1);
 
     for (int i = 0; i < MAX_FILES; i++) {
         struct file *file = file_for_task_locked(t, i);
@@ -5929,10 +6122,35 @@ static struct fops *vfsops();
 static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out) {
     file_unlock(out, 0);
 
+    // The VFS holds cpio mounts and is read-only: vfsop_write is unimplemented
+    // (ENOTSUP) and nothing in it ever persists. Opens for writing used to
+    // succeed anyway, and O_CREAT even minted a phantom in-memory node, so a
+    // program that probes writability by opening was misled: sqlite3's
+    // unixOpen() tries O_RDWR|O_CREAT first and only falls back to O_RDONLY
+    // when that fails, so `sqlite3 /tvm/etc/x.db 'create table ...'` got an
+    // empty node, took the database for writable and failed at its first
+    // write with "disk I/O error" -- leaving /tvm/etc/x.db behind -- instead
+    // of "unable to open database file"; `echo x > /tvm/etc/foo` likewise
+    // created foo and then failed with "Not supported". Refuse write access
+    // and creation with EROFS, as a read-only mount does, so callers take
+    // their read-only paths (an existing file opens read-only, and a write to
+    // it is then reported as such: "attempt to write a readonly database").
+    // The lookup comes first: a path outside every mount is ENOTSUP, which
+    // file_open() takes as "not ours" and hands to the host filesystem.
     int nofollow = !!(flags & O_NOFOLLOW);
-    struct vfs_node *vn = vfs_lookup(pathname, flags & O_CREAT, nofollow, mode, uid, gid);
+    struct vfs_node *vn = vfs_lookup(pathname, 0, nofollow, mode, uid, gid);
     if (!vn) {
+        if ((flags & O_CREAT) && errno == ENOENT)
+            errno = EROFS;
         file_lock(out, 0);
+        return -1;
+    }
+    if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_TRUNC | O_APPEND)) ||
+        (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+        int last_errno = ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) ? EEXIST : EROFS;
+        vn_unlock(vn, 1);
+        file_lock(out, 0);
+        errno = last_errno;
         return -1;
     }
 
@@ -10138,9 +10356,37 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
     if (!sh || !*sh)
         sh = "/bin/sh";
 
-    int fds[2];
-    if (pipe(fds) == -1)
+    // The child must not read `command` from the caller's memory. TVM's
+    // fork() copies the arena, the image maps and this thread's host stack
+    // for the child and translates the pointers it finds in those copies,
+    // but the child's `command` came through untranslated: it still named
+    // the parent's buffer (same address on both sides), and popen's parent,
+    // unlike system()'s, does not wait -- it is back in the program by the
+    // time the child reaches execl(), which copies the string only then.
+    // sqlite3 hands popen the command out of its input-line buffer and goes
+    // on to read the next line into it, so the child's `sh -c` ran a
+    // fragment of whatever sqlite3 had put there since ("sh: line 1:
+    // $'\037': command not found", exit 127) and `.once |cmd`, `.output
+    // |cmd` and `.import "|cmd"` lost their pipe about every other run. So
+    // the parent copies the command into host memory before forking --
+    // nothing but the child ever touches that copy -- and the child moves
+    // it onto its own (private) stack and frees it before exec; the parent
+    // releases it only when there is no child.
+    size_t cmdlen = strlen(command) + 1;
+    char *cmdcopy = kalloc(cmdlen);
+    if (!cmdcopy) {
+        errno = ENOMEM;
         return NULL;
+    }
+    memcpy(cmdcopy, command, cmdlen);
+
+    int fds[2];
+    if (pipe(fds) == -1) {
+        int last_errno = errno;
+        kfree(cmdcopy);
+        errno = last_errno;
+        return NULL;
+    }
     int parent_end = reading ? fds[0] : fds[1];
     int child_end  = reading ? fds[1] : fds[0];
 
@@ -10149,15 +10395,19 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
         int last_errno = errno;
         close(fds[0]);
         close(fds[1]);
+        kfree(cmdcopy);
         errno = last_errno;
         return NULL;
     }
     if (pid == 0) {
+        char *cmd = alloca(cmdlen);
+        memcpy(cmd, cmdcopy, cmdlen);
+        kfree(cmdcopy);
         close(parent_end);
         if (dup2(child_end, reading ? STDOUT_FILENO : STDIN_FILENO) == -1)
             _exit(127);
         close(child_end);
-        execl(sh, "sh", "-c", command, (char *)NULL);
+        execl(sh, "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
 
@@ -10317,23 +10567,63 @@ FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb,
     return ret / size;
 }
 
+// Host stdio reads, restarted the way read() is. TVM delivers every guest
+// signal as a real signal to the task's thread -- a child's exit arrives as
+// SIGCHLD through pthread_kill whatever the guest's disposition -- and its
+// OS-level handlers are installed without SA_RESTART, so that read() sees
+// EINTR and can hand it to a guest whose handler asks for it. The read the
+// host libc does on the real FILE behind a guest stream is interrupted just
+// the same, but libc turns that into EOF with the error flag set and errno
+// EINTR, and the interposers passed the EOF on. So a program reading a pipe
+// through stdio lost the rest of its input whenever a child exited meanwhile:
+// sqlite3's `.import "|cmd"` said "empty file" and a script piped into
+// sqlite3 stopped at its first `.shell` line, about every other run (toybox
+// awk's `"cmd" | getline` failed with "i/o error 4" the same way). Same
+// policy as read(): retry unless a guest handler ran and was installed
+// without SA_RESTART. Callers clear tvm_sig_interrupted before the host call
+// and make it under tvm_sig_enter/leave, where a deferred signal is
+// dispatched and tvm_sig_interrupted set; they pass the errno the call left.
+static int stdio_host_read_interrupted(FILE *real, int call_errno)
+{
+    if (call_errno != EINTR || !CALL_FUNC(ferror, real))
+        return 0;
+    if (tvm_sig_interrupted &&
+        !(current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART))
+        return 0;
+    CALL_FUNC(clearerr, real);
+    return 1;
+}
+
 FUNCTION_DEFINE4(size_t, fread, void *, ptr, size_t, size, size_t, nmemb, FILE *, stream) {
     size_t ret;
+    size_t done = 0;
 
+retry:
+    tvm_sig_interrupted = 0;
     tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
         tvm_sig_leave();
-        return 0;
+        return done;
     }
 
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fread, ptr, size, nmemb, real_fp(stream));
+        int last_errno = errno;
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
-        return ret;
+        errno = last_errno;
+        // Interrupted after `ret` whole items: they are in ptr, continue
+        // behind them (bytes of a partial item are libc's loss, as in libc).
+        if (size && ret < nmemb && stdio_host_read_interrupted(real_fp(stream), last_errno)) {
+            done += ret;
+            ptr = (char *)ptr + ret * size;
+            nmemb -= ret;
+            goto retry;
+        }
+        return done + ret;
     }
     
     if (!size) {
@@ -10401,6 +10691,17 @@ FUNCTION_DEFINE3(int, fseeko, FILE *, stream, off_t, offset, int, whence) {
 
 FUNCTION_DEFINE1(off_t, ftello, FILE *, stream) {
     return (off_t)ftell(stream);
+}
+
+// rewind, for the same reason as every other stdio interposer here: a guest
+// FILE is a TVM file_stream, not a libc FILE, and libc's rewind() took it for
+// one. Nothing shipped had called it until sqlite3, whose shell slurps a file
+// with fseek(SEEK_END)/ftell()/rewind() (`.open --deserialize`, the edit()
+// SQL function) and died with SIGSEGV on the rewind. fseek() is interposed,
+// so rewind is what C99 says: fseek(stream, 0, SEEK_SET) plus clearerr().
+FUNCTION_DEFINE_VOID1(rewind, FILE *, stream) {
+    fseek(stream, 0L, SEEK_SET);
+    clearerr(stream);
 }
 
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
@@ -10610,6 +10911,8 @@ FUNCTION_DEFINE1(int, puts, const char *, s) {
 
 FUNCTION_DEFINE1(int, fgetc, FILE *, stream) {
     int ret;
+retry:
+    tvm_sig_interrupted = 0;
     tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
@@ -10620,9 +10923,13 @@ FUNCTION_DEFINE1(int, fgetc, FILE *, stream) {
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fgetc, real_fp(stream));
+        int last_errno = errno;
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
+        errno = last_errno;
+        if (ret == EOF && stdio_host_read_interrupted(real_fp(stream), last_errno))
+            goto retry;
         return ret;
     }
     
@@ -10637,6 +10944,8 @@ FUNCTION_DEFINE1(int, fgetc, FILE *, stream) {
 
 FUNCTION_DEFINE3(char *, fgets, char *, s, int, size, FILE *, stream) {
     char *ret;
+retry:
+    tvm_sig_interrupted = 0;
     tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
@@ -10647,9 +10956,15 @@ FUNCTION_DEFINE3(char *, fgets, char *, s, int, size, FILE *, stream) {
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
         ret = CALL_FUNC(fgets, s, size, real_fp(stream));
+        int last_errno = errno;
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
+        errno = last_errno;
+        // Interrupted before any character: retry (with characters already
+        // in s, libc returns the partial line and the next call goes on).
+        if (!ret && stdio_host_read_interrupted(real_fp(stream), last_errno))
+            goto retry;
         return ret;
     }
     
@@ -10975,6 +11290,12 @@ FUNCTION_DEFINE1(int, close, int, fd) {
         errno = EBADF;
         return -1;
     }
+
+    // POSIX record locks: closing any descriptor of a file drops the task's
+    // locks on that file, dup'd descriptors included (see fcntl_rlock).
+    // tsk_rlocks is only a hint that spares tasks holding none the fstat.
+    if (current->tsk_rlocks && !file->f_ops && file->f_rfd >= 0)
+        rlock_release(current, file->f_rfd);
 
     // this order is extremely important!! file deallocation may lock current
     task_unlock(current);
@@ -11471,10 +11792,116 @@ FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
     return ret;
 }
 
+// fcntl(F_GETLK/F_SETLK/F_SETLKW) on a task's descriptor: the record-lock
+// table (see "POSIX record locks" above) decides between tasks, the kernel
+// between this process and the outside.
+static int fcntl_rlock(int fd, int cmd, struct flock *fl)
+{
+    if (!fl) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+    int rfd = file->f_rfd;
+    int emulate = !file->f_ops;
+    file_unlock(file, 0);
+
+    int ret = -1;
+    struct stat st;
+    off_t start, end;
+    if (!emulate || -1 == CALL_FUNC(fstat, rfd, &st) || !S_ISREG(st.st_mode))
+        ret = CALL_FUNC(fcntl, rfd, cmd, fl);
+    else if (0 == rlock_range(rfd, fl, &start, &end)) {
+        if (cmd == F_GETLK) {
+            pthread_mutex_lock(&rlocks_lock);
+            struct rlock *c = (fl->l_type == F_UNLCK) ? NULL :
+                rlock_conflict_locked(st.st_dev, st.st_ino, current, fl->l_type, start, end);
+            if (c) {
+                fl->l_type = c->rl_type;
+                fl->l_whence = SEEK_SET;
+                fl->l_start = c->rl_start;
+                fl->l_len = (c->rl_end == RLOCK_EOF) ? 0 : c->rl_end - c->rl_start + 1;
+                fl->l_pid = c->rl_owner->tsk_pid;
+                ret = 0;
+            }
+            pthread_mutex_unlock(&rlocks_lock);
+            if (!c) // no task holds one; a process outside TVM may
+                ret = CALL_FUNC(fcntl, rfd, F_GETLK, fl);
+        }
+        else {
+            for (;;) {
+                pthread_mutex_lock(&rlocks_lock);
+                struct rlock *c = (fl->l_type == F_UNLCK) ? NULL :
+                    rlock_conflict_locked(st.st_dev, st.st_ino, current, fl->l_type, start, end);
+                if (!c) {
+                    // Kernel first -- inside the process it cannot refuse on
+                    // account of another task, only of an outside process --
+                    // then the table. Always F_SETLK: a kernel F_SETLKW would
+                    // sleep with rlocks_lock held.
+                    ret = CALL_FUNC(fcntl, rfd, F_SETLK, fl);
+                    if (0 == ret)
+                        ret = rlock_apply_locked(st.st_dev, st.st_ino, current, fl->l_type, start, end);
+                    if (fl->l_type == F_UNLCK)
+                        pthread_cond_broadcast(&rlocks_cond);
+                    int held_outside = (-1 == ret && cmd == F_SETLKW && (errno == EAGAIN || errno == EACCES));
+                    pthread_mutex_unlock(&rlocks_lock);
+                    if (!held_outside)
+                        break;
+                    // F_SETLKW held off by a process outside TVM, which the
+                    // condition variable knows nothing about: poll.
+                    usleep(20000);
+                }
+                else if (cmd == F_SETLK) {
+                    pthread_mutex_unlock(&rlocks_lock);
+                    errno = EAGAIN;
+                    ret = -1;
+                    break;
+                }
+                else {
+                    // F_SETLKW: sleep until a release, in short slices so a
+                    // signal that arrived meanwhile interrupts the wait with
+                    // EINTR, as the kernel's would.
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    ts.tv_nsec += 20 * 1000000L;
+                    if (ts.tv_nsec >= 1000000000L) {
+                        ts.tv_sec++;
+                        ts.tv_nsec -= 1000000000L;
+                    }
+                    pthread_cond_timedwait(&rlocks_cond, &rlocks_lock, &ts);
+                    pthread_mutex_unlock(&rlocks_lock);
+                }
+                if (__atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE)) {
+                    errno = EINTR;
+                    ret = -1;
+                    break;
+                }
+            }
+        }
+    }
+
+    int last_errno = errno;
+    file_lock(file, 0);
+    file_unlock(file, 1);
+    tvm_sig_leave();
+    errno = last_errno;
+    return ret;
+}
+
 FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     void *arg = va_arg (__ap, void *);
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(fcntl, fd, cmd, arg);
+
+    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW)
+        return fcntl_rlock(fd, cmd, (struct flock *)arg);
 
     if (cmd == F_DUPFD) {
         // TODO: F_DUPFD_CLOEXEC
@@ -11593,6 +12020,30 @@ FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
     tvm_sig_leave();
     
     return ret;
+}
+
+// fstatfs was not interposed, so a guest's fstatfs(fd) reached libc with the
+// *guest* descriptor number and queried whichever host descriptor happened to
+// carry it: some other guest's file, a pipe, or nothing. sqlite3's unixOpen()
+// calls fstatfs() on every file it opens when built for Apple (to spot
+// msdos/exfat volumes), so opening a database failed with "disk I/O error"
+// (SQLITE_IOERR_ACCESS, errno EINVAL from a pipe or EBADF) whenever the
+// descriptor numbers of the guest and the host process disagreed -- which
+// they do as soon as the shell has a pipeline or a background job around
+// the call, so the same command passed alone and failed inside a script.
+// statfs(path) is the path-based twin and goes through the task's cwd like
+// stat() does. Neither consults the cpio VFS: a VFS file's real descriptor is
+// /dev/null, whose devfs answer is as good as any for a read-only mount, and
+// a VFS path is simply not on the host.
+FUNCTION_DEFINE2(int, fstatfs, int, fd, struct statfs *, buf) {
+    return CURRENT_RFD(fd, CALL_FUNC(fstatfs, __rfd, buf));
+}
+
+FUNCTION_DEFINE2(int, statfs, const char *, pathname, struct statfs *, buf) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    return CALL_FUNC(statfs, pathname_abs, buf);
 }
 
 FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *, statbuf, int, flag) {
@@ -15051,6 +15502,8 @@ FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, F
     char *tmp = NULL;
     size_t tmpn = 0;
 
+retry:
+    tvm_sig_interrupted = 0;
     tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
@@ -15062,12 +15515,20 @@ FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, F
 
     file_unlock(file, 0);
     ssize_t r = CALL_FUNC(getdelim, &tmp, &tmpn, delim, real_fp(stream));
+    int last_errno = errno;
     file_lock(file, 0);
     file_unlock(file, 1);
 
     if (r < 0) {
         CALL_FUNC(free, tmp);
+        tmp = NULL;
+        tmpn = 0;
         tvm_sig_leave();
+        errno = last_errno;
+        // Interrupted: retry (a line cut in the middle is started over, as
+        // libc's own getdelim would lose it too).
+        if (stdio_host_read_interrupted(real_fp(stream), last_errno))
+            goto retry;
         return -1;
     }
 
