@@ -74,6 +74,7 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${BIN_OUT}/curl_launcher' \"$ROOTFS/bin/curl\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/less_launcher' \"$ROOTFS/bin/less\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/nano_launcher' \"$ROOTFS/bin/nano\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/sqlite_launcher' \"$ROOTFS/bin/sqlite3\"\n")
     else()
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
@@ -84,6 +85,7 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/curl_tool/curl' \"$ROOTFS/bin/curl\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/less/src/less' \"$ROOTFS/bin/less\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/nano/build/src/nano' \"$ROOTFS/bin/nano\"\n")
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/sqlite/sqlite3' \"$ROOTFS/bin/sqlite3\"\n")
     endif()
     string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n")
     # /bin/sh is bash invoked as `sh`: POSIX mode, reads $ENV when interactive
@@ -193,11 +195,11 @@ endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )

@@ -26,3 +26,4 @@ scp_large_dst
 *.imcp
 .bash_history
 .lesshst
+.sqlite_history

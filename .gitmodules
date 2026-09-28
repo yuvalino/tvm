@@ -43,3 +43,9 @@
 [submodule "third_party/gnulib"]
 	path = third_party/gnulib
 	url = https://git.savannah.gnu.org/git/gnulib.git
+[submodule "third_party/sqlite"]
+	path = third_party/sqlite
+	url = https://github.com/sqlite/sqlite.git
+[submodule "third_party/linenoise"]
+	path = third_party/linenoise
+	url = https://github.com/antirez/linenoise.git
