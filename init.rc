@@ -7,7 +7,7 @@ mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 setenv TVM_SHELL=/tvm/bin/bash
 setenv SHELL=/tvm/bin/bash
 setenv PATH=/tvm/bin:$PATH
-setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git
 # Terminfo database for less/nano (static ncursesw, see scripts/build_ncurses.sh)
 setenv TERMINFO=/tvm/share/terminfo
 # Pager/editor defaults, kept if the environment already has them

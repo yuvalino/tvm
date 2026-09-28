@@ -75,6 +75,7 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${BIN_OUT}/less_launcher' \"$ROOTFS/bin/less\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/nano_launcher' \"$ROOTFS/bin/nano\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/sqlite_launcher' \"$ROOTFS/bin/sqlite3\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/git_launcher' \"$ROOTFS/bin/git\"\n")
     else()
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
@@ -86,6 +87,7 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/less/src/less' \"$ROOTFS/bin/less\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/nano/build/src/nano' \"$ROOTFS/bin/nano\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/sqlite/sqlite3' \"$ROOTFS/bin/sqlite3\"\n")
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/git/git' \"$ROOTFS/bin/git\"\n")
     endif()
     string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n")
     # /bin/sh is bash invoked as `sh`: POSIX mode, reads $ENV when interactive
@@ -120,6 +122,27 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/nanorc' \"$ROOTFS/etc/nanorc\"\n")
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/nano\"\n")
     string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/nano/syntax/'*.nanorc \"$ROOTFS/share/nano/\"\n\n")
+
+    # ── git ──
+    # The exec path (git --exec-path = /tvm/libexec/git-core, compiled in; see
+    # third_party/configs/git_config.mak): everything git execs by name. The
+    # curl helpers and upstream's dashed built-in names are links to the one
+    # multi-call /tvm/bin/git (third_party/git_main.c) -- absolute, so that
+    # TVM_NOEMU's symlink resolution lands on /tvm/bin/git -- and git itself
+    # is there too because git prepends the exec path to PATH and runs its
+    # subcommands as `git <cmd>`. Next to them the generated shell scripts
+    # (#!/tvm/bin/sh), the mergetool definitions they source, and the `git
+    # init` templates at the compiled-in template_dir.
+    set(GIT_BUILD ${THIRDPARTY_BUILD}/git)
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/libexec/git-core\" \"$ROOTFS/share/git-core\"\n")
+    foreach(prog git git-remote-http git-remote-https git-remote-ftp git-remote-ftps git-http-fetch)
+        string(APPEND SCRIPT "ln -sf /tvm/bin/git \"$ROOTFS/libexec/git-core/${prog}\"\n")
+    endforeach()
+    string(APPEND SCRIPT "for n in $(cat '${GIT_BUILD}/tvm/built_ins'); do ln -sf /tvm/bin/git \"$ROOTFS/libexec/git-core/$n\"; done\n")
+    string(APPEND SCRIPT "for n in $(cat '${GIT_BUILD}/tvm/scripts'); do cp '${GIT_BUILD}/src/'\"$n\" \"$ROOTFS/libexec/git-core/$n\"; done\n")
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/libexec/git-core/mergetools\"\n")
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/git/mergetools/'* \"$ROOTFS/libexec/git-core/mergetools/\"\n")
+    string(APPEND SCRIPT "cp -R '${GIT_BUILD}/src/templates/blt' \"$ROOTFS/share/git-core/templates\"\n\n")
 
     # ── CA bundle (Linux only) ──
     # curl verifies through the OS trust store on macOS/iOS (USE_APPLE_SECTRUST);
@@ -195,11 +218,11 @@ endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )

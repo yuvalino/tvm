@@ -1,7 +1,7 @@
 umask 022
 setenv TVM_SHELL=/tvm/bin/bash
 setenv ENV=$HOME/.forklessrc
-setenv? TVM_NOEMU=libdropbear.dylib:libbash.dylib:libtoybox.dylib:libvim.dylib:libsftpserver.dylib:libcurl.dylib:libless.dylib:libnano.dylib:libsqlite.dylib
+setenv? TVM_NOEMU=libdropbear.dylib:libbash.dylib:libtoybox.dylib:libvim.dylib:libsftpserver.dylib:libcurl.dylib:libless.dylib:libnano.dylib:libsqlite.dylib:libgit.dylib
 setenv TERMINFO=/tvm/share/terminfo
 setenv? PAGER=less
 setenv? LESS=-R
