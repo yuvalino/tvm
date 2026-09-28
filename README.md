@@ -91,7 +91,7 @@ perror("tvm_start");                // only reached on a pre-boot failure
 
 `flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
 on-device, letting you `ssh` into a full POSIX environment. The TVM core is
-built as `libtvm.dylib`; dropbear/bash/toybox/vim/curl as dylibs; the
+built as `libtvm.dylib`; dropbear/bash/toybox/vim/curl/less/nano as dylibs; the
 rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
 native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
 `tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
@@ -169,13 +169,17 @@ pytest tests/test_integration.py --device <device-name> --backend flutter
 | [vim](https://github.com/vim/vim) | Text editor |
 | [curl](https://curl.se/) | HTTP(S) client, TLS via OpenSSL; certificate verification through the OS trust store on macOS/iOS (Apple SecTrust), Mozilla's CA bundle on Linux. License: curl |
 | [OpenSSL](https://www.openssl.org/) | TLS/crypto library, statically linked into curl. License: Apache-2.0 |
+| [less](https://greenwoodsoftware.com/less/) | Pager (less 710, unpatched upstream; `PAGER=less`, `LESS=-R` by default). Terminal handling through the bundled ncurses and terminfo database. License: GPLv3 / Less License |
+| [nano](https://www.nano-editor.org/) | GNU nano 9.2 text editor (unpatched upstream, built from git with the pinned gnulib; `EDITOR=nano` by default unless set). Syntax highlighting from its own definitions via `/tvm/etc/nanorc`. License: GPLv3 |
+| [ncurses](https://invisible-island.net/ncurses/) | ncurses 6.6 (wide-char), statically linked into less and nano; a minimal terminfo database (xterm, xterm-256color, screen, screen-256color, vt100, tmux-256color, dumb) is compiled from its `terminfo.src` into `/tvm/share/terminfo` (`TERMINFO`). License: MIT |
 | [unicorn](https://www.unicorn-engine.org/) | CPU emulator (TCI interpreter mode for iOS) |
 | Apple *_cmds | BSD userland from apple-oss-distributions (`ifconfig`, `netstat`, `ps`, `sysctl`, etc.) |
 
-Licensing note: bash is GPLv3 (unicorn is already GPLv2); everything else is
-permissively licensed. Nothing links against bash — it is shipped as a separate
-program (`/tvm/bin/bash`, `libbash.dylib` in the apps) — so the GPL covers the
-bash binary and its sources only.
+Licensing note: bash, nano and less are GPLv3 (unicorn is already GPLv2);
+everything else is permissively licensed. Nothing links against them — each is
+shipped as a separate program (`/tvm/bin/bash`, `libbash.dylib` in the apps,
+and likewise for nano and less) — so the GPL covers those binaries and their
+sources only.
 
 The login shell is `-bash`: it reads `/tvm/etc/profile` (a login shell does not
 read `$ENV`), which sources `$ENV` (e.g. `ENV=$HOME/.forklessrc` in the app's

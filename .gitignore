@@ -25,3 +25,4 @@ scp_large_dst
 *.til
 *.imcp
 .bash_history
+.lesshst

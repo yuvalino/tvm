@@ -23,6 +23,10 @@ jobs:
       with:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
+    - name: deps
+      # autotools for the less and nano git trees (scripts/build_less.sh,
+      # scripts/build_nano.sh generate their configure scripts)
+      run: sudo apt-get update && sudo apt-get install -y autoconf automake autopoint gettext pkg-config
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
@@ -64,7 +68,7 @@ jobs:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: deps
-      run: brew install ninja cmake gnu-sed openssl
+      run: brew install ninja cmake gnu-sed openssl autoconf automake gettext pkg-config
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli

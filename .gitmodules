@@ -31,3 +31,15 @@
 [submodule "third_party/bash"]
 	path = third_party/bash
 	url = https://git.savannah.gnu.org/git/bash.git
+[submodule "third_party/less"]
+	path = third_party/less
+	url = https://github.com/gwsw/less.git
+[submodule "third_party/nano"]
+	path = third_party/nano
+	url = https://git.savannah.gnu.org/git/nano.git
+[submodule "third_party/ncurses"]
+	path = third_party/ncurses
+	url = https://github.com/ThomasDickey/ncurses-snapshots.git
+[submodule "third_party/gnulib"]
+	path = third_party/gnulib
+	url = https://git.savannah.gnu.org/git/gnulib.git

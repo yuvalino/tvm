@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano"
 # build.py -t flutter symlinks the built app here (→ tvm.app / Runner.app).
 FLUTTER_APP = f"./output/macos-arm64/lib/flutter"
 IOS_APP = f"./output/ios-arm64/lib/flutter"
@@ -1237,6 +1237,126 @@ def test_vim_backspace(sshi: spawn):
     sshi.expect(r"\$ ")
     sshi.sendline("cat $TMPDIR/vt_bs.txt")
     sshi.expect("xyzABC")
+    sshi.expect(r"\$ ")
+
+# ── less ─────────────────────────────────────────────────────
+
+# less resets attributes after every line it paints (`\x1b[m` with LESS=-R);
+# match line text tolerating a trailing SGR sequence.
+_SGR = r"(?:\x1b\[[0-9;]*m)?"
+
+def _less_lines(*lines):
+    return r"\r\n".join(l + _SGR for l in lines)
+
+def test_less_version(sshi: spawn):
+    sshi.sendline("less --version | head -1")
+    sshi.expect(r"less \d+ ")
+    sshi.expect(r"\$ ")
+
+def test_pager_editor_defaults(sshi: spawn):
+    """The rc files export TERMINFO and default PAGER/LESS/EDITOR."""
+    sshi.sendline("echo PAGER=${PAGER:-unset} LESS=${LESS:-unset} EDITOR=${EDITOR:-unset} TERMINFO=$TERMINFO")
+    sshi.expect(r"PAGER=(\S+) LESS=(\S+) EDITOR=(\S+) TERMINFO=/tvm/share/terminfo")
+    # setenv? keeps values the host environment already had; only the
+    # unconditional TERMINFO is exact.
+    assert b"unset" not in sshi.match.group(0)
+    sshi.expect(r"\$ ")
+    sshi.sendline("ls /tvm/share/terminfo/x/xterm-256color /tvm/share/terminfo/d/dumb")
+    sshi.expect("x/xterm-256color")
+    sshi.expect(r"\$ ")
+
+def test_less_interactive(sshi: spawn):
+    """Pipe into less on a tty: first screen, G to the end, q back to the shell."""
+    sshi.sendline("export TERM=xterm-256color; seq 1 500 | less")
+    sshi.expect(_less_lines("1", "2", "3"))
+    sshi.expect(r"\r\n23\b")
+    sshi.send("G")
+    sshi.expect(r"\r\n500\b")
+    sshi.send("q")
+    sshi.expect(r"\$ ")
+    sshi.sendline("echo still_here")
+    sshi.expect("still_here")
+    sshi.expect(r"\$ ")
+
+def test_less_file_search(sshi: spawn):
+    """less on a file: / search jumps to the match, q exits with status 0."""
+    sshi.sendline("export TERM=xterm-256color; seq 1 500 > $TMPDIR/less_file.txt; less $TMPDIR/less_file.txt; echo RC=$?")
+    sshi.expect(r"\r\n23\b")
+    sshi.expect("less_file.txt")   # file-mode prompt: first screen fully painted
+    sshi.send("/250\r")
+    sshi.expect("250")            # the match, highlighted (reverse video)
+    sshi.expect(_less_lines("", "251"))
+    sshi.send("q")
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+
+def test_less_not_a_tty(sshi: spawn):
+    """stdout is a pipe: less passes the input through unchanged (cat mode)."""
+    sshi.sendline("seq 1 5 | less | cat; echo RC=$?")
+    sshi.expect("1\r\n2\r\n3\r\n4\r\n5\r\nRC=0")
+    sshi.expect(r"\$ ")
+    sshi.sendline("seq 1 5 > $TMPDIR/less_pipe.txt; less $TMPDIR/less_pipe.txt | cat; echo RC=$?")
+    sshi.expect("1\r\n2\r\n3\r\n4\r\n5\r\nRC=0")
+    sshi.expect(r"\$ ")
+
+def test_less_pager_quit_if_one_screen(sshi: spawn):
+    """git-style PAGER='less -F -X': one screen prints and exits without
+    interaction, more than one screen pages until q."""
+    sshi.sendline("export TERM=xterm-256color PAGER='less -F -X'; seq 1 3 | sh -c '$PAGER'; echo RC=$?")
+    sshi.expect(_less_lines("1", "2", "3"))
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+    sshi.sendline("seq 1 500 | sh -c '$PAGER'; echo RC=$?")
+    sshi.expect(r"\r\n23\b")
+    sshi.send("q")
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+
+# ── nano ─────────────────────────────────────────────────────
+
+def test_nano_version(sshi: spawn):
+    sshi.sendline("nano --version | head -1")
+    sshi.expect(r"GNU nano, version \d+\.\d+")
+    sshi.expect(r"\$ ")
+
+def test_nano_interactive_edit(sshi: spawn):
+    """Open a new file in nano, type, ^O Enter to save, ^X to quit, cat it."""
+    sshi.sendline("export TERM=xterm-256color; rm -f $TMPDIR/nano_new.txt; nano $TMPDIR/nano_new.txt")
+    sshi.expect("Write Out")
+    sshi.send("hello from nano")
+    sshi.send("\x0f")            # ^O
+    sshi.expect("File")          # "File Name to Write:" prompt
+    sshi.send("\r")
+    sshi.expect(r"Wrote \d+ lines?")
+    sshi.send("\x18")            # ^X
+    sshi.expect(r"\$ ")
+    sshi.sendline("cat $TMPDIR/nano_new.txt")
+    sshi.expect("hello from nano")
+    sshi.expect(r"\$ ")
+
+def test_nano_open_existing(sshi: spawn):
+    """nano shows an existing file's content; ^X on an unmodified buffer exits."""
+    sshi.sendline("export TERM=xterm-256color; printf 'first line\\nsecond line\\n' > $TMPDIR/nano_old.txt; nano $TMPDIR/nano_old.txt; echo RC=$?")
+    sshi.expect("first line")
+    sshi.expect("second line")
+    sshi.expect("Write Out")
+    sshi.send("\x18")            # ^X
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+
+def test_nano_syntax_rc(sshi: spawn):
+    """/tvm/etc/nanorc includes the bundled syntax files (glob include):
+    a shell script opens straight into the editor with no rc errors."""
+    sshi.sendline("ls /tvm/share/nano/sh.nanorc /tvm/etc/nanorc")
+    sshi.expect("sh.nanorc")
+    sshi.expect(r"\$ ")
+    sshi.sendline("export TERM=xterm-256color; printf '#!/bin/sh\\necho hi\\n' > $TMPDIR/nano_syn.sh; nano $TMPDIR/nano_syn.sh 2> $TMPDIR/nano_syn.err; echo RC=$?")
+    sshi.expect("Write Out")
+    sshi.send("\x18")            # ^X
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+    sshi.sendline("wc -c < $TMPDIR/nano_syn.err")
+    sshi.expect(r"[\r\n]0\r\n")
     sshi.expect(r"\$ ")
 
 # ── File descriptor & dup ────────────────────────────────────

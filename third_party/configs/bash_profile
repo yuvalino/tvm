@@ -3,3 +3,12 @@
 # TVM's rc files export ENV (e.g. ENV=$HOME/.forklessrc); bash only honours
 # $ENV itself when invoked as `sh`, so source it here for login shells too.
 [ -n "$ENV" ] && [ -f "$ENV" ] && . "$ENV"
+
+# less, nano and vim look terminals up in the bundled terminfo database
+# (/tvm/share/terminfo, a handful of entries). If the ssh client announced a
+# terminal that is not in it, fall back to xterm-256color so full-screen
+# programs still work. ${TERM%"${TERM#?}"} is the first character of $TERM,
+# the database's directory letter.
+if [ -n "$TERM" ] && [ ! -e "/tvm/share/terminfo/${TERM%"${TERM#?}"}/$TERM" ]; then
+    export TERM=xterm-256color
+fi
