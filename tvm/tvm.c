@@ -39,6 +39,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <wchar.h>
 #include <setjmp.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -526,6 +527,7 @@ DECL_FUNC(tcflow);
 
 DECL_FUNC(strdup);
 DECL_FUNC(strndup);
+DECL_FUNC(wcsdup);
 DECL_FUNC(asprintf);
 DECL_FUNC(vasprintf);
 DECL_FUNC(getline);
@@ -14920,19 +14922,33 @@ FUNCTION_DEFINE1(void *, malloc, size_t, size) {
     return calloc(1, size);
 }
 
+// malloc(0) and calloc(0, n) return a unique, freeable pointer, as the host
+// libc does (Darwin and glibc alike). The arena used to return NULL, which a
+// program configured against the host libc reads as out-of-memory: gnulib's
+// autoconf probe records malloc(0) as non-NULL, so no replacement malloc is
+// compiled in, and gnulib's regex (nano) then failed regcomp("^a") -- and
+// nano's built-in quoting regex, aborting every start -- with REG_ESPACE
+// ("Memory exhausted") as soon as one of its allocations came out zero-sized
+// (plain "a" compiled, "^a" did not). The smallest arena object stands in
+// for the zero-sized one.
 FUNCTION_DEFINE2(void *, calloc, size_t, nmemb, size_t, size) {
-    if (0 == (nmemb * size))
+    size_t total = nmemb * size;
+    if (nmemb && total / nmemb != size) {
+        errno = ENOMEM;
         return NULL;
+    }
+    if (0 == total)
+        total = 1;
 
     struct rmem_arena *ar = arena_for_task(current);
     if (!ar)
         return NULL;
 
-    void *p = rmem_arena_alloc(ar, nmemb * size);
+    void *p = rmem_arena_alloc(ar, total);
     if (NULL == p)
         return NULL;
     
-    memset(p, 0, nmemb * size);
+    memset(p, 0, total);
     return p;
 }
 
@@ -14949,6 +14965,18 @@ FUNCTION_DEFINE2(void *, realloc, void *, ptr, size_t, size) {
     if (!ar)
         panic("realloc for task without arena %p", current);
 
+    // Zero sizes as the host libc has them (see calloc above): realloc(NULL,
+    // 0) is malloc(0) everywhere; realloc(p, 0) frees p and returns a new
+    // minimum-sized object on Darwin, but frees p and returns NULL with
+    // glibc, which is what rmem_arena_realloc does.
+    if (0 == size) {
+#ifdef __APPLE__
+        size = 1;
+#else
+        if (!ptr)
+            size = 1;
+#endif
+    }
     return rmem_arena_realloc(ar, ptr, size);
 }
 
@@ -14969,6 +14997,22 @@ FUNCTION_DEFINE2(char *, strndup, const char *, s, size_t, n) {
         return NULL;
     memcpy(p, s, len);
     p[len] = 0;
+    return p;
+}
+
+// wcsdup, for the same reason as strdup above: libc's version hands the
+// caller memory from the host malloc, which the guest later releases through
+// the interposed free(), and rmem_arena_free() aborts on a pointer outside the
+// task's arena. bash's remove_wpattern() (subst.c) wcsdup()s the parameter
+// for ${var#pat}/${var%pat} whenever the locale is multibyte (LANG=C.UTF-8
+// leaks into the CLI backend from the host), so every such expansion took the
+// shell down with SIGABRT; in the C locale the byte path never calls it.
+FUNCTION_DEFINE1(wchar_t *, wcsdup, const wchar_t *, s) {
+    size_t len = wcslen(s);
+    wchar_t *p = malloc((len + 1) * sizeof(wchar_t));
+    if (!p)
+        return NULL;
+    memcpy(p, s, (len + 1) * sizeof(wchar_t));
     return p;
 }
 
