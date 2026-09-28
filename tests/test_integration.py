@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3"
 # build.py -t flutter symlinks the built app here (→ tvm.app / Runner.app).
 FLUTTER_APP = f"./output/macos-arm64/lib/flutter"
 IOS_APP = f"./output/ios-arm64/lib/flutter"
@@ -26,7 +26,7 @@ IOS_BUNDLE_ID = "com.yuvalino.tvm"
 
 
 def clean_ansi(text: str) -> str:
-    return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[>=<]', '', text)
+    return re.sub(r'\x1b\[[?0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[>=<]', '', text)
 
 @dataclass
 class Forkless:
@@ -1358,6 +1358,163 @@ def test_nano_syntax_rc(sshi: spawn):
     sshi.sendline("wc -c < $TMPDIR/nano_syn.err")
     sshi.expect(r"[\r\n]0\r\n")
     sshi.expect(r"\$ ")
+
+# ── sqlite3 ──────────────────────────────────────────────────
+
+def test_sqlite3_version(sshi: spawn):
+    """sqlite3 --version: the 3.x shell built from the amalgamation."""
+    out, rc = _sh(sshi, "sqlite3 --version")
+    assert rc == 0, out
+    assert any(re.match(r"3\.\d+\.\d+ \d{4}-\d{2}-\d{2} ", l) for l in _lines(out)), out
+
+def test_sqlite3_create_query(sshi: spawn):
+    """A database file in the guest TMPDIR: create, insert, read back in
+    column mode (with headers) and as JSON."""
+    out, rc = _sh(sshi, "rm -f $TMPDIR/sq_basic.db; sqlite3 $TMPDIR/sq_basic.db "
+                        "\"create table t(id integer primary key, name text); "
+                        "insert into t(name) values ('alice'),('bob');\"")
+    assert rc == 0, out
+    out, rc = _sh(sshi, "sqlite3 -header -column $TMPDIR/sq_basic.db 'select * from t order by id'")
+    assert rc == 0, out
+    lines = _lines(out)
+    for pat in (r"id\s+name", r"1\s+alice", r"2\s+bob"):
+        assert any(re.fullmatch(pat, l) for l in lines), f"{pat}: {out}"
+    out, rc = _sh(sshi, "sqlite3 -json $TMPDIR/sq_basic.db 'select * from t order by id'")
+    assert rc == 0, out
+    assert '{"id":1,"name":"alice"}' in out and '{"id":2,"name":"bob"}' in out, out
+
+def test_sqlite3_dot_commands(sshi: spawn):
+    """.tables and .schema, both as command-line arguments and on stdin."""
+    out, rc = _sh(sshi, "rm -f $TMPDIR/sq_dot.db; sqlite3 $TMPDIR/sq_dot.db "
+                        "'create table alpha(a); create table beta(b text)' '.tables'")
+    assert rc == 0, out
+    assert any(re.fullmatch(r"alpha\s+beta", l) for l in _lines(out)), out
+    out, rc = _sh(sshi, "printf '.schema beta\\n' | sqlite3 $TMPDIR/sq_dot.db")
+    assert rc == 0, out
+    assert "CREATE TABLE beta(b text);" in _lines(out), out
+
+def test_sqlite3_memory_functions(sshi: spawn):
+    """An in-memory database with a math function (SQLITE_ENABLE_MATH_FUNCTIONS)
+    and JSON functions (built in)."""
+    out, rc = _sh(sshi, "sqlite3 -list :memory: \"select sqrt(16), power(2, 10), "
+                        "json_extract('{\\\"a\\\":42}', '$.a'), json_array(1, 'x')\"")
+    assert rc == 0, out
+    assert '4.0|1024.0|42|[1,"x"]' in _lines(out), out
+
+def test_sqlite3_extensions(sshi: spawn):
+    """FTS5 and R*Tree virtual tables and the dbstat table are compiled in;
+    extension loading is not (no dlopen in a TVM image)."""
+    out, rc = _sh(sshi, "sqlite3 -list :memory: "
+                        "\"create virtual table ft using fts5(body); "
+                        "insert into ft values ('the quick brown fox'), ('lazy dog'); "
+                        "select body from ft where ft match 'quick';\" "
+                        "\"create virtual table rt using rtree(id, minx, maxx); "
+                        "insert into rt values (1, 0, 10), (2, 20, 30); "
+                        "select id from rt where minx <= 5 and maxx >= 5;\" "
+                        "'select count(*) > 0 from dbstat'")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "the quick brown fox" in lines and "1" in lines, out
+    out, rc = _sh(sshi, "sqlite3 :memory: \"select load_extension('nope')\"")
+    assert rc != 0, out
+    assert "no such function: load_extension" in out, out
+
+def test_sqlite3_interactive(sshi: spawn):
+    """An interactive session on the tty (linenoise line editing): a
+    statement at the sqlite> prompt, then .quit back to the shell."""
+    sshi.sendline("sqlite3 -list :memory:")
+    sshi.expect("sqlite> ")
+    # linenoise runs the tty in raw mode: Enter is the CR a terminal sends,
+    # not the LF sendline() would.
+    sshi.send("select 40 + 2;\r")
+    sshi.expect(r"\r\n42\r\n")
+    sshi.expect("sqlite> ")
+    sshi.send(".quit\r")
+    sshi.expect(r"\$ ")
+    sshi.sendline("echo still_here")
+    sshi.expect("still_here")
+    sshi.expect(r"\$ ")
+
+def test_sqlite3_transaction_rollback(sshi: spawn):
+    """ROLLBACK undoes an insert within the same connection; a later
+    connection sees only what was committed."""
+    out, rc = _sh(sshi, "rm -f $TMPDIR/sq_tx.db; sqlite3 -list $TMPDIR/sq_tx.db "
+                        "\"create table t(v); insert into t values (1); "
+                        "begin; insert into t values (2); select count(*) from t; rollback; "
+                        "select count(*) from t;\"")
+    assert rc == 0, out
+    assert _lines(out)[-2:] == ["2", "1"], out
+    out, rc = _sh(sshi, "sqlite3 -list $TMPDIR/sq_tx.db 'select * from t'")
+    assert rc == 0, out
+    assert _lines(out)[-1] == "1", out
+
+def test_sqlite3_import_csv(sshi: spawn):
+    """.import of a 5000-row CSV written by the shell (header row names the
+    columns), then an aggregate over it."""
+    n = 5000
+    out, rc = _sh(sshi, f"awk 'BEGIN {{ print \"id,name,score\"; for (i = 1; i <= {n}; i++) "
+                        "print i \",n\" i \",\" i % 97 }' > $TMPDIR/sq_in.csv; wc -l < $TMPDIR/sq_in.csv")
+    assert rc == 0, out
+    assert _lines(out)[-1] == str(n + 1), out
+    out, rc = _sh(sshi, "rm -f $TMPDIR/sq_imp.db; sqlite3 -list $TMPDIR/sq_imp.db "
+                        "\".import --csv $TMPDIR/sq_in.csv rows\" "
+                        "\"select count(*), sum(cast(score as integer)), name from rows where id = 4242 or id > 0\"")
+    assert rc == 0, out
+    assert _lines(out)[-1] == f"{n}|{sum(i % 97 for i in range(1, n + 1))}|n1", out
+
+def test_sqlite3_locking(sshi: spawn):
+    """Two sqlite3 processes on one file. The first holds a write transaction
+    open (BEGIN IMMEDIATE) for a few seconds; meanwhile a reader gets its
+    rows (shared locks coexist with RESERVED) and a second writer is refused
+    with SQLITE_BUSY. The first then commits successfully: its locks survived
+    the other two opening and closing the file. This is fcntl() record locking
+    between tasks of one host process, which TVM emulates."""
+    out, rc = _sh(sshi, "rm -f $TMPDIR/sq_lock.db $TMPDIR/sq_lock.err; "
+                        "sqlite3 $TMPDIR/sq_lock.db 'create table lk(v); insert into lk values (0)'")
+    assert rc == 0, out
+    out, rc = _sh(sshi, "( printf 'begin immediate;\\ninsert into lk values (1);\\n'; sleep 4; "
+                        "printf 'commit;\\n' ) | sqlite3 $TMPDIR/sq_lock.db 2> $TMPDIR/sq_lock.err & "
+                        "sleep 1; sqlite3 -list $TMPDIR/sq_lock.db 'select count(*) from lk'; echo reader=$?; "
+                        "sqlite3 $TMPDIR/sq_lock.db 'insert into lk values (2)'; echo writer=$?; "
+                        "wait; sqlite3 -list $TMPDIR/sq_lock.db 'select group_concat(v) from lk'; "
+                        "echo holder_err=$(wc -c < $TMPDIR/sq_lock.err)", timeout=60)
+    assert rc == 0, out
+    lines = _lines(out)
+    i = lines.index("reader=0")
+    assert lines[i - 1] == "1", out                # the reader saw the committed row only
+    assert "database is locked" in out, out        # the second writer was refused
+    assert "writer=1" in lines, out
+    assert "0,1" in lines, out                     # the holder's commit went through
+    assert "holder_err=0" in lines, out            # and it reported no error
+
+def test_sqlite3_readonly(sshi: spawn):
+    """/tvm is a read-only cpio mount: creating a database there fails cleanly
+    (no crash, no phantom file), a file that exists there opens read-only, and
+    a read-only connection reports writes as such."""
+    out, rc = _sh(sshi, "sqlite3 /tvm/etc/sq_ro.db 'create table t(x)'; echo sqlite=$?; "
+                        "test -e /tvm/etc/sq_ro.db && echo phantom || echo no_phantom; "
+                        "echo x > /tvm/etc/sq_ro.txt")
+    assert rc != 0, out
+    assert "unable to open database file" in out, out
+    assert "sqlite=1" in _lines(out) and "no_phantom" in _lines(out), out
+    assert "Read-only file system" in out, out
+    out, rc = _sh(sshi, "sqlite3 /tvm/etc/profile 'select count(*) from sqlite_schema'")
+    assert rc != 0, out
+    assert "file is not a database" in out, out
+    out, rc = _sh(sshi, "rm -f $TMPDIR/sq_ro.db; sqlite3 $TMPDIR/sq_ro.db 'create table t(x)'; "
+                        "sqlite3 -readonly $TMPDIR/sq_ro.db 'insert into t values (1)'")
+    assert rc != 0, out
+    assert "attempt to write a readonly database" in out, out
+
+def test_sqlite3_shell_escape(sshi: spawn):
+    """.shell runs a command through system(3) and .import '|cmd' reads a
+    pipe through popen(3) (both interposed by TVM; on iOS system() is bound
+    through the include shim)."""
+    out, rc = _sh(sshi, "printf 'create table t(v);\\n.shell echo from_shell\\n.import \"|seq 1 3\" t\\n"
+                        "select sum(v) from t;\\n' | sqlite3 -list :memory:")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "from_shell" in lines and "6" in lines, out
 
 # ── File descriptor & dup ────────────────────────────────────
 
