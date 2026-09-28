@@ -354,6 +354,9 @@ DECL_FUNC(fseeko);
 DECL_FUNC(ftell);
 DECL_FUNC(ftello);
 DECL_FUNC(rewind);
+DECL_FUNC(flockfile);
+DECL_FUNC(ftrylockfile);
+DECL_FUNC(funlockfile);
 DECL_FUNC(fflush);
 DECL_FUNC(setbuf);
 DECL_FUNC(setbuffer);
@@ -441,6 +444,7 @@ DECL_FUNC(rmdir);
 DECL_FUNC(mkfifo);
 DECL_FUNC(mkfifoat);
 DECL_FUNC(mkstemp);
+DECL_FUNC(mkdtemp);
 
 DECL_FUNC(socket);
 DECL_FUNC(accept);
@@ -1551,13 +1555,13 @@ void file_unlock(struct file *file, int refcount) {
     pthread_mutex_unlock(&file->f_lock);
 }
 
+char *normalize_path(const char *dirname, const char *file_name, char *out_path);
+
 /**
  * returns locked with refcnt
  */
-struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid)
+struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid)
 {
-    // TODO support opening devices when dirfd != AT_FDCWD
-
     struct file *file = filealloc();
     if (!file)
         return NULL;
@@ -1565,8 +1569,33 @@ struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode, 
     file->f_refcnt++;
     file_lock(file, 0);
 
-    if (pathname[0] == '/') {
-        file->f_pathname = kstrdup(pathname);
+    // The pathname the file is known by, recorded in f_pathname for the
+    // *at() calls that TVM answers by path (dirfd_normalize_path). An open
+    // relative to a directory descriptor used to record nothing, so a
+    // directory reached through openat(dirfd, "sub") had no name and every
+    // later fstatat(fd, "entry")/faccessat(...) on it resolved "entry"
+    // against the task's cwd instead (see dirfd_normalize_path). toybox's
+    // dirtree walks a tree exactly that way -- openat(parentfd, name) per
+    // directory, fstatat(dirfd, entry) per entry -- so `rm -rf dir` failed on
+    // anything two levels deep ("rm: dir/a/f: No such file or directory",
+    // then "Directory not empty"), which every git working tree is. The
+    // name is now the directory's recorded name joined with the relative
+    // one (normalized, so ".." components fold), and that absolute name is
+    // also what the devices (tty, cpio VFS) are asked about, so a
+    // dirfd-relative open of a /tvm entry finds it too. The host open keeps
+    // the (dirfd, relative) form, so the kernel's own semantics -- following
+    // a directory across a rename, say -- are unchanged.
+    char pathname_abs[PATH_MAX];
+    if (pathname[0] != '/' && dirfd != AT_FDCWD && dirpath) {
+        if (!normalize_path(dirpath, pathname, pathname_abs)) {
+            filedealloc_locked(file);
+            return NULL;
+        }
+    }
+    const char *devpath = (pathname[0] != '/' && dirfd != AT_FDCWD && dirpath) ? pathname_abs : pathname;
+
+    if (devpath[0] == '/') {
+        file->f_pathname = kstrdup(devpath);
         if (!file->f_pathname) {
             filedealloc_locked(file);
             return NULL;
@@ -1576,7 +1605,7 @@ struct file *file_open(int dirfd, const char *pathname, int flags, mode_t mode, 
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
-        if (0 == dev->dev_fops.f_open(pathname, flags, mode, uid, gid, file)) {
+        if (0 == dev->dev_fops.f_open(devpath, flags, mode, uid, gid, file)) {
             return file;
         }
 
@@ -1617,6 +1646,11 @@ struct file *file_dup_locked(struct file *oldfile) {
     newfile->f_refcnt++;
     newfile->f_type = oldfile->f_type;
     newfile->f_ops = oldfile->f_ops;
+    // The name goes with the duplicate: fdopendir(dup(dirfd)) followed by
+    // fstatat(dirfd(dir), entry) is the portable way to walk a directory,
+    // and the duplicate must answer by path like the original.
+    if (oldfile->f_pathname)
+        newfile->f_pathname = kstrdup(oldfile->f_pathname);
 
     // we can blatantly lock although oldfile is locked, as it was just created
     file_lock(newfile, 0);
@@ -3139,9 +3173,33 @@ char *dirfd_normalize_path(int dirnfd, const char *file_name, char *out_path)
             return NULL;
 
         if (!dir->f_pathname) {
-            strncpy(out_path, file_name, PATH_MAX-1);
+            // A directory descriptor with no recorded name (opened before
+            // file_open recorded relative opens, or adopted from the host).
+            // This used to hand back the bare relative name, which the
+            // path-based callers (fstatat, faccessat, fchmodat, fchownat,
+            // readlinkat) then resolved against the task's cwd -- silently
+            // the wrong directory. Ask the host for the descriptor's path
+            // instead, and fail rather than guess when it has none.
+            char dirbuf[PATH_MAX];
+#if defined(__APPLE__)
+            if (-1 == CALL_FUNC(fcntl, dir->f_rfd, F_GETPATH, dirbuf)) {
+                file_unlock(dir, 1);
+                errno = EBADF;
+                return NULL;
+            }
+#else
+            char proc[64];
+            snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dir->f_rfd);
+            ssize_t n = CALL_FUNC(readlink, proc, dirbuf, sizeof(dirbuf) - 1);
+            if (n <= 0) {
+                file_unlock(dir, 1);
+                errno = EBADF;
+                return NULL;
+            }
+            dirbuf[n] = 0;
+#endif
             file_unlock(dir, 1);
-            return out_path;
+            return normalize_path(dirbuf, file_name, out_path);
         }
 
         dirname = dir->f_pathname;
@@ -3687,7 +3745,32 @@ void task_filestreamdealloc_list(struct task *t, struct list_head *head) {
     }
 }
 
+// A libc FILE attached to no descriptor (fileno -1): what a standard stream
+// becomes after fclose() (see there). Operations on it fail with EBADF.
+static FILE *fp_detached(const char *mode)
+{
+    int fd = CALL_FUNC(open, "/dev/null", O_RDWR);
+    if (fd == -1)
+        return NULL;
+    FILE *fp = CALL_FUNC(fdopen, fd, mode);
+    if (!fp) {
+        CALL_FUNC(close, fd);
+        return NULL;
+    }
+    fp_setfileno(fp, -1);
+    CALL_FUNC(close, fd);
+    return fp;
+}
+
 int task_filestreamrealloc_locked(struct task *t, struct file_stream *fs) {
+    if (fs->fs_nfd < 0) {
+        // a standard stream the parent fclose()d: the copy still names the
+        // parent's libc FILE, give the child a detached one of its own
+        if (fs->fs_type == FS_FILE && !(fs->fs_fp = fp_detached(fs->fs_mode[0] ? fs->fs_mode : "r")))
+            return -1;
+        return 0;
+    }
+
     struct file *file = file_for_task_locked(t, fs->fs_nfd);
     if (!file)
         return -1;
@@ -5934,19 +6017,36 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
             memcpy(link_target, child->vn_data, child->vn_size);
             link_target[child->vn_size] = 0;
 
-            if (link_target[0] == '/') {
-                /* absolute symlink — can't resolve within VFS root */
-                vn_unlock(child, 1);
-                if (cur != root) vn_unlock(cur, 1);
-                errno = ENOTSUP;
-                return NULL;
-            }
-
-            /* relative symlink: resolve against cur (the parent dir)
-               build new path = path_to_cur/target[/remaining...] */
+            /* An absolute symlink used to be refused outright (ENOTSUP,
+               "can't resolve within VFS root"), so a cpio entry such as
+               /tvm/libexec/git-core/git-remote-https -> /tvm/bin/git was
+               a dead link: stat() followed it to ENOENT and git could not
+               exec its own helper. One that points back into this mount
+               is resolved from the mount root, the way a relative one is
+               resolved from its directory: the rest of the path is
+               appended and the lookup restarts. A target outside the mount
+               (a host path) still cannot be reached from here. */
             char newpath[PATH_MAX];
             char cur_path[PATH_MAX];
-            vfs_build_path_locked(root, cur, cur_path, sizeof(cur_path));
+            if (link_target[0] == '/') {
+                size_t vnlen = strlen(root->vn_name);
+                if (strncmp(link_target, root->vn_name, vnlen) != 0 ||
+                    (link_target[vnlen] != '/' && link_target[vnlen] != 0)) {
+                    vn_unlock(child, 1);
+                    if (cur != root) vn_unlock(cur, 1);
+                    errno = ENOTSUP;
+                    return NULL;
+                }
+                /* drop the mount prefix: the target is relative to root */
+                memmove(link_target, link_target + vnlen + (link_target[vnlen] == '/' ? 1 : 0),
+                        strlen(link_target + vnlen + (link_target[vnlen] == '/' ? 1 : 0)) + 1);
+                cur_path[0] = 0;
+            }
+            else {
+                /* relative symlink: resolve against cur (the parent dir)
+                   build new path = path_to_cur/target[/remaining...] */
+                vfs_build_path_locked(root, cur, cur_path, sizeof(cur_path));
+            }
 
             vn_unlock(child, 1);
 
@@ -10449,10 +10549,54 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
 
     struct file_stream *fs = (struct file_stream *)stream;
 
-    int nfd = fs->fs_nfd;
-
     tvm_sig_enter();
     task_lock(current);
+
+    // fclose(stdout): the guest names libc's own stdout object, which every
+    // other stdio interposer translates to the task's stream
+    // (file_stream_fp). fclose() took the pointer verbatim and handed libc's
+    // FILE to task_filestreamdealloc_locked(), which freed it from the task
+    // arena: rmem's "invalid pointer" abort, and, abort() needing the task
+    // lock fclose still held, a hang rather than a crash. git closes stdout
+    // at the end of every built-in command (run_builtin in git.c, to report
+    // ENOSPC/EIO on a file) -- `git add` never returned. The standard
+    // streams are not freed, as libc does not free its static ones either:
+    // the descriptor is closed and the stream detached from it (fd -1 on
+    // the libc FILE, fs_nfd -1), so later use fails with EBADF instead of
+    // reaching a descriptor the number may have been reused for. A fork
+    // after that gives the child its own detached FILE
+    // (task_filestreamrealloc_locked).
+    int std = (stream == stdin) ? 0 : (stream == stdout) ? 1 : (stream == stderr) ? 2 : -1;
+    if (std >= 0) {
+        fs = current->tsk_io_filestreams[std];
+        if (!fs || fs->fs_nfd < 0) {
+            task_unlock(current);
+            tvm_sig_leave();
+            errno = EBADF;
+            return EOF;
+        }
+        int nfd = fs->fs_nfd;
+        int ret = 0, last_errno = errno;
+        if (fs->fs_fp) {
+            if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                ret = EOF;
+                last_errno = errno;
+            }
+            fp_setfileno(fs->fs_fp, -1);
+        }
+        fs->fs_nfd = -1;
+        task_unlock(current);
+        tvm_sig_leave();
+        errno = last_errno;
+        if (ret == EOF)
+            epipe_signal();
+        if (close(nfd) == -1)
+            return EOF;
+        errno = last_errno;
+        return ret;
+    }
+
+    int nfd = fs->fs_nfd;
     task_filestreamdealloc_locked(current, fs);
     task_unlock(current);
     tvm_sig_leave();
@@ -10702,6 +10846,42 @@ FUNCTION_DEFINE1(off_t, ftello, FILE *, stream) {
 FUNCTION_DEFINE_VOID1(rewind, FILE *, stream) {
     fseek(stream, 0L, SEEK_SET);
     clearerr(stream);
+}
+
+// flockfile/ftrylockfile/funlockfile were not interposed either, and libc's
+// took the guest FILE for one of its own: flockfile() dereferences the
+// libc FILE's lock pointer (fp->_extra) at offset 8 of whatever it is
+// handed, so a guest stream, being a TVM file_stream, was a SIGSEGV at
+// address 0x8 in flockfile via pthread_mutex_lock. git brackets every
+// config file read and strbuf_getwholeline() with flockfile()/funlockfile()
+// (config.c, strbuf.c), so `git init`, `git var` and anything that opened a
+// repository died at its first config read (nano's read_file() had the same
+// crash, sidestepped at configure time with ac_cv_func_flockfile=no). The
+// lock is taken on the libc FILE behind the stream, which is what every
+// other stdio call on it ends up using, so a program that really does share
+// a stream between threads still gets the mutual exclusion it asked for. A
+// stream with no libc FILE behind it (a cpio VFS file) has nothing to lock.
+// The *_unlocked accessors that usually go with these are inline macros over
+// the libc FILE's fields on Darwin and cannot be interposed; a program using
+// them must be built with them mapped back to the locking functions (see
+// third_party/include-shim/tvm_stdio_unlocked.h).
+FUNCTION_DEFINE_VOID1(flockfile, FILE *, stream) {
+    FILE *fp = real_fp(stream);
+    if (fp)
+        CALL_FUNC(flockfile, fp);
+}
+
+FUNCTION_DEFINE1(int, ftrylockfile, FILE *, stream) {
+    FILE *fp = real_fp(stream);
+    if (!fp)
+        return 0;
+    return CALL_FUNC(ftrylockfile, fp);
+}
+
+FUNCTION_DEFINE_VOID1(funlockfile, FILE *, stream) {
+    FILE *fp = real_fp(stream);
+    if (fp)
+        CALL_FUNC(funlockfile, fp);
 }
 
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
@@ -11182,7 +11362,9 @@ FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags)
     }
 
     tvm_sig_enter();
-    struct file *file = (void *)CURRENT_RFD(dirfd, (long)file_open(__rfd, pathname, flags, mode, getuid(), getgid()));
+    // __FILE's name is read without its lock: f_pathname is written once at
+    // open and freed only with the file, on which a reference is held here.
+    struct file *file = (void *)CURRENT_RFD(dirfd, (long)file_open(__rfd, __FILE ? __FILE->f_pathname : NULL, pathname, flags, mode, getuid(), getgid()));
     if (!file) {
         tvm_sig_leave();
         return -1;
@@ -12473,13 +12655,29 @@ FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode
     return CURRENT_RFD(dirfd, CALL_FUNC(mkfifoat, __rfd, pathname, mode & ~current->tsk_umask));
 }
 
+// Copy the characters the host generated for the template's trailing X run
+// back into the caller's template (the absolute copy has the same tail).
+static void mktemp_copyback(char *template, const char *abs)
+{
+    size_t len = strlen(template), alen = strlen(abs), n = 0;
+    while (n < len && n < alen && template[len - 1 - n] == 'X')
+        n++;
+    memcpy(template + len - n, abs + alen - n, n);
+}
+
 FUNCTION_DEFINE1(int, mkstemp, char *, template) {
     int r, f;
+    // Resolve a relative template against the task's cwd, not the host
+    // process's (see mkdtemp), and hand the generated suffix back.
+    char abs[PATH_MAX];
+    if (!normalize_path(NULL, template, abs))
+        return -1;
     tvm_sig_enter();
-    if (-1 == (r = CALL_FUNC(mkstemp, template))) {
+    if (-1 == (r = CALL_FUNC(mkstemp, abs))) {
         tvm_sig_leave();
         return -1;
     }
+    mktemp_copyback(template, abs);
 
     if (-1 == (f = task_new_fd(current, r))) {
         VERIFY(0 == CALL_FUNC(close, r));
@@ -12489,6 +12687,26 @@ FUNCTION_DEFINE1(int, mkstemp, char *, template) {
     tvm_sig_leave();
 
     return f;
+}
+
+// mkdtemp was not interposed, so a relative template was created relative
+// to the host process's cwd, which is not the task's (TVM tracks each task's
+// cwd itself and resolves every other path call against it). git creates
+// its quarantine directory for incoming objects that way --
+// mkdtemp("./objects/tmp_objdir-incoming-XXXXXX") in the receiving
+// repository -- so `git push` to a local repository failed in
+// receive-pack with "unable to create temporary object directory". The
+// template is resolved against the task's cwd, created by the host, and
+// the generated suffix copied back into the caller's template, which is
+// what the caller reads (mkdtemp returns it).
+FUNCTION_DEFINE1(char *, mkdtemp, char *, template) {
+    char abs[PATH_MAX];
+    if (!normalize_path(NULL, template, abs))
+        return NULL;
+    if (!CALL_FUNC(mkdtemp, abs))
+        return NULL;
+    mktemp_copyback(template, abs);
+    return template;
 }
 
 FUNCTION_DEFINE3(int, socket, int, domain, int, type, int, protocol) {
@@ -12977,6 +13195,19 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // include prologue (fp + lr) when adjusting jmpbuf context regs
     //jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
 
+    // The atexit handlers taskalloc_fork copied from the parent are
+    // addresses in the parent's image; the child runs its own copy of the
+    // image at another address. Nothing had noticed while guest atexit()
+    // registered nothing (see atexit): git's `maintenance run --auto
+    // --detach`, run after every commit, daemonizes with fork() + exit() in
+    // the parent, and the child's exit() then called the parent's handler
+    // addresses -- unmapped by then -- and took the whole VM down with a
+    // hardware fault in TVM's exit path.
+    for (int i = 0; i < (int)(sizeof(arg->tsk->tsk_exits)/sizeof(*arg->tsk->tsk_exits)); i++) {
+        if (arg->tsk->tsk_exits[i])
+            arg->tsk->tsk_exits[i] = (exit_t)cow_fixup_translate(&arg->fixup, (void *)arg->tsk->tsk_exits[i]);
+    }
+
     // fix the jmpbuf
     void **jb = (void **) (&arg->jmpbuf_parent);
     for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
@@ -13404,17 +13635,42 @@ FUNCTION_DEFINE_NORET0(abort) {
 
 // atexit is implemented in the executable rather than libc
 // so we cannot really call the original one
+//
+// It is a plain function, not a FUNCTION_DEFINE interposer, so no tvm_call
+// record is pushed for it, and can_enter_tvm(NULL) -- which takes the
+// caller's address from that record -- found none and said no: every
+// guest's atexit() returned 0 and registered nothing, and no guest exit
+// handler ever ran. (curl_main.c works around exactly that by calling
+// OPENSSL_cleanup() after main instead.) git's curl helpers register
+// OPENSSL_cleanup() with atexit() so that OpenSSL's thread-state destructor
+// does not fire during the task thread's teardown -- where it aborts in
+// libmalloc and leaves the helper's parent waiting forever, so every
+// `git clone https://...` hung -- on every exit path, die() included. The
+// caller is now taken from the return address, as the interposer wrappers
+// record it, so a guest's registration is kept and exit() runs it.
+static int tvm_atexit(exit_t function, void *lr);
 
 #if defined(__linux__)
 int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle) {
-    return atexit((exit_t)func);
+    return tvm_atexit((exit_t)func, __builtin_return_address(0));
 }
 #endif
 
 //FUNCTION_DEFINE1(int, atexit, exit_t, function) {
 int atexit(exit_t function) {
+    return tvm_atexit(function, __builtin_return_address(0));
+}
+// Listed with the interposers so the linker binds a guest's atexit here by
+// name. Without the entry, ulinker_external_dlsym fell back to
+// dlsym(RTLD_DEFAULT), which finds this definition only where the TVM
+// executable itself exports it (the CLI); in the apps TVM is libtvm.dylib,
+// searched after libSystem, so guests got libc's atexit and their handlers
+// were queued for the app's own exit, never run at the task's.
+FUNCTION_METADATA(atexit, &atexit);
+
+static int tvm_atexit(exit_t function, void *lr) {
     
-    if (!can_enter_tvm(NULL))
+    if (!can_enter_tvm(lr))
         return 0;
 
     tvm_sig_enter();
@@ -15835,7 +16091,9 @@ FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_nam
     if (resolved_name)
         return tmp2;
 
-    char *ret = malloc(strlen(tmp2));
+    // strlen + 1: the terminator (this used to allocate one byte short and
+    // strcpy() wrote past the end of the guest's allocation)
+    char *ret = malloc(strlen(tmp2) + 1);
     if (ret)
         strcpy(ret, tmp2);
     CALL_FUNC(free, tmp2);
@@ -15875,19 +16133,52 @@ FUNCTION_DEFINE1(int, fchdir, int, fildes) {
     return chdir(tmp);
 }
 
+// getcwd() returned the task's cwd string as chdir() had recorded it: the
+// normalized path the program asked for, symlinks and all. POSIX has
+// getcwd() return a path with no symbolic link components, and programs
+// build on that: git's strbuf_realpath() (abspath.c) starts from getcwd()
+// and resolves symlinks only in the part of the path it appends. With the
+// cwd under /tmp (-> private/tmp) or $TMPDIR (/var -> private/var), git got
+// /tmp/repo/.git/objects for one spelling of the object directory and
+// /private/tmp/repo/.git/objects for another, took them for different
+// object stores, and `git multi-pack-index verify --object-dir .git/objects`
+// (run by every `git fsck`) dereferenced the NULL store it then got: SIGSEGV
+// at 0x8. The recorded cwd stays as it is -- it is what relative paths are
+// resolved against, on the cpio VFS as well -- and getcwd() now answers the
+// host's physical path for it. A cwd on the VFS, which the host cannot
+// resolve, is returned as recorded (the VFS has no symlinked directories on
+// the way to a cwd: chdir() normalizes). Also: a buffer too small is ERANGE
+// as POSIX says, rather than a silently unterminated string.
 FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
+    char cwd[PATH_MAX], phys[PATH_MAX];
     tvm_sig_enter();
     task_lock(current);
+    snprintf(cwd, sizeof(cwd), "%s", current->tsk_cwd);
+    task_unlock(current);
+    int last_errno = errno;
+    const char *path = CALL_FUNC(realpath, cwd, phys) ? phys : cwd;
+    errno = last_errno;
+    tvm_sig_leave();
+
+    size_t len = strlen(path) + 1;
     if (buf != NULL) {
-        strncpy(buf, current->tsk_cwd, size);
-        task_unlock(current);
-        tvm_sig_leave();
+        if (size == 0) {
+            errno = EINVAL;
+            return NULL;
+        }
+        if (len > size) {
+            errno = ERANGE;
+            return NULL;
+        }
+        memcpy(buf, path, len);
         return buf;
     }
-    
-    char *ret = strdup(current->tsk_cwd);
-    task_unlock(current);
-    tvm_sig_leave();
+
+    // getcwd(NULL, size) allocates (at least size bytes when size > 0)
+    char *ret = malloc(size > len ? size : len);
+    if (!ret)
+        return NULL;
+    memcpy(ret, path, len);
     return ret;
 }
 
