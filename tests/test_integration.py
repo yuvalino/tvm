@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git"
 # build.py -t flutter symlinks the built app here (→ tvm.app / Runner.app).
 FLUTTER_APP = f"./output/macos-arm64/lib/flutter"
 IOS_APP = f"./output/ios-arm64/lib/flutter"
@@ -1515,6 +1515,206 @@ def test_sqlite3_shell_escape(sshi: spawn):
     assert rc == 0, out
     lines = _lines(out)
     assert "from_shell" in lines and "6" in lines, out
+
+# ── git ──────────────────────────────────────────────────────
+
+# Every git test works in its own directory under $TMPDIR with a private
+# global config: GIT_CONFIG_GLOBAL keeps the CLI backend (whose HOME is the
+# runner's) from reading or writing the user's ~/.gitconfig, and the host's
+# GIT_ASKPASS (an IDE's helper script) must not leak into the VM. The
+# session is a tty, so git would page everything: GIT_PAGER=cat, except in
+# the pager tests, which unset it.
+_GIT_ENV = ("export GIT_CONFIG_GLOBAL=$TMPDIR/tvm_gitconfig GIT_CONFIG_NOSYSTEM=1 GIT_PAGER=cat; "
+            "unset GIT_ASKPASS SSH_ASKPASS GIT_EDITOR; "
+            "git config --global user.name 'TVM Tester' && "
+            "git config --global user.email tvm@example.com && "
+            "git config --global init.defaultBranch main")
+
+def _git_setup(sshi: spawn, name: str) -> str:
+    """Private config, a fresh $TMPDIR/<name> as cwd; returns its path."""
+    d = f"$TMPDIR/{name}"
+    out, rc = _sh(sshi, f"{_GIT_ENV}; rm -rf {d} && mkdir -p {d} && cd {d}")
+    assert rc == 0, out
+    return d
+
+def _git(sshi: spawn, cmd: str, timeout: float = CURL_TIMEOUT) -> tuple[str, int, str]:
+    """Run cmd with stderr captured separately: (stdout, rc, stderr)."""
+    out, rc = _sh(sshi, f"{cmd} 2>$TMPDIR/git_stderr", timeout=timeout)
+    err, _ = _sh(sshi, "cat $TMPDIR/git_stderr")
+    # _sh's output starts with the echoed command line
+    err = "\n".join(_lines(err)[1:])
+    return out, rc, err
+
+def test_git_version_exec_path(sshi: spawn):
+    """git --version and the compiled-in exec path, where the helpers live;
+    `git remote-https` reaches remote-curl's main through the multi-call
+    image (argv[0] dispatch) and prints its usage."""
+    out, rc, err = _git(sshi, "git --version")
+    assert rc == 0 and err == "", (out, err)
+    assert any(re.fullmatch(r"git version 2\.\d+\.\d+", l) for l in _lines(out)), out
+    out, rc, err = _git(sshi, "git --exec-path")
+    assert rc == 0 and err == "", (out, err)
+    assert "/tvm/libexec/git-core" in _lines(out), out
+    out, rc = _sh(sshi, "ls /tvm/libexec/git-core/git-remote-https /tvm/libexec/git-core/git-sh-setup"
+                        " /tvm/share/git-core/templates/hooks/pre-commit.sample >/dev/null")
+    assert rc == 0, out
+    out, rc = _sh(sshi, "git remote-https 2>&1")
+    assert rc == 1 and "usage: git remote-curl" in out, out
+
+def test_git_init_add_commit_log_status(sshi: spawn):
+    _git_setup(sshi, "git_basic")
+    out, rc, err = _git(sshi, "git init -q . && echo hello > a.txt && git add a.txt && git commit -q -m 'first commit'")
+    assert rc == 0 and err == "", (out, err)
+    out, rc, err = _git(sshi, "git log --oneline --no-decorate")
+    assert rc == 0 and err == "", (out, err)
+    assert any(re.fullmatch(r"[0-9a-f]{7,} first commit", l) for l in _lines(out)), out
+    out, rc, err = _git(sshi, "echo more >> a.txt; echo new > b.txt; git status --short")
+    assert rc == 0 and err == "", (out, err)
+    lines = _lines(out)
+    assert "M a.txt" in lines and "?? b.txt" in lines, out
+    out, rc, err = _git(sshi, "git status")
+    assert rc == 0 and "On branch main" in out, (out, err)
+
+def test_git_merge_conflict_ours(sshi: spawn):
+    """A conflicting merge stops with CONFLICT; checkout --ours, add and
+    commit conclude it as a two-parent merge."""
+    _git_setup(sshi, "git_merge")
+    out, rc, err = _git(sshi, "git init -q . && echo base > f && git add f && git commit -qm base && "
+                              "git checkout -q -b feature && echo feature > f && git commit -qam feature && "
+                              "git checkout -q main && echo main > f && git commit -qam main")
+    assert rc == 0 and err == "", (out, err)
+    out, rc = _sh(sshi, "git merge feature")
+    assert rc == 1 and "CONFLICT (content): Merge conflict in f" in out, out
+    out, rc, err = _git(sshi, "git checkout -q --ours f && git add f && git commit -q --no-edit && cat f")
+    assert rc == 0 and err == "", (out, err)
+    assert "main" in _lines(out), out
+    out, rc, err = _git(sshi, "git log --format=%s:%p -1")
+    assert rc == 0 and err == "", (out, err)
+    assert any(re.fullmatch(r"Merge branch 'feature':[0-9a-f]+ [0-9a-f]+", l) for l in _lines(out)), out
+
+def test_git_diff_through_pager(sshi: spawn):
+    """git diff through less without interaction: on the tty with
+    LESS=FRX (git's own default) the short diff prints and less exits by
+    itself; into a pipe, git does not page and less passes it through."""
+    _git_setup(sshi, "git_diff")
+    out, rc, err = _git(sshi, "git init -q . && printf 'one\\ntwo\\n' > f && git add f && git commit -qm c1 && "
+                              "printf 'one\\nTWO\\n' > f")
+    assert rc == 0 and err == "", (out, err)
+    out, rc = _sh(sshi, "unset GIT_PAGER; export TERM=xterm-256color; LESS=FRX PAGER=less git diff")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "-two" in lines and "+TWO" in lines, out
+    out, rc, err = _git(sshi, "git diff | less | cat")
+    assert rc == 0 and err == "", (out, err)
+    lines = _lines(out)
+    assert "diff --git a/f b/f" in lines and "-two" in lines and "+TWO" in lines, out
+
+def test_git_log_pager_interactive(sshi: spawn):
+    """git log pages through less on the tty (PAGER=less, LESS=-R from the
+    rc: no quit-at-end), q returns to the shell with status 0."""
+    _git_setup(sshi, "git_logpager")
+    out, rc, err = _git(sshi, "git init -q . && for i in $(seq 1 40); do git commit -q --allow-empty -m \"commit number $i\"; done")
+    assert rc == 0 and err == "", (out, err)
+    sshi.sendline("unset GIT_PAGER; export TERM=xterm-256color PAGER=less LESS=-R; git log --format=%s; echo RC=$?")
+    sshi.expect("commit number 40")
+    sshi.expect("commit number 30")
+    sshi.expect(r"\r\n:")       # less's prompt: waiting for a key
+    sshi.send("q")
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+
+def test_git_commit_editor_nano(sshi: spawn):
+    """git commit without -m opens $EDITOR (nano, the rc default): type a
+    message, ^O Enter, ^X, and the commit carries it."""
+    _git_setup(sshi, "git_editor")
+    out, rc, err = _git(sshi, "git init -q . && echo x > f && git add f")
+    assert rc == 0 and err == "", (out, err)
+    sshi.sendline("export TERM=xterm-256color EDITOR=nano; git commit -q; echo RC=$?")
+    sshi.expect("COMMIT_EDITMSG")
+    sshi.expect("Write Out")
+    sshi.send("message from nano")
+    sshi.send("\x0f")            # ^O
+    sshi.expect("File")          # "File Name to Write:" prompt
+    sshi.send("\r")
+    sshi.expect(r"Wrote \d+ lines?")
+    sshi.send("\x18")            # ^X
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+    out, rc, err = _git(sshi, "git log -1 --format=%s")
+    assert rc == 0 and err == "", (out, err)
+    assert "message from nano" in _lines(out), out
+
+def test_git_pre_commit_hook(sshi: spawn):
+    """A pre-commit hook (#!/bin/sh, run through the guest shell) that
+    fails blocks the commit; once it succeeds the commit goes through."""
+    _git_setup(sshi, "git_hook")
+    out, rc, err = _git(sshi, "git init -q . && "
+                              "printf '#!/bin/sh\\necho hook says no >&2\\nexit 1\\n' > .git/hooks/pre-commit && "
+                              "chmod +x .git/hooks/pre-commit && echo x > f && git add f")
+    assert rc == 0 and err == "", (out, err)
+    out, rc, err = _git(sshi, "git commit -q -m hooked")
+    assert rc == 1 and "hook says no" in err, (out, err)
+    out, rc = _sh(sshi, "git rev-parse --verify -q HEAD")
+    assert rc == 1, out
+    out, rc, err = _git(sshi, "printf '#!/bin/sh\\necho hook says yes\\nexit 0\\n' > .git/hooks/pre-commit && "
+                              "git commit -q -m hooked && git log -1 --format=%s")
+    assert rc == 0, (out, err)
+    assert "hooked" in _lines(out) and "hook says yes" in out + err, (out, err)
+
+@network_required
+def test_git_clone_https(sshi: spawn):
+    """git clone over HTTPS: git-remote-https from the exec path, libcurl
+    with OpenSSL and Apple SecTrust (no CA file); a shallow clone of a
+    tiny public repository."""
+    _git_setup(sshi, "git_https")
+    out, rc, err = _git(sshi, "git clone -q --depth 1 https://github.com/octocat/test-repo1 repo")
+    assert rc == 0 and err == "", (out, err)
+    out, rc, err = _git(sshi, "git -C repo log -1 --format=%H && git -C repo rev-list --count HEAD && ls repo")
+    assert rc == 0 and err == "", (out, err)
+    lines = _lines(out)
+    assert any(re.fullmatch(r"[0-9a-f]{40}", l) for l in lines), out
+    assert "1" in lines and "2016-02-24-first-post.md" in out, out
+
+def test_git_clone_local_push_bare(sshi: spawn):
+    """Clone a local repository, commit, push to a bare repository
+    (receive-pack's quarantine directory is a relative mkdtemp)."""
+    d = _git_setup(sshi, "git_push")
+    out, rc, err = _git(sshi, "git init -q src && cd src && echo a > a && git add a && git commit -qm one && cd .. && "
+                              "git init -q --bare bare.git && git clone -q src work && cd work && "
+                              "echo b > b && git add b && git commit -qm two && git push -q ../bare.git main")
+    assert rc == 0 and err == "", (out, err)
+    out, rc, err = _git(sshi, f"git -C {d}/bare.git log --format=%s main")
+    assert rc == 0 and err == "", (out, err)
+    lines = _lines(out)
+    assert lines[-2:] == ["two", "one"], out
+
+def test_git_gc_fsck(sshi: spawn):
+    """git gc packs the objects (pack-objects with threads), repack -a -d
+    and fsck, which runs commit-graph and multi-pack-index verify as child
+    git processes, find nothing wrong."""
+    _git_setup(sshi, "git_gc")
+    out, rc, err = _git(sshi, "git init -q . && for i in $(seq 1 20); do echo $i > f$i; git add f$i; "
+                              "git commit -qm c$i; done")
+    assert rc == 0 and err == "", (out, err)
+    out, rc, err = _git(sshi, "git gc -q && git repack -q -a -d --threads=4 && git count-objects -v")
+    assert rc == 0 and err == "", (out, err)
+    lines = _lines(out)
+    assert "count: 0" in lines and "packs: 1" in lines, out
+    out, rc, err = _git(sshi, "git fsck --no-progress --no-dangling")
+    assert rc == 0 and err == "", (out, err)
+
+def test_git_stash_pop(sshi: spawn):
+    _git_setup(sshi, "git_stash")
+    out, rc, err = _git(sshi, "git init -q . && echo one > f && git add f && git commit -qm one && echo two > f")
+    assert rc == 0 and err == "", (out, err)
+    out, rc, err = _git(sshi, "git stash -q && cat f && git status --short")
+    assert rc == 0 and err == "", (out, err)
+    lines = _lines(out)
+    assert "one" in lines and not any(l.startswith("M ") for l in lines[1:]), out
+    out, rc, err = _git(sshi, "git stash pop -q && cat f && git status --short && git stash list | wc -l")
+    assert rc == 0 and err == "", (out, err)
+    lines = _lines(out)
+    assert "two" in lines and "M f" in lines and "0" in lines, out
 
 # ── File descriptor & dup ────────────────────────────────────
 

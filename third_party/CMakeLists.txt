@@ -507,3 +507,44 @@ set_target_properties(sqlite_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(sqlite "objects/*.o" -lm -lz)
 add_launcher(sqlite)
+
+###############################################################################
+# git
+#
+# Unpatched upstream built in a shadow tree by scripts/build_git.sh with the
+# knobs in third_party/configs/git_config.mak (its config.mak); HTTPS through
+# the static libcurl/OpenSSL of the curl tool above. One multi-call image
+# (third_party/git_main.c dispatches on argv[0]) serves git and the helpers
+# git execs from its exec path (git-remote-https, git-http-fetch): the exe
+# `git` for the CLI initrd, libgit.dylib for the Flutter initrd, with the
+# helper names linked to /tvm/bin/git in /tvm/libexec/git-core by
+# scripts/CMakeLists.txt. The script relinks the dylib itself (mode `dylib`,
+# as build_curl_tool.sh does) because the link line is git's own, exported by
+# the build step, rather than an object glob.
+###############################################################################
+set(GIT_BUILD ${THIRDPARTY_BUILD}/git)
+
+ExternalProject_Add(git_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/git
+    BINARY_DIR ${GIT_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_git.sh
+        build ${THIRDPARTY_SRC}/git ${GIT_BUILD} ${THIRDPARTY_SRC}/curl ${CURL_BUILD} ${TVM_OPENSSL_PREFIX}
+    INSTALL_COMMAND ""
+    DEPENDS curl_ext
+    EXCLUDE_FROM_ALL TRUE
+)
+ExternalProject_Add_StepDependencies(git_ext build
+    ${SCRIPTS_DIR}/build_git.sh ${THIRDPARTY_SRC}/configs/git_config.mak ${THIRDPARTY_SRC}/git_main.c)
+add_custom_target(git_exe DEPENDS git_ext)
+set_target_properties(git_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+add_custom_target(git_shared
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}
+    COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_git.sh
+        dylib ${THIRDPARTY_SRC}/git ${GIT_BUILD} ${THIRDPARTY_SRC}/curl ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${LIB_OUT}/libgit.dylib
+    DEPENDS git_ext
+    COMMENT "Linking git (shared)"
+)
+set_target_properties(git_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_launcher(git)
