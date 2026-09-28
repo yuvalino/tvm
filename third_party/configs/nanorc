@@ -1,0 +1,6 @@
+## /tvm/etc/nanorc -- system-wide nano defaults for TVM (SYSCONFDIR, see
+## scripts/build_nano.sh). Per-user settings go in ~/.nanorc or
+## $XDG_CONFIG_HOME/nano/nanorc, which nano reads after this file.
+
+## Syntax highlighting: nano's own definitions, shipped in the initrd.
+include "/tvm/share/nano/*.nanorc"

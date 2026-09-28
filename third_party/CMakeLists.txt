@@ -391,3 +391,91 @@ add_custom_target(curl_shared
 )
 set_target_properties(curl_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_launcher(curl)
+
+###############################################################################
+# ncurses (static libncursesw for nano and less, plus a host-side tic)
+#
+# Unpatched upstream, configured by scripts/build_ncurses.sh. The target
+# library goes into ${TVM_NCURSES_PREFIX}; the host build only provides
+# progs/tic, which scripts/CMakeLists.txt runs at initrd time to compile the
+# terminfo database shipped at /tvm/share/terminfo.
+###############################################################################
+set(NCURSES_BUILD ${THIRDPARTY_BUILD}/ncurses)
+set(NCURSES_HOST_BUILD ${THIRDPARTY_BUILD}/ncurses_host)
+set(TVM_NCURSES_PREFIX ${NCURSES_BUILD}/prefix)
+set(NCURSES_LIB ${TVM_NCURSES_PREFIX}/lib/libncursesw.a)
+
+ExternalProject_Add(ncurses_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/ncurses
+    BINARY_DIR ${NCURSES_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_ncurses.sh target ${THIRDPARTY_SRC}/ncurses ${NCURSES_BUILD}
+    INSTALL_COMMAND ""
+    EXCLUDE_FROM_ALL TRUE
+)
+ExternalProject_Add_StepDependencies(ncurses_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
+
+# Host tic: built with the host compiler so it runs on the build machine for
+# every target (cf. toybox_host_ext).
+ExternalProject_Add(ncurses_host_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/ncurses
+    BINARY_DIR ${NCURSES_HOST_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=cc" sh ${SCRIPTS_DIR}/build_ncurses.sh host ${THIRDPARTY_SRC}/ncurses ${NCURSES_HOST_BUILD}
+    INSTALL_COMMAND ""
+    EXCLUDE_FROM_ALL TRUE
+)
+ExternalProject_Add_StepDependencies(ncurses_host_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
+
+###############################################################################
+# less
+#
+# Unpatched GNU less, generated sources + configure in a shadow tree
+# (scripts/build_less.sh), linked against the static ncursesw above. The exe
+# is less's own `less`; the Flutter dylib relinks the objects of less's link
+# line (exported to objects/ by the script).
+###############################################################################
+set(LESS_BUILD ${THIRDPARTY_BUILD}/less)
+
+ExternalProject_Add(less_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/less
+    BINARY_DIR ${LESS_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_less.sh ${THIRDPARTY_SRC}/less ${LESS_BUILD} ${TVM_NCURSES_PREFIX}
+    INSTALL_COMMAND ""
+    DEPENDS ncurses_ext
+    EXCLUDE_FROM_ALL TRUE
+)
+ExternalProject_Add_StepDependencies(less_ext build ${SCRIPTS_DIR}/build_less.sh)
+add_custom_target(less_exe DEPENDS less_ext)
+set_target_properties(less_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+add_shared_lib(less "objects/*.o" ${NCURSES_LIB})
+add_launcher(less)
+
+###############################################################################
+# nano
+#
+# Unpatched GNU nano built from git: gnulib import (third_party/gnulib, the
+# commit nano's autogen.sh pins) and autoreconf in a shadow tree, out-of-tree
+# configure and make (scripts/build_nano.sh), linked against the static
+# ncursesw above. The exe is nano's own `nano`; the Flutter dylib relinks
+# nano's objects (src/ holds nothing else) with gnulib's libgnu.a.
+###############################################################################
+set(NANO_BUILD ${THIRDPARTY_BUILD}/nano)
+
+ExternalProject_Add(nano_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/nano
+    BINARY_DIR ${NANO_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_nano.sh ${THIRDPARTY_SRC}/nano ${NANO_BUILD} ${THIRDPARTY_SRC}/gnulib ${TVM_NCURSES_PREFIX}
+    INSTALL_COMMAND ""
+    DEPENDS ncurses_ext
+    EXCLUDE_FROM_ALL TRUE
+)
+ExternalProject_Add_StepDependencies(nano_ext build ${SCRIPTS_DIR}/build_nano.sh)
+add_custom_target(nano_exe DEPENDS nano_ext)
+set_target_properties(nano_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+add_shared_lib(nano "build/src/*.o" ${NANO_BUILD}/build/lib/libgnu.a ${NCURSES_LIB})
+add_launcher(nano)

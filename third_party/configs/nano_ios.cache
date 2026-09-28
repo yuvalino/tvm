@@ -1,0 +1,100 @@
+# Autoconf cache for the iOS cross-build of nano (scripts/build_nano.sh).
+#
+# nano's gnulib configure has dozens of AC_RUN_IFELSE probes that cannot run
+# when cross-compiling and fall back to pessimistic guesses ("guessing no"),
+# which would give the iOS nano a different set of gnulib replacement
+# functions than the macOS one (rpl_lstat, rpl_getcwd, rpl_readlink, ...).
+# Both targets share the same libSystem and run inside TVM, so the answers
+# measured by the native macOS configure are used for iOS as well. Only the
+# probes iOS actually guesses are listed; everything else is detected.
+#
+# Regenerate after a nano/gnulib bump: build nano for macos-arm64 and
+# ios-arm64, then list every cache variable whose value in the iOS
+# config.log contains "guessing" together with its value from the macOS
+# config.log.
+ac_cv_func_malloc_0_nonnull=yes
+am_cv_func_working_getline=yes
+gl_cv_func_btowc_consistent=yes
+gl_cv_func_btowc_nul=yes
+gl_cv_func_dup2_works=yes
+gl_cv_func_fcntl_f_dupfd_cloexec=yes
+gl_cv_func_fcntl_f_dupfd_works=yes
+gl_cv_func_fnmatch_posix=no
+gl_cv_func_frexp_works=yes
+gl_cv_func_frexpl_works=yes
+gl_cv_func_fstatat_zero_flag=yes
+gl_cv_func_futimens_works=no
+gl_cv_func_getcwd_null=yes
+gl_cv_func_getdtablesize_works=yes
+gl_cv_func_getlogin_r_works=no
+gl_cv_func_getopt_posix=no
+gl_cv_func_isnanf_works=yes
+gl_cv_func_isnanl_works=yes
+gl_cv_func_iswcntrl_works=yes
+gl_cv_func_iswdigit_works=yes
+gl_cv_func_iswpunct_works=yes
+gl_cv_func_iswxdigit_works=yes
+gl_cv_func_itold_works=yes
+gl_cv_func_ldexpl_works=yes
+gl_cv_func_localeconv_works=yes
+gl_cv_func_lstat_dereferences_slashed_symlink=yes
+gl_cv_func_mbrtowc_C_locale_sans_EILSEQ=yes
+gl_cv_func_mbrtowc_empty_input=yes
+gl_cv_func_mbrtowc_incomplete_state=yes
+gl_cv_func_mbrtowc_invalid_UTF8=yes
+gl_cv_func_mbrtowc_nul_retval=yes
+gl_cv_func_mbrtowc_null_arg1=yes
+gl_cv_func_mbrtowc_retval=yes
+gl_cv_func_mbrtowc_sanitycheck=yes
+gl_cv_func_mbrtowc_stores_incomplete=no
+gl_cv_func_mbsrtowcs_works=yes
+gl_cv_func_memchr_works=yes
+gl_cv_func_mkdir_trailing_dot_works=yes
+gl_cv_func_mkdir_trailing_slash_works=yes
+gl_cv_func_open_slash=yes
+gl_cv_func_printf_directive_a=no
+gl_cv_func_printf_directive_b=no
+gl_cv_func_printf_directive_f=yes
+gl_cv_func_printf_directive_lc=yes
+gl_cv_func_printf_directive_ls=yes
+gl_cv_func_printf_flag_alt_precision_zero=yes
+gl_cv_func_printf_flag_grouping=yes
+gl_cv_func_printf_flag_grouping_int_precision=no
+gl_cv_func_printf_flag_grouping_multibyte=yes
+gl_cv_func_printf_flag_leftadjust=yes
+gl_cv_func_printf_flag_zero=yes
+gl_cv_func_printf_infinite=yes
+gl_cv_func_printf_positions=yes
+gl_cv_func_printf_precision=yes
+gl_cv_func_printf_sizes_c23=no
+gl_cv_func_printf_sizes_c99=yes
+gl_cv_func_pthread_once_no_lib=yes
+gl_cv_func_pthread_sigmask_in_libc_works=yes
+gl_cv_func_pthread_sigmask_return_works=yes
+gl_cv_func_re_compile_pattern_working=no
+gl_cv_func_readlink_trailing_slash=yes
+gl_cv_func_readlink_truncate=yes
+gl_cv_func_realloc_0_nonnull=yes
+gl_cv_func_realloc_posix=yes
+gl_cv_func_realpath_works=no
+gl_cv_func_signbit=yes
+gl_cv_func_signbit_builtins=yes
+gl_cv_func_snprintf_retval_c99=yes
+gl_cv_func_snprintf_size1=yes
+gl_cv_func_snprintf_truncation_c99=yes
+gl_cv_func_stat_file_slash=yes
+gl_cv_func_strcasecmp_works=yes
+gl_cv_func_strerror_0_works=no
+gl_cv_func_strncpy_works=yes
+gl_cv_func_utime_file_slash=yes
+gl_cv_func_vsnprintf_zerosize_c99=yes
+gl_cv_func_wcrtomb_retval=yes
+gl_cv_func_wcrtomb_works=yes
+gl_cv_func_wctype_works=yes
+gl_cv_func_wcwidth_works=yes
+gl_cv_func_working_utimes=yes
+gl_cv_glob_overflows_stack=yes
+gl_cv_header_working_fcntl_h=yes
+gl_cv_header_working_stdint_h=yes
+gl_cv_macro_MB_CUR_MAX_good=yes
+gl_cv_pthread_rwlock_rdlock_prefer_writer=yes

@@ -72,6 +72,8 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${BIN_OUT}/toybox_launcher' \"$ROOTFS/bin/toybox\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/vim_launcher' \"$ROOTFS/bin/vim\"\n")
         string(APPEND SCRIPT "cp '${BIN_OUT}/curl_launcher' \"$ROOTFS/bin/curl\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/less_launcher' \"$ROOTFS/bin/less\"\n")
+        string(APPEND SCRIPT "cp '${BIN_OUT}/nano_launcher' \"$ROOTFS/bin/nano\"\n")
     else()
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
@@ -80,6 +82,8 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/toybox/toybox' \"$ROOTFS/bin/toybox\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/vim/vim' \"$ROOTFS/bin/vim\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/curl_tool/curl' \"$ROOTFS/bin/curl\"\n")
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/less/src/less' \"$ROOTFS/bin/less\"\n")
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/nano/build/src/nano' \"$ROOTFS/bin/nano\"\n")
     endif()
     string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n")
     # /bin/sh is bash invoked as `sh`: POSIX mode, reads $ENV when interactive
@@ -96,6 +100,24 @@ function(mkinitrd_target NAME)
     # Termcap database for readline on iOS (bash's bundled GNU termcap reads
     # TERMCAP_FILE=/tvm/etc/termcap there; unused on macOS, which has terminfo).
     string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/termcap' \"$ROOTFS/etc/termcap\"\n\n")
+
+    # ── Terminfo database ──
+    # less and nano link a static ncursesw whose compiled-in database is
+    # /tvm/share/terminfo (the rc files export TERMINFO to the same path).
+    # Compiled here from ncurses' own terminfo.src with the host-built tic
+    # (ncurses_host_ext), limited to the terminals ssh clients announce;
+    # /tvm/etc/profile maps anything else to xterm-256color.
+    set(TERMINFO_ENTRIES xterm xterm-256color screen screen-256color vt100 tmux-256color dumb)
+    string(REPLACE ";" "," TERMINFO_ENTRIES_CSV "${TERMINFO_ENTRIES}")
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/terminfo\"\n")
+    string(APPEND SCRIPT "'${THIRDPARTY_BUILD}/ncurses_host/progs/tic' -x -e ${TERMINFO_ENTRIES_CSV} -o \"$ROOTFS/share/terminfo\" '${ROOTDIR}/third_party/ncurses/misc/terminfo.src'\n\n")
+
+    # ── nano ──
+    # System nanorc (SYSCONFDIR=/tvm/etc, see scripts/build_nano.sh) and the
+    # syntax definitions it includes from /tvm/share/nano.
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/nanorc' \"$ROOTFS/etc/nanorc\"\n")
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/nano\"\n")
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/nano/syntax/'*.nanorc \"$ROOTFS/share/nano/\"\n\n")
 
     # ── CA bundle (Linux only) ──
     # curl verifies through the OS trust store on macOS/iOS (USE_APPLE_SECTRUST);
@@ -171,11 +193,11 @@ endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe toybox_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher toybox_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )
