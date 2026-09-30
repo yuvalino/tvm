@@ -6754,6 +6754,13 @@ struct cow_fixup_context {
         int fixup;
     } *ptrs;
     size_t count;
+
+    // Lookup index over ptrs, rebuilt when ranges were added since the last
+    // build (see cow_fixup_index).
+    size_t *order;          // indices into ptrs, sorted by old address
+    size_t indexed;         // count the index was built for
+    uintptr_t lo, hi;       // lowest old start, highest old end
+    int overlap;            // some old ranges overlap: use the linear scan
 };
 
 static int cow_fixup_ctx_add(struct cow_fixup_context *dctx, void *new, void *old, size_t size, int fixup)
@@ -6774,7 +6781,7 @@ static int cow_fixup_ctx_add(struct cow_fixup_context *dctx, void *new, void *ol
     return 0;
 }
 
-static void *cow_fixup_translate(struct cow_fixup_context *dctx, void *p)
+static void *cow_fixup_translate_linear(struct cow_fixup_context *dctx, void *p)
 {
     for (int i = 0; i < dctx->count; i++)
     {
@@ -6787,19 +6794,138 @@ static void *cow_fixup_translate(struct cow_fixup_context *dctx, void *p)
     return p;
 }
 
+/*
+ * Build the sorted index used by cow_fixup_translate.
+ *
+ * cow_fixup_process() translates every pointer-sized word of every copied
+ * writable region, and it used to test each word against every range in
+ * insertion order. A fork of a shell whose heap holds a large script (bash
+ * running neofetch: several MB) did (heap words) x (ranges) comparisons:
+ * ~10 ms per MB of used heap, 100+ ms per fork, which is where almost all of
+ * neofetch's 11 s went (sampled: cow_fixup_translate was the hottest
+ * on-CPU function by far). The index turns that into a min/max reject for
+ * the common non-pointer word plus a binary search. With overlapping old
+ * ranges the linear scan's "first added range wins" rule could differ from
+ * a binary search, so that case keeps the linear scan.
+ */
+static void cow_fixup_index(struct cow_fixup_context *dctx)
+{
+    if (dctx->indexed == dctx->count && dctx->order)
+        return;
+
+    size_t *order = krealloc(dctx->order, sizeof(*order) * (dctx->count ? dctx->count : 1));
+    if (!order) {
+        // no index: everything goes through the linear scan
+        dctx->overlap = 1;
+        dctx->indexed = dctx->count;
+        return;
+    }
+    dctx->order = order;
+
+    // insertion sort by old start: counts are small (tens to hundreds)
+    for (size_t i = 0; i < dctx->count; i++) {
+        size_t j = i;
+        while (j > 0 && (uintptr_t)dctx->ptrs[order[j - 1]].old > (uintptr_t)dctx->ptrs[i].old) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = i;
+    }
+
+    dctx->overlap = 0;
+    dctx->lo = UINTPTR_MAX;
+    dctx->hi = 0;
+    for (size_t k = 0; k < dctx->count; k++) {
+        uintptr_t start = (uintptr_t)dctx->ptrs[order[k]].old;
+        uintptr_t end = start + dctx->ptrs[order[k]].size;
+        if (start < dctx->lo)
+            dctx->lo = start;
+        if (end > dctx->hi)
+            dctx->hi = end;
+        if (k > 0) {
+            uintptr_t prev_end = (uintptr_t)dctx->ptrs[order[k - 1]].old + dctx->ptrs[order[k - 1]].size;
+            if (prev_end > start)
+                dctx->overlap = 1;
+        }
+    }
+    dctx->indexed = dctx->count;
+}
+
+// Index lookup; the caller has built the index and checked there is no
+// overlap. Inlined into the per-word loop of cow_fixup_process.
+static inline __attribute__((always_inline)) void *cow_fixup_translate_indexed(struct cow_fixup_context *dctx, void *p)
+{
+    uintptr_t v = (uintptr_t)p;
+    if (v < dctx->lo || v >= dctx->hi)
+        return p;
+
+    size_t lo = 0, hi = dctx->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if ((uintptr_t)dctx->ptrs[dctx->order[mid]].old <= v)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo == 0)
+        return p;
+    size_t i = dctx->order[lo - 1];
+    if (v >= (uintptr_t)dctx->ptrs[i].old + dctx->ptrs[i].size)
+        return p;
+    return (void *)(v - (uintptr_t)dctx->ptrs[i].old + (uintptr_t)dctx->ptrs[i].new);
+}
+
+static void *cow_fixup_translate(struct cow_fixup_context *dctx, void *p)
+{
+    cow_fixup_index(dctx);
+    if (dctx->overlap)
+        return cow_fixup_translate_linear(dctx, p);
+
+    uintptr_t v = (uintptr_t)p;
+    if (v < dctx->lo || v >= dctx->hi)
+        return p;
+
+    // last range whose old start is <= v
+    size_t lo = 0, hi = dctx->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if ((uintptr_t)dctx->ptrs[dctx->order[mid]].old <= v)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo == 0)
+        return p;
+    size_t i = dctx->order[lo - 1];
+    if (v >= (uintptr_t)dctx->ptrs[i].old + dctx->ptrs[i].size)
+        return p;
+    return (void *)(v - (uintptr_t)dctx->ptrs[i].old + (uintptr_t)dctx->ptrs[i].new);
+}
+
 static void cow_fixup_process(struct cow_fixup_context *dctx)
 {
+    // The ranges do not change during the scan: build the index once and use
+    // the inlined lookup per word (this loop visits every word of every
+    // copied writable region; a call plus an index check per word was a third
+    // of what remained of fork's cost).
+    cow_fixup_index(dctx);
+    int indexed = !dctx->overlap;
+
     for (int i = 0; i < dctx->count; i++) {
         // only used for other fixups
         if (!dctx->ptrs[i].fixup)
             continue;
 
-        for (
-            void **p = (void **)dctx->ptrs[i].new;
-            (uintptr_t)(p + 1) <= (uintptr_t)dctx->ptrs[i].new + dctx->ptrs[i].size;
-            p++
-        ) {
-            *p = cow_fixup_translate(dctx, *p);
+        void **end = (void **)((uintptr_t)dctx->ptrs[i].new + (dctx->ptrs[i].size & ~(sizeof(void *) - 1)));
+        for (void **p = (void **)dctx->ptrs[i].new; p < end; p++) {
+            if (indexed) {
+                uintptr_t v = (uintptr_t)*p;
+                if (v < dctx->lo || v >= dctx->hi)
+                    continue;  // not a pointer into any copied range
+                *p = cow_fixup_translate_indexed(dctx, *p);
+            }
+            else
+                *p = cow_fixup_translate_linear(dctx, *p);
         }
     }
 }
@@ -7406,7 +7532,8 @@ int emulator_find_dl(struct emulator_context *ec, uint64_t pc, struct ulinker_dl
 {
     memset(out_info, 0, sizeof(*out_info));
 
-    if (ulinker_dladdr(ec->ec_ulinker, (void *)pc, out_info)) {
+    // image only: no caller of emulator_find_dl uses the symbol fields
+    if (ulinker_dladdr_image(ec->ec_ulinker, (void *)pc, out_info)) {
         return 0;
     }
 
@@ -8523,23 +8650,30 @@ int in_tvm_range(void *lr) {
 int can_enter_tvm(void *lr) {
     // A thread without per-thread TLS (newborn inside pthread_create, dying
     // after the key destructor, TVM-internal helpers) never enters TVM.
-    // This must come first: everything below reads TLS via tvm_tls(), which
-    // aborts when there is none.
-    if (!TVM_TLS_PEEK())
+    // This must come first.
+    //
+    // The TLS block is looked up once and its fields read directly: this runs
+    // on every interposed call, and each use of the `call` /
+    // `thread_tvm_disallow` macros was a separate pthread_getspecific() --
+    // together with the wrapper's own lookups the hottest thing in a bash
+    // loop, ahead of the allocator.
+    struct tvm_tls *t = TVM_TLS_PEEK();
+    if (!t)
         return 0;
 
     // not initialized
     if (!main_task)
         return 0;
 
-    if (thread_tvm_disallow) {
+    if (t->tls_thread_tvm_disallow) {
         return 0;
     }
 
+    struct tvm_call *c = t->tls_call;
     if (!lr) {
-        if (!call)
+        if (!c)
             return 0;
-        lr = call->lr;
+        lr = c->lr;
     }
 
 
@@ -8547,15 +8681,15 @@ int can_enter_tvm(void *lr) {
         return 0;
 
     // fork() does not use call (for now)
-    if (!call)
+    if (!c)
         return 1;
 
     // if this isn't an inner call, just go
-    if (!call->prev)
+    if (!c->prev)
         return 1;
 
     // if this is an inner call, check first call
-    struct tvm_call *call_itr = call;
+    struct tvm_call *call_itr = c;
     while (call_itr) {
         lr = call_itr->lr;
         call_itr = call_itr->prev;
@@ -13292,6 +13426,9 @@ pid_t fork(void) {
         errno = ENOMEM;
         goto out;
     }
+    // kalloc does not zero: an uninitialized fixup.ptrs was handed to
+    // krealloc (a reused block's stale pointer to a never-freed table)
+    memset(&arg->fixup, 0, sizeof(arg->fixup));
 
     arg->pid = 0;
     arg->tsk = tsk;
@@ -13402,6 +13539,13 @@ out:
             CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
             arg->tmp_stack = NULL;
         }        
+
+        // the fork pointer-translation table, grown with krealloc in the
+        // global arena by cow_fixup_ctx_add
+        kfree(arg->fixup.ptrs);
+        arg->fixup.ptrs = NULL;
+        kfree(arg->fixup.order);
+        arg->fixup.order = NULL;
 
         kfree(arg);
         arg = NULL;
@@ -15632,8 +15776,13 @@ FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
 #endif
 }
 
+static void *tvm_calloc(size_t nmemb, size_t size);
+
+// Straight to the implementation: going through the interposed calloc
+// symbol ran the whole interposer wrapper (TLS lookups, can_enter_tvm, call
+// chain) a second time for every malloc.
 FUNCTION_DEFINE1(void *, malloc, size_t, size) {
-    return calloc(1, size);
+    return tvm_calloc(1, size);
 }
 
 // malloc(0) and calloc(0, n) return a unique, freeable pointer, as the host
@@ -15646,6 +15795,10 @@ FUNCTION_DEFINE1(void *, malloc, size_t, size) {
 // (plain "a" compiled, "^a" did not). The smallest arena object stands in
 // for the zero-sized one.
 FUNCTION_DEFINE2(void *, calloc, size_t, nmemb, size_t, size) {
+    return tvm_calloc(nmemb, size);
+}
+
+static void *tvm_calloc(size_t nmemb, size_t size) {
     size_t total = nmemb * size;
     if (nmemb && total / nmemb != size) {
         errno = ENOMEM;
