@@ -56,12 +56,35 @@ static size_t round_up_objsize(size_t size) {
     return n;
 }
 
+/*
+ * A slab reserves room for 512 objects of its size class, but never more
+ * than RMEM_MAX_SLAB of address space: larger size classes get as many objects
+ * as fit, at least one, plus a page for the header and bitmap.
+ *
+ * Uncapped, the reservation grew with the object size: one 16 MB allocation
+ * reserved an 8 GB slab, and a git process reached 31 slabs / ~20 GB of
+ * reserved address space. That is harmless on macOS, but fork duplicates each
+ * slab at its full size, so the child needed another ~20 GB, and on iOS,
+ * whose per-app address space is far smaller, the slab mmap failed with
+ * ENOMEM in every fork of a git process (`git commit`'s auto-maintenance
+ * daemonizes with fork), which then brought the whole VM down.
+ */
+#define RMEM_MAX_SLAB ((size_t)64 << 20)
+
 size_t get_slab_size(size_t objsize) {
     size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
 
-    /* target at least N chunks per slab */
     size_t min_nobj = 512;   // tweakable
-    size_t slabsize = objsize * min_nobj;
+    size_t slabsize;
+    if (objsize <= RMEM_MAX_SLAB / min_nobj) {
+        slabsize = objsize * min_nobj;
+    }
+    else {
+        size_t nobj = RMEM_MAX_SLAB / objsize;
+        if (!nobj)
+            nobj = 1;
+        slabsize = nobj * objsize + pagesz;
+    }
 
     /* round up to multiple of page size for mmap */
     slabsize = round_up(slabsize, pagesz);
@@ -656,9 +679,14 @@ int rmem_arena_duplicate(struct rmem_arena *dst_ar, struct rmem_arena *src_ar, v
     for (struct rmem_slab *sl = src_ar->ar_slabs; sl; sl = sl->sl_next) {
         struct rmem_slab *sl2 = rmem_slab_create(sl->sl_size, sl->sl_objsize);
         if (!sl2) {
-            rmem_arena_destroy(dst_ar);
+            // The caller owns dst_ar and destroys it. Destroying it here
+            // unmapped the arena and then unlocked the mutex inside it: a
+            // fault in the fork child while holding the parent's arena lock,
+            // which deadlocked the VM instead of reporting the failure.
+            int last_errno = errno;
             pthread_mutex_unlock(&src_ar->ar_lock);
             pthread_mutex_unlock(&dst_ar->ar_lock);
+            errno = last_errno;
             return -1;
         }
 

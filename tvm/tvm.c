@@ -3168,7 +3168,7 @@ char *dirfd_normalize_path(int dirnfd, const char *file_name, char *out_path)
     struct file *dir = NULL;
     const char *dirname = NULL;
     if (dirnfd != AT_FDCWD) {
-        struct file *dir = file_for_task(current, dirnfd);
+        dir = file_for_task(current, dirnfd);
         if (!dir)
             return NULL;
 
@@ -4080,7 +4080,14 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
 {
     if (!sigshutup) {
         if (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL) {
-            INFO("signum=%d at %p si_code=%d in_emu=%d sigblk=%d depth=%d", signum, siginfo->si_addr, siginfo->si_code, tvm_in_emu, tvm_sig_blocked, tvm_sig_depth);
+            unsigned long fault_pc = 0, fault_lr = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (ucontext && ucontext->uc_mcontext) {
+                fault_pc = (unsigned long)__darwin_arm_thread_state64_get_pc(ucontext->uc_mcontext->__ss);
+                fault_lr = (unsigned long)__darwin_arm_thread_state64_get_lr(ucontext->uc_mcontext->__ss);
+            }
+#endif
+            INFO("signum=%d at %p pc=0x%lx lr=0x%lx si_code=%d in_emu=%d sigblk=%d depth=%d", signum, siginfo->si_addr, fault_pc, fault_lr, siginfo->si_code, tvm_in_emu, tvm_sig_blocked, tvm_sig_depth);
             dump_stacktrace();
         }
         else if (signum != SIGCHLD) {
@@ -4991,7 +4998,7 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
             
             pgid = tt->t_pgid;
 
-            tty_unlock(tt, 0);
+            tty_unlock(tt, 1);
             file_unlock(file, 0);
 
             kill(-pgid, SIGWINCH);
@@ -5053,7 +5060,7 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
             pthread_mutex_unlock(&tasks_lock);
             
             pgid = tt->t_pgid;
-            tty_unlock(tt, 0);
+            tty_unlock(tt, 1);
 
             kill(-pgid, SIGHUP);
             kill(-pgid, SIGCONT);

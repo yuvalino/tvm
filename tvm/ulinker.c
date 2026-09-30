@@ -2105,6 +2105,18 @@ struct dlinfo_macho64 {
     void       *dlm64_chainedfixups_imports;
 
     struct jit_code_entry dlm64_jit_entry;
+
+    // image slot reuse, see macho_slot_take()
+    struct macho_slot_key {
+        dev_t    dev;
+        ino_t    ino;
+        off_t    size;
+        long     mtime_sec;
+        long     mtime_nsec;
+        size_t   load_size;
+    } dlm64_slot_key;
+    int dlm64_slot_cacheable;   // native image with executable segments, all mapped
+    int dlm64_slot_reused;      // executable segments came from a parked slot
 };
 
 struct dlinfo_external {
@@ -3393,6 +3405,83 @@ out:
     return ret;
 }
 
+/*
+ * Parked Mach-O image slots (Apple only).
+ *
+ * On iOS the kernel never frees an executable mapping of signed code: once
+ * vm_map_entry_cs_associate() succeeds it marks the entry permanent
+ * (vm_map_executable_immutable, always on in release kernels), and
+ * vm_map_delete() then keeps a permanent entry in place with its protections
+ * stripped to none instead of removing it ("A permanent entry can not be
+ * removed, so leave it in place but remove all access permissions",
+ * osfmk/vm/vm_map.c). So munmap() of a native image left its __TEXT behind as
+ * dead 0/0 address space. TVM maps every native image once per exec and again
+ * in every fork child, so each exec leaked its text for good: ~9 MB and two
+ * map entries per `git` run, until iOS SIGKILLed the whole app (reproduced:
+ * killed after ~2800 `git --version` runs, 6400 regions; the device test
+ * suite died a little after its git tests).
+ *
+ * Instead of unmapping, an unloaded native image keeps its whole range, with
+ * the executable segments still mapped, and is parked here keyed by the file's
+ * identity. The next load of the same file takes the slot: its executable
+ * segments are left as they are (same file, same bytes, still validly signed)
+ * and every other segment is mapped afresh over the stale one with MAP_FIXED.
+ * Address space is then bounded by the peak number of simultaneously loaded
+ * copies of each image rather than by the number of loads ever made. The
+ * parked slots' stale data pages stay resident until reuse; they are small.
+ */
+#if defined(__APPLE__)
+#define MACHO_SLOTS_MAX 256
+
+struct macho_slot {
+    int in_use;
+    struct macho_slot_key key;
+    void *base;
+};
+
+static pthread_mutex_t g_macho_slots_mtx = PTHREAD_MUTEX_INITIALIZER;
+static struct macho_slot g_macho_slots[MACHO_SLOTS_MAX];
+
+static int macho_slot_key_eq(const struct macho_slot_key *a, const struct macho_slot_key *b)
+{
+    return a->dev == b->dev && a->ino == b->ino && a->size == b->size &&
+           a->mtime_sec == b->mtime_sec && a->mtime_nsec == b->mtime_nsec &&
+           a->load_size == b->load_size;
+}
+
+static void *macho_slot_take(const struct macho_slot_key *key)
+{
+    void *base = NULL;
+    pthread_mutex_lock(&g_macho_slots_mtx);
+    for (int i = 0; i < MACHO_SLOTS_MAX; i++) {
+        if (g_macho_slots[i].in_use && macho_slot_key_eq(&g_macho_slots[i].key, key)) {
+            base = g_macho_slots[i].base;
+            g_macho_slots[i].in_use = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macho_slots_mtx);
+    return base;
+}
+
+static int macho_slot_put(const struct macho_slot_key *key, void *base)
+{
+    int ok = 0;
+    pthread_mutex_lock(&g_macho_slots_mtx);
+    for (int i = 0; i < MACHO_SLOTS_MAX; i++) {
+        if (!g_macho_slots[i].in_use) {
+            g_macho_slots[i].in_use = 1;
+            g_macho_slots[i].key = *key;
+            g_macho_slots[i].base = base;
+            ok = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macho_slots_mtx);
+    return ok;
+}
+#endif
+
 static void free_macho64_library(struct dlinfo_macho64 *dl)
 {
     if (dl->dlm64_jit_entry.symfile_addr) {
@@ -3402,6 +3491,9 @@ static void free_macho64_library(struct dlinfo_macho64 *dl)
         dl->dlm64_jit_entry.symfile_size = 0;
     }
     if (DLBASE(dl)->dl_base) {
+#if defined(__APPLE__)
+        if (!(dl->dlm64_slot_cacheable && macho_slot_put(&dl->dlm64_slot_key, DLBASE(dl)->dl_base)))
+#endif
         uo.uo_munmap(DLPRIVATE(dl), DLBASE(dl)->dl_base, DLBASE(dl)->dl_size);
         DLBASE(dl)->dl_base = NULL;
         DLBASE(dl)->dl_size = 0;
@@ -3532,7 +3624,38 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
 
     size_t load_size = max_vaddr - min_vaddr;
 
-    void *base = uo.uo_mmap(ulinker->ul_private, NULL, load_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *base = MAP_FAILED;
+#if defined(__APPLE__)
+    // Native images with executable segments go through the slot table (see
+    // macho_slot_take); emulated images map their text without PROT_EXEC,
+    // which the kernel frees normally.
+    if (!DLBASE(dl)->dl_emu) {
+        int has_exec = 0;
+        curr_lc = lc;
+        for (size_t i = 0; i < dl->dlm64_hdr.ncmds; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+            if (curr_lc->cmd == LC_SEGMENT_64 && (((const struct segment_command_64 *)curr_lc)->initprot & VM_PROT_EXECUTE))
+                has_exec = 1;
+        }
+        struct stat st;
+        if (has_exec && 0 == uo.uo_fstat(ulinker->ul_private, fd, &st)) {
+            dl->dlm64_slot_key.dev = st.st_dev;
+            dl->dlm64_slot_key.ino = st.st_ino;
+            dl->dlm64_slot_key.size = st.st_size;
+            dl->dlm64_slot_key.mtime_sec = (long)st.st_mtimespec.tv_sec;
+            dl->dlm64_slot_key.mtime_nsec = (long)st.st_mtimespec.tv_nsec;
+            dl->dlm64_slot_key.load_size = load_size;
+            void *slot = macho_slot_take(&dl->dlm64_slot_key);
+            if (slot) {
+                base = slot;
+                dl->dlm64_slot_reused = 1;
+                // its executable segments are intact whatever happens below
+                dl->dlm64_slot_cacheable = 1;
+            }
+        }
+    }
+#endif
+    if (MAP_FAILED == base)
+        base = uo.uo_mmap(ulinker->ul_private, NULL, load_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (MAP_FAILED == base) {
         ERROR("failed to map Mach-O \"%s\" (size 0x%zx): -%d (%s)", filename, load_size, errno, strerror(errno));
         goto out;
@@ -3546,7 +3669,7 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
     // Register code signature with kernel so mmap(PROT_EXEC) is allowed.
     // Required on iOS; best-effort on macOS.
 #if defined(__APPLE__)
-    if (codesig_off && codesig_size && !DLBASE(dl)->dl_emu) {
+    if (codesig_off && codesig_size && !DLBASE(dl)->dl_emu && !dl->dlm64_slot_reused) {
         fsignatures_t siginfo;
         siginfo.fs_file_start = 0;
         siginfo.fs_blob_start = (void *)(long)codesig_off;
@@ -3609,6 +3732,12 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             goto out;
         }
 
+#if defined(__APPLE__)
+        // a reused slot's executable segment is still mapped from this file
+        if (dl->dlm64_slot_reused && (curr_sc->initprot & VM_PROT_EXECUTE))
+            continue;
+#endif
+
         if (file_length != 0) {
             void* seg_addr = uo.uo_mmap(ulinker->ul_private, (void *)seg_page_start,
                                 file_length,
@@ -3648,6 +3777,12 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         }
 
     }
+
+#if defined(__APPLE__)
+    // every segment is mapped now; the image may be parked on unload
+    if (!DLBASE(dl)->dl_emu && dl->dlm64_slot_key.load_size)
+        dl->dlm64_slot_cacheable = 1;
+#endif
 
     // find phdr as it appears in the loaded segments
 
