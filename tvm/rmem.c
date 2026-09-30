@@ -534,6 +534,28 @@ void rmem_arena_destroy(struct rmem_arena *ar) {
     rops.ro_munmap(ar, sizeof(struct rmem_arena));
 }
 
+/*
+ * Move `sl` (found after `prev` while walking ar_slabs) to the head of the
+ * list. Called with the arena lock held.
+ *
+ * alloc and free both find their slab by walking ar_slabs, and new slabs are
+ * pushed at the head, so the small size classes a program uses constantly --
+ * created first -- ended up at the tail: bash walked ~20 of its 24 slabs on
+ * every malloc and every free (~55 of each per iteration of a shell loop),
+ * which with the arena lock and TLS lookups made `i=$((i+1))` loops ~8x
+ * slower than the same bash binary outside TVM. Keeping the slab last used
+ * at the head makes the common case one or two steps. List order carries no
+ * other meaning (fork copies every slab).
+ */
+static inline void rmem_slab_to_front(struct rmem_arena *ar, struct rmem_slab *prev, struct rmem_slab *sl)
+{
+    if (!prev)
+        return;
+    prev->sl_next = sl->sl_next;
+    sl->sl_next = ar->ar_slabs;
+    ar->ar_slabs = sl;
+}
+
 static void *rmem_arena_alloc_locked(struct rmem_arena *ar, size_t size) {
     if (!size)
         return NULL;
@@ -542,16 +564,17 @@ static void *rmem_arena_alloc_locked(struct rmem_arena *ar, size_t size) {
 
     size_t need = 1;
 
-    struct rmem_slab *sl;
+    struct rmem_slab *sl, *prev = NULL;
     size_t idx;
     void *p = NULL;
-    for (sl = ar->ar_slabs; sl; sl = sl->sl_next) {
+    for (sl = ar->ar_slabs; sl; prev = sl, sl = sl->sl_next) {
         if (sl->sl_objsize != size)
             continue;
 
         idx = bitmap_find_run_zero(sl->sl_bitmap, sl->sl_bitmap_words, sl->sl_nobj, need);
         if (idx != SIZE_MAX) {
             p = (char*)sl->sl_base + idx * sl->sl_objsize;
+            rmem_slab_to_front(ar, prev, sl);
             break;
         }
     }
@@ -590,11 +613,12 @@ void *rmem_arena_alloc(struct rmem_arena *ar, size_t size) {
 void rmem_arena_free(struct rmem_arena *ar, void *p) {
     if (!p) return;
     pthread_mutex_lock(&ar->ar_lock);
-    for (struct rmem_slab *sl = ar->ar_slabs; sl; sl = sl->sl_next) {
+    for (struct rmem_slab *sl = ar->ar_slabs, *prev = NULL; sl; prev = sl, sl = sl->sl_next) {
         if ((uintptr_t)p < (uintptr_t)sl->sl_base || (uintptr_t)p >= ((uintptr_t)sl->sl_base + sl->sl_nobj * sl->sl_objsize))
             continue;
 
         rmem_slab_free(&ar->ar_lock, sl, p);
+        rmem_slab_to_front(ar, prev, sl);
         pthread_mutex_unlock(&ar->ar_lock);
         return;
     }

@@ -1995,6 +1995,10 @@ struct ulinker {
 
     void *ul_cb_arg;
     void (*ul_cb_mmap)(struct ulinker *, void *, size_t, void *, size_t, int);
+
+    // set by ulinker_duplicate while it reloads the parent's images for a
+    // fork child (see load_library)
+    int ul_duplicating;
 };
 
 #define DLINFO_LOCK(_ul)   pthread_mutex_lock(&(_ul)->ul_dlinfo_mtx)
@@ -4279,6 +4283,31 @@ static void notify_loaded_segments(struct ulinker *ulinker, struct dlinfo *dl)
     }
 }
 
+/*
+ * Every segment holding chained fixups is mapped read-write, so a fork copy
+ * of the parent's writable segments (fork_dup_linker_cb) carries all of the
+ * parent's already-applied fixups.
+ */
+static int macho64_fixups_in_writable_segments(struct dlinfo_macho64 *dl)
+{
+    if (!dl->dlm64_chainedfixups_starts)
+        return 1;
+
+    uint32_t sg = 0;
+    const struct load_command *lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        if (sg < dl->dlm64_chainedfixups_starts->seg_count &&
+            dl->dlm64_chainedfixups_starts->seg_info_offset[sg] != 0 &&
+            (sc->initprot & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE))
+            return 0;
+        sg++;
+    }
+    return 1;
+}
+
 static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename, int flags) {
     struct dlinfo *ret = NULL;
     struct dlinfo *dl = NULL;
@@ -4286,10 +4315,27 @@ static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename
     if (!(dl = load_library_internal(ulinker, filename, flags)))
         goto out;
 
-    if (link_library(dl))
+    /*
+     * Reloading a parent's image for a fork child (ulinker_duplicate): the
+     * child's writable segments are about to be overwritten with the parent's
+     * (fork_dup_linker_cb, driven by notify_loaded_segments below), which
+     * already hold every rebase and bind the parent applied. Resolving the
+     * imports again by name was ~45% of the cost of a fork (sampled: symbol
+     * lookups, strcmp and dyld's export-trie walks), so skip it whenever that
+     * copy covers all the fixups. Constructors are skipped too: a fork does
+     * not re-run initializers, and re-running them in the child repeated any
+     * side effect outside the image's own data (an atexit registration, an
+     * open file) that the parent had already done.
+     */
+    if (ulinker->ul_duplicating && dl->dl_type == DLT_MACHO64 && !dl->dl_linked &&
+        macho64_fixups_in_writable_segments((struct dlinfo_macho64 *)dl)) {
+        dl->dl_linked = 1;
+    }
+    else if (link_library(dl))
         goto out;
 
-    call_constructors(dl);
+    if (!ulinker->ul_duplicating)
+        call_constructors(dl);
 
     // calls mmap_cb, load event is reported right at mmap time.
     // this is purely for post-processing memory after initialization is done.
@@ -4474,7 +4520,25 @@ char *ulinker_dlerror(void) {
     return errormsg;
 }
 
+static int ulinker_dladdr_ex(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int want_symbol);
+
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
+    return ulinker_dladdr_ex(ulinker, addr, info, 1);
+}
+
+/*
+ * Like ulinker_dladdr, without the nearest-symbol search: udli_sname and
+ * udli_saddr come back NULL. That search walks the image's symbol table and
+ * is only wanted for diagnostics; the emulator asks "which image, which
+ * arch, emulated or not" on every emulated call (emulator_find_dl), e.g.
+ * once per comparison when host qsort() calls an emulated comparator, and
+ * the symbol walk was the single hottest function in a neofetch run.
+ */
+int ulinker_dladdr_image(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
+    return ulinker_dladdr_ex(ulinker, addr, info, 0);
+}
+
+static int ulinker_dladdr_ex(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int want_symbol) {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = library_for_address_locked(ulinker, addr);
     DLINFO_UNLOCK(ulinker);
@@ -4490,6 +4554,9 @@ int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dla
     info->udli_femu  = dl->dl_emu;
     info->udli_sname = NULL;
     info->udli_saddr = NULL;
+
+    if (!want_symbol)
+        return 1;
 
     if (dl->dl_type == DLT_ELF64)
         reverse_lookup_symbol_elf64((struct dlinfo_elf64 *)dl, addr, &info->udli_sname, &info->udli_saddr);
@@ -4524,6 +4591,7 @@ int ulinker_duplicate(struct ulinker *old, struct ulinker *new, void (*segment_c
     DLINFO_LOCK(old);
 
     new->ul_cb_mmap = dup_mmap_cb;
+    new->ul_duplicating = 1;
 
     for (struct dlinfo *dl = old->ul_dlinfo; dl; dl = dl->dl_next) {
         // end of linker-specific list
@@ -4548,6 +4616,7 @@ out:
 
     new->ul_cb_arg = NULL;
     new->ul_cb_mmap = NULL;
+    new->ul_duplicating = 0;
 
     if (ret) {
         while (new->ul_dlinfo) {

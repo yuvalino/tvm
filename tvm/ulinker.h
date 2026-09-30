@@ -89,6 +89,8 @@ struct ulinker_dladdr_info {
     void       *udli_saddr;
 };
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
+// image fields only (no symbol lookup): udli_sname/udli_saddr are NULL
+int ulinker_dladdr_image(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
 
 /**
  * duplicate a linker with all loaded libraries and data.
