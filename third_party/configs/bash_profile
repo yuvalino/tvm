@@ -1,5 +1,10 @@
 # /tvm/etc/profile — read by bash for login shells (-bash, bash -l, sh -l).
 #
+# mksh-style prompt: "$ " (or "# " for root) instead of bash's built-in
+# default, which shows the shell name and version ("-bash-5.3$ " for a login
+# shell). Set before $ENV is sourced so a user's rc file can override it.
+PS1='\$ '
+
 # TVM's rc files export ENV (e.g. ENV=$HOME/.forklessrc); bash only honours
 # $ENV itself when invoked as `sh`, so source it here for login shells too.
 [ -n "$ENV" ] && [ -f "$ENV" ] && . "$ENV"

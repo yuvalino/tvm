@@ -1718,6 +1718,23 @@ def test_git_stash_pop(sshi: spawn):
 
 # ── File descriptor & dup ────────────────────────────────────
 
+def test_prompt_is_dollar(sshi: spawn):
+    """The login shell's prompt is mksh-style "$ ", not bash's default
+    "-bash-5.3$ "; so is an interactive non-login bash (reads bash.bashrc)."""
+    # a prompt at the start of a line; bash puts its bracketed-paste escapes
+    # (ESC [?2004l / ESC [?2004h) and a carriage return in front of it
+    prompt = r"[\r\n](?:\x1b\[\?2004[hl]|\r)*\$ "
+    sshi.sendline("echo \"PS1=[$PS1]\"")
+    sshi.expect(r"PS1=\[\\\$ \]")
+    sshi.expect(prompt)
+    sshi.sendline("bash -i")
+    sshi.expect(prompt)
+    sshi.sendline("echo \"inner=[$PS1]\"; exit")
+    sshi.expect(r"inner=\[\\\$ \]")
+    sshi.expect(prompt)
+    before = sshi.before.decode() if isinstance(sshi.before, bytes) else sshi.before
+    assert "bash-5" not in before, before
+
 def test_dup_stdout(sshi: spawn):
     """dup2 of stdout — exercises fd table duplication."""
     sshi.sendline("sh -c 'exec 3>&1; echo dup_ok >&3'; echo RC=$?")

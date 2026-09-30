@@ -1,1 +1,4 @@
 # /tvm/etc/bash.bashrc — read by bash for interactive non-login shells.
+
+# mksh-style prompt, as in /tvm/etc/profile: "$ " (or "# " for root).
+PS1='\$ '
