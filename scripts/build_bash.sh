@@ -14,6 +14,8 @@ set -e
 SRCDIR="$1"
 BUILDDIR="$2"
 CONFIGS_DIR="$(cd "$(dirname "$0")/.." && pwd)/third_party/configs"
+. "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$CONFIGS_DIR/bash_stdio_unlocked.h"
 
 mkdir -p "$BUILDDIR"
 cd "$BUILDDIR"

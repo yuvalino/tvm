@@ -32,6 +32,9 @@ NCURSES_PREFIX="$4"
 
 SHADOW="$BUILDDIR/src"
 OUT="$BUILDDIR/build"
+. "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$GNULIB" "$NCURSES_PREFIX/lib/libncursesw.a" \
+    "$(cd "$(dirname "$0")/.." && pwd)/third_party/configs/nano_ios.cache"
 
 if [ ! -f "$SHADOW/configure" ]; then
     rm -rf "$SHADOW"
