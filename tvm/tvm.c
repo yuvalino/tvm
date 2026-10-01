@@ -589,6 +589,18 @@ DECL_FUNC_OPT(timer_getoverrun);
 #if defined(__linux__)
 DECL_FUNC(memalign);
 DECL_FUNC(pvalloc);
+DECL_FUNC(pread64);
+DECL_FUNC(pwrite64);
+DECL_FUNC(preadv64);
+DECL_FUNC(pwritev64);
+DECL_FUNC(fdatasync);
+DECL_FUNC(mmap64);
+DECL_FUNC(statfs64);
+DECL_FUNC(mkstemp64);
+DECL_FUNC(fseeko64);
+DECL_FUNC(ftello64);
+DECL_FUNC(posix_fallocate);
+DECL_FUNC(posix_fallocate64);
 DECL_FUNC(eaccess);
 DECL_FUNC(euidaccess);
 DECL_FUNC(mknod);
@@ -12212,6 +12224,38 @@ FUNCTION_DEFINE1(int, fsync, int, fd) {
     return CURRENT_RFD(fd, CALL_FUNC(fsync, __rfd));
 }
 
+#if defined(__linux__)
+/*
+ * glibc's large-file names. A program built with _FILE_OFFSET_BITS=64
+ * (sqlite, git, coreutils-style code) calls pread64/pwrite64/fcntl64/...
+ * instead of pread/pwrite/fcntl, and guest symbols bind to interposers by
+ * name: these went to the host libc with TVM's task descriptor numbers.
+ * sqlite then read and locked whatever host descriptor had that number
+ * ("disk I/O error", "no such table"). On x86-64 off_t is already 64-bit,
+ * so they are the same functions.
+ */
+FUNCTION_DEFINE4(ssize_t, pread64, int, fd, void *, buf, size_t, count, off64_t, offset) {
+    return __tvm_pread(fd, buf, count, offset);
+}
+
+FUNCTION_DEFINE4(ssize_t, pwrite64, int, fd, const void *, buf, size_t, count, off64_t, offset) {
+    return __tvm_pwrite(fd, buf, count, offset);
+}
+
+FUNCTION_DEFINE4(ssize_t, preadv64, int, fd, const struct iovec *, iov, int, iovcnt, off64_t, offset) {
+    return __tvm_preadv(fd, iov, iovcnt, offset);
+}
+
+FUNCTION_DEFINE4(ssize_t, pwritev64, int, fd, const struct iovec *, iov, int, iovcnt, off64_t, offset) {
+    return __tvm_pwritev(fd, iov, iovcnt, offset);
+}
+
+// sqlite on Linux syncs with fdatasync (HAVE_FDATASYNC), not fsync.
+FUNCTION_DEFINE1(int, fdatasync, int, fd) {
+    return CURRENT_RFD(fd, CALL_FUNC(fdatasync, __rfd));
+}
+#endif
+
 FUNCTION_DEFINE1(int, dup, int, oldfd) {
     return fcntl(oldfd, F_DUPFD, 0);
 }
@@ -12626,6 +12670,14 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
 
     return CURRENT_RFD(fd, CALL_FUNC(fcntl, __rfd, cmd, arg));
 }
+
+#if defined(__linux__)
+// glibc >= 2.28 with _FILE_OFFSET_BITS=64: fcntl is fcntl64 (see pread64).
+// struct flock is struct flock64 and F_*LK64 are F_*LK on x86-64.
+FUNCTION_DEFINE_VA2(int, fcntl64, int, fd, int, cmd/*, ...  arg */ ) {
+    return __tvm_fcntl_va(fd, cmd, __ap);
+}
+#endif
 
 FUNCTION_DEFINE2(int, ftruncate, int, fd, off_t, length) {
     return CURRENT_RFD(fd, CALL_FUNC(ftruncate, __rfd, length));
@@ -17377,6 +17429,43 @@ FUNCTION_DEFINE2(int, eventfd_read, int, fd, eventfd_t *, value) {
 
 FUNCTION_DEFINE2(int, eventfd_write, int, fd, eventfd_t, value) {
     return write(fd, &value, sizeof(value)) == sizeof(value) ? 0 : -1;
+}
+
+/*
+ * More of glibc's large-file names (see pread64): the same functions on
+ * x86-64, interposed under their 64 names so a _FILE_OFFSET_BITS=64 guest
+ * does not reach the host libc with a task descriptor (mmap64 of a file,
+ * mkstemp64 returning a host descriptor the task table never saw) or a TVM
+ * stream in place of a glibc FILE (fseeko64/ftello64: curl).
+ */
+FUNCTION_DEFINE6(void *, mmap64, void *, addr, size_t, length, int, prot, int, flags, int, fd, off64_t, offset) {
+    return __tvm_mmap(addr, length, prot, flags, fd, offset);
+}
+
+FUNCTION_DEFINE2(int, statfs64, const char *, pathname, struct statfs64 *, buf) {
+    return __tvm_statfs(pathname, (struct statfs *)buf);
+}
+
+FUNCTION_DEFINE1(int, mkstemp64, char *, template) {
+    return __tvm_mkstemp(template);
+}
+
+FUNCTION_DEFINE3(int, fseeko64, FILE *, stream, off64_t, offset, int, whence) {
+    return __tvm_fseeko(stream, offset, whence);
+}
+
+FUNCTION_DEFINE1(off64_t, ftello64, FILE *, stream) {
+    return __tvm_ftello(stream);
+}
+
+FUNCTION_DEFINE3(int, posix_fallocate, int, fd, off_t, offset, off_t, len) {
+    // returns the error number; an unknown descriptor reaches the host as
+    // -1 (WITH_RFD), which answers EBADF
+    return CURRENT_RFD(fd, CALL_FUNC(posix_fallocate, __rfd, offset, len));
+}
+
+FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len) {
+    return __tvm_posix_fallocate(fd, offset, len);
 }
 
 FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
