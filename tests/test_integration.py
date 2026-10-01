@@ -1315,6 +1315,16 @@ def test_less_pager_quit_if_one_screen(sshi: spawn):
 
 # ── nano ─────────────────────────────────────────────────────
 
+def _expect_all(sshi: spawn, *texts: str):
+    """Wait until every text has appeared, in any order. A full-screen
+    program paints its rows in whatever order its screen update chooses:
+    nano sometimes draws the help bar ("Write Out") before the file's lines,
+    and a sequence of expects then skips past the earlier one."""
+    pending = list(texts)
+    while pending:
+        i = sshi.expect([re.escape(t) for t in pending])
+        del pending[i]
+
 def test_nano_version(sshi: spawn):
     sshi.sendline("nano --version | head -1")
     sshi.expect(r"GNU nano, version \d+\.\d+")
@@ -1338,9 +1348,7 @@ def test_nano_interactive_edit(sshi: spawn):
 def test_nano_open_existing(sshi: spawn):
     """nano shows an existing file's content; ^X on an unmodified buffer exits."""
     sshi.sendline("export TERM=xterm-256color; printf 'first line\\nsecond line\\n' > $TMPDIR/nano_old.txt; nano $TMPDIR/nano_old.txt; echo RC=$?")
-    sshi.expect("first line")
-    sshi.expect("second line")
-    sshi.expect("Write Out")
+    _expect_all(sshi, "first line", "second line", "Write Out")
     sshi.send("\x18")            # ^X
     sshi.expect("RC=0")
     sshi.expect(r"\$ ")
@@ -2290,7 +2298,8 @@ def test_system_basic(sshi: spawn):
     # Match the output line, not the echoed command line: fork's pointer
     # fixup once rewrote the tail of the command string and this printed
     # "hello_syste" plus garbage bytes, which "hello_system" alone let pass.
-    sshi.expect(r"\rhello_system\r\n")
+    # (\r after bash's bracketed-paste reset, \n without one)
+    sshi.expect(r"[\r\n]hello_system\r\n")
     sshi.expect(r"rc=0")
     sshi.expect(r"\$ ")
 
