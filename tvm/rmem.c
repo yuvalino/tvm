@@ -560,6 +560,14 @@ static void *rmem_arena_alloc_locked(struct rmem_arena *ar, size_t size) {
     if (!size)
         return NULL;
 
+    // round_up_objsize doubles until it reaches size: above 2^63 that
+    // overflows to 0 and never terminates (malloc(SIZE_MAX) spun forever
+    // holding the arena lock). Nothing that large can be mapped anyway.
+    if (size > ((size_t)1 << 48)) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
     size = round_up_objsize(size);
 
     size_t need = 1;
@@ -632,6 +640,12 @@ void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
 
     if (size == 0) {
         rmem_arena_free(ar, p);
+        return NULL;
+    }
+
+    // see rmem_arena_alloc_locked: round_up_objsize cannot represent this
+    if (size > ((size_t)1 << 48)) {
+        errno = ENOMEM;
         return NULL;
     }
 

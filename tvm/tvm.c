@@ -341,10 +341,14 @@ DECL_FUNC(wait4);
 DECL_FUNC(wait3);
 DECL_FUNC(vwarn);
 DECL_FUNC(vwarnx);
+#if defined(__APPLE__)
+// BSD-only: glibc has none of these, and an unguarded DECL_FUNC both fails to
+// compile there and panics at startup when dlsym cannot find the original.
 DECL_FUNC(vwarnc);
 DECL_FUNC(verrc);
 DECL_FUNC(getprogname);
 DECL_FUNC(setprogname);
+#endif
 DECL_FUNC(freopen);
 DECL_FUNC(fclose);
 DECL_FUNC(fwrite);
@@ -586,7 +590,6 @@ DECL_FUNC(epoll_create);
 DECL_FUNC(epoll_create1);
 DECL_FUNC(timerfd_create);
 DECL_FUNC(pipe2);
-DECL_FUNC(fstatfs);
 DECL_FUNC(fstatfs64);
 DECL_FUNC(open64);
 DECL_FUNC(openat64);
@@ -1410,6 +1413,10 @@ struct file {
     struct task *f_task; // back pointer to owning task
 
     char *f_pathname; // optionally available pathname for open file
+
+    // The program's own no-SIGPIPE choice (SO_NOSIGPIPE, F_SETNOSIGPIPE),
+    // kept here because the host descriptor always has it on (rfd_adopt).
+    int f_nosigpipe;
 };
 
 uint64_t next_gencnt = 0;
@@ -1500,6 +1507,8 @@ static int rfd_adopt(int rfd)
  * section it is deferred to the matching tvm_sig_leave() like any other.
  * errno is preserved for the caller.
  */
+static void epipe_signal_fd(int nfd, int send_flags);
+
 static void epipe_signal(void)
 {
 #ifdef F_SETNOSIGPIPE
@@ -1651,6 +1660,7 @@ struct file *file_dup_locked(struct file *oldfile) {
     // and the duplicate must answer by path like the original.
     if (oldfile->f_pathname)
         newfile->f_pathname = kstrdup(oldfile->f_pathname);
+    newfile->f_nosigpipe = oldfile->f_nosigpipe;
 
     // we can blatantly lock although oldfile is locked, as it was just created
     file_lock(newfile, 0);
@@ -1867,6 +1877,7 @@ struct task {
     struct ulinker *tsk_linker;
     char tsk_cwd[PATH_MAX];
     exit_t tsk_exits[32];
+    void *tsk_exit_args[32];  // argument for each tsk_exits entry (__cxa_atexit), NULL for atexit
     uint32_t tsk_pending_sigs;  // bitmask of deferred signals (atomic via __atomic builtins)
     siginfo_t tsk_pending_siginfo[MAX_SIGNALS];
     ucontext_t tsk_pending_ucontext[MAX_SIGNALS];
@@ -2231,6 +2242,40 @@ static LIST_HEAD(rlocks);
 static pthread_mutex_t rlocks_lock = PTHREAD_MUTEX_INITIALIZER; // leaf: never held while taking another lock
 static pthread_cond_t rlocks_cond = PTHREAD_COND_INITIALIZER;   // broadcast on every release, for F_SETLKW waiters
 
+// F_SETLKW waiters, each "waiter is blocked on a lock owner holds", for
+// deadlock detection. Entries live on the waiting thread's stack and are
+// linked only while it sleeps, under rlocks_lock.
+struct rlock_waiter {
+    struct list_head rw_list;
+    struct task *rw_waiter;
+    struct task *rw_owner;
+};
+static LIST_HEAD(rlock_waiters);
+
+// Would `self` blocking on a lock held by `owner` close a cycle? Follows
+// owner -> the owner it is itself waiting for -> ... A kernel refuses such a
+// wait with EDEADLK; without this, two tasks that each held a lock the other
+// wanted slept forever. Pointers are only compared, never dereferenced, so a
+// stale entry for a task that has just exited cannot fault. Called with
+// rlocks_lock held.
+static int rlock_would_deadlock_locked(struct task *self, struct task *owner)
+{
+    for (int hops = 0; owner && hops < 1024; hops++) {
+        if (owner == self)
+            return 1;
+        struct task *next = NULL;
+        struct rlock_waiter *w;
+        list_for_each_entry(w, &rlock_waiters, rw_list) {
+            if (w->rw_waiter == owner) {
+                next = w->rw_owner;
+                break;
+            }
+        }
+        owner = next;
+    }
+    return 0;
+}
+
 // The byte range [*start, *end] a struct flock denotes, SEEK_CUR/SEEK_END
 // resolved against the real descriptor. -1 with errno on a bad range.
 static int rlock_range(int rfd, const struct flock *fl, off_t *start, off_t *end)
@@ -2453,6 +2498,7 @@ static struct task *taskalloc()
     t->tsk_state = current->tsk_state & TS_CTTY;
     memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
     memcpy(&t->tsk_exits, &current->tsk_exits, sizeof(t->tsk_exits));
+    memcpy(&t->tsk_exit_args, &current->tsk_exit_args, sizeof(t->tsk_exit_args));
 
     // dup all files (file streams fixed up by memory duplication)
     for (int i = 0; i < MAX_FILES; i++) {
@@ -2462,6 +2508,16 @@ static struct task *taskalloc()
         // will never dealloc because current is locked and has ref on file
         file_lock(current->tsk_files[i], 1);
         struct file *file = file_dup_locked(current->tsk_files[i]);
+        // The child's descriptor is a host dup(), and dup() clears
+        // FD_CLOEXEC; a fork must keep it. Without this every descriptor a
+        // program marked close-on-exec lost the mark in its fork children and
+        // leaked into whatever they exec'd -- e.g. popen()'s pipes stayed open
+        // in later popen() children, so pclose() of the first could hang.
+        if (file) {
+            int fdflags = CALL_FUNC(fcntl, current->tsk_files[i]->f_rfd, F_GETFD);
+            if (fdflags != -1 && (fdflags & FD_CLOEXEC))
+                (void)CALL_FUNC(fcntl, file->f_rfd, F_SETFD, FD_CLOEXEC);
+        }
         file_unlock(current->tsk_files[i], 1);
         if (!file)
             goto out;
@@ -2726,6 +2782,8 @@ static int stop_signal_dropped(int signum, pid_t pid)
     return 1;
 }
 
+static int task_signal_ignored_locked(struct task *t, int signum);
+
 static int task_kill_locked(struct task *t, int signum) {
     int r;
 
@@ -2734,6 +2792,20 @@ static int task_kill_locked(struct task *t, int signum) {
 
     if (stop_signal_dropped(signum, t->tsk_pid))
         return 0;
+
+    // An ignored signal is discarded (POSIX), and must not interrupt
+    // anything: pthread_kill made every blocking host call in the target
+    // fail with EINTR, including reads inside the host libc's stdio, which
+    // report it as EOF or an error. The common case was SIGCHLD, default-
+    // ignored, sent to a parent reading a pipe from its child (awk's
+    // `"cmd" | getline`, sqlite3's `.import "|cmd"`, fscanf loops); SIGWINCH
+    // on a terminal resize likewise. Still delivered when some thread blocks
+    // it, where it stays pending (sigwait). waitpid sleepers are woken as
+    // before.
+    if (task_signal_ignored_locked(t, signum)) {
+        pthread_cond_broadcast(&t->tsk_wait_cond);
+        return 0;
+    }
 
     // Try to find a thread that isn't blocking signals
     struct thread *fallback = NULL;
@@ -3664,6 +3736,8 @@ struct file_stream {
     };
 
     char fs_mode[5]; // for files only
+    int fs_flush_pending; // fflush(NULL): lock was busy, retry this stream
+    int fs_discard;       // deallocate without flushing (execve)
     pid_t fs_pid;    // popen(): the child running the command, reaped by pclose()
 
     struct dirent fs_dirent; // for dirs only
@@ -3674,6 +3748,8 @@ struct file_stream_list_entry {
     struct list_head fsle_list;
     struct file_stream *fsle_stream;
 };
+
+static struct file *file_for_task_stream_locked(struct task *t, struct file_stream *fs, int fs_type);
 
 void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
 {
@@ -3691,13 +3767,28 @@ void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
     if (fs->fs_type == FS_FILE) {
         if (fs->fs_fp) {
             int last_errno = errno;
-            // Flush while the fd is still attached: the real fclose() below
-            // would otherwise flush to fd -1 and silently drop the buffer.
-            // A broken pipe here is SIGPIPE for the closing task, as in
-            // fclose(3), but not during teardown: the task is already exiting.
-            if (CALL_FUNC(fflush, fs->fs_fp) == EOF && errno == EPIPE &&
-                t == current && !(t->tsk_state & TS_EXITING))
-                epipe_signal();
+            // fclose(): flush while the fd is still attached, or the real
+            // fclose() below would flush to fd -1 and drop the buffer; a
+            // broken pipe here is SIGPIPE for the closing task, as in
+            // fclose(3). The flush goes through file_for_task_stream_locked,
+            // which re-syncs the libc FILE's descriptor (it can be stale after
+            // a dup2 over it) and skips a stream whose descriptor is gone,
+            // instead of writing into a host descriptor number that may now
+            // belong to another task.
+            //
+            // Task teardown (_exit(), death by a signal, or execve dropping
+            // the old image's streams) does not flush: POSIX discards
+            // unflushed stdio buffers there, exit() has already flushed, and
+            // a write that blocked on a full pipe here would do so holding
+            // tasks_lock, stopping every task in the VM.
+            if (t == current && !(t->tsk_state & TS_EXITING) && !fs->fs_discard && fs->fs_nfd >= 0) {
+                struct file *file = file_for_task_stream_locked(t, fs, FS_FILE);
+                if (file) {
+                    if (CALL_FUNC(fflush, fs->fs_fp) == EOF && errno == EPIPE)
+                        epipe_signal();
+                    file_unlock(file, 1);
+                }
+            }
             fp_setfileno(fs->fs_fp, -1);
             (void)CALL_FUNC(fclose, fs->fs_fp);
             errno = last_errno;
@@ -3760,6 +3851,51 @@ static FILE *fp_detached(const char *mode)
     fp_setfileno(fp, -1);
     CALL_FUNC(close, fd);
     return fp;
+}
+
+/*
+ * execve replaces the program image, and with it the stdio state: the old
+ * image's streams and their unflushed buffers are gone, and the new image's
+ * stdin/stdout/stderr are bound to descriptors 0-2 as they are now. TVM kept
+ * the old streams, so the new program's fflush(NULL)/exit() flushed the old
+ * image's buffers a second time, and a standard stream the old image had
+ * fclose()d stayed detached (EBADF) even when descriptor 1 was open again.
+ * Called with t locked.
+ */
+static void task_exec_reset_streams_locked(struct task *t)
+{
+    while (!list_empty(&t->tsk_filestreams)) {
+        struct file_stream_list_entry *fsle =
+            list_first_entry(&t->tsk_filestreams, struct file_stream_list_entry, fsle_list);
+        fsle->fsle_stream->fs_discard = 1;
+        task_filestreamdealloc_locked(t, fsle->fsle_stream);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        t->tsk_io_filestreams[i] = NULL;
+        struct file_stream *fs = task_filestreamalloc_locked(t);
+        if (!fs)
+            panic("execve: std stream %d", i);
+        fs->fs_type = FS_FILE;
+        memset(fs->fs_mode, 0, sizeof(fs->fs_mode));
+        strncpy(fs->fs_mode, (i ? "w" : "r"), sizeof(fs->fs_mode) - 1);
+
+        struct file *file = file_for_task_locked(t, i);
+        if (file) {
+            fs->fs_nfd = i;
+            fs->fs_gencnt = file->f_gencnt;
+            fs->fs_fp = CALL_FUNC(fdopen, file->f_rfd, fs->fs_mode);
+            file_unlock(file, 1);
+        }
+        if (!fs->fs_fp) {
+            fs->fs_nfd = -1;
+            if (!(fs->fs_fp = fp_detached(fs->fs_mode)))
+                panic("execve: detached std stream %d", i);
+        }
+        else
+            (void)CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0);
+        t->tsk_io_filestreams[i] = fs;
+    }
 }
 
 int task_filestreamrealloc_locked(struct task *t, struct file_stream *fs) {
@@ -3972,6 +4108,27 @@ static const int default_signal_actions[MAX_SIGNALS] = {
     [SIGUSR2]   = SAD_TERM, // 31
 #endif
 };
+
+// signum is ignored by t: SIG_IGN, or SIG_DFL whose default action is to
+// ignore, and no thread of t blocks it (a blocked signal stays pending).
+// Called with t locked.
+static int task_signal_ignored_locked(struct task *t, int signum)
+{
+    if (signum <= 0 || signum >= MAX_SIGNALS)
+        return 0;
+    struct sigaction *act = &t->tsk_sighandlers[signum];
+    if (act->sa_flags & SA_SIGINFO)
+        return 0;
+    if (!(act->sa_handler == SIG_IGN ||
+          (act->sa_handler == SIG_DFL && default_signal_actions[signum] == SAD_IGN)))
+        return 0;
+    struct thread *thr;
+    list_for_each_entry(thr, &t->tsk_threads, thr_list) {
+        if (sigismember(&thr->thr_sigmask, signum))
+            return 0;
+    }
+    return 1;
+}
 
 struct safeio_ctx
 {
@@ -6119,7 +6276,13 @@ static struct vfs_node *vfs_lookup(const char *abspath, int create, int nofollow
                 return root;
 
             struct vfs_node *vn = vfs_lookup_locked(root, abspath + vnlen + 1, create, nofollow, mode, uid, gid);
-            vn_unlock(root, 1);
+            // vfs_lookup_locked returns the root itself, without a reference
+            // of its own, when the path resolves to it ("/tvm/.", a symlink
+            // to "/tvm"): hand over the reference taken above instead of
+            // dropping it, or the caller's release is a second one (refcount
+            // underflow on the mount root).
+            if (vn != root)
+                vn_unlock(root, 1);
             return vn;
         }
     }
@@ -6745,6 +6908,26 @@ static int vfs_load_cpio(struct vfs_node *vn, const void *buf, size_t len) {
 /////////////
 // MARK: Copy-On-Write (COW) Fixup
 /////////////
+
+/*
+ * alloca() for bytes that must survive a fork unchanged, e.g. strings.
+ *
+ * fork copies the stack between sp and thr_fork_fp and cow_fixup_process()
+ * then rewrites every 8-byte word whose value falls inside a copied range: it
+ * cannot tell pointers from data. alloca(n) leaves the bytes between n and
+ * the next word boundary as they were, stale stack contents such as the high
+ * bytes of an earlier stack address. The last word of a short string ("m\0"
+ * plus those stale bytes) can then read as an address in the parent's stack
+ * and get "relocated" into the child's: the final character and the NUL are
+ * overwritten, and `tvm shell 'echo hello_system'` printed
+ * "hello_syste}\xf2Lp\x01" (a 0x1xxxxxxxx thread-stack address). Rounding
+ * up to whole words and zeroing keeps such a word below any mapped address.
+ */
+#define tvm_alloca_zero(n) ({ \
+    size_t _az_n = ((size_t)(n) + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1); \
+    void *_az_p = alloca(_az_n); \
+    memset(_az_p, 0, _az_n); \
+    _az_p; })
 
 struct cow_fixup_context {
     struct {
@@ -9472,7 +9655,9 @@ static int tvm_shell(int argc, char **argv)
     for (int i = 1; i < argc; i++)
         len += strlen(argv[i]) + 1; // +1 for space or NUL
 
-    char *cmd = alloca(len);
+    // Zero-padded to whole words: fork's pointer fixup rewrites any stack word
+    // that looks like a pointer into a copied range (see tvm_alloca_zero).
+    char *cmd = tvm_alloca_zero(len);
     char *p = cmd;
     for (int i = 1; i < argc; i++) {
         size_t n = strlen(argv[i]);
@@ -10631,6 +10816,14 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
     int parent_end = reading ? fds[0] : fds[1];
     int child_end  = reading ? fds[1] : fds[0];
 
+    // Our end is close-on-exec, as with the host libc (glibc uses
+    // pipe2(O_CLOEXEC); POSIX requires a popen() child to close the streams
+    // of earlier popen() calls). Otherwise every later popen child held this
+    // pipe open: awk's `print | "sort"; print | "sort -r"; close("sort")`
+    // hung, sort never saw EOF because `sort -r`'s shell still had the write
+    // end, and pclose() waited on it forever.
+    (void)fcntl(parent_end, F_SETFD, FD_CLOEXEC);
+
     pid_t pid = fork();
     if (pid == -1) {
         int last_errno = errno;
@@ -10645,9 +10838,14 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
         memcpy(cmd, cmdcopy, cmdlen);
         kfree(cmdcopy);
         close(parent_end);
-        if (dup2(child_end, reading ? STDOUT_FILENO : STDIN_FILENO) == -1)
-            _exit(127);
-        close(child_end);
+        int target = reading ? STDOUT_FILENO : STDIN_FILENO;
+        // with 0 and 1 closed, pipe() can hand out the target itself; dup2
+        // is then a no-op and the close would remove the only descriptor
+        if (child_end != target) {
+            if (dup2(child_end, target) == -1)
+                _exit(127);
+            close(child_end);
+        }
         execl(sh, "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -10755,10 +10953,27 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     if (fmode_to_flags(mode, &flags))
         return NULL;
 
-    struct file_stream *fs = (struct file_stream *)stream;
-    fflush(fs->fs_fp);
+    // stdin/stdout/stderr name libc's own objects: translate to the task's
+    // stream like every other stdio interposer (freopen("log", "w", stdout)
+    // used libc's static FILE as a file_stream: a garbage fs_fp and an
+    // arbitrary descriptor closed).
+    struct file_stream *fs = file_stream_fp(stream);
+    if (!fs) {
+        errno = EBADF;
+        return NULL;
+    }
+    int std = (stream == stdin || stream == stdout || stream == stderr);
 
-    close(fs->fs_nfd);
+    // Flush through the interposed fflush with the caller's stream, which
+    // translates it and re-syncs the libc FILE's descriptor first. This
+    // passed fs->fs_fp -- the libc FILE, which the interposed fflush does not
+    // know -- so the buffered output of every stream given to freopen was
+    // silently dropped.
+    if (fs->fs_fp && fs->fs_nfd >= 0)
+        (void)fflush(stream);
+
+    if (fs->fs_nfd >= 0)
+        close(fs->fs_nfd);
     fs->fs_nfd = -1;
 
     int fd = open(pathname, flags, 0666);
@@ -10767,8 +10982,10 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
 
     task_lock(current);
 
-    fp_setfileno(fs->fs_fp, -1);
-    CALL_FUNC(fclose, fs->fs_fp);
+    if (fs->fs_fp) {
+        fp_setfileno(fs->fs_fp, -1);
+        CALL_FUNC(fclose, fs->fs_fp);
+    }
     fs->fs_fp = NULL;
 
     if (-1 == fd) {
@@ -10809,8 +11026,9 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     fs->fs_fp = fp;
 
     tvm_sig_leave();
-    
-    return (FILE *)fs;
+
+    // a standard stream keeps its identity (callers compare with stdout)
+    return std ? stream : (FILE *)fs;
 }
 
 FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb, FILE *, stream) {
@@ -11029,19 +11247,59 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
     tvm_sig_enter();
 
     // fflush all open streams
+    //
+    // - Never block on a stream's lock while holding the task lock: a thread
+    //   between flockfile() and funlockfile() needs the task lock for every
+    //   stdio call it makes on that stream, so waiting for it here deadlocked
+    //   both (exit() calls fflush(NULL)). A stream whose lock is taken is
+    //   retried after dropping the task lock, a bounded number of times.
+    // - Go through file_for_task_stream_locked(), which re-syncs the libc
+    //   FILE's descriptor and skips a stream whose descriptor is gone, rather
+    //   than flushing into a stale or reused host descriptor.
+    // - Only writable streams: a read-only one (stdin) fails with EBADF,
+    //   which overwrote an EPIPE from an earlier stream, so exit() lost the
+    //   SIGPIPE it should raise. EPIPE is remembered explicitly.
     if (!stream) {
-        int ret = 0;
-        task_lock(current);
-        struct file_stream_list_entry *fsle;
-        list_for_each_entry(fsle, &current->tsk_filestreams, fsle_list) {
-            if (fsle->fsle_stream->fs_type != FS_FILE)
-                continue;
-            ret |= CALL_FUNC(fflush, fsle->fsle_stream->fs_fp);
+        int ret = 0, saw_epipe = 0;
+        for (int attempt = 0; attempt < 200; attempt++) {
+            int busy = 0;
+            task_lock(current);
+            struct file_stream_list_entry *fsle;
+            list_for_each_entry(fsle, &current->tsk_filestreams, fsle_list) {
+                struct file_stream *fs = fsle->fsle_stream;
+                if (fs->fs_type != FS_FILE || !fs->fs_fp || fs->fs_nfd < 0)
+                    continue;
+                if (!strpbrk(fs->fs_mode, "wa+"))
+                    continue;
+                if (attempt > 0 && !(fs->fs_flush_pending))
+                    continue;
+                if (0 != CALL_FUNC(ftrylockfile, fs->fs_fp)) {
+                    fs->fs_flush_pending = 1;
+                    busy = 1;
+                    continue;
+                }
+                fs->fs_flush_pending = 0;
+                struct file *file = file_for_task_stream_locked(current, fs, FS_FILE);
+                if (file) {
+                    if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                        ret = EOF;
+                        if (errno == EPIPE)
+                            saw_epipe = 1;
+                    }
+                    file_unlock(file, 1);
+                }
+                CALL_FUNC(funlockfile, fs->fs_fp);
+            }
+            task_unlock(current);
+            if (!busy)
+                break;
+            usleep(1000);
         }
-        task_unlock(current);
         tvm_sig_leave();
-        if (ret)
+        if (saw_epipe) {
+            errno = EPIPE;
             epipe_signal();
+        }
         return ret;
     }
 
@@ -11411,7 +11669,7 @@ FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
         file_unlock(file, 0);
         ret = CALL_FUNC(vdprintf, file->f_rfd, format, ap);
         if (ret < 0)
-            epipe_signal();
+            epipe_signal_fd(fd, 0);
         file_lock(file, 0);
     }
     else {
@@ -11562,6 +11820,40 @@ retry:
     return ret;
 }
 
+/**
+ * epipe_signal() for a write on the calling task's descriptor `nfd`, unless
+ * the program opted out: MSG_NOSIGNAL in `send_flags`, or SO_NOSIGPIPE /
+ * F_SETNOSIGPIPE on the descriptor. rfd_adopt() sets no-SIGPIPE on every host
+ * descriptor, so the kernel's copy of that option says nothing about what the
+ * program asked for; raising SIGPIPE regardless killed programs that rely on
+ * the opt-out instead of ignoring the signal -- libcurl on Darwin (and so
+ * curl and git-remote-https) uses SO_NOSIGPIPE and installs no handler, so a
+ * server resetting a kept-alive connection killed it with status 141.
+ */
+static void epipe_signal_fd(int nfd, int send_flags)
+{
+#ifdef F_SETNOSIGPIPE
+    if (errno != EPIPE)
+        return;
+#ifdef MSG_NOSIGNAL
+    if (send_flags & MSG_NOSIGNAL)
+        return;
+#endif
+    int last_errno = errno;
+    int optout = 0;
+    struct file *file = file_for_task(current, nfd);
+    if (file) {
+        optout = file->f_nosigpipe;
+        file_unlock(file, 1);
+    }
+    errno = last_errno;
+    if (!optout)
+        epipe_signal();
+#else
+    (void)nfd; (void)send_flags;
+#endif
+}
+
 FUNCTION_DEFINE3(ssize_t, write, int, fd, const void *, buf, size_t, count) {
     tvm_sig_interrupted = 0;
 retry:
@@ -11594,7 +11886,7 @@ retry:
     }
 
     if (ret == (size_t)-1)
-        epipe_signal();
+        epipe_signal_fd(fd, 0);
 
     return ret;
 }
@@ -11699,7 +11991,7 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
                 if (ret == 0) {
                     file_unlock(file, 1);
                     tvm_sig_leave();
-                    epipe_signal();
+                    epipe_signal_fd(fd, 0);
                     return -1;
                 }
                 break;
@@ -11716,7 +12008,7 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
     tvm_sig_leave();
 
     if (ret == (size_t)-1)
-        epipe_signal();
+        epipe_signal_fd(fd, 0);
 
     return ret;
 }
@@ -11787,7 +12079,7 @@ retry:
     }
 
     if (ret == (size_t)-1)
-        epipe_signal();
+        epipe_signal_fd(fd, 0);
 
     return ret;
 }
@@ -11862,7 +12154,7 @@ FUNCTION_DEFINE4(ssize_t, pwritev, int, fd, const struct iovec *, iov, int, iovc
                 if (ret == 0) {
                     file_unlock(file, 1);
                     tvm_sig_leave();
-                    epipe_signal();
+                    epipe_signal_fd(fd, 0);
                     return -1;
                 }
                 break;
@@ -11879,7 +12171,7 @@ FUNCTION_DEFINE4(ssize_t, pwritev, int, fd, const struct iovec *, iov, int, iovc
     tvm_sig_leave();
 
     if (ret == (size_t)-1)
-        epipe_signal();
+        epipe_signal_fd(fd, 0);
 
     return ret;
 }
@@ -11945,6 +12237,14 @@ FUNCTION_DEFINE2(int, dup2, int, oldfd, int, newfd) {
     if (current->tsk_files[newfd])
         prevnewfile = task_unassign_fd_locked(current, newfd);
     VERIFY(newfd == task_assign_file_locked(current, newfile, newfd));
+
+    // dup2 closes newfd first, and closing any descriptor of a file drops the
+    // task's record locks on it -- exactly as in close(). Skipping this left
+    // the locks in TVM's table after the host descriptor was gone, so every
+    // other task got EAGAIN (or waited forever in F_SETLKW) until this task
+    // closed another descriptor of the file or exited.
+    if (prevnewfile && current->tsk_rlocks && !prevnewfile->f_ops && prevnewfile->f_rfd >= 0)
+        rlock_release(current, prevnewfile->f_rfd);
 
     // this order is extremely important!! file deallocation may lock current
     task_unlock(current);
@@ -12188,9 +12488,17 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                     break;
                 }
                 else {
+                    if (rlock_would_deadlock_locked(current, c->rl_owner)) {
+                        pthread_mutex_unlock(&rlocks_lock);
+                        errno = EDEADLK;
+                        ret = -1;
+                        break;
+                    }
                     // F_SETLKW: sleep until a release, in short slices so a
                     // signal that arrived meanwhile interrupts the wait with
                     // EINTR, as the kernel's would.
+                    struct rlock_waiter waiter = { .rw_waiter = current, .rw_owner = c->rl_owner };
+                    list_add(&waiter.rw_list, &rlock_waiters);
                     struct timespec ts;
                     clock_gettime(CLOCK_REALTIME, &ts);
                     ts.tv_nsec += 20 * 1000000L;
@@ -12199,9 +12507,21 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                         ts.tv_nsec -= 1000000000L;
                     }
                     pthread_cond_timedwait(&rlocks_cond, &rlocks_lock, &ts);
+                    list_del(&waiter.rw_list);
                     pthread_mutex_unlock(&rlocks_lock);
                 }
-                if (__atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE)) {
+                // A deliverable signal ends the wait with EINTR. Deferred
+                // signals are recorded per thread (signal_handler sets
+                // thr_pending_sigs); checking only tsk_pending_sigs, which
+                // nothing sets, made the wait impossible to interrupt, even
+                // by SIGKILL.
+                uint32_t pend = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE) |
+                                __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
+                int deliverable = 0;
+                for (int sig = 1; sig < MAX_SIGNALS && !deliverable; sig++)
+                    if ((pend & (1u << sig)) && !sigismember(&current_thread->thr_sigmask, sig))
+                        deliverable = 1;
+                if (deliverable) {
                     errno = EINTR;
                     ret = -1;
                     break;
@@ -12225,6 +12545,27 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
 
     if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW)
         return fcntl_rlock(fd, cmd, (struct flock *)arg);
+
+#ifdef F_SETNOSIGPIPE
+    // the program's own no-SIGPIPE setting, kept in TVM (see setsockopt)
+    if (cmd == F_SETNOSIGPIPE || cmd == F_GETNOSIGPIPE) {
+        tvm_sig_enter();
+        struct file *file = file_for_task(current, fd);
+        if (!file) {
+            tvm_sig_leave();
+            errno = EBADF;
+            return -1;
+        }
+        int ret = 0;
+        if (cmd == F_SETNOSIGPIPE)
+            file->f_nosigpipe = ((int)(long)arg) ? 1 : 0;
+        else
+            ret = file->f_nosigpipe;
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        return ret;
+    }
+#endif
 
     if (cmd == F_DUPFD) {
         // TODO: F_DUPFD_CLOEXEC
@@ -12912,31 +13253,73 @@ FUNCTION_DEFINE3(int, getsockname, int, sockfd, struct sockaddr *, addr, socklen
 }
 
 FUNCTION_DEFINE5(int, getsockopt, int, sockfd, int, level, int, optname, void *, optval, socklen_t *, optlen) {
+#ifdef SO_NOSIGPIPE
+    // the program's own setting (see setsockopt), not the host's
+    if (level == SOL_SOCKET && optname == SO_NOSIGPIPE) {
+        if (!optval || !optlen || *optlen < (socklen_t)sizeof(int)) {
+            errno = EINVAL;
+            return -1;
+        }
+        tvm_sig_enter();
+        struct file *file = file_for_task(current, sockfd);
+        if (!file) {
+            tvm_sig_leave();
+            errno = EBADF;
+            return -1;
+        }
+        *(int *)optval = file->f_nosigpipe;
+        *optlen = sizeof(int);
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        return 0;
+    }
+#endif
     return CURRENT_RFD(sockfd, CALL_FUNC(getsockopt, __rfd, level, optname, optval, optlen));
 }
 
 FUNCTION_DEFINE5(int, setsockopt, int, sockfd, int, level, int, optname, const void *, optval, socklen_t, optlen) {
+#ifdef SO_NOSIGPIPE
+    // Recorded for epipe_signal_fd, not passed on: the host descriptor must
+    // keep no-SIGPIPE on (rfd_adopt), even when the program turns it off.
+    if (level == SOL_SOCKET && optname == SO_NOSIGPIPE) {
+        if (!optval || optlen < (socklen_t)sizeof(int)) {
+            errno = EINVAL;
+            return -1;
+        }
+        tvm_sig_enter();
+        struct file *file = file_for_task(current, sockfd);
+        if (!file) {
+            tvm_sig_leave();
+            errno = EBADF;
+            return -1;
+        }
+        file->f_nosigpipe = *(const int *)optval ? 1 : 0;
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        return 0;
+    }
+#endif
     return CURRENT_RFD(sockfd, CALL_FUNC(setsockopt, __rfd, level, optname, optval, optlen));
 }
 
 FUNCTION_DEFINE4(ssize_t, send, int, sockfd, const void *, buf, size_t, len, int, flags) {
     ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(send, __rfd, buf, len, flags));
     if (ret == -1)
-        epipe_signal();
+        epipe_signal_fd(sockfd, flags);
     return ret;
 }
 
 FUNCTION_DEFINE6(ssize_t, sendto, int, sockfd, const void *, buf, size_t, len, int, flags, const struct sockaddr *, dest_addr, socklen_t, addrlen) {
     ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(sendto, __rfd, buf, len, flags, dest_addr, addrlen));
     if (ret == -1)
-        epipe_signal();
+        epipe_signal_fd(sockfd, flags);
     return ret;
 }
 
 FUNCTION_DEFINE3(ssize_t, sendmsg, int, sockfd, const struct msghdr *, msg, int, flags) {
     ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(sendmsg, __rfd, msg, flags));
     if (ret == -1)
-        epipe_signal();
+        epipe_signal_fd(sockfd, flags);
     return ret;
 }
 
@@ -13347,6 +13730,8 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     for (int i = 0; i < (int)(sizeof(arg->tsk->tsk_exits)/sizeof(*arg->tsk->tsk_exits)); i++) {
         if (arg->tsk->tsk_exits[i])
             arg->tsk->tsk_exits[i] = (exit_t)cow_fixup_translate(&arg->fixup, (void *)arg->tsk->tsk_exits[i]);
+        if (arg->tsk->tsk_exit_args[i])
+            arg->tsk->tsk_exit_args[i] = cow_fixup_translate(&arg->fixup, arg->tsk->tsk_exit_args[i]);
     }
 
     // fix the jmpbuf
@@ -13744,13 +14129,16 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
     tvm_sig_enter();
     task_lock(current);
     exit_t exits[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
+    void *exit_args[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
     memcpy(&exits, current->tsk_exits, sizeof(exits));
+    memcpy(&exit_args, current->tsk_exit_args, sizeof(exit_args));
     memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
+    memset(&current->tsk_exit_args, 0, sizeof(current->tsk_exit_args));
     task_unlock(current);
 
     for (int i = 0; i < sizeof(current->tsk_exits)/sizeof(*current->tsk_exits); i++) {
         if (exits[i]) {
-            if (0 != emulator_call(NULL, (uint64_t)exits[i], 0, 0, 0, 0, 0, 0))
+            if (0 != emulator_call(NULL, (uint64_t)exits[i], (uint64_t)exit_args[i], 0, 0, 0, 0, 0))
                 abort();
         }
     }
@@ -13799,17 +14187,19 @@ FUNCTION_DEFINE_NORET0(abort) {
 // `git clone https://...` hung -- on every exit path, die() included. The
 // caller is now taken from the return address, as the interposer wrappers
 // record it, so a guest's registration is kept and exit() runs it.
-static int tvm_atexit(exit_t function, void *lr);
+static int tvm_atexit(exit_t function, void *arg, void *lr);
 
 #if defined(__linux__)
+// C++ static destructors: func(arg) at exit. The argument used to be
+// dropped, so every destructor ran on a NULL object.
 int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle) {
-    return tvm_atexit((exit_t)func, __builtin_return_address(0));
+    return tvm_atexit((exit_t)func, arg, __builtin_return_address(0));
 }
 #endif
 
 //FUNCTION_DEFINE1(int, atexit, exit_t, function) {
 int atexit(exit_t function) {
-    return tvm_atexit(function, __builtin_return_address(0));
+    return tvm_atexit(function, NULL, __builtin_return_address(0));
 }
 // Listed with the interposers so the linker binds a guest's atexit here by
 // name. Without the entry, ulinker_external_dlsym fell back to
@@ -13819,7 +14209,7 @@ int atexit(exit_t function) {
 // were queued for the app's own exit, never run at the task's.
 FUNCTION_METADATA(atexit, &atexit);
 
-static int tvm_atexit(exit_t function, void *lr) {
+static int tvm_atexit(exit_t function, void *arg, void *lr) {
     
     if (!can_enter_tvm(lr))
         return 0;
@@ -13836,6 +14226,7 @@ static int tvm_atexit(exit_t function, void *lr) {
     for (int i = (sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)) - 1; i >= 0; i--) {
         if (!current->tsk_exits[i]) {
             current->tsk_exits[i] = function;
+            current->tsk_exit_args[i] = arg;
             task_unlock(current);
             tvm_sig_leave();
             return 0;
@@ -13870,6 +14261,10 @@ FUNCTION_DEFINE_NORET3(verr, int, eval, const char *, fmt, va_list, args) {
     }
 
     fprintf(stderr, "%s\n", strerror(saved_errno));
+    // balance the tvm_sig_enter() above: exit() only leaves its own, so a
+    // SIGPIPE from the flush it does would otherwise stay deferred and be
+    // lost at _exit()
+    tvm_sig_leave();
     exit(eval);
 }
 
@@ -13883,6 +14278,10 @@ FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
     }
 
     fprintf(stderr, "\n");
+    // balance the tvm_sig_enter() above: exit() only leaves its own, so a
+    // SIGPIPE from the flush it does would otherwise stay deferred and be
+    // lost at _exit()
+    tvm_sig_leave();
     exit(eval);
 }
 
@@ -13916,11 +14315,13 @@ FUNCTION_DEFINE_VOID2(vwarnx, const char *, fmt, va_list, args) {
     errno = last_errno;
 }
 
+#if defined(__APPLE__)
 FUNCTION_DEFINE_VOID3(vwarnc, int, code, const char *, fmt, va_list, args) {
     int last_errno = errno;
     tvm_vwarnc(code, fmt, args);
     errno = last_errno;
 }
+#endif
 
 FUNCTION_DEFINE_VOID_VA1(warn, const char *, fmt) {
     vwarn(fmt, __ap);
@@ -13930,6 +14331,7 @@ FUNCTION_DEFINE_VOID_VA1(warnx, const char *, fmt) {
     vwarnx(fmt, __ap);
 }
 
+#if defined(__APPLE__)  // warnc/errc/getprogname/setprogname are BSD-only
 FUNCTION_DEFINE_VOID_VA2(warnc, int, code, const char *, fmt) {
     vwarnc(code, fmt, __ap);
 }
@@ -13937,6 +14339,10 @@ FUNCTION_DEFINE_VOID_VA2(warnc, int, code, const char *, fmt) {
 FUNCTION_DEFINE_NORET4(verrc, int, eval, int, code, const char *, fmt, va_list, args) {
     tvm_sig_enter();
     tvm_vwarnc(code, fmt, args);
+    // balance the tvm_sig_enter() above: exit() only leaves its own, so a
+    // SIGPIPE from the flush it does would otherwise stay deferred and be
+    // lost at _exit()
+    tvm_sig_leave();
     exit(eval);
 }
 
@@ -13955,6 +14361,7 @@ FUNCTION_DEFINE_VOID1(setprogname, const char *, name) {
     memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
     strncpy(current->tsk_comm, base, sizeof(current->tsk_comm) - 1);
 }
+#endif
 
 FUNCTION_DEFINE0(pid_t, getpid) {
     return current->tsk_pid;
@@ -14930,7 +15337,12 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         }
     }
 
-    if (n < 4) {
+    // An empty file (or a read error) is ENOEXEC, as from a kernel; bash
+    // treats an empty sample as success without running anything. Files of
+    // 1-3 bytes are still checked for text below: they used to get ENOEXEC
+    // here, so `printf 'ls\n' > x; ./x` took bash's in-process longjmp path
+    // that the text fallback exists to avoid.
+    if (n <= 0) {
         INFO("  failed(ENOEXEC)");
         errno = ENOEXEC;
         return -1;
@@ -14948,9 +15360,10 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     // also treat as a script: no NUL byte in the sample; anything else (and
     // any non-Mach-O binary) still gets ENOEXEC, which bash reports as
     // "cannot execute binary file" without longjmp'ing.
-    if (!(hdr[0] == '#' && hdr[1] == '!') && memchr(hdr, 0, n) == NULL
-        && memcmp(hdr, "\xcf\xfa\xed\xfe", 4) != 0 /* MH_MAGIC_64 */
-        && memcmp(hdr, "\x7f" "ELF", 4) != 0) {
+    int has_shebang = n >= 2 && hdr[0] == '#' && hdr[1] == '!';
+    if (!has_shebang && memchr(hdr, 0, n) == NULL
+        && !(n >= 4 && memcmp(hdr, "\xcf\xfa\xed\xfe", 4) == 0) /* MH_MAGIC_64 */
+        && !(n >= 4 && memcmp(hdr, "\x7f" "ELF", 4) == 0)) {
         const char *sh = getenv("TVM_SHELL");
         if (!sh || !*sh) sh = "/bin/sh";
         INFO("execve: text file without #!, running it with %s", sh);
@@ -14959,9 +15372,17 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             errno = ENOEXEC;
             return -1;
         }
+        has_shebang = 1;
     }
 
-    if (hdr[0] == '#' && hdr[1] == '!') {
+    // too short to be a loadable image, and not a script
+    if (!has_shebang && n < 4) {
+        INFO("  failed(ENOEXEC)");
+        errno = ENOEXEC;
+        return -1;
+    }
+
+    if (has_shebang) {
         hdr[n] = '\0';
         char *eol = strchr(hdr + 2, '\n');
         if (eol) *eol = '\0';
@@ -15014,7 +15435,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
              interp, interp_arg ? interp_arg : "(none)", pathname);
 
         // Save the script path before overwriting pathname_abs with the interpreter
-        char *script_path = alloca(strlen(pathname) + 1);
+        char *script_path = tvm_alloca_zero(strlen(pathname) + 1);
         strcpy(script_path, pathname);
 
         // Resolve interpreter path (overwrites pathname_abs)
@@ -15069,10 +15490,13 @@ do_exec:
         for (char * const *e = envp; *e; e++)
             envc++;
 
+    // These copies stay in this frame, below thr_fork_fp, for the program's
+    // whole life, so every fork it does copies and fixes them up: zero-pad
+    // them (see tvm_alloca_zero).
     char **new_argv = alloca(sizeof(char *) * (argc + 1));
     for (int i = 0; i < argc; i++) {
         size_t len = strlen(argv[i]) + 1;
-        new_argv[i] = alloca(len);
+        new_argv[i] = tvm_alloca_zero(len);
         memcpy(new_argv[i], argv[i], len);
     }
     new_argv[argc] = NULL;
@@ -15080,7 +15504,7 @@ do_exec:
     char **new_envp = alloca(sizeof(char *) * (envc + 1));
     for (int i = 0; i < envc; i++) {
         size_t len = strlen(envp[i]) + 1;
-        new_envp[i] = alloca(len);
+        new_envp[i] = tvm_alloca_zero(len);
         memcpy(new_envp[i], envp[i], len);
     }
     new_envp[envc] = NULL;
@@ -15184,6 +15608,7 @@ do_exec:
     memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
     strncpy(current->tsk_comm, basename, sizeof(current->tsk_comm) - 1);
     memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
+    memset(&current->tsk_exit_args, 0, sizeof(current->tsk_exit_args));
     task_unlock(current);
 
     // close all file-descriptors marked as CLOEXEC
@@ -15199,6 +15624,10 @@ do_exec:
             VERIFY(0 == close(i));
     }
     errno = last_errno;
+
+    task_lock(current);
+    task_exec_reset_streams_locked(current);
+    task_unlock(current);
 
     // POSIX execve: caught signals go back to the default, ignored signals
     // stay ignored (so `trap '' PIPE`, nohup and shells backgrounding a job
@@ -15376,9 +15805,21 @@ static int tvm_path_search(const char *file, char *out)
             memcpy(out, path, len);
             out[len] = '/';
             strcpy(out + len + 1, file);
-            if (0 == access(out, X_OK))
+            // An executable regular file (or a registered program), as
+            // execvp() requires. This used access(X_OK), but the interposed
+            // access() drops X_OK, so the first PATH entry that merely
+            // existed won -- a directory or a non-executable file -- and
+            // execve then failed with EACCES instead of the search moving on
+            // to the next entry.
+            if (find_program(out))
                 return 0;
-            if (errno == EACCES)
+            struct stat st;
+            if (0 == stat(out, &st)) {
+                if (S_ISREG(st.st_mode) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
+                    return 0;
+                eacces = 1;
+            }
+            else if (errno == EACCES)
                 eacces = 1;
         }
         path = end ? end + 1 : path + strlen(path);
@@ -16828,10 +17269,6 @@ FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
 
     memcpy(pipefd, f, sizeof(f));
     return 0;
-}
-
-FUNCTION_DEFINE2(int, fstatfs, int, fd, struct statfs *, buf) {
-    return CURRENT_RFD(fd, CALL_FUNC(fstatfs, __rfd, buf));
 }
 
 FUNCTION_DEFINE2(int, fstatfs64, int, fd, struct statfs64 *, buf) {
