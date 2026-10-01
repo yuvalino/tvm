@@ -582,6 +582,8 @@ DECL_FUNC_OPT(timer_delete);
 DECL_FUNC_OPT(timer_getoverrun);
 
 #if defined(__linux__)
+DECL_FUNC(eaccess);
+DECL_FUNC(euidaccess);
 DECL_FUNC(mknod);
 DECL_FUNC(mknodat);
 DECL_FUNC(clearenv);
@@ -12771,6 +12773,28 @@ FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, 
     tvm_sig_leave();
     return ret;
 }
+
+#if defined(__linux__)
+/*
+ * glibc's eaccess()/euidaccess(): access() against the effective IDs. bash
+ * built on Linux finds HAVE_EACCESS and tests every PATH candidate with
+ * eaccess(X_OK) (findcmd.c file_status). Without these the call reached the
+ * host, which has no /tvm/bin/cat: bash skipped TVM's programs and ran the
+ * host's /usr/bin/cat, which TVM cannot load ("Invalid argument").
+ */
+static int tvm_eaccess(const char *pathname, int mode)
+{
+    return faccessat(AT_FDCWD, pathname, mode, AT_EACCESS);
+}
+
+FUNCTION_DEFINE2(int, eaccess, const char *, pathname, int, mode) {
+    return tvm_eaccess(pathname, mode);
+}
+
+FUNCTION_DEFINE2(int, euidaccess, const char *, pathname, int, mode) {
+    return tvm_eaccess(pathname, mode);
+}
+#endif
 
 FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
