@@ -20,7 +20,30 @@
 #ifndef TVM_STDIO_UNLOCKED_H
 #define TVM_STDIO_UNLOCKED_H
 
+/*
+ * glibc: the same holds there (getc_unlocked() & co. are extern inlines
+ * over the glibc FILE's _IO_read_ptr/_IO_write_ptr at -O2), but the
+ * <stdio.h> below is then the translation unit's first system header, and
+ * glibc's <features.h> settles the feature set once, before git's
+ * compat/posix.h defines _GNU_SOURCE: <fcntl.h> then declared no
+ * sync_file_range() and wrapper.c (HAVE_SYNC_FILE_RANGE on Linux) failed to
+ * compile. Ask for what compat/posix.h asks for, with its exact values so
+ * its own definitions later repeat them harmlessly; on glibc _GNU_SOURCE
+ * implies the _XOPEN_SOURCE/_DEFAULT_SOURCE/... it also sets.
+ */
+#if !defined(__APPLE__)
+#define _FILE_OFFSET_BITS 64
+#define _GNU_SOURCE 1
+#endif
+
 #include <stdio.h>
+
+#if !defined(__APPLE__)
+/* <features.h> (done by now) set these to 700 / 1 for _GNU_SOURCE; drop
+ * them so compat/posix.h's 600 is not a redefinition in every file. */
+#undef _XOPEN_SOURCE
+#undef _XOPEN_SOURCE_EXTENDED
+#endif
 
 #undef getc_unlocked
 #undef putc_unlocked
