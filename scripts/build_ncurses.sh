@@ -17,6 +17,8 @@ set -e
 MODE="$1"
 SRCDIR="$2"
 BUILDDIR="$3"
+. "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR"
 
 mkdir -p "$BUILDDIR"
 cd "$BUILDDIR"

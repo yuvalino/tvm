@@ -26,6 +26,9 @@ BUILDDIR="$2"
 NCURSES_PREFIX="$3"
 
 SHADOW="$BUILDDIR/src"
+. "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$NCURSES_PREFIX/lib/libncursesw.a" \
+    "$(cd "$(dirname "$0")/.." && pwd)/third_party/include-shim/tvm_ios_libc.h"
 mkdir -p "$SHADOW"
 cd "$SHADOW"
 

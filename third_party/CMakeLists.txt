@@ -25,6 +25,30 @@ endif()
 add_subdirectory(unicorn EXCLUDE_FROM_ALL)
 
 set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../scripts)
+
+# tvm_ext_inputs(<ExternalProject> <input>...)
+# Re-run the project's build step when an input changes. ExternalProject
+# considers a step done for good once its stamp exists, so without this an
+# edited build script, TVM config or shim file, or a submodule moved to another
+# revision never reached an existing build tree. Plain paths are files;
+# SUBMODULE:<path> is the submodule's checked-out revision, tracked through its
+# HEAD file under .git/modules (rewritten by every `git submodule update`).
+# The build scripts then decide from the same inputs whether to rebuild from
+# scratch (scripts/tvm_stamp.sh).
+function(tvm_ext_inputs target)
+    set(deps ${SCRIPTS_DIR}/tvm_stamp.sh)
+    foreach(item ${ARGN})
+        if(item MATCHES "^SUBMODULE:(.*)$")
+            set(head "${CMAKE_SOURCE_DIR}/.git/modules/${CMAKE_MATCH_1}/HEAD")
+            if(EXISTS "${head}")
+                list(APPEND deps "${head}")
+            endif()
+        else()
+            list(APPEND deps "${item}")
+        endif()
+    endforeach()
+    ExternalProject_Add_StepDependencies(${target} build ${deps})
+endfunction()
 set(THIRDPARTY_SRC ${CMAKE_CURRENT_SOURCE_DIR})
 set(THIRDPARTY_BUILD ${CMAKE_CURRENT_BINARY_DIR})
 set(LIB_OUT ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
@@ -190,6 +214,8 @@ ExternalProject_Add(bash_ext
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
+tvm_ext_inputs(bash_ext ${SCRIPTS_DIR}/build_bash.sh SUBMODULE:third_party/bash
+    ${CMAKE_CURRENT_SOURCE_DIR}/configs/bash_stdio_unlocked.h)
 add_custom_target(bash_exe DEPENDS bash_ext)
 set_target_properties(bash_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -229,6 +255,7 @@ ExternalProject_Add(toybox_ext
 # build tree.
 ExternalProject_Add_StepDependencies(toybox_ext build
     ${THIRDPARTY_SRC}/configs/toybox.config ${SCRIPTS_DIR}/build_toybox.sh)
+tvm_ext_inputs(toybox_ext SUBMODULE:third_party/toybox ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_ios_libc.h)
 add_custom_target(toybox_exe DEPENDS toybox_ext)
 set_target_properties(toybox_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -249,6 +276,7 @@ ExternalProject_Add(toybox_host_ext
 )
 ExternalProject_Add_StepDependencies(toybox_host_ext build
     ${THIRDPARTY_SRC}/configs/toybox.config ${SCRIPTS_DIR}/build_toybox.sh)
+tvm_ext_inputs(toybox_host_ext SUBMODULE:third_party/toybox)
 
 ###############################################################################
 # vim
@@ -414,6 +442,7 @@ ExternalProject_Add(ncurses_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(ncurses_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
+tvm_ext_inputs(ncurses_ext SUBMODULE:third_party/ncurses)
 
 # Host tic: built with the host compiler so it runs on the build machine for
 # every target (cf. toybox_host_ext).
@@ -426,6 +455,7 @@ ExternalProject_Add(ncurses_host_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(ncurses_host_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
+tvm_ext_inputs(ncurses_host_ext SUBMODULE:third_party/ncurses)
 
 ###############################################################################
 # less
@@ -447,6 +477,7 @@ ExternalProject_Add(less_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(less_ext build ${SCRIPTS_DIR}/build_less.sh)
+tvm_ext_inputs(less_ext SUBMODULE:third_party/less ${NCURSES_LIB} ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_ios_libc.h)
 add_custom_target(less_exe DEPENDS less_ext)
 set_target_properties(less_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -474,6 +505,8 @@ ExternalProject_Add(nano_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(nano_ext build ${SCRIPTS_DIR}/build_nano.sh)
+tvm_ext_inputs(nano_ext SUBMODULE:third_party/nano SUBMODULE:third_party/gnulib ${NCURSES_LIB}
+    ${CMAKE_CURRENT_SOURCE_DIR}/configs/nano_ios.cache)
 add_custom_target(nano_exe DEPENDS nano_ext)
 set_target_properties(nano_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -502,6 +535,8 @@ ExternalProject_Add(sqlite_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(sqlite_ext build ${SCRIPTS_DIR}/build_sqlite.sh)
+tvm_ext_inputs(sqlite_ext SUBMODULE:third_party/sqlite SUBMODULE:third_party/linenoise
+    ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_ios_libc.h)
 add_custom_target(sqlite_exe DEPENDS sqlite_ext)
 set_target_properties(sqlite_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -536,6 +571,8 @@ ExternalProject_Add(git_ext
 )
 ExternalProject_Add_StepDependencies(git_ext build
     ${SCRIPTS_DIR}/build_git.sh ${THIRDPARTY_SRC}/configs/git_config.mak ${THIRDPARTY_SRC}/git_main.c)
+tvm_ext_inputs(git_ext SUBMODULE:third_party/git ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h
+    ${CURL_BUILD}/lib/libcurl.a ${TVM_OPENSSL_PREFIX}/lib/libssl.a ${TVM_OPENSSL_PREFIX}/lib/libcrypto.a)
 add_custom_target(git_exe DEPENDS git_ext)
 set_target_properties(git_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 

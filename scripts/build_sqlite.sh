@@ -33,6 +33,8 @@ set -e
 SRCDIR="$1"
 BUILDDIR="$2"
 LINENOISE="$3"
+. "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$LINENOISE" "$(cd "$(dirname "$0")/.." && pwd)/third_party/include-shim/tvm_ios_libc.h"
 CC="${CC:-cc}"
 
 GEN="$BUILDDIR/gen"

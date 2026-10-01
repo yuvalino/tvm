@@ -7,6 +7,8 @@ SRCDIR="$(cd "$1" && pwd)"
 BUILDDIR="$(mkdir -p "$2" && cd "$2" && pwd)"
 SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
 THIRDPARTY="$(cd "$SCRIPTDIR/../third_party" && pwd)"
+. "$SCRIPTDIR/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$THIRDPARTY/configs/toybox.config" "$THIRDPARTY/include-shim/tvm_ios_libc.h"
 
 # Symlink source tree into build dir (read-only references)
 for item in Config.in Makefile configure kconfig lib main.c scripts toys toys.h; do
@@ -44,7 +46,13 @@ export OPTIMIZE="-ffunction-sections -fdata-sections -fno-asynchronous-unwind-ta
 export CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 ${CFLAGS_EXTRA}"
 export V=1
 
-bash scripts/make.sh || true
+# Never ship a binary left over from an earlier build: `make.sh || true`
+# (its own final link can fail when cross-compiling, hence the fallback link
+# below) used to leave a failed compile unnoticed, and the old toybox went into
+# the initrd with symlinks for applets it did not contain.
+rm -f "$BUILDDIR/toybox" "$BUILDDIR/generated/unstripped/toybox"
+make_status=0
+bash scripts/make.sh || make_status=$?
 
 # make.sh strips with -s which removes .symtab. The ulinker needs "main" in
 # .symtab to exec the binary. Re-strip keeping symbols (debug sections only).
@@ -68,4 +76,9 @@ if [ ! -x "$BUILDDIR/toybox" ] || file "$BUILDDIR/toybox" | grep -q "text"; then
         STRIP_FLAG="-Wl,--gc-sections"
     fi
     $CC -g $STRIP_FLAG generated/obj/*.o $LINK_LIBS -o "$BUILDDIR/toybox"
+fi
+
+if [ ! -x "$BUILDDIR/toybox" ]; then
+    echo "build_toybox.sh: no toybox binary produced (make.sh exit status $make_status)" >&2
+    exit 1
 fi

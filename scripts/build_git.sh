@@ -49,6 +49,11 @@ CONFIGS_DIR="$ROOT/third_party/configs"
 WRAP_SRC="$ROOT/third_party/git_main.c"
 INCLUDE_SHIM="$ROOT/third_party/include-shim"
 SHADOW="$BUILDDIR/src"
+if [ "$MODE" = build ]; then
+    . "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+    tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$CONFIGS_DIR/git_config.mak" "$INCLUDE_SHIM/tvm_stdio_unlocked.h" \
+        "$ROOT/third_party/git_main.c" "$CURL_BUILD/lib/libcurl.a" "$OPENSSL_PREFIX/lib/libssl.a" "$OPENSSL_PREFIX/lib/libcrypto.a"
+fi
 TVMDIR="$BUILDDIR/tvm"   # renamed objects, wrapper, exported link line
 
 case "$MODE" in
