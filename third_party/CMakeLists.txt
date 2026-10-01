@@ -35,6 +35,12 @@ set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../scripts)
 # HEAD file under .git/modules (rewritten by every `git submodule update`).
 # The build scripts then decide from the same inputs whether to rebuild from
 # scratch (scripts/tvm_stamp.sh).
+#
+# Only list sources here, never another ExternalProject's outputs (libcurl.a,
+# libncursesw.a, ...): no rule declares those, so ninja fails on a fresh tree
+# with "missing and no known rule to make it". A rebuilt dependency is already
+# covered by DEPENDS <project>, whose done stamp ExternalProject makes a file
+# dependency of this project's configure step.
 function(tvm_ext_inputs target)
     set(deps ${SCRIPTS_DIR}/tvm_stamp.sh)
     foreach(item ${ARGN})
@@ -477,7 +483,7 @@ ExternalProject_Add(less_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(less_ext build ${SCRIPTS_DIR}/build_less.sh)
-tvm_ext_inputs(less_ext SUBMODULE:third_party/less ${NCURSES_LIB} ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_ios_libc.h)
+tvm_ext_inputs(less_ext SUBMODULE:third_party/less ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_ios_libc.h)
 add_custom_target(less_exe DEPENDS less_ext)
 set_target_properties(less_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -505,7 +511,7 @@ ExternalProject_Add(nano_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(nano_ext build ${SCRIPTS_DIR}/build_nano.sh)
-tvm_ext_inputs(nano_ext SUBMODULE:third_party/nano SUBMODULE:third_party/gnulib ${NCURSES_LIB}
+tvm_ext_inputs(nano_ext SUBMODULE:third_party/nano SUBMODULE:third_party/gnulib
     ${CMAKE_CURRENT_SOURCE_DIR}/configs/nano_ios.cache)
 add_custom_target(nano_exe DEPENDS nano_ext)
 set_target_properties(nano_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
@@ -571,8 +577,7 @@ ExternalProject_Add(git_ext
 )
 ExternalProject_Add_StepDependencies(git_ext build
     ${SCRIPTS_DIR}/build_git.sh ${THIRDPARTY_SRC}/configs/git_config.mak ${THIRDPARTY_SRC}/git_main.c)
-tvm_ext_inputs(git_ext SUBMODULE:third_party/git ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h
-    ${CURL_BUILD}/lib/libcurl.a ${TVM_OPENSSL_PREFIX}/lib/libssl.a ${TVM_OPENSSL_PREFIX}/lib/libcrypto.a)
+tvm_ext_inputs(git_ext SUBMODULE:third_party/git ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h)
 add_custom_target(git_exe DEPENDS git_ext)
 set_target_properties(git_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
