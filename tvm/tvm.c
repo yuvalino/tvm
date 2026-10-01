@@ -71,6 +71,10 @@
 #include <link.h>
 #include <malloc.h>   // memalign, pvalloc
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <sys/statvfs.h>
+#include <sys/xattr.h>
+#include <stdio_ext.h>  // __fpurge
 #endif
 
 #if defined(__linux__)
@@ -601,6 +605,56 @@ DECL_FUNC(fseeko64);
 DECL_FUNC(ftello64);
 DECL_FUNC(posix_fallocate);
 DECL_FUNC(posix_fallocate64);
+// glibc entry points that only its own headers' redirections name (fortify,
+// C23 scanf): not declared for this translation unit.
+extern int __open_2(const char *, int);
+extern int __open64_2(const char *, int);
+extern int __vprintf_chk(int, const char *, va_list);
+extern int __vfprintf_chk(FILE *, int, const char *, va_list);
+extern int __vdprintf_chk(int, int, const char *, va_list);
+extern size_t __fread_chk(void *, size_t, size_t, size_t, FILE *);
+extern size_t __fread_unlocked_chk(void *, size_t, size_t, size_t, FILE *);
+extern char *__fgets_chk(char *, size_t, int, FILE *);
+extern char *__fgets_unlocked_chk(char *, size_t, int, FILE *);
+DECL_FUNC(__open_2);
+DECL_FUNC(__open64_2);
+DECL_FUNC(__vprintf_chk);
+DECL_FUNC(__vfprintf_chk);
+DECL_FUNC(__vdprintf_chk);
+DECL_FUNC(__fread_chk);
+DECL_FUNC(__fread_unlocked_chk);
+DECL_FUNC(__fgets_chk);
+DECL_FUNC(__fgets_unlocked_chk);
+DECL_FUNC(fread_unlocked);
+DECL_FUNC(fwrite_unlocked);
+DECL_FUNC(fgets_unlocked);
+DECL_FUNC(fputs_unlocked);
+DECL_FUNC(fputc_unlocked);
+DECL_FUNC(fflush_unlocked);
+DECL_FUNC(__fpurge);
+DECL_FUNC(accept4);
+DECL_FUNC(recvmmsg);
+DECL_FUNC(sendmmsg);
+DECL_FUNC(memfd_create);
+DECL_FUNC(inotify_init);
+DECL_FUNC(inotify_init1);
+DECL_FUNC(inotify_add_watch);
+DECL_FUNC(inotify_rm_watch);
+DECL_FUNC(sync_file_range);
+DECL_FUNC(fpathconf);
+DECL_FUNC(futimens);
+DECL_FUNC(utimensat);
+DECL_FUNC(futimesat);
+DECL_FUNC(fgetxattr);
+DECL_FUNC(fsetxattr);
+DECL_FUNC(flistxattr);
+DECL_FUNC(fremovexattr);
+DECL_FUNC(getxattr);
+DECL_FUNC(lgetxattr);
+DECL_FUNC(statvfs);
+DECL_FUNC(statvfs64);
+DECL_FUNC(fstatvfs);
+DECL_FUNC(fstatvfs64);
 DECL_FUNC(eaccess);
 DECL_FUNC(euidaccess);
 DECL_FUNC(mknod);
@@ -17466,6 +17520,282 @@ FUNCTION_DEFINE3(int, posix_fallocate, int, fd, off_t, offset, off_t, len) {
 
 FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len) {
     return __tvm_posix_fallocate(fd, offset, len);
+}
+
+/*
+ * The rest of what the Linux guest programs import that takes a FILE * or a
+ * descriptor (from the undefined symbols of git, bash, toybox, curl, nano).
+ * Anything not interposed runs in the host libc, where a guest stdout is
+ * the TVM process's own stdout and a guest descriptor is just a number:
+ *
+ * - Fortified stdio (_FORTIFY_SOURCE, which Ubuntu's gcc enables at -O1 and
+ *   up): git's printf/fprintf are __printf_chk/__fprintf_chk. `git
+ *   --version` printed into the TVM process's stdout (the backend log)
+ *   instead of the session, and `git init` aborted in glibc with "invalid
+ *   stdio handle" on a TVM stream. The checks themselves only guard the
+ *   caller's buffer sizes; they are kept for fread/fgets.
+ * - The _unlocked stdio functions (bash on Linux; the Darwin build maps
+ *   them away with bash_stdio_unlocked.h) and __fpurge.
+ * - C99/C23 scanf: glibc's headers redirect fscanf to __isoc99_fscanf, or
+ *   __isoc23_fscanf from 2.38 (git, toybox). This file's own
+ *   fscanf/scanf/vfscanf are emitted under one of those names too, so a
+ *   guest import only found them by symbol through dlsym, which works where
+ *   TVM is the executable; register both spellings by name.
+ * - Descriptors created outside the task table (accept4, memfd_create,
+ *   inotify_init) and calls on task descriptors (xattrs, futimens, ...).
+ */
+static void tvm_chk_fail(void)
+{
+    // what glibc's __chk_fail does: a buffer overflow was caught
+    static const char msg[] = "*** buffer overflow detected ***: terminated\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    abort();
+}
+
+FUNCTION_DEFINE_VA2(int, __printf_chk, int, flag, const char *, format) {
+    return vfprintf(stdout, format, __ap);
+}
+
+FUNCTION_DEFINE_VA3(int, __fprintf_chk, FILE *, stream, int, flag, const char *, format) {
+    return vfprintf(stream, format, __ap);
+}
+
+FUNCTION_DEFINE3(int, __vprintf_chk, int, flag, const char *, format, va_list, ap) {
+    return vfprintf(stdout, format, ap);
+}
+
+FUNCTION_DEFINE4(int, __vfprintf_chk, FILE *, stream, int, flag, const char *, format, va_list, ap) {
+    return vfprintf(stream, format, ap);
+}
+
+FUNCTION_DEFINE_VA3(int, __dprintf_chk, int, fd, int, flag, const char *, format) {
+    return vdprintf(fd, format, __ap);
+}
+
+FUNCTION_DEFINE4(int, __vdprintf_chk, int, fd, int, flag, const char *, format, va_list, ap) {
+    return vdprintf(fd, format, ap);
+}
+
+FUNCTION_DEFINE5(size_t, __fread_chk, void *, ptr, size_t, ptrlen, size_t, size, size_t, n, FILE *, stream) {
+    if (size && n > ptrlen / size)
+        tvm_chk_fail();
+    return fread(ptr, size, n, stream);
+}
+
+FUNCTION_DEFINE5(size_t, __fread_unlocked_chk, void *, ptr, size_t, ptrlen, size_t, size, size_t, n, FILE *, stream) {
+    if (size && n > ptrlen / size)
+        tvm_chk_fail();
+    return fread(ptr, size, n, stream);
+}
+
+FUNCTION_DEFINE4(char *, __fgets_chk, char *, s, size_t, slen, int, n, FILE *, stream) {
+    if (n > 0 && (size_t)n > slen)
+        tvm_chk_fail();
+    return fgets(s, n, stream);
+}
+
+FUNCTION_DEFINE4(char *, __fgets_unlocked_chk, char *, s, size_t, slen, int, n, FILE *, stream) {
+    if (n > 0 && (size_t)n > slen)
+        tvm_chk_fail();
+    return fgets(s, n, stream);
+}
+
+FUNCTION_DEFINE4(size_t, fread_unlocked, void *, ptr, size_t, size, size_t, n, FILE *, stream) {
+    return fread(ptr, size, n, stream);
+}
+
+FUNCTION_DEFINE4(size_t, fwrite_unlocked, const void *, ptr, size_t, size, size_t, n, FILE *, stream) {
+    return fwrite(ptr, size, n, stream);
+}
+
+FUNCTION_DEFINE3(char *, fgets_unlocked, char *, s, int, n, FILE *, stream) {
+    return fgets(s, n, stream);
+}
+
+FUNCTION_DEFINE2(int, fputs_unlocked, const char *, str, FILE *, stream) {
+    return fputs(str, stream);
+}
+
+FUNCTION_DEFINE2(int, fputc_unlocked, int, c, FILE *, stream) {
+    return fputc(c, stream);
+}
+
+FUNCTION_DEFINE1(int, fflush_unlocked, FILE *, stream) {
+    return fflush(stream);
+}
+
+FUNCTION_DEFINE_VOID1(__fpurge, FILE *, stream) {
+    tvm_sig_enter();
+    struct file *file = file_for_task_fp(current, stream);
+    if (!file) {
+        tvm_sig_leave();
+        return;
+    }
+    file_unlock(file, 0);
+    CALL_FUNC(__fpurge, real_fp(stream));
+    file_lock(file, 0);
+    file_unlock(file, 1);
+    tvm_sig_leave();
+}
+
+FUNCTION_METADATA(__isoc99_fscanf, &fscanf);
+FUNCTION_METADATA(__isoc99_scanf, &scanf);
+FUNCTION_METADATA(__isoc99_vfscanf, &vfscanf);
+FUNCTION_METADATA(__isoc23_fscanf, &fscanf);
+FUNCTION_METADATA(__isoc23_scanf, &scanf);
+FUNCTION_METADATA(__isoc23_vfscanf, &vfscanf);
+
+// _FORTIFY_SOURCE's open(): __open_2 checks that O_CREAT/O_TMPFILE came
+// with a mode, i.e. went to the variadic open instead.
+FUNCTION_DEFINE2(int, __open_2, const char *, pathname, int, flags) {
+    return open(pathname, flags);
+}
+
+FUNCTION_DEFINE2(int, __open64_2, const char *, pathname, int, flags) {
+    return open(pathname, flags);
+}
+
+// A new host descriptor, entered into the task's table (cf. eventfd).
+static int tvm_task_adopt_fd(int r)
+{
+    int f;
+    if (-1 == r)
+        return -1;
+    if (-1 == (f = task_new_fd(current, r))) {
+        CALL_FUNC(close, r);
+        errno = EMFILE;
+    }
+    return f;
+}
+
+FUNCTION_DEFINE4(int, accept4, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen, int, flags) {
+    tvm_sig_enter();
+    int f = tvm_task_adopt_fd(CURRENT_RFD(sockfd, CALL_FUNC(accept4, __rfd, addr, addrlen, flags)));
+    tvm_sig_leave();
+    return f;
+}
+
+FUNCTION_DEFINE2(int, memfd_create, const char *, name, unsigned int, flags) {
+    tvm_sig_enter();
+    int f = tvm_task_adopt_fd(CALL_FUNC(memfd_create, name, flags));
+    tvm_sig_leave();
+    return f;
+}
+
+FUNCTION_DEFINE0(int, inotify_init) {
+    tvm_sig_enter();
+    int f = tvm_task_adopt_fd(CALL_FUNC(inotify_init));
+    tvm_sig_leave();
+    return f;
+}
+
+FUNCTION_DEFINE1(int, inotify_init1, int, flags) {
+    tvm_sig_enter();
+    int f = tvm_task_adopt_fd(CALL_FUNC(inotify_init1, flags));
+    tvm_sig_leave();
+    return f;
+}
+
+FUNCTION_DEFINE3(int, inotify_add_watch, int, fd, const char *, pathname, uint32_t, mask) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    return CURRENT_RFD(fd, CALL_FUNC(inotify_add_watch, __rfd, pathname_abs, mask));
+}
+
+FUNCTION_DEFINE2(int, inotify_rm_watch, int, fd, int, wd) {
+    return CURRENT_RFD(fd, CALL_FUNC(inotify_rm_watch, __rfd, wd));
+}
+
+FUNCTION_DEFINE5(int, recvmmsg, int, fd, struct mmsghdr *, msgvec, unsigned int, vlen, int, flags, struct timespec *, timeout) {
+    return CURRENT_RFD(fd, CALL_FUNC(recvmmsg, __rfd, msgvec, vlen, flags, timeout));
+}
+
+FUNCTION_DEFINE4(int, sendmmsg, int, fd, struct mmsghdr *, msgvec, unsigned int, vlen, int, flags) {
+    return CURRENT_RFD(fd, CALL_FUNC(sendmmsg, __rfd, msgvec, vlen, flags));
+}
+
+FUNCTION_DEFINE4(int, sync_file_range, int, fd, off64_t, offset, off64_t, nbytes, unsigned int, flags) {
+    return CURRENT_RFD(fd, CALL_FUNC(sync_file_range, __rfd, offset, nbytes, flags));
+}
+
+FUNCTION_DEFINE2(long, fpathconf, int, fd, int, name) {
+    return CURRENT_RFD(fd, CALL_FUNC(fpathconf, __rfd, name));
+}
+
+FUNCTION_DEFINE2(int, futimens, int, fd, const struct timespec *, times) {
+    return CURRENT_RFD(fd, CALL_FUNC(futimens, __rfd, times));
+}
+
+FUNCTION_DEFINE4(int, utimensat, int, dirfd, const char *, pathname, const struct timespec *, times, int, flags) {
+    if (!pathname)  // Linux: the descriptor itself, as futimens
+        return CURRENT_RFD(dirfd, CALL_FUNC(utimensat, __rfd, NULL, times, flags));
+    char pathname_abs[PATH_MAX];
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    return CALL_FUNC(utimensat, AT_FDCWD, pathname_abs, times, flags);
+}
+
+FUNCTION_DEFINE3(int, futimesat, int, dirfd, const char *, pathname, const struct timeval *, times) {
+    if (!pathname)
+        return CURRENT_RFD(dirfd, CALL_FUNC(futimesat, __rfd, NULL, times));
+    char pathname_abs[PATH_MAX];
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    return CALL_FUNC(futimesat, AT_FDCWD, pathname_abs, times);
+}
+
+FUNCTION_DEFINE4(ssize_t, fgetxattr, int, fd, const char *, name, void *, value, size_t, size) {
+    return CURRENT_RFD(fd, CALL_FUNC(fgetxattr, __rfd, name, value, size));
+}
+
+FUNCTION_DEFINE5(int, fsetxattr, int, fd, const char *, name, const void *, value, size_t, size, int, flags) {
+    return CURRENT_RFD(fd, CALL_FUNC(fsetxattr, __rfd, name, value, size, flags));
+}
+
+FUNCTION_DEFINE3(ssize_t, flistxattr, int, fd, char *, list, size_t, size) {
+    return CURRENT_RFD(fd, CALL_FUNC(flistxattr, __rfd, list, size));
+}
+
+FUNCTION_DEFINE2(int, fremovexattr, int, fd, const char *, name) {
+    return CURRENT_RFD(fd, CALL_FUNC(fremovexattr, __rfd, name));
+}
+
+FUNCTION_DEFINE4(ssize_t, getxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    return CALL_FUNC(getxattr, pathname_abs, name, value, size);
+}
+
+FUNCTION_DEFINE4(ssize_t, lgetxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    return CALL_FUNC(lgetxattr, pathname_abs, name, value, size);
+}
+
+// As statfs: the host's answer for the resolved path.
+FUNCTION_DEFINE2(int, statvfs, const char *, pathname, struct statvfs *, buf) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    return CALL_FUNC(statvfs, pathname_abs, buf);
+}
+
+FUNCTION_DEFINE2(int, statvfs64, const char *, pathname, struct statvfs64 *, buf) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    return CALL_FUNC(statvfs64, pathname_abs, buf);
+}
+
+FUNCTION_DEFINE2(int, fstatvfs, int, fd, struct statvfs *, buf) {
+    return CURRENT_RFD(fd, CALL_FUNC(fstatvfs, __rfd, buf));
+}
+
+FUNCTION_DEFINE2(int, fstatvfs64, int, fd, struct statvfs64 *, buf) {
+    return CURRENT_RFD(fd, CALL_FUNC(fstatvfs64, __rfd, buf));
 }
 
 FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
