@@ -3439,9 +3439,12 @@ out:
 
 struct macho_slot {
     int in_use;
+    unsigned long seq;          // when it was parked, for eviction
     struct macho_slot_key key;
     void *base;
 };
+
+static unsigned long g_macho_slot_seq;
 
 static pthread_mutex_t g_macho_slots_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct macho_slot g_macho_slots[MACHO_SLOTS_MAX];
@@ -3468,21 +3471,42 @@ static void *macho_slot_take(const struct macho_slot_key *key)
     return base;
 }
 
+/*
+ * Park a slot. When the table is full, the slot parked longest ago is
+ * evicted (unmapped) to make room: slots whose file was rebuilt, replaced or
+ * deleted can never be taken again, and without eviction they filled the
+ * table for the life of the process, after which every unload fell back to
+ * munmap -- on iOS, the permanent-text leak parking exists to avoid.
+ * Evicting leaks that one slot's text on iOS, once, and keeps parking working.
+ */
 static int macho_slot_put(const struct macho_slot_key *key, void *base)
 {
-    int ok = 0;
+    void *evict_base = NULL;
+    size_t evict_size = 0;
     pthread_mutex_lock(&g_macho_slots_mtx);
+    int idx = -1, oldest = -1;
     for (int i = 0; i < MACHO_SLOTS_MAX; i++) {
         if (!g_macho_slots[i].in_use) {
-            g_macho_slots[i].in_use = 1;
-            g_macho_slots[i].key = *key;
-            g_macho_slots[i].base = base;
-            ok = 1;
+            idx = i;
             break;
         }
+        if (oldest < 0 || g_macho_slots[i].seq < g_macho_slots[oldest].seq)
+            oldest = i;
     }
+    if (idx < 0) {
+        idx = oldest;
+        evict_base = g_macho_slots[idx].base;
+        evict_size = g_macho_slots[idx].key.load_size;
+    }
+    g_macho_slots[idx].in_use = 1;
+    g_macho_slots[idx].seq = ++g_macho_slot_seq;
+    g_macho_slots[idx].key = *key;
+    g_macho_slots[idx].base = base;
     pthread_mutex_unlock(&g_macho_slots_mtx);
-    return ok;
+
+    if (evict_base)
+        uo.uo_munmap(NULL, evict_base, evict_size);
+    return 1;
 }
 #endif
 

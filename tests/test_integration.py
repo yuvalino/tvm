@@ -1261,8 +1261,9 @@ def test_pager_editor_defaults(sshi: spawn):
     # unconditional TERMINFO is exact.
     assert b"unset" not in sshi.match.group(0)
     sshi.expect(r"\$ ")
-    sshi.sendline("ls /tvm/share/terminfo/x/xterm-256color /tvm/share/terminfo/d/dumb")
-    sshi.expect("x/xterm-256color")
+    # the status, not ls's output: the echoed command line contains the paths
+    sshi.sendline('test -f /tvm/share/terminfo/x/xterm-256color && test -f /tvm/share/terminfo/d/dumb; echo "terminfo=$?"')
+    sshi.expect(r"terminfo=0\r?\n")
     sshi.expect(r"\$ ")
 
 def test_less_interactive(sshi: spawn):
@@ -1347,8 +1348,9 @@ def test_nano_open_existing(sshi: spawn):
 def test_nano_syntax_rc(sshi: spawn):
     """/tvm/etc/nanorc includes the bundled syntax files (glob include):
     a shell script opens straight into the editor with no rc errors."""
-    sshi.sendline("ls /tvm/share/nano/sh.nanorc /tvm/etc/nanorc")
-    sshi.expect("sh.nanorc")
+    # the status, not ls's output: the echoed command line contains the paths
+    sshi.sendline('test -f /tvm/share/nano/sh.nanorc && test -f /tvm/etc/nanorc; echo "nanorc=$?"')
+    sshi.expect(r"nanorc=0\r?\n")
     sshi.expect(r"\$ ")
     sshi.sendline("export TERM=xterm-256color; printf '#!/bin/sh\\necho hi\\n' > $TMPDIR/nano_syn.sh; nano $TMPDIR/nano_syn.sh 2> $TMPDIR/nano_syn.err; echo RC=$?")
     sshi.expect("Write Out")
@@ -1410,11 +1412,12 @@ def test_sqlite3_extensions(sshi: spawn):
                         "select body from ft where ft match 'quick';\" "
                         "\"create virtual table rt using rtree(id, minx, maxx); "
                         "insert into rt values (1, 0, 10), (2, 20, 30); "
-                        "select id from rt where minx <= 5 and maxx >= 5;\" "
-                        "'select count(*) > 0 from dbstat'")
+                        "select 'rtree:' || id from rt where minx <= 5 and maxx >= 5;\" "
+                        "\"select 'dbstat:' || (count(*) > 0) from dbstat\"")
     assert rc == 0, out
     lines = _lines(out)
-    assert "the quick brown fox" in lines and "1" in lines, out
+    # distinct result lines, none of which appear in the echoed command
+    assert "the quick brown fox" in lines and "rtree:1" in lines and "dbstat:1" in lines, out
     out, rc = _sh(sshi, "sqlite3 :memory: \"select load_extension('nope')\"")
     assert rc != 0, out
     assert "no such function: load_extension" in out, out
@@ -1656,10 +1659,13 @@ def test_git_pre_commit_hook(sshi: spawn):
     assert rc == 1 and "hook says no" in err, (out, err)
     out, rc = _sh(sshi, "git rev-parse --verify -q HEAD")
     assert rc == 1, out
-    out, rc, err = _git(sshi, "printf '#!/bin/sh\\necho hook says yes\\nexit 0\\n' > .git/hooks/pre-commit && "
+    # the hook prints a computed value, so the check cannot be satisfied by
+    # the echoed command line, which only contains the expression
+    out, rc, err = _git(sshi, "printf '#!/bin/sh\\necho hook says $((6*7)) >&2\\nexit 0\\n' > .git/hooks/pre-commit && "
                               "git commit -q -m hooked && git log -1 --format=%s")
     assert rc == 0, (out, err)
-    assert "hooked" in _lines(out) and "hook says yes" in out + err, (out, err)
+    # the hook's stderr reaches the terminal (only git log's is redirected)
+    assert "hooked" in _lines(out) and "hook says 42" in _lines(out) + _lines(err), (out, err)
 
 @network_required
 def test_git_clone_https(sshi: spawn):
@@ -1717,6 +1723,39 @@ def test_git_stash_pop(sshi: spawn):
     assert "two" in lines and "M f" in lines and "0" in lines, out
 
 # ── File descriptor & dup ────────────────────────────────────
+
+def test_popen_close_first_of_two(sshi: spawn):
+    """awk's `print | cmd` is popen(). Closing the first of two pipes must
+    not hang: each popen child used to inherit the other pipes (popen's end
+    was not close-on-exec, and fork dropped FD_CLOEXEC), so `sort` never saw
+    EOF while `sort -r` held its write end."""
+    out, rc = _sh(sshi, "printf 'b\\na\\n' | awk '{ print | \"sort\"; print | \"sort -r\" } "
+                        "END { close(\"sort\"); print \"MID\"; close(\"sort -r\"); print \"END\" }'",
+                  timeout=30)
+    assert rc == 0, out
+    lines = _lines(out)
+    assert lines[-6:] == ["a", "b", "MID", "b", "a", "END"], out
+
+def test_exec_short_text_script(sshi: spawn):
+    """A #!-less text script shorter than 4 bytes runs through the shell like
+    any other (it used to get ENOEXEC and bash's in-process fallback)."""
+    out, rc = _sh(sshi, "d=$(mktemp -d) && cd $d && printf 'pwd' > s3 && chmod +x s3 && "
+                        "./s3 | sed 's/^/OUT:/'; cd - >/dev/null")
+    assert rc == 0, out
+    assert any(l.startswith("OUT:/") for l in _lines(out)), out
+
+def test_path_search_skips_dir_and_nonexec(sshi: spawn, device):
+    """execvp() moves past a PATH entry that is a directory or a
+    non-executable file of the same name, instead of failing with EACCES.
+    On iOS TVM's stat() reports every regular file as executable (the sandbox
+    does not report execute permission on the app's signed dylibs), so there
+    only the directory case applies."""
+    out, rc = _sh(sshi, "d=$(mktemp -d) && mkdir -p $d/p1/true && PATH=$d/p1:$PATH env true")
+    assert rc == 0, out
+    if not device:
+        out, rc = _sh(sshi, "d=$(mktemp -d) && mkdir -p $d/p1/true $d/p2 && printf 'exit 7\\n' > $d/p2/true && "
+                            "PATH=$d/p1:$d/p2:$PATH env true")
+        assert rc == 0, out
 
 def test_prompt_is_dollar(sshi: spawn):
     """The login shell's prompt is mksh-style "$ ", not bash's default
@@ -2248,7 +2287,10 @@ def test_double_close(sshi: spawn):
 def test_system_basic(sshi: spawn):
     """tvm system runs a command via system() and returns its exit code."""
     sshi.sendline("/usr/bin/tvm shell 'echo hello_system'; echo rc=$?")
-    sshi.expect("hello_system")
+    # Match the output line, not the echoed command line: fork's pointer
+    # fixup once rewrote the tail of the command string and this printed
+    # "hello_syste" plus garbage bytes, which "hello_system" alone let pass.
+    sshi.expect(r"\rhello_system\r\n")
     sshi.expect(r"rc=0")
     sshi.expect(r"\$ ")
 

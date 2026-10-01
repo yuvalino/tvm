@@ -111,7 +111,28 @@ static int tvm_sysctl_infer_fmt(int *oid, u_int len, void *oldp, size_t *oldlenp
 
     u_int kind = CTLFLAG_RD;
     const char *fmt = "";
-    if (got == sizeof(struct timeval)) {
+
+    // A string first: a NUL-terminated run of printable characters with at
+    // least one alphanumeric. Size alone cannot tell a 4- or 8-byte string
+    // ("iPad8,1", "16.7.10") from an int or a quad, and checking sizes first
+    // printed those as numbers. An int/quad/timeval whose bytes all happen to
+    // be printable-then-NUL would be misread the other way, which needs
+    // every byte but the last to be printable text -- not a real value.
+    if (got >= 2 && val[got - 1] == '\0') {
+        size_t i;
+        int alnum = 0;
+        for (i = 0; i + 1 < got; i++) {
+            if (!isprint(val[i]) && !isspace(val[i]))
+                break;
+            if (isalnum(val[i]))
+                alnum = 1;
+        }
+        if (i + 1 == got && alnum) {
+            kind |= CTLTYPE_STRING;
+            fmt = "A";
+        }
+    }
+    if (!*fmt && got == sizeof(struct timeval)) {
         struct timeval tv;
         memcpy(&tv, val, sizeof(tv));
         if (tv.tv_sec > 0 && tv.tv_usec >= 0 && tv.tv_usec < 1000000) {
@@ -125,15 +146,6 @@ static int tvm_sysctl_infer_fmt(int *oid, u_int len, void *oldp, size_t *oldlenp
     } else if (!*fmt && got == sizeof(long long)) {
         kind |= CTLTYPE_QUAD;
         fmt = "Q";
-    } else if (!*fmt && got > 0 && val[got - 1] == '\0') {
-        size_t i;
-        for (i = 0; i + 1 < got; i++)
-            if (!isprint(val[i]) && !isspace(val[i]))
-                break;
-        if (i + 1 == got) {
-            kind |= CTLTYPE_STRING;
-            fmt = "A";
-        }
     }
     if (!*fmt)
         kind |= CTLTYPE_OPAQUE;
