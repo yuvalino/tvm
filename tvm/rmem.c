@@ -384,13 +384,21 @@ static struct rmem_slab *rmem_slab_create(size_t slabsize, size_t objsize) {
     slabsize = round_up(slabsize, pagesz);
 
     /* layout:
-    [ header | bitmap | data ]
+    [ header | bitmap | pad | data ]
+
+    The data starts on a multiple of min(objsize, page size). objsize is a
+    power of two, so every object is then aligned to its own size up to a
+    page, which is what rmem_arena_memalign() relies on (posix_memalign,
+    aligned_alloc, ...). Without the pad the objects were only 8-aligned.
     */
+    size_t align = objsize < pagesz ? objsize : pagesz;
     size_t nobj = (slabsize - sizeof(struct rmem_slab)) / objsize;
-    size_t bitmap_words = 0; 
+    size_t bitmap_words = 0;
+    size_t data_off = 0;
     while (nobj > 0) {
         bitmap_words = (nobj + BITMAP_WORD_BITS - 1) / BITMAP_WORD_BITS;
-        if ((sizeof(struct rmem_slab) + bitmap_words * sizeof(BITMAP_WORD) + nobj * objsize) <= slabsize)
+        data_off = round_up(sizeof(struct rmem_slab) + bitmap_words * sizeof(BITMAP_WORD), align);
+        if (data_off + nobj * objsize <= slabsize)
             break;
         nobj--;
     }
@@ -406,7 +414,7 @@ static struct rmem_slab *rmem_slab_create(size_t slabsize, size_t objsize) {
     struct rmem_slab *sl = (struct rmem_slab *)mem;
     sl->sl_next = NULL;
 
-    sl->sl_base = (char*)mem + sizeof(struct rmem_slab) + bitmap_words * sizeof(BITMAP_WORD);
+    sl->sl_base = (char*)mem + data_off;
     sl->sl_size = slabsize;
     sl->sl_objsize = objsize;
     sl->sl_nobj = nobj;
@@ -616,6 +624,24 @@ void *rmem_arena_alloc(struct rmem_arena *ar, size_t size) {
     void *p = rmem_arena_alloc_locked(ar, size);
     pthread_mutex_unlock(&ar->ar_lock);
     return p;
+}
+
+/*
+ * An object aligned to `alignment` (a power of two). Objects are aligned to
+ * their size class up to a page (see rmem_slab_create), so a size class of
+ * at least `alignment` is enough; larger alignments are not supported
+ * (EINVAL). The result is an ordinary object: rmem_arena_free and
+ * rmem_arena_realloc take it like any other.
+ */
+void *rmem_arena_memalign(struct rmem_arena *ar, size_t alignment, size_t size) {
+    size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
+    if (!alignment || (alignment & (alignment - 1)) || alignment > pagesz) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (!size)
+        size = 1;
+    return rmem_arena_alloc(ar, size < alignment ? alignment : size);
 }
 
 void rmem_arena_free(struct rmem_arena *ar, void *p) {

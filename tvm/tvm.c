@@ -69,6 +69,8 @@
 #include <sys/timerfd.h>
 #include <asm/prctl.h>
 #include <link.h>
+#include <malloc.h>   // memalign, pvalloc
+#include <sys/eventfd.h>
 #endif
 
 #if defined(__linux__)
@@ -324,6 +326,9 @@ DECL_FUNC(malloc);
 DECL_FUNC(calloc);
 DECL_FUNC(realloc);
 DECL_FUNC(free);
+DECL_FUNC(posix_memalign);
+DECL_FUNC(aligned_alloc);
+DECL_FUNC(valloc);
 
 DECL_FUNC(opendir)
 DECL_FUNC(fdopendir);
@@ -582,6 +587,8 @@ DECL_FUNC_OPT(timer_delete);
 DECL_FUNC_OPT(timer_getoverrun);
 
 #if defined(__linux__)
+DECL_FUNC(memalign);
+DECL_FUNC(pvalloc);
 DECL_FUNC(eaccess);
 DECL_FUNC(euidaccess);
 DECL_FUNC(mknod);
@@ -591,6 +598,9 @@ DECL_FUNC(execvpe);
 DECL_FUNC(epoll_create);
 DECL_FUNC(epoll_create1);
 DECL_FUNC(timerfd_create);
+DECL_FUNC(eventfd);
+DECL_FUNC(eventfd_read);
+DECL_FUNC(eventfd_write);
 DECL_FUNC(pipe2);
 DECL_FUNC(fstatfs64);
 DECL_FUNC(open64);
@@ -16292,6 +16302,72 @@ FUNCTION_DEFINE_VOID1(free, void *, ptr) {
     rmem_arena_free(ar, ptr);
 }
 
+/*
+ * The aligned allocators. Not interposed before, so they reached the host
+ * libc and the guest later handed the host block to the interposed free(),
+ * which aborted ("rmem_arena_free: invalid pointer"): OpenSSL on glibc
+ * allocates its hash tables with posix_memalign (CRYPTO_aligned_alloc), and
+ * curl died in OPENSSL_cleanup at every exit. They come from the task's
+ * arena now, like malloc (rmem_arena_memalign: alignments up to a page).
+ */
+static void *tvm_memalign(size_t alignment, size_t size)
+{
+    struct rmem_arena *ar = arena_for_task(current);
+    if (!ar)
+        return NULL;
+    return rmem_arena_memalign(ar, alignment, size);
+}
+
+FUNCTION_DEFINE3(int, posix_memalign, void **, memptr, size_t, alignment, size_t, size) {
+    if (!alignment || (alignment & (alignment - 1)) || (alignment % sizeof(void *)))
+        return EINVAL;
+    int saved_errno = errno;
+    void *p = tvm_memalign(alignment, size);
+    if (!p) {
+        int r = errno == EINVAL ? EINVAL : ENOMEM;
+        errno = saved_errno;
+        return r;
+    }
+    *memptr = p;
+    return 0;
+}
+
+FUNCTION_DEFINE2(void *, aligned_alloc, size_t, alignment, size_t, size) {
+    if (!alignment || (alignment & (alignment - 1))) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return tvm_memalign(alignment, size);
+}
+
+FUNCTION_DEFINE1(void *, valloc, size_t, size) {
+    return tvm_memalign((size_t)sysconf(_SC_PAGESIZE), size);
+}
+
+#if defined(__linux__)
+// glibc: a non-power-of-two alignment is rounded up to the next one.
+FUNCTION_DEFINE2(void *, memalign, size_t, alignment, size_t, size) {
+    if (alignment > (size_t)sysconf(_SC_PAGESIZE)) {
+        errno = EINVAL;  // beyond what the arena aligns (and the loop's range)
+        return NULL;
+    }
+    size_t a = sizeof(void *);
+    while (a < alignment)
+        a <<= 1;
+    return tvm_memalign(a, size);
+}
+
+FUNCTION_DEFINE1(void *, pvalloc, size_t, size) {
+    size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
+    size_t rounded = (size + pagesz - 1) & ~(pagesz - 1);
+    if (rounded < size) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return tvm_memalign(pagesz, rounded ? rounded : pagesz);
+}
+#endif
+
 FUNCTION_DEFINE2(void *, realloc, void *, ptr, size_t, size) {
     struct rmem_arena *ar = arena_for_task(current);
     if (!ar)
@@ -17263,6 +17339,44 @@ FUNCTION_DEFINE2(int, timerfd_create, int, clockid, int, flags) {
     tvm_sig_leave();
 
     return f;
+}
+
+/*
+ * eventfd(): like timerfd_create, a host descriptor entered into the task's
+ * table. Not interposed before, so the guest got the raw host number, which
+ * TVM's poll()/read()/write() then looked up in the task table: libcurl
+ * (USE_EVENTFD on Linux) puts its wakeup eventfd in every multi poll, the
+ * poll failed (CURLM_UNRECOVERABLE_POLL) and every transfer, even file://,
+ * ended in "(43) A libcurl function was given a bad argument".
+ */
+FUNCTION_DEFINE2(int, eventfd, unsigned int, initval, int, flags) {
+    int r, f;
+
+    tvm_sig_enter();
+
+    if (-1 == (r = CALL_FUNC(eventfd, initval, flags))) {
+        tvm_sig_leave();
+        return -1;
+    }
+
+    if (-1 == (f = task_new_fd(current, r))) {
+        CALL_FUNC(close, r);
+        errno = EMFILE;
+    }
+
+    tvm_sig_leave();
+
+    return f;
+}
+
+// glibc's helpers read/write the descriptor internally, past the
+// interposed read()/write(): route them through those.
+FUNCTION_DEFINE2(int, eventfd_read, int, fd, eventfd_t *, value) {
+    return read(fd, value, sizeof(*value)) == sizeof(*value) ? 0 : -1;
+}
+
+FUNCTION_DEFINE2(int, eventfd_write, int, fd, eventfd_t, value) {
+    return write(fd, &value, sizeof(value)) == sizeof(value) ? 0 : -1;
 }
 
 FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
