@@ -70,6 +70,7 @@
 #include <asm/prctl.h>
 #include <link.h>
 #include <malloc.h>   // memalign, pvalloc
+#include <elf.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/statvfs.h>
@@ -10256,9 +10257,70 @@ static int is_noemu_binary(const char *pathname)
 static void usershell_cache_init(void);
 static int tvm_path_search(const char *file, char *out);
 
-// True if `path` is an image TVM's linker can load: a thin 64-bit Mach-O or
-// an ELF. Fat Mach-O binaries (the host's /bin/*, /usr/bin/* on macOS),
-// shared-cache stubs (iOS) and anything else are not.
+#if defined(__linux__)
+// True if the ELF open on `fd` defines `main` in its dynamic or regular
+// symbol table, where ulinker_dlsym(..., "main") finds it: execve starts an
+// image there. TVM's own builds keep it (unstripped); a host executable
+// (Linux /bin/sh is dash) is a perfectly good ELF that is stripped and
+// fails there ("symbol main not found").
+static int tvm_elf_exports_main(int fd)
+{
+    Elf64_Ehdr eh;
+    if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh) ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_shentsize != sizeof(Elf64_Shdr) || !eh.e_shnum || eh.e_shnum > 4096)
+        return 0;
+
+    size_t shsize = (size_t)eh.e_shnum * sizeof(Elf64_Shdr);
+    Elf64_Shdr *sh = malloc(shsize);
+    if (!sh)
+        return 0;
+    int found = 0;
+    char *strtab = NULL;
+    Elf64_Sym *syms = NULL;
+    if (pread(fd, sh, shsize, (off_t)eh.e_shoff) != (ssize_t)shsize)
+        goto out;
+
+    for (int i = 0; i < eh.e_shnum && !found; i++) {
+        if ((sh[i].sh_type != SHT_DYNSYM && sh[i].sh_type != SHT_SYMTAB) ||
+            sh[i].sh_link >= eh.e_shnum ||
+            sh[i].sh_entsize != sizeof(Elf64_Sym))
+            continue;
+        Elf64_Shdr *str = &sh[sh[i].sh_link];
+        if (sh[i].sh_size > (256u << 20) || str->sh_size > (256u << 20) || !str->sh_size)
+            continue;
+        free(syms);
+        free(strtab);
+        syms = malloc(sh[i].sh_size);
+        strtab = malloc(str->sh_size);
+        if (!syms || !strtab ||
+            pread(fd, syms, sh[i].sh_size, (off_t)sh[i].sh_offset) != (ssize_t)sh[i].sh_size ||
+            pread(fd, strtab, str->sh_size, (off_t)str->sh_offset) != (ssize_t)str->sh_size)
+            break;
+        strtab[str->sh_size - 1] = 0;
+        size_t nsyms = sh[i].sh_size / sizeof(Elf64_Sym);
+        for (size_t k = 0; k < nsyms; k++) {
+            unsigned bind = ELF64_ST_BIND(syms[k].st_info);
+            if (syms[k].st_shndx != SHN_UNDEF && syms[k].st_name < str->sh_size &&
+                (bind == STB_GLOBAL || bind == STB_WEAK) &&
+                0 == strcmp(strtab + syms[k].st_name, "main")) {
+                found = 1;
+                break;
+            }
+        }
+    }
+out:
+    free(syms);
+    free(strtab);
+    free(sh);
+    return found;
+}
+#endif
+
+// True if `path` is an image TVM's linker can load: a thin 64-bit Mach-O,
+// or (Linux) an ELF that exports main. Fat Mach-O binaries (the host's
+// /bin/*, /usr/bin/* on macOS), shared-cache stubs (iOS), host ELF
+// executables (Linux) and anything else are not.
 static int tvm_loadable_image(const char *path)
 {
     unsigned char magic[4] = {0};
@@ -10266,11 +10328,17 @@ static int tvm_loadable_image(const char *path)
     if (fd < 0)
         return 0;
     ssize_t n = read(fd, magic, sizeof(magic));
-    close(fd);
-    return n == 4 &&
+    int ok = n == 4 &&
         (memcmp(magic, "\xcf\xfa\xed\xfe", 4) == 0 ||   /* MH_MAGIC_64 */
          memcmp(magic, "\x7f" "ELF", 4) == 0);
+#if defined(__linux__)
+    if (ok && memcmp(magic, "\x7f" "ELF", 4) == 0)
+        ok = tvm_elf_exports_main(fd);
+#endif
+    close(fd);
+    return ok;
 }
+
 
 static int tvm_started = 0;
 
