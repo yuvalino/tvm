@@ -1952,6 +1952,17 @@ void __jit_debug_register_code(void) {
 
 pthread_mutex_t __jit_debug_descriptor_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Whether loaded images are registered with gdb's JIT interface. Building an
+ * entry reads the whole image file and rewrites its DWARF to the load
+ * address: cheap for Mach-O (debug info stays in the .dSYM), but a Linux
+ * guest carries its DWARF inline (git: 58 MB), and every exec and every fork
+ * (ulinker_duplicate reloads the images) paid for it -- seconds per git
+ * command, which timed out git's commit loops in CI. TVM turns it off on
+ * Linux unless a debugger is attached (ULINKER_GDB_JIT).
+ */
+static int gdb_jit = 1;
+
 void gdb_jit_register(struct jit_code_entry *entry)
 {
     pthread_mutex_lock(&__jit_debug_descriptor_mtx);
@@ -3364,7 +3375,7 @@ static struct dlinfo *load_elf64_library(struct ulinker *ulinker, const char *fi
         }
     }
 
-    if (0 == create_elf64_jit_entry(dl, filename))
+    if (gdb_jit && 0 == create_elf64_jit_entry(dl, filename))
         gdb_jit_register(&dl->dle64_jit_entry);
 
 out:
@@ -3877,7 +3888,7 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         }
     }
 
-    if (0 == create_macho64_jit_entry(dl, filename))
+    if (gdb_jit && 0 == create_macho64_jit_entry(dl, filename))
         gdb_jit_register(&dl->dlm64_jit_entry);
 
 out:
@@ -4431,6 +4442,10 @@ int ulinker_setopt(int opt, void *val)
     }
     if (opt == ULINKER_NOEMU) {
         noemu = (int)(long)val;
+        return 0;
+    }
+    if (opt == ULINKER_GDB_JIT) {
+        gdb_jit = (int)(long)val;
         return 0;
     }
 

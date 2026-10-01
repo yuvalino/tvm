@@ -11,6 +11,7 @@ enum {
     ULINKER_PRINT_CB,
     ULINKER_EVENT_CB,
     ULINKER_NOEMU, // deprecated — use RTLD_NOEMU per-dlopen instead
+    ULINKER_GDB_JIT, // int (as void *): register loaded images with gdb's JIT interface (default 1)
 };
 
 enum {

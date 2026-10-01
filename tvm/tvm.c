@@ -10339,6 +10339,31 @@ static int tvm_loadable_image(const char *path)
     return ok;
 }
 
+#if defined(__linux__)
+/*
+ * gdb JIT registration of guest images (see ULINKER_GDB_JIT): TVM_GDB_JIT=1
+ * or 0 decides; otherwise only when a tracer is attached at startup
+ * (`gdb --args tvm ...`). Runs before any task exists, on the host's calls.
+ */
+static int tvm_want_gdb_jit(void)
+{
+    const char *env = getenv("TVM_GDB_JIT");
+    if (env && *env)
+        return 0 != strcmp(env, "0");
+
+    char buf[4096];
+    int fd = CALL_FUNC(open, "/proc/self/status", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    ssize_t n = CALL_FUNC(read, fd, buf, sizeof(buf) - 1);
+    CALL_FUNC(close, fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    const char *t = strstr(buf, "TracerPid:");
+    return t && atoi(t + sizeof("TracerPid:") - 1) != 0;
+}
+#endif
 
 static int tvm_started = 0;
 
@@ -10416,6 +10441,9 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
+#if defined(__linux__)
+    ulinker_setopt(ULINKER_GDB_JIT, (void *)(long)tvm_want_gdb_jit());
+#endif
 
     // Config mounts. The VFS needs only the global arena, so a bad archive
     // is still reported to the caller before any task exists. A later
