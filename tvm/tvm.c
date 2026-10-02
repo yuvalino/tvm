@@ -4281,7 +4281,7 @@ static void dump_stacktrace()
 
     for (int i = 0; i < nstack; i++) {
         struct ulinker_dladdr_info uldli;
-        if (linker && ulinker_dladdr(linker, stack[i], &uldli)) {
+        if (linker && ulinker_dladdr(linker, stack[i], &uldli, 0)) {
             if (uldli.udli_sname)
                 INFO("  stacktrace[% 2d] = %s : %s + %lx", i, uldli.udli_fname, uldli.udli_sname, (long)stack[i] - (long)uldli.udli_saddr);
             else
@@ -7795,7 +7795,7 @@ int emulator_find_dl(struct emulator_context *ec, uint64_t pc, struct ulinker_dl
     memset(out_info, 0, sizeof(*out_info));
 
     // image only: no caller of emulator_find_dl uses the symbol fields
-    if (ulinker_dladdr_image(ec->ec_ulinker, (void *)pc, out_info)) {
+    if (ulinker_dladdr(ec->ec_ulinker, (void *)pc, out_info, DLA_NOSYM)) {
         return 0;
     }
 
@@ -9597,7 +9597,7 @@ static int tvm_sorunner(int argc, char **argv)
     }
 
     struct ulinker_dladdr_info info;
-    ulinker_dladdr(current->tsk_linker, sym, &info);
+    ulinker_dladdr(current->tsk_linker, sym, &info, 0);
 
     printf("sorunner %s %s %p base %p\n", argv[1], "main", sym, info.udli_fbase);
 
