@@ -89,9 +89,9 @@ struct ulinker_dladdr_info {
     const char *udli_sname;
     void       *udli_saddr;
 };
-int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
-// image fields only (no symbol lookup): udli_sname/udli_saddr are NULL
-int ulinker_dladdr_image(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info);
+// ulinker_dladdr flags
+#define DLA_NOSYM 0x1  // image fields only, skip the symbol lookup: udli_sname/udli_saddr are NULL
+int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int flags);
 
 /**
  * duplicate a linker with all loaded libraries and data.

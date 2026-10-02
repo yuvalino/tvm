@@ -4559,25 +4559,15 @@ char *ulinker_dlerror(void) {
     return errormsg;
 }
 
-static int ulinker_dladdr_ex(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int want_symbol);
-
-int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
-    return ulinker_dladdr_ex(ulinker, addr, info, 1);
-}
-
 /*
- * Like ulinker_dladdr, without the nearest-symbol search: udli_sname and
- * udli_saddr come back NULL. That search walks the image's symbol table and
- * is only wanted for diagnostics; the emulator asks "which image, which
- * arch, emulated or not" on every emulated call (emulator_find_dl), e.g.
- * once per comparison when host qsort() calls an emulated comparator, and
- * the symbol walk was the single hottest function in a neofetch run.
+ * DLA_NOSYM skips the nearest-symbol search: udli_sname and udli_saddr come
+ * back NULL. That search walks the image's symbol table and is only wanted
+ * for diagnostics; the emulator asks "which image, which arch, emulated or
+ * not" on every emulated call (emulator_find_dl), e.g. once per comparison
+ * when host qsort() calls an emulated comparator, and the symbol walk was
+ * the single hottest function in a neofetch run.
  */
-int ulinker_dladdr_image(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info) {
-    return ulinker_dladdr_ex(ulinker, addr, info, 0);
-}
-
-static int ulinker_dladdr_ex(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int want_symbol) {
+int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int flags) {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = library_for_address_locked(ulinker, addr);
     DLINFO_UNLOCK(ulinker);
@@ -4594,7 +4584,7 @@ static int ulinker_dladdr_ex(struct ulinker *ulinker, const void *addr, struct u
     info->udli_sname = NULL;
     info->udli_saddr = NULL;
 
-    if (!want_symbol)
+    if (flags & DLA_NOSYM)
         return 1;
 
     if (dl->dl_type == DLT_ELF64)
