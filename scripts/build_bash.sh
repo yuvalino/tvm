@@ -68,16 +68,6 @@ TVM_MAKE_CFLAGS="$TVM_CFLAGS -include $INCLUDE_SHIM/tvm_stdio_unlocked.h"
 #  unusable_rtsigs=yes: no real-time signals on Darwin.
 #  ulimit_maxfds=no, func_sbrk=no, func_brk=no: only affect bash's own malloc
 #     (disabled with --without-bash-malloc) and `ulimit -n` fallbacks.
-#  ac_cv_func_killpg=no: REQUIRED. TVM does not interpose killpg(), so bash
-#     must use its kill(-pgrp) fallback (lib/sh/oslib.c), which TVM does route.
-#  ac_cv_func_pselect=no: TVM interposes select() but not pselect(); a guest
-#     pselect() reaches the host with guest fd numbers, so `read -t`, `read -t
-#     0` and readline timeouts waited on the wrong fd (read -t 1 </dev/null
-#     timed out instead of hitting EOF). bash then uses select() everywhere
-#     (lib/sh/timers.c, input_avail.c, ufuncs.c, lib/readline/input.c).
-#  ac_cv_func_shm_open=no: same class of problem for lib/sh/anonfile.c (used
-#     by ${ command; } nofork substitutions): a host shm_open() fd is not a
-#     guest fd. bash falls back to sh_mktmpfd(), i.e. an interposed open().
 #  ac_cv_func_dlopen/dlsym/dlclose=no, ac_cv_lib_dl_dlopen=no: no loadable
 #     builtins (guest dlopen is not interposed); `enable -f` reports them
 #     unsupported. dlclose must go with them: enable.def compiles its
@@ -89,7 +79,6 @@ bash_cv_dev_fd=absent bash_cv_dev_stdin=absent bash_cv_func_sigsetjmp=present \
 bash_cv_unusable_rtsigs=yes bash_cv_wcontinued_broken=no bash_cv_pgrp_pipe=no \
 bash_cv_must_reinstall_sighandlers=no bash_cv_getcwd_malloc=yes \
 bash_cv_ulimit_maxfds=no bash_cv_func_sbrk=no bash_cv_func_brk=no \
-ac_cv_func_killpg=no ac_cv_func_pselect=no ac_cv_func_shm_open=no \
 ac_cv_func_dlopen=no ac_cv_func_dlsym=no \
 ac_cv_func_dlclose=no ac_cv_lib_dl_dlopen=no am_cv_func_iconv=no"
 

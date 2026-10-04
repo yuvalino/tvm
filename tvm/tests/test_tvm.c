@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 
 #if defined(__linux__)
@@ -582,6 +583,261 @@ TEST(FDsPoll) {
     ASSERT_EQ(select(nfds, &rfds, &wfds, NULL, &t), 2);
     ASSERT_NEQ(FD_ISSET(pp[1], &wfds), 0);
     ASSERT_NEQ(FD_ISSET(pp[0], &rfds), 0);
+}
+
+// --- killpg, pselect, shm_open (what bash relies on since it is no longer
+// configured ac_cv_func_{killpg,pselect,shm_open}=no) ---
+
+TEST(ProcKillpg) {
+    // killpg(pgrp) reaches the group's members, like kill(-pgrp)
+    pid_t p1 = fork();
+    ASSERT_NEQ(p1, -1);
+    if (!p1) {
+        ASSERT_EQ(0, setpgid(0, 0));
+        PHASE_SET(1);
+        pause();
+        _exit(0);
+    }
+    PHASE_WAIT(1);
+    ASSERT_EQ(0, killpg(p1, SIGTERM));
+    int s;
+    ASSERT_EQ(p1, wait(&s));
+    ASSERT_EQ(WIFSIGNALED(s), 1);
+    ASSERT_EQ(WTERMSIG(s), SIGTERM);
+
+    // a negative group is EINVAL, a group nobody is in ESRCH
+    ASSERT_EQ(-1, killpg(-5, SIGTERM));
+    ASSERT_EQ(EINVAL, errno);
+    ASSERT_EQ(-1, killpg(p1, SIGTERM));
+    ASSERT_EQ(ESRCH, errno);
+
+    // pgrp 0 is the caller's own group
+    pid_t p2 = fork();
+    ASSERT_NEQ(p2, -1);
+    if (!p2) {
+        PHASE_SET(2);
+        pause();
+        _exit(0);
+    }
+    PHASE_WAIT(2);
+    usleep(20000);
+    struct sigaction sa = { .sa_handler = SIG_IGN };
+    struct sigaction old;
+    ASSERT_EQ(0, sigaction(SIGUSR2, &sa, &old));
+    ASSERT_EQ(0, killpg(0, SIGUSR2));   // the parent ignores it, the child dies of it
+    ASSERT_EQ(p2, wait(&s));
+    ASSERT_EQ(WIFSIGNALED(s), 1);
+    ASSERT_EQ(WTERMSIG(s), SIGUSR2);
+    ASSERT_EQ(0, sigaction(SIGUSR2, &old, NULL));
+}
+
+static volatile int psel_got = 0;
+static void psel_handler(int sig) { psel_got = 1; }
+
+TEST(PselectBasic) {
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+    fd_set rfds;
+    struct timespec ts = { 0, 50 * 1000 * 1000 };
+
+    // nothing to read: the timeout elapses, and the mask argument is optional
+    FD_ZERO(&rfds);
+    FD_SET(pp[0], &rfds);
+    ASSERT_EQ(0, pselect(pp[0] + 1, &rfds, NULL, NULL, &ts, NULL));
+    ASSERT_EQ(0, FD_ISSET(pp[0], &rfds));
+
+    sigset_t empty;
+    sigemptyset(&empty);
+    FD_ZERO(&rfds);
+    FD_SET(pp[0], &rfds);
+    ts.tv_nsec = 50 * 1000 * 1000;
+    ASSERT_EQ(0, pselect(pp[0] + 1, &rfds, NULL, NULL, &ts, &empty));
+
+    // readable once written to
+    ASSERT_EQ(1, write(pp[1], "x", 1));
+    FD_ZERO(&rfds);
+    FD_SET(pp[0], &rfds);
+    ASSERT_EQ(1, pselect(pp[0] + 1, &rfds, NULL, NULL, NULL, &empty));
+    ASSERT_NEQ(0, FD_ISSET(pp[0], &rfds));
+
+    // a bad timeout is EINVAL
+    ts.tv_nsec = 2000000000L;
+    ASSERT_EQ(-1, pselect(pp[0] + 1, &rfds, NULL, NULL, &ts, &empty));
+    ASSERT_EQ(EINVAL, errno);
+    close(pp[0]);
+    close(pp[1]);
+}
+
+TEST(PselectSignalInterrupts) {
+    // SIGUSR1 blocked by the caller, let through by the pselect mask: the
+    // handler runs, pselect returns EINTR, the caller's mask is restored
+    psel_got = 0;
+    struct sigaction sa = { .sa_handler = psel_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+
+        pid_t c = fork();
+        if (!c) {
+            usleep(50000);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+
+        int pp[2];
+        if (0 != pipe(pp)) _exit(10);
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pp[0], &rfds);
+        sigset_t empty;
+        sigemptyset(&empty);
+        struct timespec ts = { 5, 0 };
+        int r = pselect(pp[0] + 1, &rfds, NULL, NULL, &ts, &empty);
+        if (r != -1 || errno != EINTR) _exit(2);
+        if (!psel_got) _exit(3);
+        sigset_t cur;
+        sigprocmask(SIG_SETMASK, NULL, &cur);
+        if (!sigismember(&cur, SIGUSR1)) _exit(4);
+        int cs;
+        wait(&cs);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(PselectPendingBeforeCall) {
+    // The race pselect exists for: the signal is already pending (blocked)
+    // when pselect is entered with a mask that lets it through. It must be
+    // taken before any wait: EINTR at once, not a 5 s timeout.
+    psel_got = 0;
+    struct sigaction sa = { .sa_handler = psel_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+        raise(SIGUSR1);
+        if (psel_got) _exit(5);     // blocked: must not have run yet
+
+        int pp[2];
+        if (0 != pipe(pp)) _exit(10);
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pp[0], &rfds);
+        sigset_t empty;
+        sigemptyset(&empty);
+        struct timespec ts = { 5, 0 };
+        struct timeval t0, t1;
+        gettimeofday(&t0, NULL);
+        int r = pselect(pp[0] + 1, &rfds, NULL, NULL, &ts, &empty);
+        gettimeofday(&t1, NULL);
+        if (r != -1 || errno != EINTR) _exit(2);
+        if (!psel_got) _exit(3);
+        if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000 > 1000) _exit(6);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(PselectBlockedSignalDoesNotInterrupt) {
+    // A signal the pselect mask blocks must neither run its handler nor end
+    // the wait: the data arriving later is what returns. (The caller blocks
+    // it too, so a signal landing before pselect is entered is parked
+    // rather than handled; it is delivered once the caller unblocks.)
+    psel_got = 0;
+    struct sigaction sa = { .sa_handler = psel_handler };
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+
+        int pp[2];
+        if (0 != pipe(pp)) _exit(10);
+        pid_t c = fork();
+        if (!c) {
+            usleep(50000);
+            kill(getppid(), SIGUSR1);
+            usleep(150000);
+            write(pp[1], "x", 1);
+            _exit(0);
+        }
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pp[0], &rfds);
+        struct timespec ts = { 5, 0 };
+        int r = pselect(pp[0] + 1, &rfds, NULL, NULL, &ts, &block);
+        if (r != 1 || !FD_ISSET(pp[0], &rfds)) _exit(2);
+        if (psel_got) _exit(3);
+        // still blocked by the caller's mask, so still parked
+        sigset_t cur;
+        sigprocmask(SIG_SETMASK, NULL, &cur);
+        if (!sigismember(&cur, SIGUSR1)) _exit(4);
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+        if (!psel_got) _exit(5);
+        int cs;
+        wait(&cs);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+TEST(FDsShmOpen) {
+    // the object's descriptor is a task descriptor: fcntl, ftruncate, fstat,
+    // mmap and close all go through the task's table
+    char name[32];
+    snprintf(name, sizeof(name), "/tvm-test-%d", (int)getpid());
+    shm_unlink(name);
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_NEQ(-1, fcntl(fd, F_GETFD));
+    ASSERT_EQ(-1, shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600));
+    ASSERT_EQ(EEXIST, errno);
+    // a page: Darwin rounds the object's size up to one
+    long pg = sysconf(_SC_PAGESIZE);
+    ASSERT_EQ(0, ftruncate(fd, pg));
+    struct stat st;
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(pg, st.st_size);
+    char *m = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ASSERT_NEQ(m, MAP_FAILED);
+    memcpy(m, "shared", 7);
+    ASSERT_EQ(0, munmap(m, pg));
+    m = mmap(NULL, pg, PROT_READ, MAP_SHARED, fd, 0);
+    ASSERT_NEQ(m, MAP_FAILED);
+    ASSERT_EQ(0, strcmp(m, "shared"));
+    ASSERT_EQ(0, munmap(m, pg));
+    ASSERT_EQ(0, shm_unlink(name));
+    ASSERT_EQ(-1, shm_unlink(name));
+    ASSERT_EQ(ENOENT, errno);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(-1, fcntl(fd, F_GETFD));
+    ASSERT_EQ(EBADF, errno);
 }
 
 TEST(FDsFcntl) {
