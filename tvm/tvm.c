@@ -10173,6 +10173,19 @@ static void *ulinker_call(void *arg, void *addr) {
     return (void *)ret;
 }
 
+// Dependencies (ulinker.c): the task's environment for TVM_RPATH, and the
+// host's dlopen for the system libraries a guest image depends on. dlopen
+// is not interposed, so this is the host's; RTLD_GLOBAL makes the library's
+// symbols reachable for ulinker_external_dlsym's dlsym(RTLD_DEFAULT).
+static const char *ulinker_getenv(void *arg, const char *name) { VERIFY(arg == current); return getenv(name); }
+static void *ulinker_dlopen_host(void *arg, const char *name) {
+    void *h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+    if (!h)
+        INFO("dependency %s: %s", name, dlerror());
+    return h;
+}
+static int ulinker_dlclose_host(void *arg, void *handle) { return dlclose(handle); }
+
 static struct ulinker_ops ulinker_ops = {
     .uo_malloc = ulinker_malloc,
     .uo_free = ulinker_free,
@@ -10188,6 +10201,10 @@ static struct ulinker_ops ulinker_ops = {
     .uo_mprotect = ulinker_mprotect,
 
     .uo_call = ulinker_call,
+
+    .uo_getenv = ulinker_getenv,
+    .uo_dlopen = ulinker_dlopen_host,
+    .uo_dlclose = ulinker_dlclose_host,
 };
 
 static void *ulinker_external_dlsym(void *arg, const char *s, int emu)

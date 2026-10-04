@@ -17,18 +17,16 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_executable(tvm_exe main.c)
     set_target_properties(tvm_exe PROPERTIES OUTPUT_NAME tvm)
     target_link_libraries(tvm_exe PRIVATE tvm_static)
+    # Only what TVM itself uses: a guest's own dependencies (libz, libiconv,
+    # the frameworks curl's SecTrust verification uses, ...) are loaded by
+    # the ulinker through the host as the guest names them (ulinker.c,
+    # "Dependencies"). CoreFoundation stays on Darwin for the interposer
+    # of CFDictionaryApplyFunction, resolved at startup.
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_link_libraries(tvm_exe PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt)
+        target_link_libraries(tvm_exe PRIVATE unicorn pthread util m ${CMAKE_DL_LIBS})
         target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        # The ulinker resolves a guest's undefined symbols against what is
-        # already loaded in this process, so host libraries the tools need
-        # are linked here: z (dropbear/toybox) and the frameworks curl's
-        # Apple SecTrust verification uses. (No curses library: every
-        # terminal program links the static ncursesw of the build.)
-        target_link_libraries(tvm_exe PRIVATE unicorn z pthread m
-            "-framework Security" "-framework CoreFoundation"
-            "-framework SystemConfiguration")
+        target_link_libraries(tvm_exe PRIVATE unicorn pthread m "-framework CoreFoundation")
     endif()
 endif()
 
@@ -43,16 +41,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
         INSTALL_NAME_DIR "@rpath"
         C_VISIBILITY_PRESET default
     )
-    # Objects come from tvm_static via TARGET_OBJECTS; only link the deps.
-    # As for tvm_exe: the tool dylibs resolve their host symbols through
-    # this process, so curl's frameworks (Security/CoreFoundation, plus
-    # SystemConfiguration on macOS only, as in curl's own build) go here.
-    set(TVM_SHARED_LIBS unicorn z pthread m
-        "-framework Security" "-framework CoreFoundation")
-    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        list(APPEND TVM_SHARED_LIBS "-framework SystemConfiguration")
-    endif()
-    target_link_libraries(tvm_shared PRIVATE ${TVM_SHARED_LIBS})
+    # Objects come from tvm_static via TARGET_OBJECTS; only link the deps,
+    # as for tvm_exe: nothing on the tools' behalf.
+    target_link_libraries(tvm_shared PRIVATE unicorn pthread m "-framework CoreFoundation")
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 

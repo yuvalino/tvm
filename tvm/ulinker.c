@@ -1395,6 +1395,16 @@ struct dylib_command {
 };
 
 /*
+ * The rpath_command contains a path which at runtime should be added to
+ * the current run path used to find @rpath prefixed dylibs.
+ */
+struct rpath_command {
+	uint32_t	 cmd;		/* LC_RPATH */
+	uint32_t	 cmdsize;	/* includes string */
+	union lc_str path;		/* path to add to run path */
+};
+
+/*
  * The symtab_command contains the offsets and sizes of the link-edit 4.3BSD
  * "stab" style symbol table information as described in the header files
  * <nlist.h> and <stab.h>.
@@ -1899,6 +1909,10 @@ static int   mprotect_wrapper(void *arg, void *addr, size_t size, int flags)    
 
 static void *call_wrapper(void *arg, void *addr) { return ((void *(*)(void))addr)(); }
 
+static const char *getenv_wrapper(void *arg, const char *name) { return getenv(name); }
+static void *dlopen_wrapper(void *arg, const char *name)       { return dlopen(name, RTLD_NOW | RTLD_GLOBAL); }
+static int   dlclose_wrapper(void *arg, void *handle)          { return dlclose(handle); }
+
 static struct ulinker_ops uo = {
     .uo_malloc = malloc_wrapper,
     .uo_free = free_wrapper,
@@ -1914,6 +1928,10 @@ static struct ulinker_ops uo = {
     .uo_mprotect = mprotect_wrapper,
 
     .uo_call = call_wrapper,
+
+    .uo_getenv = getenv_wrapper,
+    .uo_dlopen = dlopen_wrapper,
+    .uo_dlclose = dlclose_wrapper,
 };
 
 /* ------------------- GDB JIT Interface ------------------- */
@@ -1999,6 +2017,9 @@ void gdb_jit_unregister(struct jit_code_entry *entry)
 
 /* -------------------- Linker Instance -------------------- */
 
+#define DLINFO_NAME_LEN 128
+#define DLINFO_PATH_LEN 4096
+
 struct ulinker {
     pthread_mutex_t  ul_dlinfo_mtx;
     struct dlinfo   *ul_dlinfo;
@@ -2010,6 +2031,10 @@ struct ulinker {
     // set by ulinker_duplicate while it reloads the parent's images for a
     // fork child (see load_library)
     int ul_duplicating;
+
+    // directory of the first image loaded, what @executable_path means to its
+    // dependencies
+    char ul_exec_dir[DLINFO_PATH_LEN];
 };
 
 #define DLINFO_LOCK(_ul)   pthread_mutex_lock(&(_ul)->ul_dlinfo_mtx)
@@ -2151,8 +2176,6 @@ enum {
     DLT_MACHO64
 };
 
-#define DLINFO_NAME_LEN 128
-#define DLINFO_PATH_LEN 4096
 struct dlinfo {
     struct dlinfo *dl_next;
     struct ulinker *dl_linker; // back pointer to owning linker
@@ -2169,6 +2192,14 @@ struct dlinfo {
     int dl_constructors_called;
     int dl_flags;  // flags as passed by dlopen()
     int dl_emu;  // != 0 means no PROT_EXEC mappings, made to run under emulator
+
+    // dependencies (see "Dependencies"): the images this one made the linker
+    // load, one reference each, and the host handles of its system libraries
+    struct dlinfo **dl_deps;
+    size_t         dl_ndeps;
+    void         **dl_hostdeps;
+    size_t         dl_nhostdeps;
+    int            dl_deps_loaded;
 };
 
 #define DLBASE(_ptr) ((struct dlinfo *)_ptr)
@@ -3930,12 +3961,15 @@ out:
     return ret;
 }
 
+static void release_dependencies(struct dlinfo *dl);
 static void free_library(struct dlinfo *dl)
 {
     if (dl->dl_type == DLT_EXTERNAL) {
         // external shouldn't ever be free'd (linked by multiple linkers)
         return;
     }
+
+    release_dependencies(dl);
 
     if (dl->dl_type == DLT_ELF64)
         free_elf64_library((struct dlinfo_elf64 *)dl);
@@ -4204,11 +4238,21 @@ static struct dlinfo *load_library_internal(struct ulinker *ulinker, const char 
     if (!dl)
         goto out;
 
+    // An image without a name of its own (no DT_SONAME, no LC_ID_DYLIB:
+    // every executable, a dylib built without -soname/-install_name) is
+    // known by its file name. Two such images used to compare equal below
+    // on their empty names, so a dependency of an executable was taken
+    // for the executable itself, freed, and its symbols were never found.
+    if (!dl->dl_name[0]) {
+        const char *base = strrchr(filename, '/');
+        strncpy(dl->dl_name, base ? base + 1 : filename, DLINFO_NAME_LEN - 1);
+    }
+
     // link library to linker loaded library list
     DLINFO_LOCK(ulinker);
     for (struct dlinfo *curr = ulinker->ul_dlinfo; curr != NULL; curr = curr->dl_next) {
         // some other thread managed to load this library before we did, abort
-        if (0 == strcmp(curr->dl_name, dl->dl_name)) {
+        if (curr->dl_type != DLT_EXTERNAL && 0 == strcmp(curr->dl_pathname, dl->dl_pathname)) {
             free_library(dl);
             dl = NULL;
 
@@ -4371,12 +4415,349 @@ static int macho64_fixups_in_writable_segments(struct dlinfo_macho64 *dl)
     return 1;
 }
 
+/* -------------------- Dependencies -------------------- */
+
+/*
+ * An image's dependencies -- the dylibs of its LC_LOAD_DYLIB,
+ * LC_LOAD_WEAK_DYLIB and LC_REEXPORT_DYLIB commands, the sonames of its
+ * DT_NEEDED entries -- are of two kinds here:
+ *
+ *  - a system library (Darwin: a path under /usr/lib or /System/Library;
+ *    ELF: a soname that no run path turns into a file) is the host's. It is
+ *    dlopen()ed through the host (uo_dlopen, RTLD_GLOBAL), which makes its
+ *    symbols reachable for the import resolution's host fallback
+ *    (lookup_symbol_external -> dlsym(RTLD_DEFAULT)); it is never mapped by
+ *    this linker. On iOS these libraries exist only in the dyld shared
+ *    cache, and loading a second libSystem next to the host's would be
+ *    wrong anywhere. libSystem itself is the host's by definition and is
+ *    skipped.
+ *  - anything else is an image of the program's own, loaded through this
+ *    linker like the program (same emulation flag), so a tool may ship as
+ *    an executable plus helper dylibs. "@rpath/NAME" is searched along the
+ *    image's LC_RPATH entries (ELF: DT_RUNPATH, else DT_RPATH; "@loader_path"
+ *    and "$ORIGIN" meaning the image's directory, "@executable_path" the
+ *    first image's) and then the directories of TVM_RPATH, the embedder's
+ *    run path (the Flutter apps' Frameworks directory, where the signed
+ *    tool dylibs live; see also tvm_resolve_image_ref in tvm.c);
+ *    "@loader_path/NAME" and "@executable_path/NAME" resolve directly, an
+ *    absolute path that is a file is taken as is.
+ *
+ * A dependency is loaded before its dependent is linked (its symbols take
+ * part in the dependent's import resolution, which looks every image up by
+ * name) and is placed in the linker's list right after the dependent, so
+ * the program's own symbols come first in RTLD_DEFAULT lookups, as with
+ * dyld. Dependencies of dependencies follow the same rules. The dependent
+ * holds one reference on each image it made the linker load and releases
+ * them when it is itself unloaded (ulinker_dlclose); the host handles are
+ * dlclose()d with it. ulinker_destroy frees every image regardless.
+ *
+ * A fork child's linker (ulinker_duplicate) reloads the parent's images in
+ * the parent's order, dependencies ahead of dependents, and does not resolve
+ * dependencies again: the images are all there, and the host libraries are
+ * the process's own. Its images therefore hold no references on each other;
+ * they are released with the linker.
+ */
+
+static int dep_is_system(const char *path)
+{
+    return 0 == strncmp(path, "/usr/lib/", 9) || 0 == strncmp(path, "/System/Library/", 16);
+}
+
+static int dep_is_libsystem(const char *path)
+{
+    return 0 == strcmp(path, "/usr/lib/libSystem.B.dylib");
+}
+
+static int dep_file_exists(struct ulinker *ulinker, const char *path)
+{
+    int fd = uo.uo_open(ulinker->ul_private, path);
+    if (fd == -1)
+        return 0;
+    uo.uo_close(ulinker->ul_private, fd);
+    return 1;
+}
+
+static void dep_dirname(const char *path, char *out, size_t outlen)
+{
+    const char *slash = strrchr(path, '/');
+    size_t n = slash ? (size_t)(slash - path) : 0;
+    if (n >= outlen)
+        n = outlen - 1;
+    memcpy(out, path, n);
+    out[n] = 0;
+    if (!n)
+        strncpy(out, ".", outlen);
+}
+
+// `dir` with its @loader_path / @executable_path / $ORIGIN prefix expanded
+// for `dl`, followed by `name`; 1 if the result is a file.
+static int dep_try_dir(struct ulinker *ulinker, struct dlinfo *dl, const char *dir, const char *name, char *out)
+{
+    char loader_dir[DLINFO_PATH_LEN];
+    dep_dirname(dl->dl_pathname, loader_dir, sizeof(loader_dir));
+    const char *exec_dir = ulinker->ul_exec_dir[0] ? ulinker->ul_exec_dir : loader_dir;
+
+    char expanded[DLINFO_PATH_LEN];
+    if (0 == strncmp(dir, "@loader_path", 12))
+        snprintf(expanded, sizeof(expanded), "%s%s", loader_dir, dir + 12);
+    else if (0 == strncmp(dir, "@executable_path", 16))
+        snprintf(expanded, sizeof(expanded), "%s%s", exec_dir, dir + 16);
+    else if (0 == strncmp(dir, "$ORIGIN", 7))
+        snprintf(expanded, sizeof(expanded), "%s%s", loader_dir, dir + 7);
+    else if (0 == strncmp(dir, "${ORIGIN}", 9))
+        snprintf(expanded, sizeof(expanded), "%s%s", loader_dir, dir + 9);
+    else
+        snprintf(expanded, sizeof(expanded), "%s", dir);
+
+    snprintf(out, DLINFO_PATH_LEN, "%s/%s", expanded, name);
+    return dep_file_exists(ulinker, out);
+}
+
+// `name` along the image's run paths (`rpaths`, a ':'-separated list for ELF
+// or one entry per call for Mach-O, see the callers) and then TVM_RPATH.
+static int dep_search(struct ulinker *ulinker, struct dlinfo *dl, const char *name,
+                      const char *const *rpaths, size_t nrpaths, char *out)
+{
+    for (size_t i = 0; i < nrpaths; i++) {
+        const char *p = rpaths[i];
+        while (*p) {
+            const char *end = strchr(p, ':');
+            size_t len = end ? (size_t)(end - p) : strlen(p);
+            if (len && len < DLINFO_PATH_LEN) {
+                char dir[DLINFO_PATH_LEN];
+                memcpy(dir, p, len);
+                dir[len] = 0;
+                if (dep_try_dir(ulinker, dl, dir, name, out))
+                    return 1;
+            }
+            p = end ? end + 1 : p + len;
+        }
+    }
+    const char *tvm_rpath = uo.uo_getenv ? uo.uo_getenv(ulinker->ul_private, "TVM_RPATH") : NULL;
+    if (tvm_rpath && *tvm_rpath) {
+        const char *one[1] = { tvm_rpath };
+        // TVM_RPATH holds plain directories, so a second round over it as a
+        // single ':'-list is exact
+        for (size_t i = 0; i < 1; i++) {
+            const char *p = one[i];
+            while (*p) {
+                const char *end = strchr(p, ':');
+                size_t len = end ? (size_t)(end - p) : strlen(p);
+                if (len && len < DLINFO_PATH_LEN) {
+                    char dir[DLINFO_PATH_LEN];
+                    memcpy(dir, p, len);
+                    dir[len] = 0;
+                    if (dep_try_dir(ulinker, dl, dir, name, out))
+                        return 1;
+                }
+                p = end ? end + 1 : p + len;
+            }
+        }
+    }
+    return 0;
+}
+
+static int dep_record(struct dlinfo *dl, struct dlinfo *dep)
+{
+    struct dlinfo **deps = uo.uo_realloc(DLPRIVATE(dl), dl->dl_deps, (dl->dl_ndeps + 1) * sizeof(*deps));
+    if (!deps)
+        return 1;
+    deps[dl->dl_ndeps++] = dep;
+    dl->dl_deps = deps;
+    return 0;
+}
+
+static int dep_record_host(struct dlinfo *dl, void *handle)
+{
+    void **deps = uo.uo_realloc(DLPRIVATE(dl), dl->dl_hostdeps, (dl->dl_nhostdeps + 1) * sizeof(*deps));
+    if (!deps)
+        return 1;
+    deps[dl->dl_nhostdeps++] = handle;
+    dl->dl_hostdeps = deps;
+    return 0;
+}
+
+static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename, int flags);
+
+// One dependency of `dl`, named `name` as the image names it; `rpaths` are
+// the image's run paths. Returns 0 when resolved (or weak and missing).
+static int load_dependency(struct ulinker *ulinker, struct dlinfo *dl, const char *name, int weak,
+                           const char *const *rpaths, size_t nrpaths)
+{
+    char path[DLINFO_PATH_LEN];
+    int is_file = 0;
+
+    if (dep_is_libsystem(name))
+        return 0;
+
+    if (0 == strncmp(name, "@rpath/", 7))
+        is_file = dep_search(ulinker, dl, name + 7, rpaths, nrpaths, path);
+    else if (0 == strncmp(name, "@loader_path/", 13))
+        is_file = dep_try_dir(ulinker, dl, "@loader_path", name + 13, path);
+    else if (0 == strncmp(name, "@executable_path/", 17))
+        is_file = dep_try_dir(ulinker, dl, "@executable_path", name + 17, path);
+    else if (name[0] == '/') {
+        snprintf(path, sizeof(path), "%s", name);
+        is_file = !dep_is_system(name) && dep_file_exists(ulinker, path);
+    }
+    else // an ELF soname: the run paths, else the host's library search
+        is_file = dep_search(ulinker, dl, name, rpaths, nrpaths, path);
+
+    if (is_file) {
+        struct dlinfo *dep = load_library(ulinker, path, dl->dl_flags);
+        if (!dep) {
+            if (weak)
+                return 0;
+            ERROR("failed to load \"%s\": dependency \"%s\" (%s) failed to load", dl->dl_pathname, name, path);
+            return 1;
+        }
+        if (dep_record(dl, dep)) {
+            ulinker_dlclose(dep);
+            ERROR("failed to load \"%s\": -%d (%s)", dl->dl_pathname, ENOMEM, strerror(ENOMEM));
+            return 1;
+        }
+        PRINT("%s depends on %s: loaded %s", dl->dl_pathname, name, path);
+        // right after the dependent: the program's own symbols first
+        DLINFO_LOCK(ulinker);
+        if (ulinker->ul_dlinfo == dep && dep != dl) {
+            ulinker->ul_dlinfo = dep->dl_next;
+            dep->dl_next = dl->dl_next;
+            dl->dl_next = dep;
+        }
+        DLINFO_UNLOCK(ulinker);
+        return 0;
+    }
+
+    // the host's
+    void *handle = uo.uo_dlopen ? uo.uo_dlopen(ulinker->ul_private, name) : NULL;
+    if (!handle) {
+        if (weak)
+            return 0;
+        ERROR("failed to load \"%s\": dependency \"%s\" not found", dl->dl_pathname, name);
+        return 1;
+    }
+    if (dep_record_host(dl, handle)) {
+        if (uo.uo_dlclose)
+            uo.uo_dlclose(ulinker->ul_private, handle);
+        ERROR("failed to load \"%s\": -%d (%s)", dl->dl_pathname, ENOMEM, strerror(ENOMEM));
+        return 1;
+    }
+    PRINT("%s depends on %s: the host's", dl->dl_pathname, name);
+    return 0;
+}
+
+static int load_dependencies_macho64(struct ulinker *ulinker, struct dlinfo_macho64 *dl)
+{
+    // the run paths first: an LC_RPATH may follow the LC_LOAD_DYLIBs
+    const char *rpaths[64];
+    size_t nrpaths = 0;
+    const struct load_command *lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_RPATH && nrpaths < sizeof(rpaths) / sizeof(rpaths[0])) {
+            const struct rpath_command *rc = (const struct rpath_command *)lc;
+            rpaths[nrpaths++] = (const char *)rc + rc->path.offset;
+        }
+    }
+    lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_LOAD_DYLIB && lc->cmd != LC_LOAD_WEAK_DYLIB && lc->cmd != LC_REEXPORT_DYLIB)
+            continue;
+        const struct dylib_command *dc = (const struct dylib_command *)lc;
+        const char *name = (const char *)dc + dc->dylib.name.offset;
+        if (load_dependency(ulinker, DLBASE(dl), name, lc->cmd == LC_LOAD_WEAK_DYLIB, rpaths, nrpaths))
+            return 1;
+    }
+    return 0;
+}
+
+static int load_dependencies_elf64(struct ulinker *ulinker, struct dlinfo_elf64 *dl)
+{
+    const Elf64_Phdr *dyn_phdr = elf64_find_phdr(dl, PT_DYNAMIC);
+    if (!dyn_phdr || !dl->dle64_strtab)
+        return 0;
+    const Elf64_Dyn *dyn = (Elf64_Dyn *)(dl->dle64_load_bias + dyn_phdr->p_vaddr);
+
+    // DT_RUNPATH takes precedence over DT_RPATH, as in ld.so
+    const char *runpath = NULL, *rpath = NULL;
+    for (const Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_RUNPATH)
+            runpath = string_elf64(dl, d->d_un.d_val);
+        else if (d->d_tag == DT_RPATH)
+            rpath = string_elf64(dl, d->d_un.d_val);
+    }
+    const char *rpaths[1] = { runpath ? runpath : rpath };
+    size_t nrpaths = rpaths[0] ? 1 : 0;
+
+    for (const Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag != DT_NEEDED)
+            continue;
+        const char *name = string_elf64(dl, d->d_un.d_val);
+        if (!name)
+            continue;
+        if (load_dependency(ulinker, DLBASE(dl), name, 0, rpaths, nrpaths))
+            return 1;
+    }
+    return 0;
+}
+
+static int load_dependencies(struct ulinker *ulinker, struct dlinfo *dl)
+{
+    if (dl->dl_type == DLT_MACHO64)
+        return load_dependencies_macho64(ulinker, (struct dlinfo_macho64 *)dl);
+    if (dl->dl_type == DLT_ELF64)
+        return load_dependencies_elf64(ulinker, (struct dlinfo_elf64 *)dl);
+    return 0;
+}
+
+// The dependent's references on the images it loaded (ulinker_dlclose path
+// only; ulinker_destroy frees every image itself).
+static void release_dependency_refs(struct dlinfo *dl)
+{
+    struct dlinfo **deps = dl->dl_deps;
+    size_t ndeps = dl->dl_ndeps;
+    dl->dl_deps = NULL;
+    dl->dl_ndeps = 0;
+    for (size_t i = 0; i < ndeps; i++)
+        ulinker_dlclose(deps[i]);
+    if (deps)
+        uo.uo_free(DLPRIVATE(dl), deps);
+}
+
+// The dependency bookkeeping of an image about to be freed (every path).
+static void release_dependencies(struct dlinfo *dl)
+{
+    for (size_t i = 0; i < dl->dl_nhostdeps; i++)
+        if (uo.uo_dlclose)
+            uo.uo_dlclose(DLPRIVATE(dl), dl->dl_hostdeps[i]);
+    if (dl->dl_hostdeps)
+        uo.uo_free(DLPRIVATE(dl), dl->dl_hostdeps);
+    dl->dl_hostdeps = NULL;
+    dl->dl_nhostdeps = 0;
+    if (dl->dl_deps)
+        uo.uo_free(DLPRIVATE(dl), dl->dl_deps);
+    dl->dl_deps = NULL;
+    dl->dl_ndeps = 0;
+}
+
 static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename, int flags) {
     struct dlinfo *ret = NULL;
     struct dlinfo *dl = NULL;
 
     if (!(dl = load_library_internal(ulinker, filename, flags)))
         goto out;
+
+    if (!ulinker->ul_exec_dir[0])
+        dep_dirname(dl->dl_pathname, ulinker->ul_exec_dir, sizeof(ulinker->ul_exec_dir));
+
+    // Dependencies, before the import resolution below (see "Dependencies";
+    // a fork child's linker gets the parent's images from ulinker_duplicate)
+    if (!dl->dl_deps_loaded && !ulinker->ul_duplicating) {
+        dl->dl_deps_loaded = 1;
+        if (load_dependencies(ulinker, dl)) {
+            ulinker_dlclose(dl);
+            return NULL;
+        }
+    }
 
     /*
      * Reloading a parent's image for a fork child (ulinker_duplicate): the
@@ -4572,6 +4953,8 @@ int ulinker_dlclose(void *handle)
 
     DLINFO_UNLOCK(ulinker);
 
+    ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, dl);
+    release_dependency_refs(dl);
     free_library(dl);
 
     return 0;
@@ -4649,13 +5032,23 @@ int ulinker_duplicate(struct ulinker *old, struct ulinker *new, void (*segment_c
 
     new->ul_cb_mmap = dup_mmap_cb;
     new->ul_duplicating = 1;
+    strncpy(new->ul_exec_dir, old->ul_exec_dir, sizeof(new->ul_exec_dir));
 
-    for (struct dlinfo *dl = old->ul_dlinfo; dl; dl = dl->dl_next) {
-        // end of linker-specific list
-        if (dl->dl_type == DLT_EXTERNAL) {
-            break;
-        }
+    // The list is newest first; reload oldest first so the child's list has
+    // the parent's order (every load prepends), dependencies ahead of their
+    // dependents (see "Dependencies").
+    size_t count = 0;
+    for (struct dlinfo *dl = old->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL; dl = dl->dl_next)
+        count++;
+    struct dlinfo **images = count ? uo.uo_malloc(new->ul_private, count * sizeof(*images)) : NULL;
+    if (count && !images)
+        goto out;
+    size_t n = count;
+    for (struct dlinfo *dl = old->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL; dl = dl->dl_next)
+        images[--n] = dl;
 
+    for (size_t i = 0; i < count; i++) {
+        struct dlinfo *dl = images[i];
         struct dup_arg dup_arg = {
             .arg = arg,
             .old_base = dl->dl_base,
@@ -4663,9 +5056,13 @@ int ulinker_duplicate(struct ulinker *old, struct ulinker *new, void (*segment_c
         };
 
         new->ul_cb_arg = (void *)&dup_arg;
-        if (!load_library(new, dl->dl_pathname, dl->dl_flags))
+        if (!load_library(new, dl->dl_pathname, dl->dl_flags)) {
+            uo.uo_free(new->ul_private, images);
             goto out;
+        }
     }
+    if (images)
+        uo.uo_free(new->ul_private, images);
 
     ret = 0;
 

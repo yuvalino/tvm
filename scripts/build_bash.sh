@@ -73,14 +73,13 @@ TVM_MAKE_CFLAGS="$TVM_CFLAGS -include $INCLUDE_SHIM/tvm_stdio_unlocked.h"
 #     unsupported. dlclose must go with them: enable.def compiles its
 #     dlclose/dlerror helpers under HAVE_DLCLOSE alone but only includes
 #     <dlfcn.h> under HAVE_DLOPEN && HAVE_DLSYM.
-#  am_cv_func_iconv=no: no libiconv dependency on any platform.
 CACHE_VARS="bash_cv_job_control_missing=present bash_cv_sys_named_pipes=present \
 bash_cv_dev_fd=absent bash_cv_dev_stdin=absent bash_cv_func_sigsetjmp=present \
 bash_cv_unusable_rtsigs=yes bash_cv_wcontinued_broken=no bash_cv_pgrp_pipe=no \
 bash_cv_must_reinstall_sighandlers=no bash_cv_getcwd_malloc=yes \
 bash_cv_ulimit_maxfds=no bash_cv_func_sbrk=no bash_cv_func_brk=no \
 ac_cv_func_dlopen=no ac_cv_func_dlsym=no \
-ac_cv_func_dlclose=no ac_cv_lib_dl_dlopen=no am_cv_func_iconv=no"
+ac_cv_func_dlclose=no ac_cv_lib_dl_dlopen=no"
 
 CROSS_FLAGS=""
 CC_FLAG=""

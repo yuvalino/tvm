@@ -79,7 +79,6 @@ if [ ! -f auto/config.mk ]; then
         --disable-smack \
         --with-tlib=ncursesw \
         --without-wayland \
-        ac_cv_header_iconv_h=no \
         vim_cv_terminfo=yes vim_cv_tgetent=zero \
         $EXTRA_FLAGS \
         $CROSS_FLAGS \

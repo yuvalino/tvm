@@ -49,6 +49,13 @@ struct ulinker_ops {
     int   (*uo_mprotect)(void *, void *, size_t, int);
 
     void *(*uo_call)(void *, void *);
+
+    // dependencies (ulinker.c, "Dependencies"): the environment the run-path
+    // search reads TVM_RPATH from, and the host's dlopen()/dlclose() for the
+    // system libraries an image depends on
+    const char *(*uo_getenv)(void *, const char *);
+    void *(*uo_dlopen)(void *, const char *);
+    int   (*uo_dlclose)(void *, void *);
 };
 
 struct ulinker_external_dlinfo_args {
