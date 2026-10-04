@@ -11091,9 +11091,18 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
         int nfd = fs->fs_nfd;
         int ret = 0, last_errno = errno;
         if (fs->fs_fp) {
-            if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
-                ret = EOF;
-                last_errno = errno;
+            // Flush through file_for_task_stream_locked(), which re-syncs the
+            // libc FILE's descriptor first: after dup2() over the stream's fd
+            // the FILE still names the previous host descriptor, by now closed
+            // or reused by another task, and the buffered output went there
+            // (printf("x"); dup2(fd, 1); fclose(stdout) left the file empty).
+            struct file *file = file_for_task_stream_locked(current, fs, FS_FILE);
+            if (file) {
+                if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                    ret = EOF;
+                    last_errno = errno;
+                }
+                file_unlock(file, 1);
             }
             fp_setfileno(fs->fs_fp, -1);
         }
