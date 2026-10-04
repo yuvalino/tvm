@@ -84,13 +84,24 @@ else()
     set(TVM_CC "cc")
 endif()
 
+# Launcher — tiny executable that execs a dylib via PATH
+set(LAUNCHER_SRC ${SCRIPTS_DIR}/launcher.c)
+function(add_launcher NAME)
+    add_custom_target(${NAME}_launcher
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${BIN_OUT}
+        COMMAND cc -o ${BIN_OUT}/${NAME}_launcher
+            ${LAUNCHER_SRC} -DTARGET=\\\"lib${NAME}.dylib\\\"
+        COMMENT "Building ${NAME} launcher"
+    )
+    set_target_properties(${NAME}_launcher PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endfunction()
+
 # add_shared_lib(<name> <exe-target> <exe-path>)
 # The Flutter apps load each tool as lib<name>.dylib from the app bundle's
 # Frameworks directory (an App Store bundle may not contain standalone
 # executables). <name>_shared converts the tool's own upstream executable,
 # built by <exe-target>, with scripts/exe2lib.py: same code, dylib metadata.
-# No tool is linked twice. The apps' initrd refers to the dylib by its
-# install name (scripts/CMakeLists.txt, image references).
+# No tool is linked twice.
 find_program(TVM_PYTHON3 python3 REQUIRED)
 function(add_shared_lib NAME EXE_TARGET EXE_PATH)
     add_custom_target(${NAME}_shared
@@ -186,6 +197,7 @@ add_custom_target(dropbear_exe DEPENDS dropbear_ext)
 set_target_properties(dropbear_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(dropbear dropbear_exe ${DROPBEAR_BUILD}/dropbearmulti)
+add_launcher(dropbear)
 
 ###############################################################################
 # sftp-server (standalone)
@@ -202,6 +214,7 @@ add_custom_target(sftpserver_ext
 set_target_properties(sftpserver_ext PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(sftpserver sftpserver_ext ${SFTPSERVER_EXE})
+add_launcher(sftpserver)
 
 
 ###############################################################################
@@ -229,6 +242,7 @@ add_custom_target(bash_exe DEPENDS bash_ext)
 set_target_properties(bash_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(bash bash_exe ${BASH_BUILD}/bash)
+add_launcher(bash)
 
 ###############################################################################
 # toybox
@@ -254,6 +268,7 @@ add_custom_target(toybox_exe DEPENDS toybox_ext)
 set_target_properties(toybox_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(toybox toybox_exe ${TOYBOX_BUILD}/toybox)
+add_launcher(toybox)
 
 # Host toybox — hermetic cpio tool for packing initrds. Built with the host
 # compiler (not TVM_CC) so it runs on the build machine even when the target
@@ -294,6 +309,7 @@ add_custom_target(vim_exe DEPENDS vim_ext)
 set_target_properties(vim_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(vim vim_exe ${VIM_BUILD}/vim)
+add_launcher(vim)
 
 ###############################################################################
 # openssl (static libssl/libcrypto for curl)
@@ -395,6 +411,7 @@ add_custom_target(curl_exe DEPENDS curl_ext)
 set_target_properties(curl_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(curl curl_exe ${CURL_BUILD}/src/curl)
+add_launcher(curl)
 
 ###############################################################################
 # less
@@ -421,6 +438,7 @@ add_custom_target(less_exe DEPENDS less_ext)
 set_target_properties(less_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(less less_exe ${LESS_BUILD}/src/less)
+add_launcher(less)
 
 ###############################################################################
 # nano
@@ -449,6 +467,7 @@ add_custom_target(nano_exe DEPENDS nano_ext)
 set_target_properties(nano_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(nano nano_exe ${NANO_BUILD}/build/src/nano)
+add_launcher(nano)
 
 ###############################################################################
 # sqlite3 (command-line shell)
@@ -478,6 +497,7 @@ add_custom_target(sqlite_exe DEPENDS sqlite_ext)
 set_target_properties(sqlite_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(sqlite sqlite_exe ${SQLITE_BUILD}/sqlite3)
+add_launcher(sqlite)
 
 ###############################################################################
 # git
@@ -510,3 +530,4 @@ add_custom_target(git_exe DEPENDS git_ext)
 set_target_properties(git_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(git git_exe ${GIT_BUILD}/git)
+add_launcher(git)
