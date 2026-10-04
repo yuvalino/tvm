@@ -1909,7 +1909,6 @@ static int   mprotect_wrapper(void *arg, void *addr, size_t size, int flags)    
 
 static void *call_wrapper(void *arg, void *addr) { return ((void *(*)(void))addr)(); }
 
-static const char *getenv_wrapper(void *arg, const char *name) { return getenv(name); }
 static void *dlopen_wrapper(void *arg, const char *name)       { return dlopen(name, RTLD_NOW | RTLD_GLOBAL); }
 static int   dlclose_wrapper(void *arg, void *handle)          { return dlclose(handle); }
 
@@ -1929,7 +1928,6 @@ static struct ulinker_ops uo = {
 
     .uo_call = call_wrapper,
 
-    .uo_getenv = getenv_wrapper,
     .uo_dlopen = dlopen_wrapper,
     .uo_dlclose = dlclose_wrapper,
 };
@@ -4436,9 +4434,7 @@ static int macho64_fixups_in_writable_segments(struct dlinfo_macho64 *dl)
  *    an executable plus helper dylibs. "@rpath/NAME" is searched along the
  *    image's LC_RPATH entries (ELF: DT_RUNPATH, else DT_RPATH; "@loader_path"
  *    and "$ORIGIN" meaning the image's directory, "@executable_path" the
- *    first image's) and then the directories of TVM_RPATH, the embedder's
- *    run path (the Flutter apps' Frameworks directory, where the signed
- *    tool dylibs live; see also tvm_resolve_image_ref in tvm.c);
+ *    first image's);
  *    "@loader_path/NAME" and "@executable_path/NAME" resolve directly, an
  *    absolute path that is a file is taken as is.
  *
@@ -4514,7 +4510,7 @@ static int dep_try_dir(struct ulinker *ulinker, struct dlinfo *dl, const char *d
 }
 
 // `name` along the image's run paths (`rpaths`, a ':'-separated list for ELF
-// or one entry per call for Mach-O, see the callers) and then TVM_RPATH.
+// or one entry per call for Mach-O, see the callers).
 static int dep_search(struct ulinker *ulinker, struct dlinfo *dl, const char *name,
                       const char *const *rpaths, size_t nrpaths, char *out)
 {
@@ -4531,27 +4527,6 @@ static int dep_search(struct ulinker *ulinker, struct dlinfo *dl, const char *na
                     return 1;
             }
             p = end ? end + 1 : p + len;
-        }
-    }
-    const char *tvm_rpath = uo.uo_getenv ? uo.uo_getenv(ulinker->ul_private, "TVM_RPATH") : NULL;
-    if (tvm_rpath && *tvm_rpath) {
-        const char *one[1] = { tvm_rpath };
-        // TVM_RPATH holds plain directories, so a second round over it as a
-        // single ':'-list is exact
-        for (size_t i = 0; i < 1; i++) {
-            const char *p = one[i];
-            while (*p) {
-                const char *end = strchr(p, ':');
-                size_t len = end ? (size_t)(end - p) : strlen(p);
-                if (len && len < DLINFO_PATH_LEN) {
-                    char dir[DLINFO_PATH_LEN];
-                    memcpy(dir, p, len);
-                    dir[len] = 0;
-                    if (dep_try_dir(ulinker, dl, dir, name, out))
-                        return 1;
-                }
-                p = end ? end + 1 : p + len;
-            }
         }
     }
     return 0;

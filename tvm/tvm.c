@@ -10172,11 +10172,10 @@ static void *ulinker_call(void *arg, void *addr) {
     return (void *)ret;
 }
 
-// Dependencies (ulinker.c): the task's environment for TVM_RPATH, and the
-// host's dlopen for the system libraries a guest image depends on. dlopen
+// Dependencies (ulinker.c): the host's dlopen for the system libraries a
+// guest image depends on. dlopen
 // is not interposed, so this is the host's; RTLD_GLOBAL makes the library's
 // symbols reachable for ulinker_external_dlsym's dlsym(RTLD_DEFAULT).
-static const char *ulinker_getenv(void *arg, const char *name) { VERIFY(arg == current); return getenv(name); }
 static void *ulinker_dlopen_host(void *arg, const char *name) {
     void *h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
     if (!h)
@@ -10201,7 +10200,6 @@ static struct ulinker_ops ulinker_ops = {
 
     .uo_call = ulinker_call,
 
-    .uo_getenv = ulinker_getenv,
     .uo_dlopen = ulinker_dlopen_host,
     .uo_dlclose = ulinker_dlclose_host,
 };
@@ -10401,84 +10399,12 @@ out:
 }
 #endif
 
-/*
- * Image references. The Flutter apps ship each tool as a signed
- * lib<tool>.dylib in the app bundle's Frameworks directory, outside the
- * initrd, at a location only known at run time -- so the initrd's
- * /tvm/bin/<tool> cannot be the image, nor a symlink to it. It is instead a
- * small executable text file whose only line is the image's install name,
- * "@rpath/lib<tool>.dylib" (scripts/CMakeLists.txt, mkinitrd_target): a
- * regular file, so PATH searches, stat() and the execute bit behave for
- * every program as for a real executable, and a symlink to it (sh -> bash,
- * the toybox applets, the git helpers) resolves inside the VFS as usual.
- * execve() resolves the reference the way dyld resolves an @rpath install
- * name: against the directories of TVM_RPATH (the embedder's; the app
- * bindings set it to the Frameworks directory), and runs the image found
- * there with the caller's argv unchanged, so argv[0] dispatch (sh, the
- * toybox applets, git-remote-https) and TVM_NOEMU matching on the image's
- * name work as before. This replaced per-tool launcher executables that
- * ran under the emulator just to execvp() the dylib's name through PATH.
- *
- * Returns 1 with the image's path in `out` when `path` is a reference, 0
- * when it is not one, -1 with errno set when it is one that resolves to
- * nothing.
- */
-#define TVM_IMAGE_REF_PREFIX "@rpath/"
-static int tvm_resolve_image_ref(const char *path, char *out)
-{
-    char line[PATH_MAX];
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return 0;
-    ssize_t n = read(fd, line, sizeof(line) - 1);
-    close(fd);
-    if (n < (ssize_t)sizeof(TVM_IMAGE_REF_PREFIX) ||
-        0 != memcmp(line, TVM_IMAGE_REF_PREFIX, sizeof(TVM_IMAGE_REF_PREFIX) - 1))
-        return 0;
-    line[n] = 0;
-    char *name = line + sizeof(TVM_IMAGE_REF_PREFIX) - 1;
-    name[strcspn(name, "\r\n")] = 0;
-    if (!*name || strchr(name, '/')) {
-        errno = ENOEXEC;
-        return -1;
-    }
-
-    const char *rpath = getenv("TVM_RPATH");
-    if (!rpath)
-        rpath = "";
-    while (*rpath) {
-        const char *end = strchr(rpath, ':');
-        size_t len = end ? (size_t)(end - rpath) : strlen(rpath);
-        if (len > 0 && len + 1 + strlen(name) < PATH_MAX) {
-            memcpy(out, rpath, len);
-            out[len] = '/';
-            strcpy(out + len + 1, name);
-            struct stat st;
-            if (0 == stat(out, &st) && S_ISREG(st.st_mode)) {
-                INFO("image reference %s -> %s", path, out);
-                return 1;
-            }
-        }
-        rpath = end ? end + 1 : rpath + strlen(rpath);
-    }
-    INFO("image reference %s: %s not found in TVM_RPATH", path, name);
-    errno = ENOENT;
-    return -1;
-}
-
 // True if `path` is an image TVM's linker can load: a thin 64-bit Mach-O,
-// or (Linux) an ELF that exports main, or an image reference to one. Fat
-// Mach-O binaries (the host's /bin/*, /usr/bin/* on macOS), shared-cache
-// stubs (iOS), host ELF executables (Linux) and anything else are not.
+// or (Linux) an ELF that exports main. Fat Mach-O binaries (the host's
+// /bin/*, /usr/bin/* on macOS), shared-cache stubs (iOS), host ELF
+// executables (Linux) and anything else are not.
 static int tvm_loadable_image(const char *path)
 {
-    char ref[PATH_MAX];
-    int r = tvm_resolve_image_ref(path, ref);
-    if (r < 0)
-        return 0;
-    if (r > 0)
-        path = ref;
-
     unsigned char magic[4] = {0};
     int fd = open(path, O_RDONLY);
     if (fd < 0)
@@ -16142,11 +16068,6 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         return -1;
     pathname = pathname_abs;
 
-    // The program's name for tsk_comm: what was asked for (or the script's
-    // interpreter), not the image an image reference resolved it to.
-    char exec_name[PATH_MAX];
-    snprintf(exec_name, sizeof(exec_name), "%s", pathname_abs);
-
     INFO("execve(\"%s\")", pathname);
 
     // since we zero out the callers here, this is a small snippet to get a quick stacktrace if crashes occur
@@ -16223,22 +16144,6 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         INFO("  failed(ENOEXEC)");
         errno = ENOEXEC;
         return -1;
-    }
-
-    // An image reference (see tvm_resolve_image_ref): run the image it
-    // names, with this argv.
-    if (n >= (ssize_t)sizeof(TVM_IMAGE_REF_PREFIX) - 1 &&
-        0 == memcmp(hdr, TVM_IMAGE_REF_PREFIX, sizeof(TVM_IMAGE_REF_PREFIX) - 1)) {
-        char ref[PATH_MAX];
-        int r = tvm_resolve_image_ref(pathname, ref);
-        if (r <= 0) {
-            if (r == 0)
-                errno = ENOEXEC;
-            INFO("  failed(image reference) errno=%d", errno);
-            return -1;
-        }
-        snprintf(pathname_abs, sizeof(pathname_abs), "%s", ref);
-        goto do_exec;
     }
 
     // A text file without a #! line: a kernel says ENOEXEC and lets the
@@ -16357,13 +16262,6 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
                 errno = ENOENT;
                 return -1;
             }
-        }
-        snprintf(exec_name, sizeof(exec_name), "%s", pathname_abs);
-        // The interpreter may be an image reference (the apps' /tvm/bin/sh)
-        {
-            char ref[PATH_MAX];
-            if (tvm_resolve_image_ref(pathname_abs, ref) > 0)
-                snprintf(pathname_abs, sizeof(pathname_abs), "%s", ref);
         }
         pathname = pathname_abs;
 
@@ -16499,9 +16397,9 @@ do_exec:
     if (current->tsk_threads_cnt != 1)
         panic("_exit tsk_threads_cnt");
 
-    const char *basename = (const char *)strrchr(exec_name, '/');
+    const char *basename = (const char *)strrchr(pathname, '/');
     if (!basename)
-        basename = exec_name;
+        basename = pathname;
     else
         basename++;
     task_lock(current);
