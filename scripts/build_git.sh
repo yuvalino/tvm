@@ -1,8 +1,7 @@
 #!/bin/sh
 # Build git for TVM (unpatched upstream, built in a shadow tree).
 #
-# usage: build_git.sh build <srcdir> <builddir> <curl-srcdir> <curl-builddir> <openssl-prefix>
-#        build_git.sh dylib <srcdir> <builddir> <curl-srcdir> <curl-builddir> <openssl-prefix> <output>
+# usage: build_git.sh <srcdir> <builddir> <curl-srcdir> <curl-builddir> <openssl-prefix>
 # env:   CC (the target compiler, e.g. ios-cc.sh when cross-compiling),
 #        TVM_IOS_CROSS=1 when building for iOS
 #
@@ -30,18 +29,16 @@
 # (ld -alias / objcopy --redefine-sym, as build_curl_tool.sh does for curl's
 # main) and third_party/git_main.c dispatches on argv[0]; the helper names
 # in the exec path are links to /tvm/bin/git (scripts/CMakeLists.txt).
-# `build` makes upstream's own git, git-remote-http and git-http-fetch too
+# The build makes upstream's own git, git-remote-http and git-http-fetch too
 # (the link that validates the object set) and then links the multi-call
-# `git` for the CLI initrd; `dylib` relinks the same inputs as libgit.dylib
-# (exporting main, from common-main.o) for the Flutter initrd.
+# `git` (the Flutter apps get it converted to libgit.dylib,
+# third_party/CMakeLists.txt).
 set -e
-MODE="$1"
-SRCDIR="$2"
-BUILDDIR="$3"
-CURL_SRC="$4"
-CURL_BUILD="$5"
-OPENSSL_PREFIX="$6"
-OUT="$7"
+SRCDIR="$1"
+BUILDDIR="$2"
+CURL_SRC="$3"
+CURL_BUILD="$4"
+OPENSSL_PREFIX="$5"
 CC="${CC:-cc}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -49,20 +46,10 @@ CONFIGS_DIR="$ROOT/third_party/configs"
 WRAP_SRC="$ROOT/third_party/git_main.c"
 INCLUDE_SHIM="$ROOT/third_party/include-shim"
 SHADOW="$BUILDDIR/src"
-if [ "$MODE" = build ]; then
-    . "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
-    tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$CONFIGS_DIR/git_config.mak" "$INCLUDE_SHIM/tvm_stdio_unlocked.h" \
-        "$ROOT/third_party/git_main.c" "$CURL_BUILD/lib/libcurl.a" "$OPENSSL_PREFIX/lib/libssl.a" "$OPENSSL_PREFIX/lib/libcrypto.a"
-fi
-TVMDIR="$BUILDDIR/tvm"   # renamed objects, wrapper, exported link line
-
-case "$MODE" in
-    build|dylib) ;;
-    *)
-        echo "usage: $0 build|dylib <srcdir> <builddir> <curl-srcdir> <curl-builddir> <openssl-prefix> [<output>]" >&2
-        exit 2
-        ;;
-esac
+. "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$CONFIGS_DIR/git_config.mak" "$INCLUDE_SHIM/tvm_stdio_unlocked.h" \
+    "$ROOT/third_party/git_main.c" "$CURL_BUILD/lib/libcurl.a" "$OPENSSL_PREFIX/lib/libssl.a" "$OPENSSL_PREFIX/lib/libcrypto.a"
+TVMDIR="$BUILDDIR/tvm"   # renamed objects, wrapper, exec-path name lists
 
 # The libcurl link line of the curl tool (build_curl_tool.sh): the static
 # libraries plus what they need from the system.
@@ -114,16 +101,6 @@ gitmake() {
 gitvar() {
     gitmake -s -f "$SHADOW/tvm_print.mk" "tvm-print-$1"
 }
-
-if [ "$MODE" = dylib ]; then
-    [ -f "$TVMDIR/link_libs" ] || { echo "error: $TVMDIR/link_libs not found (run build first)" >&2; exit 1; }
-    # Same flags as the other TVM tool dylibs (add_shared_lib), plus
-    # dead-stripping since three static libraries are folded in.
-    "$CC" -dynamiclib -fPIC -g -Wl,-dead_strip -o "$OUT" \
-        $(cat "$TVMDIR/link_objs") $(cat "$TVMDIR/link_libs") \
-        -install_name "$(basename "$OUT")"
-    exit 0
-fi
 
 # ── shadow tree ──
 if [ ! -f "$SHADOW/Makefile" ]; then
@@ -207,10 +184,7 @@ for l in $(gitvar LIBS); do
         *)  LIBS="$LIBS $SHADOW/$l" ;;
     esac
 done
-echo "$OBJS" > "$TVMDIR/link_objs"
-echo "$LIBS" > "$TVMDIR/link_libs"
-
-# The CLI initrd executable.
+# The executable.
 "$CC" -g -o "$BUILDDIR/git" $OBJS $LIBS
 
 # What the initrd links into the exec path (scripts/CMakeLists.txt):

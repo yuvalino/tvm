@@ -5,18 +5,17 @@
 # including the curlx helpers under __/lib/curlx/) and links its own `curl`
 # executable. TVM needs main() wrapped (see third_party/curl_main.c), so this
 # script renames curl's main to curl_tool_main in tool_main.c.o at link time
-# and relinks the objects with the wrapper, either as a static executable for
-# the CLI initrd or as a dylib exporting main for the Flutter initrd.
+# and relinks the objects with the wrapper into the `curl` executable (the
+# Flutter apps get it converted to libcurl.dylib, third_party/CMakeLists.txt).
 #
-# usage: build_curl_tool.sh exe|dylib <curl-build-dir> <openssl-prefix> <workdir> <output>
+# usage: build_curl_tool.sh <curl-build-dir> <openssl-prefix> <workdir> <output>
 # env:   CC (the target compiler, e.g. ios-cc.sh when cross-compiling),
 #        TVM_IOS_CROSS=1 when building for iOS
 set -e
-MODE="$1"
-CURL_BUILD="$2"
-OPENSSL_PREFIX="$3"
-WORKDIR="$4"
-OUT="$5"
+CURL_BUILD="$1"
+OPENSSL_PREFIX="$2"
+WORKDIR="$3"
+OUT="$4"
 CC="${CC:-cc}"
 
 WRAP_SRC="$(cd "$(dirname "$0")/.." && pwd)/third_party/curl_main.c"
@@ -53,20 +52,5 @@ esac
 OBJS="$(find "$OBJDIR" -name '*.o' ! -name 'tool_main.c.o' | sort)"
 STATIC="$CURL_BUILD/lib/libcurl.a $OPENSSL_PREFIX/lib/libssl.a $OPENSSL_PREFIX/lib/libcrypto.a"
 
-case "$MODE" in
-    exe)
-        "$CC" -g -o "$OUT" \
-            "$WORKDIR/curl_main.o" "$WORKDIR/tool_main_wrapped.o" $OBJS $STATIC $LIBS
-        ;;
-    dylib)
-        # Same flags as the other TVM tool dylibs (add_shared_lib), plus
-        # dead-stripping since three static libraries are folded in.
-        "$CC" -dynamiclib -fPIC -g -Wl,-dead_strip -o "$OUT" \
-            "$WORKDIR/curl_main.o" "$WORKDIR/tool_main_wrapped.o" $OBJS $STATIC $LIBS \
-            -install_name "$(basename "$OUT")"
-        ;;
-    *)
-        echo "usage: $0 exe|dylib <curl-build-dir> <openssl-prefix> <workdir> <output>" >&2
-        exit 2
-        ;;
-esac
+"$CC" -g -o "$OUT" \
+    "$WORKDIR/curl_main.o" "$WORKDIR/tool_main_wrapped.o" $OBJS $STATIC $LIBS

@@ -96,15 +96,19 @@ function(add_launcher NAME)
     set_target_properties(${NAME}_launcher PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endfunction()
 
-# Helper to add a _shared target that links .o files into a dylib
-function(add_shared_lib NAME OBJGLOB)
-    set(BUILDDIR ${THIRDPARTY_BUILD}/${NAME})
-    set(LIBS "${ARGN}")
-    string(REPLACE ";" " " LIBS_STR "${LIBS}")
+# add_shared_lib(<name> <exe-target> <exe-path>)
+# The Flutter apps load each tool as lib<name>.dylib from the app bundle's
+# Frameworks directory (an App Store bundle may not contain standalone
+# executables). <name>_shared converts the tool's own upstream executable,
+# built by <exe-target>, with scripts/exe2lib.py: same code, dylib metadata.
+# No tool is linked twice.
+find_program(TVM_PYTHON3 python3 REQUIRED)
+function(add_shared_lib NAME EXE_TARGET EXE_PATH)
     add_custom_target(${NAME}_shared
-        COMMAND sh -c "${TVM_CC} -dynamiclib -fPIC -g -o ${LIB_OUT}/lib${NAME}.dylib ${BUILDDIR}/${OBJGLOB} ${LIBS_STR} -install_name lib${NAME}.dylib"
-        DEPENDS ${NAME}_ext
-        COMMENT "Linking ${NAME} (shared)"
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}
+        COMMAND ${TVM_PYTHON3} ${SCRIPTS_DIR}/exe2lib.py ${EXE_PATH} ${LIB_OUT}/lib${NAME}.dylib
+        DEPENDS ${EXE_TARGET} ${SCRIPTS_DIR}/exe2lib.py
+        COMMENT "Converting ${NAME} to lib${NAME}.dylib"
     )
     set_target_properties(${NAME}_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endfunction()
@@ -154,10 +158,7 @@ ExternalProject_Add(dropbear_ext
 add_custom_target(dropbear_exe DEPENDS dropbear_ext)
 set_target_properties(dropbear_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(dropbear "obj/*.o"
-    ${DROPBEAR_BUILD}/libtomcrypt/libtomcrypt.a
-    ${DROPBEAR_BUILD}/libtommath/libtommath.a -lz
-)
+add_shared_lib(dropbear dropbear_exe ${DROPBEAR_BUILD}/dropbearmulti)
 add_launcher(dropbear)
 
 ###############################################################################
@@ -174,13 +175,7 @@ add_custom_target(sftpserver_ext
 )
 set_target_properties(sftpserver_ext PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_custom_target(sftpserver_shared
-    COMMAND ${TVM_CC} -dynamiclib -fPIC -g -o ${LIB_OUT}/libsftpserver.dylib
-        ${SFTPSERVER_OBJ} -install_name libsftpserver.dylib
-    DEPENDS sftpserver_ext
-    COMMENT "Linking sftp-server (shared)"
-)
-set_target_properties(sftpserver_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_shared_lib(sftpserver sftpserver_ext ${SFTPSERVER_EXE})
 
 add_launcher(sftpserver)
 
@@ -189,28 +184,10 @@ add_launcher(sftpserver)
 #
 # Unpatched GNU bash, autotools out-of-tree build driven by
 # scripts/build_bash.sh (configure cache vars + -D overrides on CFLAGS, no
-# source patches). The exe is bash's own `bash`; the Flutter dylib relinks the
-# objects of bash's link line (exported to objects/ by the script) with its
-# static sub-libraries in bash's own order.
+# source patches). The exe is bash's own `bash`, converted for the Flutter
+# apps by add_shared_lib.
 ###############################################################################
 set(BASH_BUILD ${THIRDPARTY_BUILD}/bash)
-
-# Termcap: ncurses via the SDK's libtermcap.tbd on macOS, bash's bundled GNU
-# termcap on iOS (no terminfo database on the device; see build_bash.sh).
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(BASH_TERMCAP_LIB ${BASH_BUILD}/lib/termcap/libtermcap.a)
-else()
-    set(BASH_TERMCAP_LIB -ltermcap)
-endif()
-set(BASH_LINK_LIBS
-    ${BASH_BUILD}/builtins/libbuiltins.a
-    ${BASH_BUILD}/lib/glob/libglob.a
-    ${BASH_BUILD}/lib/sh/libsh.a
-    ${BASH_BUILD}/lib/readline/libreadline.a
-    ${BASH_BUILD}/lib/readline/libhistory.a
-    ${BASH_TERMCAP_LIB}
-    ${BASH_BUILD}/lib/tilde/libtilde.a
-)
 
 ExternalProject_Add(bash_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/bash
@@ -225,27 +202,13 @@ tvm_ext_inputs(bash_ext ${SCRIPTS_DIR}/build_bash.sh SUBMODULE:third_party/bash
 add_custom_target(bash_exe DEPENDS bash_ext)
 set_target_properties(bash_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(bash "objects/*.o" ${BASH_LINK_LIBS})
+add_shared_lib(bash bash_exe ${BASH_BUILD}/bash)
 add_launcher(bash)
 
 ###############################################################################
 # toybox
 ###############################################################################
 set(TOYBOX_BUILD ${THIRDPARTY_BUILD}/toybox)
-
-set(TOYBOX_LINK_LIBS -lm -lz)
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    # iOS: no openssl/crypt/util/resolv
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    execute_process(COMMAND brew --prefix openssl
-        OUTPUT_VARIABLE OPENSSL_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(NOT OPENSSL_PREFIX)
-        set(OPENSSL_PREFIX /opt/homebrew/opt/openssl)
-    endif()
-    list(APPEND TOYBOX_LINK_LIBS -lcrypto -lresolv -lssl -L${OPENSSL_PREFIX}/lib)
-else()
-    list(APPEND TOYBOX_LINK_LIBS -lcrypto -lresolv -lssl -lcrypt -lutil)
-endif()
 
 ExternalProject_Add(toybox_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/toybox
@@ -265,7 +228,7 @@ tvm_ext_inputs(toybox_ext SUBMODULE:third_party/toybox ${CMAKE_CURRENT_SOURCE_DI
 add_custom_target(toybox_exe DEPENDS toybox_ext)
 set_target_properties(toybox_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(toybox "generated/obj/*.o" ${TOYBOX_LINK_LIBS})
+add_shared_lib(toybox toybox_exe ${TOYBOX_BUILD}/toybox)
 add_launcher(toybox)
 
 # Host toybox — hermetic cpio tool for packing initrds. Built with the host
@@ -290,13 +253,13 @@ tvm_ext_inputs(toybox_host_ext SUBMODULE:third_party/toybox)
 set(VIM_BUILD ${THIRDPARTY_BUILD}/vim)
 set(STUBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../stubs)
 
-set(VIM_LINK_LIBS -lm)
+# iOS: no terminfo database on the device, and the SDK's libncurses faults in
+# tputs() without one, so vim links stub termcap functions instead (vim then
+# uses its builtin terminal descriptions; see stubs/termcap_stubs.c).
 set(VIM_BUILD_ENV "")
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    list(APPEND VIM_LINK_LIBS ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libtermcap_stubs.a)
-    set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" "TVM_STUBS_DIR=${STUBS_DIR}" ${TVM_CROSS_ENV})
-else()
-    list(APPEND VIM_LINK_LIBS -lncurses)
+    set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" "TVM_STUBS_DIR=${STUBS_DIR}"
+        "TVM_STUBS_LIB=${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libtermcap_stubs.a" ${TVM_CROSS_ENV})
 endif()
 
 ExternalProject_Add(vim_ext
@@ -307,13 +270,13 @@ ExternalProject_Add(vim_ext
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_dependencies(vim_ext termcap_stubs)
+endif()
 add_custom_target(vim_exe DEPENDS vim_ext)
 set_target_properties(vim_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(vim "objects/*.o" ${VIM_LINK_LIBS})
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    add_dependencies(vim_shared termcap_stubs)
-endif()
+add_shared_lib(vim vim_exe ${VIM_BUILD}/vim)
 add_launcher(vim)
 
 ###############################################################################
@@ -410,20 +373,13 @@ ExternalProject_Add(curl_ext
 
 add_custom_target(curl_exe
     COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_curl_tool.sh
-        exe ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${CURL_TOOL_BUILD} ${CURL_TOOL_BUILD}/curl
+        ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${CURL_TOOL_BUILD} ${CURL_TOOL_BUILD}/curl
     DEPENDS curl_ext
     COMMENT "Linking curl (TVM main wrapper)"
 )
 set_target_properties(curl_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_custom_target(curl_shared
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}
-    COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_curl_tool.sh
-        dylib ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${CURL_TOOL_BUILD} ${LIB_OUT}/libcurl.dylib
-    DEPENDS curl_ext
-    COMMENT "Linking curl (shared)"
-)
-set_target_properties(curl_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_shared_lib(curl curl_exe ${CURL_TOOL_BUILD}/curl)
 add_launcher(curl)
 
 ###############################################################################
@@ -487,7 +443,7 @@ tvm_ext_inputs(less_ext SUBMODULE:third_party/less ${CMAKE_CURRENT_SOURCE_DIR}/i
 add_custom_target(less_exe DEPENDS less_ext)
 set_target_properties(less_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(less "objects/*.o" ${NCURSES_LIB})
+add_shared_lib(less less_exe ${LESS_BUILD}/src/less)
 add_launcher(less)
 
 ###############################################################################
@@ -496,8 +452,7 @@ add_launcher(less)
 # Unpatched GNU nano built from git: gnulib import (third_party/gnulib, the
 # commit nano's autogen.sh pins) and autoreconf in a shadow tree, out-of-tree
 # configure and make (scripts/build_nano.sh), linked against the static
-# ncursesw above. The exe is nano's own `nano`; the Flutter dylib relinks
-# nano's objects (src/ holds nothing else) with gnulib's libgnu.a.
+# ncursesw above. The exe is nano's own `nano`.
 ###############################################################################
 set(NANO_BUILD ${THIRDPARTY_BUILD}/nano)
 
@@ -516,7 +471,7 @@ tvm_ext_inputs(nano_ext SUBMODULE:third_party/nano SUBMODULE:third_party/gnulib
 add_custom_target(nano_exe DEPENDS nano_ext)
 set_target_properties(nano_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(nano "build/src/*.o" ${NANO_BUILD}/build/lib/libgnu.a ${NCURSES_LIB})
+add_shared_lib(nano nano_exe ${NANO_BUILD}/build/src/nano)
 add_launcher(nano)
 
 ###############################################################################
@@ -526,9 +481,9 @@ add_launcher(nano)
 # own configure/make in gen/ with the host compiler and its in-tree JimTCL,
 # then compiled for the target with an explicit define set together with
 # linenoise (third_party/linenoise) for line editing -- scripts/build_sqlite.sh
-# documents every flag. The exe is `sqlite3`; the Flutter dylib relinks the
-# three objects. The target/dylib is named `sqlite` (libsqlite.dylib) rather
-# than libsqlite3.dylib, the name of the system library on macOS and iOS.
+# documents every flag. The exe is `sqlite3`. The target/dylib is named
+# `sqlite` (libsqlite.dylib) rather than libsqlite3.dylib, the name of the
+# system library on macOS and iOS.
 ###############################################################################
 set(SQLITE_BUILD ${THIRDPARTY_BUILD}/sqlite)
 
@@ -546,7 +501,7 @@ tvm_ext_inputs(sqlite_ext SUBMODULE:third_party/sqlite SUBMODULE:third_party/lin
 add_custom_target(sqlite_exe DEPENDS sqlite_ext)
 set_target_properties(sqlite_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(sqlite "objects/*.o" -lm -lz)
+add_shared_lib(sqlite sqlite_exe ${SQLITE_BUILD}/sqlite3)
 add_launcher(sqlite)
 
 ###############################################################################
@@ -557,11 +512,9 @@ add_launcher(sqlite)
 # the static libcurl/OpenSSL of the curl tool above. One multi-call image
 # (third_party/git_main.c dispatches on argv[0]) serves git and the helpers
 # git execs from its exec path (git-remote-https, git-http-fetch): the exe
-# `git` for the CLI initrd, libgit.dylib for the Flutter initrd, with the
-# helper names linked to /tvm/bin/git in /tvm/libexec/git-core by
-# scripts/CMakeLists.txt. The script relinks the dylib itself (mode `dylib`,
-# as build_curl_tool.sh does) because the link line is git's own, exported by
-# the build step, rather than an object glob.
+# `git` (converted to libgit.dylib for the Flutter apps), with the helper
+# names linked to /tvm/bin/git in /tvm/libexec/git-core by
+# scripts/CMakeLists.txt.
 ###############################################################################
 set(GIT_BUILD ${THIRDPARTY_BUILD}/git)
 
@@ -570,7 +523,7 @@ ExternalProject_Add(git_ext
     BINARY_DIR ${GIT_BUILD}
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_git.sh
-        build ${THIRDPARTY_SRC}/git ${GIT_BUILD} ${THIRDPARTY_SRC}/curl ${CURL_BUILD} ${TVM_OPENSSL_PREFIX}
+        ${THIRDPARTY_SRC}/git ${GIT_BUILD} ${THIRDPARTY_SRC}/curl ${CURL_BUILD} ${TVM_OPENSSL_PREFIX}
     INSTALL_COMMAND ""
     DEPENDS curl_ext
     EXCLUDE_FROM_ALL TRUE
@@ -581,12 +534,5 @@ tvm_ext_inputs(git_ext SUBMODULE:third_party/git ${CMAKE_CURRENT_SOURCE_DIR}/inc
 add_custom_target(git_exe DEPENDS git_ext)
 set_target_properties(git_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_custom_target(git_shared
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}
-    COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_git.sh
-        dylib ${THIRDPARTY_SRC}/git ${GIT_BUILD} ${THIRDPARTY_SRC}/curl ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${LIB_OUT}/libgit.dylib
-    DEPENDS git_ext
-    COMMENT "Linking git (shared)"
-)
-set_target_properties(git_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_shared_lib(git git_exe ${GIT_BUILD}/git)
 add_launcher(git)
