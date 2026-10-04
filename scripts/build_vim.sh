@@ -64,4 +64,18 @@ if [ ! -f auto/config.mk ]; then
         $CC_FLAG \
         CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA"
 fi
-make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA" MAKEOVERRIDES=
+# iOS: link the termcap stubs (TVM_STUBS_LIB, third_party/CMakeLists.txt)
+# instead of the SDK's libncurses that configure found; vim's own builtin
+# terminal descriptions do the work. LIBS on the command line overrides
+# auto/config.mk; make does not relink when only LIBS changes, so drop the
+# old binary.
+if [ -n "$TVM_STUBS_LIB" ]; then
+    rm -f vim
+    make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA" LIBS="-lm $TVM_STUBS_LIB" MAKEOVERRIDES=
+    if otool -L vim | grep -q ncurses; then
+        echo "error: vim still links libncurses" >&2
+        exit 1
+    fi
+else
+    make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA" MAKEOVERRIDES=
+fi

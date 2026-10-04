@@ -20,9 +20,8 @@
 #
 #  2. Target compile. sqlite3.c, shell.c and linenoise.c are compiled with
 #     $CC and an explicit, platform-independent define set (see TVM_DEFS),
-#     linked as the `sqlite3` executable for the CLI initrd, and left in
-#     $BUILDDIR/objects/ for the libsqlite.dylib relink (third_party/
-#     CMakeLists.txt, add_shared_lib). shell.c's main() is the dylib's main.
+#     linked as the `sqlite3` executable (converted to libsqlite.dylib for
+#     the Flutter apps by third_party/CMakeLists.txt, add_shared_lib).
 #
 # Line editing is linenoise (third_party/linenoise, BSD-2), compiled in as a
 # third object: the shell's own fallback is fgets() with no editing or
@@ -111,8 +110,7 @@ mkdir -p "$OBJ"
 "$CC" $SHELL_CFLAGS $TVM_DEFS -I"$GEN" -I"$LINENOISE" -c "$GEN/shell.c" -o "$OBJ/shell.o"
 "$CC" $TVM_CFLAGS -c "$LINENOISE/linenoise.c" -o "$OBJ/linenoise.o"
 
-# Build-time assertions: no extension loading and nothing that needs dlopen
-# (the object files are the same for the exe and the dylib).
+# Build-time assertions: no extension loading and nothing that needs dlopen.
 if nm "$OBJ/sqlite3.o" | grep -Eq ' T _?sqlite3_load_extension$'; then
     echo "error: sqlite3 was built with extension loading (SQLITE_OMIT_LOAD_EXTENSION missing)" >&2
     exit 1
@@ -122,7 +120,6 @@ if nm -u "$OBJ"/*.o | grep -Eq '(^| )_?dlopen$'; then
     exit 1
 fi
 
-# The CLI initrd executable. -lm for the math functions, -lz for the
-# archive/zipfile code; the Flutter dylib gets the same libraries from
-# add_shared_lib.
+# The executable. -lm for the math functions, -lz for the archive/zipfile
+# code.
 "$CC" -g -o "$BUILDDIR/sqlite3" "$OBJ"/*.o -lm -lz

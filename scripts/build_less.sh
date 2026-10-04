@@ -15,11 +15,7 @@
 # terminfo database shipped in the initrd (/tvm/share/terminfo). The same
 # library and database serve nano, on macOS and iOS alike, so less does not
 # depend on the host's terminfo (absent on iOS) or on bash's termcap file.
-#
-# After `make less`, the objects of less's own link line are exported to
-# $BUILDDIR/objects/ so third_party/CMakeLists.txt can relink them as
-# libless.dylib for the Flutter initrd (lesskey.o and lessecho.o each have a
-# main() of their own, so a *.o glob cannot be used).
+
 set -e
 SRCDIR="$1"
 BUILDDIR="$2"
@@ -88,12 +84,3 @@ if ! grep -q '^LIBS = .*-lncursesw' Makefile; then
     echo "error: less was not configured against libncursesw" >&2
     exit 1
 fi
-
-# Export the link inputs for the libless.dylib relink.
-printf 'include Makefile\ntvm-print-objects:\n\t@echo $(OBJ)\n' > tvm_link.mk
-OBJECTS="$(make -s -f tvm_link.mk tvm-print-objects)"
-rm -rf "$BUILDDIR/objects"
-mkdir -p "$BUILDDIR/objects"
-for o in $OBJECTS; do
-    ln -sf "$SHADOW/$o" "$BUILDDIR/objects/$o"
-done

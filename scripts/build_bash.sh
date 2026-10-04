@@ -6,10 +6,8 @@
 #        TVM_IOS_CROSS=1 when building for iOS
 #
 # Everything TVM-specific is a configure cache variable or a -D on CFLAGS;
-# bash's sources are not touched. After `make`, the exact objects of bash's
-# own link line are exported to $BUILDDIR/objects/ so third_party/CMakeLists.txt
-# can relink them (with bash's static sub-libraries) as libbash.dylib for the
-# Flutter initrd.
+# bash's sources are not touched. The Flutter apps get the same `bash`,
+# converted to libbash.dylib (third_party/CMakeLists.txt, add_shared_lib).
 set -e
 SRCDIR="$1"
 BUILDDIR="$2"
@@ -112,15 +110,14 @@ if [ -n "$TVM_IOS_CROSS" ]; then
     # faults (SIGBUS in tputs from _rl_cr, seen as "crash in signal handler"
     # panics on pan1c). Use the GNU termcap bundled with bash instead and
     # point it at a termcap file shipped in the initrd (TERMCAP_FILE is
-    # lib/termcap/termcap.c's #ifndef'd default, /etc/termcap). The dylib link
-    # in third_party/CMakeLists.txt mirrors this with lib/termcap/libtermcap.a.
+    # lib/termcap/termcap.c's #ifndef'd default, /etc/termcap).
     CROSS_FLAGS="$CROSS_FLAGS bash_cv_termcap_lib=gnutermcap"
     TVM_CFLAGS="$TVM_CFLAGS -DTERMCAP_FILE=\\\"/tvm/etc/termcap\\\""
     TVM_MAKE_CFLAGS="$TVM_MAKE_CFLAGS -DTERMCAP_FILE=\\\"/tvm/etc/termcap\\\""
 else
     case "$(uname)" in
         # macOS: the SDK's libtermcap.tbd (-> libncurses.5.4.dylib) with the
-        # host terminfo database; pinned so the dylib link can list -ltermcap.
+        # host terminfo database.
         Darwin) CROSS_FLAGS="$CROSS_FLAGS bash_cv_termcap_lib=libtermcap" ;;
     esac
 fi
@@ -155,15 +152,3 @@ if strings bash | grep -q '^/etc/profile$'; then
     echo "error: bash still contains the host /etc/profile path" >&2
     exit 1
 fi
-
-# Export bash's own link inputs for the libbash.dylib relink: the top-level
-# directory also holds host-built helper objects (mksignames.o, buildversion.o,
-# buildsignames.o — each with a main(), and built with CC_FOR_BUILD when
-# cross-compiling), so a *.o glob cannot be used. Ask the Makefile instead.
-printf 'include Makefile\ntvm-print-objects:\n\t@echo $(OBJECTS)\n' > tvm_link.mk
-OBJECTS="$(make -s -f tvm_link.mk tvm-print-objects)"
-rm -rf objects
-mkdir -p objects
-for o in $OBJECTS; do
-    ln -sf "$BUILDDIR/$o" "objects/$o"
-done
