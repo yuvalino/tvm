@@ -29,11 +29,11 @@ sysconfdir = /tvm/etc
 # and the script #! lines; SHELL_PATH_CQ_SQ: the compiled-in SHELL_PATH).
 
 # ── Dependencies ──
-# A TVM image may depend on libSystem only. libiconv is a separate dylib on
-# iOS (NO_ICONV), and there is no gettext, expat (drops git-http-push, the
-# WebDAV push helper -- smart HTTP push does not need it) or pcre. Perl,
-# Python and Tcl/Tk programs are not shipped.
-NO_ICONV = 1
+# A TVM image may depend on the SDK's own libraries (TVM's ulinker loads
+# them through the host: libiconv is such a dylib on macOS and iOS, part of
+# libc on Linux), and on nothing from Homebrew. There is no gettext, expat
+# (drops git-http-push, the WebDAV push helper -- smart HTTP push does not
+# need it) or pcre. Perl, Python and Tcl/Tk programs are not shipped.
 NO_GETTEXT = 1
 NO_EXPAT = 1
 NO_PERL = 1
@@ -53,11 +53,6 @@ NO_HOMEBREW = 1
 NO_OPENSSL = 1
 
 # ── Darwin defaults that do not fit ──
-# compat/precompose_utf8.c (NFD -> NFC file name handling for HFS+) calls
-# iconv itself, so it cannot be built with NO_ICONV. Drop the object and the
-# define that enables its callers.
-COMPAT_OBJS := $(filter-out compat/precompose_utf8.o,$(COMPAT_OBJS))
-BASIC_CFLAGS := $(filter-out -DPRECOMPOSE_UNICODE,$(BASIC_CFLAGS))
 # The builtin fsmonitor daemon listens through FSEvents (CoreServices), which
 # the iPhoneOS SDK does not have, and a resident daemon behind a unix socket
 # has no place inside the VM anyway. Without a backend `git fsmonitor--daemon`

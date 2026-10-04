@@ -4,5 +4,4 @@
 - ulinker support dSYM (Mach-O)
 - ulinker support TLS iOS
 - ulinker support Android
-- ulinker support dependencies
 - call matrix

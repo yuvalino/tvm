@@ -509,6 +509,41 @@ def test_toybox_xargs(sshi: spawn):
     sshi.expect("/tvm/bin/sh")
     sshi.expect(r"\$ ")
 
+# ── Dependent images ─────────────────────────────────────────
+
+def test_exec_dependent_dylib(sshi: spawn, backend):
+    """An executable that depends on a dylib of its own (@rpath/libtvmdep.dylib
+    with an @loader_path run path; $ORIGIN on Linux), both built here on the
+    host: the ulinker loads the dependency through TVM and resolves the
+    executable's imports in it (ulinker.c, "Dependencies"). CLI backend only:
+    the apps' sandbox cannot see files built on the host."""
+    if backend != "tvm":
+        pytest.skip("needs the host filesystem")
+    d = tempfile.mkdtemp(prefix="tvmdep_", dir="/tmp")
+    with open(f"{d}/dep.c", "w") as f:
+        f.write('const char *tvmdep_greeting(void) { return "hello from the dependency"; }\n')
+    # the child of a fork() runs on a duplicated linker, dependency included
+    with open(f"{d}/main.c", "w") as f:
+        f.write('#include <stdio.h>\n#include <unistd.h>\n#include <sys/wait.h>\n'
+                'const char *tvmdep_greeting(void);\n'
+                'int main(void) { printf("%s\\n", tvmdep_greeting()); fflush(stdout);\n'
+                '  pid_t p = fork(); if (p == 0) { printf("child: %s\\n", tvmdep_greeting()); return 0; }\n'
+                '  int s; waitpid(p, &s, 0); return WEXITSTATUS(s); }\n')
+    if PLATFORM.startswith("macos"):
+        subprocess.run(["cc", "-dynamiclib", "-install_name", "@rpath/libtvmdep.dylib",
+                        "-o", f"{d}/libtvmdep.dylib", f"{d}/dep.c"], check=True)
+        subprocess.run(["cc", "-o", f"{d}/depmain", f"{d}/main.c", "-L", d, "-ltvmdep",
+                        "-Wl,-rpath,@loader_path"], check=True)
+    else:
+        subprocess.run(["cc", "-shared", "-fPIC", "-o", f"{d}/libtvmdep.so", f"{d}/dep.c"], check=True)
+        subprocess.run(["cc", "-o", f"{d}/depmain", f"{d}/main.c", "-L", d, "-ltvmdep",
+                        "-Wl,-rpath,$ORIGIN"], check=True)
+    sshi.sendline(f"{d}/depmain; echo RC=$?")
+    sshi.expect("hello from the dependency")
+    sshi.expect("child: hello from the dependency")
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+
 # ── Apple *_cmds ──────────────────────────────────────────────
 # The real BSD userland from apple-oss-distributions, built as individual
 # executables and dropped into the initrd unsigned (see
