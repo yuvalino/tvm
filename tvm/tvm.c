@@ -1587,15 +1587,46 @@ static int rfd_adopt(int rfd)
  * errno is preserved for the caller.
  */
 static void epipe_signal_fd(int nfd, int send_flags);
+#ifdef F_SETNOSIGPIPE
+static int current_signal_ignored(int signum);
+#endif
 
 static void epipe_signal(void)
 {
 #ifdef F_SETNOSIGPIPE
     if (errno == EPIPE) {
         int last_errno = errno;
-        pthread_kill(pthread_self(), SIGPIPE);
+        // An ignored SIGPIPE is discarded here, as task_kill_locked discards
+        // any ignored signal, rather than raised and dispatched to SAD_IGN. A
+        // program that ignores SIGPIPE and keeps writing to a broken pipe
+        // (every write fails with EPIPE) otherwise took a real signal per
+        // write, and OS handlers nesting on the thread at that rate ran into
+        // non-reentrant code: the dispatcher's log formatting recursed on
+        // localeconv's os_unfair_lock (libplatform abort, SIGKILL), and a
+        // signal landing inside call_sighandler's ulinker_dladdr took its
+        // mutex again (deadlock).
+        if (!current_signal_ignored(SIGPIPE))
+            pthread_kill(pthread_self(), SIGPIPE);
         errno = last_errno;
     }
+#endif
+}
+
+static int task_signal_ignored_locked(struct task *t, int signum);
+
+// epipe_signal() for a caller that holds the lock of t (the calling task):
+// current_signal_ignored() would take it again.
+static void epipe_signal_locked(struct task *t)
+{
+#ifdef F_SETNOSIGPIPE
+    if (errno == EPIPE) {
+        int last_errno = errno;
+        if (!task_signal_ignored_locked(t, SIGPIPE))
+            pthread_kill(pthread_self(), SIGPIPE);
+        errno = last_errno;
+    }
+#else
+    (void)t;
 #endif
 }
 
@@ -3864,7 +3895,7 @@ void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
                 struct file *file = file_for_task_stream_locked(t, fs, FS_FILE);
                 if (file) {
                     if (CALL_FUNC(fflush, fs->fs_fp) == EOF && errno == EPIPE)
-                        epipe_signal();
+                        epipe_signal_locked(t);  // t is locked here
                     file_unlock(file, 1);
                 }
             }
@@ -4208,6 +4239,19 @@ static int task_signal_ignored_locked(struct task *t, int signum)
     }
     return 1;
 }
+
+#ifdef F_SETNOSIGPIPE
+// task_signal_ignored_locked() for the calling task, taking the locks itself.
+static int current_signal_ignored(int signum)
+{
+    tvm_sig_enter();
+    task_lock(current);
+    int ignored = task_signal_ignored_locked(current, signum);
+    task_unlock(current);
+    tvm_sig_leave();
+    return ignored;
+}
+#endif
 
 struct safeio_ctx
 {
@@ -12024,11 +12068,17 @@ static void epipe_signal_fd(int nfd, int send_flags)
 #endif
     int last_errno = errno;
     int optout = 0;
+    // Under tvm_sig_enter like every other task_lock site: write() and the
+    // socket sends call this after their own tvm_sig_leave(), and a signal
+    // dispatched while this thread holds the task lock (a plain, non-recursive
+    // mutex) takes it again in signal_dispatch and deadlocks the thread.
+    tvm_sig_enter();
     struct file *file = file_for_task(current, nfd);
     if (file) {
         optout = file->f_nosigpipe;
         file_unlock(file, 1);
     }
+    tvm_sig_leave();
     errno = last_errno;
     if (!optout)
         epipe_signal();
