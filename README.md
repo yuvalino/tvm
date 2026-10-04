@@ -96,9 +96,12 @@ perror("tvm_start");                // only reached on a pre-boot failure
 `flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
 on-device, letting you `ssh` into a full POSIX environment. The TVM core is
 built as `libtvm.dylib`; dropbear/bash/toybox/vim/curl/less/nano/sqlite3/git as dylibs; the
-rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
-native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
-`tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
+rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`) in
+which `/tvm/bin/<tool>` is an image reference, a one-line file naming
+`@rpath/lib<tool>.dylib`, that TVM's `execve()` resolves through `TVM_RPATH`
+(the bundle's Frameworks directory). The native glue
+(`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves `tvm_start` from it
+(see [Embedding](#embedding)), sets `TVM_RPATH` and calls it on a worker
 thread.
 
 ```sh
