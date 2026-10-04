@@ -510,8 +510,8 @@ def test_toybox_xargs(sshi: spawn):
     sshi.expect(r"\$ ")
 
 # ── Apple *_cmds ──────────────────────────────────────────────
-# The real BSD userland from apple-oss-distributions, built as multi-call
-# modules and dropped into the initrd as unsigned executables (see
+# The real BSD userland from apple-oss-distributions, built as individual
+# executables and dropped into the initrd unsigned (see
 # third_party/apple/CMakeLists.txt). These run under the emulator on iOS, so
 # they also cover a much larger unsigned binary than toybox does.
 #
