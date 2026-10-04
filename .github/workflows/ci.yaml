@@ -68,7 +68,7 @@ jobs:
         submodules: 'true'
         token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: deps
-      run: brew install ninja cmake gnu-sed openssl autoconf automake gettext pkg-config
+      run: brew install ninja cmake gnu-sed autoconf automake gettext pkg-config
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli

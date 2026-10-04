@@ -24,7 +24,4 @@
 
 #define DROPBEAR_FORKLESS 1
 
-#define DEBUG_TRACE 6
-
-
 #endif /* DROPBEAR_LOCALOPTIONS_H_ */

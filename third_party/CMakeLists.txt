@@ -150,7 +150,7 @@ ExternalProject_Add(dropbear_ext
     BUILD_COMMAND make
         "PROGRAMS=dropbear dbclient dropbearkey scp"
         MULTI=1
-        "CFLAGS=-g -gdwarf-4 -DDROPBEAR_FORKLESS"
+        "CFLAGS=-g -gdwarf-4"
         MAKEOVERRIDES=
     INSTALL_COMMAND ""
     EXCLUDE_FROM_ALL TRUE

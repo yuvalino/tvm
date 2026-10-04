@@ -27,12 +27,11 @@ mkdir -p "$BUILDDIR/generated"
 
 cd "$BUILDDIR"
 
-if [ "$(uname)" = "Darwin" ] && [ -z "$TVM_IOS_CROSS" ]; then
+CFLAGS_EXTRA=""
+if [ "$(uname)" = "Darwin" ]; then
     export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
-    OPENSSL_PREFIX="$(brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl)"
-    CFLAGS_EXTRA="-I$OPENSSL_PREFIX/include"
-elif [ "$(uname)" = "Darwin" ]; then
-    export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+fi
+if [ "$(uname)" = "Darwin" ] && [ -n "$TVM_IOS_CROSS" ]; then
     # iOS SDK marks system(3) unavailable; awk needs it (see the header)
     CFLAGS_EXTRA="-include $THIRDPARTY/include-shim/tvm_ios_libc.h"
 fi
@@ -43,7 +42,7 @@ CFLAGS_EXTRA="${CFLAGS_EXTRA} -idirafter $THIRDPARTY/include-shim"
 export CC="${CC:-cc}"
 export HOSTCC="${HOSTCC:-cc}"
 export OPTIMIZE="-ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-strict-aliasing"
-export CFLAGS="-g -gdwarf-4 -DTOYBOX_FORKLESS=1 ${CFLAGS_EXTRA}"
+export CFLAGS="-g -gdwarf-4 ${CFLAGS_EXTRA}"
 export V=1
 
 # Never ship a binary left over from an earlier build: `make.sh || true`
@@ -66,9 +65,6 @@ if [ ! -x "$BUILDDIR/toybox" ] || file "$BUILDDIR/toybox" | grep -q "text"; then
     rm -f "$BUILDDIR/toybox"
     LINK_LIBS="-lm -lz"
     STRIP_FLAG=""
-    if [ "$(uname)" = "Darwin" ] && [ -z "$TVM_IOS_CROSS" ]; then
-        LINK_LIBS="$LINK_LIBS -lcrypto -lresolv -lssl -L$OPENSSL_PREFIX/lib"
-    fi
     # -dead_strip is an Apple ld flag; GNU ld rejects it. Use --gc-sections there.
     if [ "$(uname)" = "Darwin" ]; then
         STRIP_FLAG="-Wl,-dead_strip"
