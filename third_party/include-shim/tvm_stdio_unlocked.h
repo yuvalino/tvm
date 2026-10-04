@@ -1,6 +1,7 @@
 /*
- * Force-included (-include) into every git translation unit
- * (scripts/build_git.sh). Not a git patch.
+ * Force-included (-include) into every translation unit of git, bash and
+ * nano (scripts/build_git.sh, build_bash.sh, build_nano.sh). Not a patch to
+ * any of them.
  *
  * A guest FILE is a TVM file_stream, not a libc FILE: stdio reaches the
  * task's descriptors only through the functions TVM interposes. Darwin's
@@ -13,9 +14,14 @@
  * only maps those to getc()/no-ops where _POSIX_THREAD_SAFE_FUNCTIONS is
  * not defined, which Darwin defines. Map every _unlocked macro to the
  * locking function here, which TVM interposes per task. (flockfile() itself
- * is interposed by TVM.) The same problem, solved the same way, for bash:
- * third_party/configs/bash_stdio_unlocked.h; nano answers
- * ac_cv_func_flockfile=no instead.
+ * is interposed by TVM.) bash (include/unlocked-io.h maps putc()/getc()/
+ * putchar()/feof()/... onto the _unlocked names wherever they are declared)
+ * and nano (read_file() in src/files.c and gnulib's getdelim() read with
+ * getc_unlocked() under flockfile()) have the same problem and get the same
+ * header. The mapping is a preprocessor one, so a program that defines its
+ * own getc()/getc_unlocked() macros on top of it (bash) still ends in a
+ * call to the locking function: a macro is not re-expanded inside its own
+ * expansion.
  */
 #ifndef TVM_STDIO_UNLOCKED_H
 #define TVM_STDIO_UNLOCKED_H
@@ -34,6 +40,18 @@
 #if !defined(__APPLE__)
 #define _FILE_OFFSET_BITS 64
 #define _GNU_SOURCE 1
+#endif
+
+/*
+ * An autotools build (bash, nano; git has none) compiles with
+ * -DHAVE_CONFIG_H and every translation unit includes config.h first.
+ * Keep that order: gnulib's replacement headers (nano's lib/stdio.h,
+ * reached by the <stdio.h> below through -I) refuse to be included before
+ * config.h, and config.h is what defines the feature macros those headers
+ * were configured with.
+ */
+#if defined(HAVE_CONFIG_H)
+#include <config.h>
 #endif
 
 #include <stdio.h>

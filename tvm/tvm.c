@@ -11464,7 +11464,7 @@ FUNCTION_DEFINE_VOID1(rewind, FILE *, stream) {
 // config file read and strbuf_getwholeline() with flockfile()/funlockfile()
 // (config.c, strbuf.c), so `git init`, `git var` and anything that opened a
 // repository died at its first config read (nano's read_file() had the same
-// crash, sidestepped at configure time with ac_cv_func_flockfile=no). The
+// crash, at the time sidestepped with ac_cv_func_flockfile=no). The
 // lock is taken on the libc FILE behind the stream, which is what every
 // other stdio call on it ends up using, so a program that really does share
 // a stream between threads still gets the mutual exclusion it asked for. A
@@ -17710,8 +17710,11 @@ FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len)
  *   instead of the session, and `git init` aborted in glibc with "invalid
  *   stdio handle" on a TVM stream. The checks themselves only guard the
  *   caller's buffer sizes; they are kept for fread/fgets.
- * - The _unlocked stdio functions (bash on Linux; the Darwin build maps
- *   them away with bash_stdio_unlocked.h) and __fpurge.
+ * - The _unlocked stdio functions bash's include/unlocked-io.h maps
+ *   fflush()/fgets()/fputc()/fputs()/fwrite() onto on glibc, and __fpurge.
+ *   (The getc()/putc()/feof()/... family is mapped back to the locking
+ *   functions at compile time by third_party/include-shim/
+ *   tvm_stdio_unlocked.h, on every platform.)
  * - C99/C23 scanf: glibc's headers redirect fscanf to __isoc99_fscanf, or
  *   __isoc23_fscanf from 2.38 (git, toybox). This file's own
  *   fscanf/scanf/vfscanf are emitted under one of those names too, so a
