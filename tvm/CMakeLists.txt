@@ -18,14 +18,15 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set_target_properties(tvm_exe PROPERTIES OUTPUT_NAME tvm)
     target_link_libraries(tvm_exe PRIVATE tvm_static)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_link_libraries(tvm_exe PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt ncurses)
+        target_link_libraries(tvm_exe PRIVATE unicorn z pthread util m ${CMAKE_DL_LIBS} crypt)
         target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         # The ulinker resolves a guest's undefined symbols against what is
         # already loaded in this process, so host libraries the tools need
-        # are linked here: z (dropbear/toybox), ncurses (vim), and the
-        # frameworks curl's Apple SecTrust verification uses.
-        target_link_libraries(tvm_exe PRIVATE unicorn z pthread m ncurses
+        # are linked here: z (dropbear/toybox) and the frameworks curl's
+        # Apple SecTrust verification uses. (No curses library: every
+        # terminal program links the static ncursesw of the build.)
+        target_link_libraries(tvm_exe PRIVATE unicorn z pthread m
             "-framework Security" "-framework CoreFoundation"
             "-framework SystemConfiguration")
     endif()
@@ -49,7 +50,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(TVM_SHARED_LIBS unicorn z pthread m
         "-framework Security" "-framework CoreFoundation")
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        list(APPEND TVM_SHARED_LIBS ncurses "-framework SystemConfiguration")
+        list(APPEND TVM_SHARED_LIBS "-framework SystemConfiguration")
     endif()
     target_link_libraries(tvm_shared PRIVATE ${TVM_SHARED_LIBS})
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)

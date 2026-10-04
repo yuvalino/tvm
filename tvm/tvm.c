@@ -583,8 +583,6 @@ DECL_FUNC(qsort);
 DECL_FUNC(setitimer);
 DECL_FUNC(getitimer);
 
-extern int tputs(const char *, int, int (*)(int));
-DECL_FUNC_OPT(tputs);
 DECL_FUNC_OPT(timer_create);
 DECL_FUNC_OPT(timer_settime);
 DECL_FUNC_OPT(timer_gettime);
@@ -2020,7 +2018,6 @@ static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 struct tvm_call;
 typedef int (*compar_t)(const void *, const void *);
-typedef int (*tputs_putc_t)(int);
 
 struct tvm_tls {
     struct task *tls_current;
@@ -2041,7 +2038,6 @@ struct tvm_tls {
 
     compar_t tls_bsearch_compar;
     compar_t tls_qsort_compar;
-    tputs_putc_t tls_tputs_putc;
 #if defined(__APPLE__)
     CFDictionaryApplierFunction tls_CFDictionaryApplyFunction_function;
 #endif
@@ -2107,7 +2103,6 @@ static inline struct tvm_tls *tvm_tls(void) {
 #define call                        (tvm_tls()->tls_call)
 #define bsearch_compar              (tvm_tls()->tls_bsearch_compar)
 #define qsort_compar                (tvm_tls()->tls_qsort_compar)
-#define tputs_putc                  (tvm_tls()->tls_tputs_putc)
 #if defined(__APPLE__)
 #define CFDictionaryApplyFunction_function (tvm_tls()->tls_CFDictionaryApplyFunction_function)
 #endif
@@ -17198,21 +17193,6 @@ FUNCTION_DEFINE_VOID4(qsort, void *, base, size_t, nel, size_t, width, compar_t,
     qsort_compar = compar;
     CALL_FUNC(qsort, base, nel, width, qsort_compar_emulator);
     qsort_compar = NULL;
-}
-
-static int tputs_putc_emulator(int c)
-{
-    uint64_t ret;
-    if (0 != emulator_call(&ret, (uint64_t)tputs_putc, (uint64_t)c, 0, 0, 0, 0, 0))
-        err(1, "emulator_call(tputs_putc)");
-    return (int)ret;
-}
-
-FUNCTION_DEFINE3(int, tputs, const char *, str, int, affcnt, tputs_putc_t, putc_fn) {
-    tputs_putc = putc_fn;
-    int ret = CALL_FUNC(tputs, str, affcnt, tputs_putc_emulator);
-    tputs_putc = NULL;
-    return ret;
 }
 
 static void *vtimer_thread_entry(void *_arg)

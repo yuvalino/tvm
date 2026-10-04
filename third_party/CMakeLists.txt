@@ -125,6 +125,44 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 endif()
 
 ###############################################################################
+# ncurses (static libncursesw for bash, vim, nano and less, plus a host tic)
+#
+# Unpatched upstream, configured by scripts/build_ncurses.sh. The target
+# library goes into ${TVM_NCURSES_PREFIX}; the host build only provides
+# progs/tic, which scripts/CMakeLists.txt runs at initrd time to compile the
+# terminfo database shipped at /tvm/share/terminfo. First among the projects
+# because the terminal programs' DEPENDS name it.
+###############################################################################
+set(NCURSES_BUILD ${THIRDPARTY_BUILD}/ncurses)
+set(NCURSES_HOST_BUILD ${THIRDPARTY_BUILD}/ncurses_host)
+set(TVM_NCURSES_PREFIX ${NCURSES_BUILD}/prefix)
+set(NCURSES_LIB ${TVM_NCURSES_PREFIX}/lib/libncursesw.a)
+
+ExternalProject_Add(ncurses_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/ncurses
+    BINARY_DIR ${NCURSES_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_ncurses.sh target ${THIRDPARTY_SRC}/ncurses ${NCURSES_BUILD}
+    INSTALL_COMMAND ""
+    EXCLUDE_FROM_ALL TRUE
+)
+ExternalProject_Add_StepDependencies(ncurses_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
+tvm_ext_inputs(ncurses_ext SUBMODULE:third_party/ncurses)
+
+# Host tic: built with the host compiler so it runs on the build machine for
+# every target (cf. toybox_host_ext).
+ExternalProject_Add(ncurses_host_ext
+    SOURCE_DIR ${THIRDPARTY_SRC}/ncurses
+    BINARY_DIR ${NCURSES_HOST_BUILD}
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=cc" sh ${SCRIPTS_DIR}/build_ncurses.sh host ${THIRDPARTY_SRC}/ncurses ${NCURSES_HOST_BUILD}
+    INSTALL_COMMAND ""
+    EXCLUDE_FROM_ALL TRUE
+)
+ExternalProject_Add_StepDependencies(ncurses_host_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
+tvm_ext_inputs(ncurses_host_ext SUBMODULE:third_party/ncurses)
+
+###############################################################################
 # dropbear
 ###############################################################################
 set(DROPBEAR_BUILD ${THIRDPARTY_BUILD}/dropbear)
@@ -176,8 +214,8 @@ add_custom_target(sftpserver_ext
 set_target_properties(sftpserver_ext PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(sftpserver sftpserver_ext ${SFTPSERVER_EXE})
-
 add_launcher(sftpserver)
+
 
 ###############################################################################
 # bash
@@ -193,8 +231,9 @@ ExternalProject_Add(bash_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/bash
     BINARY_DIR ${BASH_BUILD}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_bash.sh ${THIRDPARTY_SRC}/bash ${BASH_BUILD}
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_bash.sh ${THIRDPARTY_SRC}/bash ${BASH_BUILD} ${TVM_NCURSES_PREFIX}
     INSTALL_COMMAND ""
+    DEPENDS ncurses_ext
     EXCLUDE_FROM_ALL TRUE
 )
 tvm_ext_inputs(bash_ext ${SCRIPTS_DIR}/build_bash.sh SUBMODULE:third_party/bash
@@ -249,30 +288,23 @@ tvm_ext_inputs(toybox_host_ext SUBMODULE:third_party/toybox)
 
 ###############################################################################
 # vim
+#
+# Unpatched upstream, configured out of tree by scripts/build_vim.sh and
+# linked against the static ncursesw below (as bash, less and nano are), so
+# its terminal handling is the one terminfo database on every platform.
 ###############################################################################
 set(VIM_BUILD ${THIRDPARTY_BUILD}/vim)
-set(STUBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../stubs)
-
-# iOS: no terminfo database on the device, and the SDK's libncurses faults in
-# tputs() without one, so vim links stub termcap functions instead (vim then
-# uses its builtin terminal descriptions; see stubs/termcap_stubs.c).
-set(VIM_BUILD_ENV "")
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(VIM_BUILD_ENV ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" "TVM_STUBS_DIR=${STUBS_DIR}"
-        "TVM_STUBS_LIB=${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}/libtermcap_stubs.a" ${TVM_CROSS_ENV})
-endif()
 
 ExternalProject_Add(vim_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/vim
     BINARY_DIR ${VIM_BUILD}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${VIM_BUILD_ENV} sh ${SCRIPTS_DIR}/build_vim.sh ${THIRDPARTY_SRC}/vim ${VIM_BUILD}
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_vim.sh ${THIRDPARTY_SRC}/vim ${VIM_BUILD} ${TVM_NCURSES_PREFIX}
     INSTALL_COMMAND ""
+    DEPENDS ncurses_ext
     EXCLUDE_FROM_ALL TRUE
 )
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    add_dependencies(vim_ext termcap_stubs)
-endif()
+tvm_ext_inputs(vim_ext ${SCRIPTS_DIR}/build_vim.sh SUBMODULE:third_party/vim)
 add_custom_target(vim_exe DEPENDS vim_ext)
 set_target_properties(vim_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -380,43 +412,6 @@ set_target_properties(curl_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_shared_lib(curl curl_exe ${CURL_BUILD}/src/curl)
 add_launcher(curl)
-
-###############################################################################
-# ncurses (static libncursesw for nano and less, plus a host-side tic)
-#
-# Unpatched upstream, configured by scripts/build_ncurses.sh. The target
-# library goes into ${TVM_NCURSES_PREFIX}; the host build only provides
-# progs/tic, which scripts/CMakeLists.txt runs at initrd time to compile the
-# terminfo database shipped at /tvm/share/terminfo.
-###############################################################################
-set(NCURSES_BUILD ${THIRDPARTY_BUILD}/ncurses)
-set(NCURSES_HOST_BUILD ${THIRDPARTY_BUILD}/ncurses_host)
-set(TVM_NCURSES_PREFIX ${NCURSES_BUILD}/prefix)
-set(NCURSES_LIB ${TVM_NCURSES_PREFIX}/lib/libncursesw.a)
-
-ExternalProject_Add(ncurses_ext
-    SOURCE_DIR ${THIRDPARTY_SRC}/ncurses
-    BINARY_DIR ${NCURSES_BUILD}
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_ncurses.sh target ${THIRDPARTY_SRC}/ncurses ${NCURSES_BUILD}
-    INSTALL_COMMAND ""
-    EXCLUDE_FROM_ALL TRUE
-)
-ExternalProject_Add_StepDependencies(ncurses_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
-tvm_ext_inputs(ncurses_ext SUBMODULE:third_party/ncurses)
-
-# Host tic: built with the host compiler so it runs on the build machine for
-# every target (cf. toybox_host_ext).
-ExternalProject_Add(ncurses_host_ext
-    SOURCE_DIR ${THIRDPARTY_SRC}/ncurses
-    BINARY_DIR ${NCURSES_HOST_BUILD}
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=cc" sh ${SCRIPTS_DIR}/build_ncurses.sh host ${THIRDPARTY_SRC}/ncurses ${NCURSES_HOST_BUILD}
-    INSTALL_COMMAND ""
-    EXCLUDE_FROM_ALL TRUE
-)
-ExternalProject_Add_StepDependencies(ncurses_host_ext build ${SCRIPTS_DIR}/build_ncurses.sh)
-tvm_ext_inputs(ncurses_host_ext SUBMODULE:third_party/ncurses)
 
 ###############################################################################
 # less

@@ -100,18 +100,20 @@ function(mkinitrd_target NAME)
     # non-login shells. Missing files are skipped silently.
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc\"\n")
     string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/bash_profile' \"$ROOTFS/etc/profile\"\n")
-    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/bash_bashrc' \"$ROOTFS/etc/bash.bashrc\"\n")
-    # Termcap database for readline on iOS (bash's bundled GNU termcap reads
-    # TERMCAP_FILE=/tvm/etc/termcap there; unused on macOS, which has terminfo).
-    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/termcap' \"$ROOTFS/etc/termcap\"\n\n")
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/bash_bashrc' \"$ROOTFS/etc/bash.bashrc\"\n\n")
 
     # ── Terminfo database ──
-    # less and nano link a static ncursesw whose compiled-in database is
-    # /tvm/share/terminfo (the rc files export TERMINFO to the same path).
-    # Compiled here from ncurses' own terminfo.src with the host-built tic
-    # (ncurses_host_ext), limited to the terminals ssh clients announce;
-    # /tvm/etc/profile maps anything else to xterm-256color.
-    set(TERMINFO_ENTRIES xterm xterm-256color screen screen-256color vt100 tmux-256color dumb)
+    # bash (readline), vim, less and nano link one static ncursesw whose
+    # compiled-in database is /tvm/share/terminfo (the rc files export
+    # TERMINFO to the same path), so this is the only terminal description
+    # in the VM. Compiled here from ncurses' own terminfo.src with the
+    # host-built tic (ncurses_host_ext), limited to the terminals ssh
+    # clients commonly announce (a name missing from terminfo.src is skipped
+    # by tic); /tvm/etc/bash.bashrc maps anything else to xterm-256color.
+    set(TERMINFO_ENTRIES
+        xterm xterm-256color screen screen-256color tmux tmux-256color
+        vt100 vt220 linux ansi dumb
+        alacritty wezterm foot konsole-256color gnome-256color putty-256color)
     string(REPLACE ";" "," TERMINFO_ENTRIES_CSV "${TERMINFO_ENTRIES}")
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/terminfo\"\n")
     string(APPEND SCRIPT "'${THIRDPARTY_BUILD}/ncurses_host/progs/tic' -x -e ${TERMINFO_ENTRIES_CSV} -o \"$ROOTFS/share/terminfo\" '${ROOTDIR}/third_party/ncurses/misc/terminfo.src'\n\n")
