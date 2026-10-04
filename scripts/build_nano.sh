@@ -32,9 +32,11 @@ NCURSES_PREFIX="$4"
 
 SHADOW="$BUILDDIR/src"
 OUT="$BUILDDIR/build"
+CONFIGS_DIR="$(cd "$(dirname "$0")/.." && pwd)/third_party/configs"
+INCLUDE_SHIM="$(cd "$(dirname "$0")/.." && pwd)/third_party/include-shim"
 . "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
 tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$GNULIB" "$NCURSES_PREFIX/lib/libncursesw.a" \
-    "$(cd "$(dirname "$0")/.." && pwd)/third_party/configs/nano_ios.cache"
+    "$CONFIGS_DIR/nano_ios.cache" "$INCLUDE_SHIM/tvm_stdio_unlocked.h"
 
 if [ ! -f "$SHADOW/configure" ]; then
     rm -rf "$SHADOW"
@@ -53,8 +55,6 @@ if [ ! -f "$SHADOW/configure" ]; then
     "$GNULIB/gnulib-tool" --import $modules
     autoreconf --install --symlink --force
 fi
-
-CONFIGS_DIR="$(cd "$(dirname "$0")/.." && pwd)/third_party/configs"
 
 mkdir -p "$OUT"
 cd "$OUT"
@@ -81,15 +81,6 @@ fi
 #  --enable-utf8: wide-character curses, which is what we build
 #  PKG_CONFIG_LIBDIR: only our ncursesw.pc is visible to pkg-config, so the
 #     curses probe cannot pick a host library
-#  ac_cv_func_flockfile=no, ac_cv_func_funlockfile=no: TVM interposes stdio
-#     with its own FILE objects, and neither flockfile() nor Darwin's inline
-#     getc_unlocked() is interposed. With HAVE_FLOCKFILE, read_file()
-#     (src/files.c) brackets its getc_unlocked() loop with flockfile(f) on
-#     such a FILE, and libc's flockfile dereferenced it as one of its own
-#     (SIGSEGV in pthread_mutex_lock via fp->_extra, "Sorry! Nano crashed!
-#     Code: 11" on opening any existing file). Answered `no`, nano falls
-#     back to plain getc(), which TVM interposes. (Same class of problem as
-#     bash's *_unlocked macros, see build_bash.sh.)
 if [ ! -f Makefile ]; then
     PKG_CONFIG_LIBDIR="$NCURSES_PREFIX/lib/pkgconfig" \
     "$SHADOW/configure" \
@@ -99,7 +90,6 @@ if [ ! -f Makefile ]; then
         --enable-utf8 \
         $CROSS_FLAGS \
         $CC_FLAG \
-        ac_cv_func_flockfile=no ac_cv_func_funlockfile=no \
         CFLAGS="-g -gdwarf-4"
 fi
 
@@ -110,5 +100,15 @@ if ! grep -q '^CURSES_LIB = .*-lncursesw' src/Makefile; then
 fi
 
 # lib (gnulib) and src only: doc/ needs makeinfo and po/ is disabled.
-make -C lib
-make -C src
+#
+# Make-time CFLAGS (configure's "-g -gdwarf-4 -Wall" plus the forced
+# include): -include tvm_stdio_unlocked.h maps the *_unlocked stdio
+# accessors back to the locking functions, which TVM interposes (see the
+# header; bash and git are built with it the same way). read_file()
+# (src/files.c) brackets a getc_unlocked() loop with flockfile(f), and
+# gnulib's getdelim() does the same, and on Darwin getc_unlocked() is an
+# inline macro over the libc FILE's buffer, which a TVM stream does not have
+# ("Sorry! Nano crashed! Code: 11" on opening any existing file). Make-time
+# only, for the reason given in build_bash.sh.
+make -C lib CFLAGS="-g -gdwarf-4 -Wall -include $INCLUDE_SHIM/tvm_stdio_unlocked.h"
+make -C src CFLAGS="-g -gdwarf-4 -Wall -include $INCLUDE_SHIM/tvm_stdio_unlocked.h"

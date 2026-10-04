@@ -11,9 +11,9 @@
 set -e
 SRCDIR="$1"
 BUILDDIR="$2"
-CONFIGS_DIR="$(cd "$(dirname "$0")/.." && pwd)/third_party/configs"
+INCLUDE_SHIM="$(cd "$(dirname "$0")/.." && pwd)/third_party/include-shim"
 . "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
-tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$CONFIGS_DIR/bash_stdio_unlocked.h"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$INCLUDE_SHIM/tvm_stdio_unlocked.h"
 
 mkdir -p "$BUILDDIR"
 cd "$BUILDDIR"
@@ -30,16 +30,18 @@ cd "$BUILDDIR"
 #  -DDEFAULT_PATH_VALUE: PATH when the environment has none (config-top.h
 #     guards it with #ifndef); the initrc normally sets PATH.
 TVM_CFLAGS='-g -gdwarf-4 -D_PATHNAMES_H_ -DSYS_PROFILE=\"/tvm/etc/profile\" -DDEFAULT_HOSTS_FILE=\"/etc/hosts\" -DDEBUGGER_START_FILE=\"/tvm/share/bashdb/bashdb-main.inc\" -DSYS_BASHRC=\"/tvm/etc/bash.bashrc\" -DDEFAULT_PATH_VALUE=\"/tvm/bin:/usr/bin:/bin\"'
-# make-time only (Darwin): -include bash_stdio_unlocked.h strips the SDK's
-# inline *_unlocked stdio macros so bash's I/O goes through the real, TVM-
-# interposed stdio functions (see the header and the ac_cv_have_decl_* cache
-# variables below). Not passed to configure: a forced <stdio.h> makes
-# AC_CHECK_FUNCS' dummy prototypes (`char dprintf (void);`) conflict and
-# every such probe would report the function missing.
-TVM_MAKE_CFLAGS="$TVM_CFLAGS"
-case "$(uname)" in
-    Darwin) TVM_MAKE_CFLAGS="$TVM_CFLAGS -include $CONFIGS_DIR/bash_stdio_unlocked.h" ;;
-esac
+# make-time only: -include tvm_stdio_unlocked.h maps the *_unlocked stdio
+# accessors back to the locking functions, which TVM interposes (see the
+# header; git and nano are built with it the same way). bash's
+# include/unlocked-io.h turns putc()/getc()/putchar()/feof()/... into their
+# _unlocked variants wherever those are declared, and on Darwin the variants
+# are inline macros over the libc FILE's buffer: the shell's own output
+# bypassed TVM's streams and bytes written by `echo` between words, and
+# everything the printf builtin wrote, were lost on pipes and files. Not
+# passed to configure: a forced <stdio.h> makes AC_CHECK_FUNCS' dummy
+# prototypes (`char dprintf (void);`) conflict and every such probe would
+# report the function missing.
+TVM_MAKE_CFLAGS="$TVM_CFLAGS -include $INCLUDE_SHIM/tvm_stdio_unlocked.h"
 
 # Configure cache variables. The bash_cv_* ones are run-time probes that
 # cannot execute when cross-compiling (iOS) and would otherwise default to
@@ -74,17 +76,6 @@ esac
 #     dlclose/dlerror helpers under HAVE_DLCLOSE alone but only includes
 #     <dlfcn.h> under HAVE_DLOPEN && HAVE_DLSYM.
 #  am_cv_func_iconv=no: no libiconv dependency on any platform.
-#  ac_cv_have_decl_{putc,putchar,getc,getchar,feof,ferror,clearerr}_unlocked=no:
-#     bash's include/unlocked-io.h maps putchar()/putc()/getc()... onto the
-#     *_unlocked variants when they are declared or defined as macros. On
-#     Darwin they are inline macros (__sputc/__sgetc/__sfeof in <_stdio.h>)
-#     that poke the libc FILE buffer directly, bypassing TVM's stdio
-#     interposition: bytes written by `echo` between words and the trailing
-#     newline (and everything written by the printf builtin) landed in the
-#     process-global stdout FILE instead of the task's stream and were lost
-#     on pipes and files. With these answered `no` and the macros removed by
-#     the forced include above, bash calls the real putc()/getc()/...
-#     functions, which TVM interposes.
 CACHE_VARS="bash_cv_job_control_missing=present bash_cv_sys_named_pipes=present \
 bash_cv_dev_fd=absent bash_cv_dev_stdin=absent bash_cv_func_sigsetjmp=present \
 bash_cv_unusable_rtsigs=yes bash_cv_wcontinued_broken=no bash_cv_pgrp_pipe=no \
@@ -92,11 +83,7 @@ bash_cv_must_reinstall_sighandlers=no bash_cv_getcwd_malloc=yes \
 bash_cv_ulimit_maxfds=no bash_cv_func_sbrk=no bash_cv_func_brk=no \
 ac_cv_func_killpg=no ac_cv_func_pselect=no ac_cv_func_shm_open=no \
 ac_cv_func_dlopen=no ac_cv_func_dlsym=no \
-ac_cv_func_dlclose=no ac_cv_lib_dl_dlopen=no am_cv_func_iconv=no \
-ac_cv_have_decl_putc_unlocked=no ac_cv_have_decl_putchar_unlocked=no \
-ac_cv_have_decl_getc_unlocked=no ac_cv_have_decl_getchar_unlocked=no \
-ac_cv_have_decl_feof_unlocked=no ac_cv_have_decl_ferror_unlocked=no \
-ac_cv_have_decl_clearerr_unlocked=no"
+ac_cv_func_dlclose=no ac_cv_lib_dl_dlopen=no am_cv_func_iconv=no"
 
 CROSS_FLAGS=""
 CC_FLAG=""

@@ -198,7 +198,7 @@ ExternalProject_Add(bash_ext
     EXCLUDE_FROM_ALL TRUE
 )
 tvm_ext_inputs(bash_ext ${SCRIPTS_DIR}/build_bash.sh SUBMODULE:third_party/bash
-    ${CMAKE_CURRENT_SOURCE_DIR}/configs/bash_stdio_unlocked.h)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h)
 add_custom_target(bash_exe DEPENDS bash_ext)
 set_target_properties(bash_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
@@ -466,7 +466,8 @@ ExternalProject_Add(nano_ext
 )
 ExternalProject_Add_StepDependencies(nano_ext build ${SCRIPTS_DIR}/build_nano.sh)
 tvm_ext_inputs(nano_ext SUBMODULE:third_party/nano SUBMODULE:third_party/gnulib
-    ${CMAKE_CURRENT_SOURCE_DIR}/configs/nano_ios.cache)
+    ${CMAKE_CURRENT_SOURCE_DIR}/configs/nano_ios.cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h)
 add_custom_target(nano_exe DEPENDS nano_ext)
 set_target_properties(nano_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
