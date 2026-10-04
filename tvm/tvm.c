@@ -422,6 +422,12 @@ DECL_FUNC(dup2);
 DECL_FUNC(pipe);
 DECL_FUNC(select);
 DECL_FUNC(poll);
+DECL_FUNC(pselect);
+#if defined(__linux__)
+DECL_FUNC(ppoll);
+#endif
+DECL_FUNC(shm_open);
+DECL_FUNC(shm_unlink);
 DECL_FUNC(fcntl);
 DECL_FUNC(ftruncate);
 DECL_FUNC(stat);
@@ -509,6 +515,7 @@ DECL_FUNC(signal);
 DECL_FUNC(sigaction);
 DECL_FUNC(raise);
 DECL_FUNC(kill);
+DECL_FUNC(killpg);
 DECL_FUNC(sigprocmask);
 DECL_FUNC(pthread_sigmask);
 DECL_FUNC(sigpending);
@@ -12640,7 +12647,22 @@ FUNCTION_DEFINE1(int, pipe, int *, pipefd) {
     return 0;
 }
 
-FUNCTION_DEFINE5(int, select, int, nfds, fd_set *, readfds, fd_set *, writefds, fd_set *, exceptfds, struct timeval *, timeout) {
+static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const struct timespec *ts, const sigset_t *os_mask);
+
+// Milliseconds for poll() from a timespec; NULL is forever (-1).
+static int tvm_timespec_to_ms(const struct timespec *ts)
+{
+    if (!ts)
+        return -1;
+    long long ms = (long long)ts->tv_sec * 1000 + (ts->tv_nsec + 999999) / 1000000;
+    return ms > INT_MAX ? INT_MAX : (int)ms;
+}
+
+// select()/pselect() over the task's descriptors, as a poll(): a host
+// descriptor number is not bounded by FD_SETSIZE. `ts` is the timeout (NULL:
+// forever); with `os_mask` the wait is pselect's atomic masked one (see
+// tvm_poll_host).
+static int tvm_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, const struct timespec *ts, const sigset_t *os_mask) {
     int fdcount = 0;
     struct pollfd *fds = NULL;
 
@@ -12667,11 +12689,7 @@ FUNCTION_DEFINE5(int, select, int, nfds, fd_set *, readfds, fd_set *, writefds, 
         fdcount++;
     }
 
-    int timeout_p = -1;
-    if (timeout)
-        timeout_p = (timeout->tv_sec * 1000) + (timeout->tv_usec / 1000);
-
-    int r = poll(fds, fdcount, timeout_p);
+    int r = tvm_poll_host(fds, fdcount, tvm_timespec_to_ms(ts), ts, os_mask);
 
     if (r == -1) {
         free(fds);
@@ -12717,7 +12735,86 @@ FUNCTION_DEFINE5(int, select, int, nfds, fd_set *, readfds, fd_set *, writefds, 
     return r;
 }
 
-FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
+FUNCTION_DEFINE5(int, select, int, nfds, fd_set *, readfds, fd_set *, writefds, fd_set *, exceptfds, struct timeval *, timeout) {
+    struct timespec ts;
+    if (timeout) {
+        ts.tv_sec = timeout->tv_sec;
+        ts.tv_nsec = (long)timeout->tv_usec * 1000;
+    }
+    return tvm_select(nfds, readfds, writefds, exceptfds, timeout ? &ts : NULL, NULL);
+}
+
+/*
+ * The wait behind pselect(): poll() on host descriptors with the OS-level
+ * signal mask reopened to `os_mask` for exactly the duration of the wait --
+ * ppoll() on Linux, the pselect() syscall on Darwin (which has no ppoll).
+ * That syscall takes fd_sets, which cannot hold a host descriptor at
+ * FD_SETSIZE or above; for such a set the mask is reopened around a plain
+ * poll() instead, and the gap pselect closes stays open for that one call.
+ */
+static int tvm_poll_host_masked(struct pollfd *realfds, nfds_t nfds, const struct timespec *ts, const sigset_t *os_mask)
+{
+#if defined(__linux__)
+    return CALL_FUNC(ppoll, realfds, nfds, ts, os_mask);
+#else
+    fd_set hr, hw, he;
+    FD_ZERO(&hr);
+    FD_ZERO(&hw);
+    FD_ZERO(&he);
+    int maxfd = -1, toobig = 0;
+    for (nfds_t i = 0; i < nfds; i++) {
+        int rfd = realfds[i].fd;
+        if (rfd < 0)
+            continue;
+        if (rfd >= FD_SETSIZE) {
+            toobig = 1;
+            break;
+        }
+        if (realfds[i].events & POLLIN)
+            FD_SET(rfd, &hr);
+        if (realfds[i].events & POLLOUT)
+            FD_SET(rfd, &hw);
+        if (realfds[i].events & POLLPRI)
+            FD_SET(rfd, &he);
+        if (rfd > maxfd)
+            maxfd = rfd;
+    }
+    if (toobig) {
+        sigset_t blocked;
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, os_mask, &blocked);
+        int ret = CALL_FUNC(poll, realfds, nfds, tvm_timespec_to_ms(ts));
+        int err = errno;
+        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &blocked, NULL);
+        errno = err;
+        return ret;
+    }
+    int ret = CALL_FUNC(pselect, maxfd + 1, &hr, &hw, &he, ts, os_mask);
+    if (ret <= 0)
+        return ret;
+    ret = 0;
+    for (nfds_t i = 0; i < nfds; i++) {
+        int rfd = realfds[i].fd;
+        realfds[i].revents = 0;
+        if (rfd < 0)
+            continue;
+        if (FD_ISSET(rfd, &hr))
+            realfds[i].revents |= POLLIN;
+        if (FD_ISSET(rfd, &hw))
+            realfds[i].revents |= POLLOUT;
+        if (FD_ISSET(rfd, &he))
+            realfds[i].revents |= POLLPRI;
+        if (realfds[i].revents)
+            ret++;
+    }
+    return ret;
+#endif
+}
+
+// poll() over the task's descriptors: each translated to the host
+// descriptor behind it for the host wait, which is poll() with `timeout`,
+// or with `os_mask` the masked wait of tvm_poll_host_masked with `ts`.
+static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const struct timespec *ts, const sigset_t *os_mask)
+{
     int ret = -1;
     struct pollfd *realfds = malloc(nfds * sizeof(*fds));
     if (!realfds) {
@@ -12751,7 +12848,11 @@ FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
         file_unlock(files[i], 0);
     }
 
-    ret = CALL_FUNC(poll, realfds, nfds, timeout);
+    if (os_mask)
+        ret = tvm_poll_host_masked(realfds, nfds, ts, os_mask);
+    else
+        ret = CALL_FUNC(poll, realfds, nfds, timeout);
+    int err = errno;
 
     for (int i = 0; i < nfds; i++)
         realfds[i].fd = fds[i].fd;
@@ -12766,7 +12867,117 @@ FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
 
     free(files);
     free(realfds);
+    errno = err;
     return ret;
+}
+
+FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
+    return tvm_poll_host(fds, nfds, timeout, NULL, NULL);
+}
+
+// A signal pending for this task or thread that the mask `mask` lets through.
+static int tvm_sig_pending_unblocked(const sigset_t *mask)
+{
+    uint32_t pending = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE);
+    if (current_thread)
+        pending |= __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
+    for (int sig = 1; sig < MAX_SIGNALS; sig++)
+        if ((pending & (1u << sig)) && !sigismember(mask, sig))
+            return 1;
+    return 0;
+}
+
+/*
+ * pselect(2): select() with the caller's signal mask installed for the
+ * duration of the wait, atomically -- a signal the mask lets through is
+ * either dispatched before the wait begins, so pselect returns EINTR at
+ * once, or interrupts the wait; never lost in between. bash used to be
+ * configured ac_cv_func_pselect=no (a guest pselect() reaching the host
+ * waited on host descriptor numbers) and fell back to sigprocmask() +
+ * select(), which has exactly that gap; readline's input timeouts, `read
+ * -t` and the shell's timers all go through here now.
+ *
+ * TVM's signals are virtual: the task's mask (thr_sigmask) and pending bits
+ * are TVM's own, and a kill() arrives as an OS signal on the task's thread
+ * (pthread_kill), which signal_handler dispatches at once or, inside a
+ * tvm_sig_enter() section, parks in the pending bits for the matching
+ * tvm_sig_leave(). So the whole call is such a section with the pselect
+ * mask installed as the virtual mask, the OS-level mask blocked, and:
+ *  - a signal already pending that the mask lets through is answered
+ *    without waiting;
+ *  - otherwise the host wait reopens the OS-level mask atomically
+ *    (tvm_poll_host_masked), so a signal arriving from then on is delivered
+ *    inside the wait, parked, and ends it with EINTR;
+ *  - a host wait ended by a signal the mask blocks (every OS signal
+ *    interrupts the thread, blocked or not; it stays parked) is not pselect's
+ *    to report: the wait restarts with the time that is left.
+ * The tvm_sig_leave() at the end runs the handlers of whatever was parked
+ * with the pselect mask still in effect, as POSIX requires, and the caller's
+ * mask is restored last. select() is never restarted after a handler, so
+ * SA_RESTART plays no part.
+ */
+FUNCTION_DEFINE6(int, pselect, int, nfds, fd_set *, readfds, fd_set *, writefds, fd_set *, exceptfds, const struct timespec *, timeout, const sigset_t *, sigmask) {
+    if (timeout && (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!sigmask)
+        return tvm_select(nfds, readfds, writefds, exceptfds, timeout, NULL);
+
+    struct timespec deadline;
+    if (timeout) {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += timeout->tv_sec;
+        deadline.tv_nsec += timeout->tv_nsec;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+
+    tvm_sig_enter();
+    sigset_t old = current_thread->thr_sigmask;
+    current_thread->thr_sigmask = *sigmask;
+    sigdelset(&current_thread->thr_sigmask, SIGKILL);
+    sigdelset(&current_thread->thr_sigmask, SIGSTOP);
+
+    sigset_t all, os_old;
+    sigfillset(&all);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+
+    int r;
+    for (;;) {
+        if (tvm_sig_pending_unblocked(&current_thread->thr_sigmask)) {
+            errno = EINTR;
+            r = -1;
+            break;
+        }
+        struct timespec left, *leftp = NULL;
+        if (timeout) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            left.tv_sec = deadline.tv_sec - now.tv_sec;
+            left.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+            if (left.tv_nsec < 0) {
+                left.tv_sec--;
+                left.tv_nsec += 1000000000L;
+            }
+            if (left.tv_sec < 0)
+                left.tv_sec = left.tv_nsec = 0;
+            leftp = &left;
+        }
+        r = tvm_select(nfds, readfds, writefds, exceptfds, leftp, &os_old);
+        if (r == -1 && errno == EINTR && !tvm_sig_pending_unblocked(&current_thread->thr_sigmask))
+            continue;
+        break;
+    }
+    int err = errno;
+
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+    tvm_sig_leave();
+    current_thread->thr_sigmask = old;
+    errno = err;
+    return r;
 }
 
 // fcntl(F_GETLK/F_SETLK/F_SETLKW) on a task's descriptor: the record-lock
@@ -13573,6 +13784,43 @@ FUNCTION_DEFINE1(char *, mkdtemp, char *, template) {
         return NULL;
     mktemp_copyback(template, abs);
     return template;
+}
+
+// A new host descriptor, entered into the task's table (cf. eventfd).
+static int tvm_task_adopt_fd(int r)
+{
+    int f;
+    if (-1 == r)
+        return -1;
+    if (-1 == (f = task_new_fd(current, r))) {
+        CALL_FUNC(close, r);
+        errno = EMFILE;
+    }
+    return f;
+}
+
+// shm_open(3)/shm_unlink(3). A POSIX shared memory object is a name in the
+// host's namespace, not a path (the task's cwd and the VFS play no part),
+// and the descriptor is the host's: it goes into the task's table like a
+// socket's. bash was configured ac_cv_func_shm_open=no because of that:
+// its nofork command substitution (lib/sh/anonfile.c) opens and at once
+// unlinks such an object for its scratch file, and the host descriptor it
+// got was not a guest one. (On Linux it asks memfd_create first.)
+// shm_unlink is a plain pass-through, interposed so the pair stays together.
+#if defined(__APPLE__)
+FUNCTION_DEFINE_VA2(int, shm_open, const char *, name, int, oflag) {
+    mode_t mode = (oflag & O_CREAT) ? (mode_t)va_arg(__ap, int) : 0;
+#else
+FUNCTION_DEFINE3(int, shm_open, const char *, name, int, oflag, mode_t, mode) {
+#endif
+    tvm_sig_enter();
+    int f = tvm_task_adopt_fd(CALL_FUNC(shm_open, name, oflag, mode));
+    tvm_sig_leave();
+    return f;
+}
+
+FUNCTION_DEFINE1(int, shm_unlink, const char *, name) {
+    return CALL_FUNC(shm_unlink, name);
 }
 
 FUNCTION_DEFINE3(int, socket, int, domain, int, type, int, protocol) {
@@ -15118,6 +15366,18 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
 
     tvm_sig_leave();
     return (kills_confirmed ? 0 : -1);
+}
+
+// killpg(2) as libc defines it: kill() of the process group, -pgrp (0 being
+// the caller's own group). bash was configured ac_cv_func_killpg=no, which
+// gave it the same definition from its lib/sh/oslib.c; a guest killpg()
+// reaching the host would have signalled host process groups.
+FUNCTION_DEFINE2(int, killpg, pid_t, pgrp, int, sig) {
+    if (pgrp < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return kill(pgrp ? -pgrp : 0, sig);
 }
 
 static int tvm_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
@@ -17912,19 +18172,6 @@ FUNCTION_DEFINE2(int, __open_2, const char *, pathname, int, flags) {
 
 FUNCTION_DEFINE2(int, __open64_2, const char *, pathname, int, flags) {
     return open(pathname, flags);
-}
-
-// A new host descriptor, entered into the task's table (cf. eventfd).
-static int tvm_task_adopt_fd(int r)
-{
-    int f;
-    if (-1 == r)
-        return -1;
-    if (-1 == (f = task_new_fd(current, r))) {
-        CALL_FUNC(close, r);
-        errno = EMFILE;
-    }
-    return f;
 }
 
 FUNCTION_DEFINE4(int, accept4, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen, int, flags) {
