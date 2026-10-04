@@ -15,7 +15,7 @@
 	url = https://github.com/apple-oss-distributions/adv_cmds.git
 [submodule "third_party/apple/network_cmds"]
 	path = third_party/apple/network_cmds
-	url = git@github.com:yuvalino/network_cmds-forkless.git
+	url = https://github.com/apple-oss-distributions/network_cmds.git
 [submodule "third_party/apple/system_cmds"]
 	path = third_party/apple/system_cmds
 	url = https://github.com/apple-oss-distributions/system_cmds.git
