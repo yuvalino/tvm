@@ -915,7 +915,8 @@ def test_curl_post_json(sshi: spawn):
 def test_curl_repeated(sshi: spawn):
     """Five HTTPS GETs back to back in one shell. Each curl is a fresh guest
     task, so this exercises OpenSSL's per-thread state being set up and torn
-    down repeatedly (the thread-exit hazard the curl_main wrapper handles)."""
+    down repeatedly (the thread-exit hazard OpenSSL's atexit cleanup handles,
+    see the openssl_ext comment in third_party/CMakeLists.txt)."""
     out, rc = _sh(sshi, "for i in 1 2 3 4 5; do curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' https://example.com; done")
     assert rc == 0, out
     codes = [l for l in _lines(out) if l == "200"]

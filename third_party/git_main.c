@@ -15,29 +15,10 @@
 // through PATH, exactly as with upstream's separate binaries -- and calls the
 // original cmd_main() of git.o, remote-curl.o or http-fetch.o, which
 // scripts/build_git.sh renamed at link time (ld -alias / objcopy
-// --redefine-sym, as scripts/build_curl_tool.sh does for curl's main). No git
-// source is patched, no static library is linked twice, and the Flutter side
-// needs one dylib and one launcher instead of one per helper.
-//
-// The two curl helpers also tear OpenSSL down at exit, for the reason
-// third_party/curl_main.c gives: OpenSSL keeps per-thread state behind a
-// pthread_key whose destructor frees it when the thread exits, and under TVM
-// that destructor fires during the task thread's teardown, after TVM's own
-// state is gone -- libmalloc then aborts on a pointer it never allocated and
-// the task never finishes exiting, so `git clone https://...` hung after the
-// transfer, with its parent waiting for the helper forever.
-// OPENSSL_cleanup() releases the state and deletes the key. It is registered
-// with atexit() rather than called after the helper returns because git
-// leaves through exit() on every path, including die() (common-main.c,
-// usage.c), and TVM runs a guest's atexit handlers from exit().
-#include <stdlib.h>
+// --redefine-sym). No git source is patched, no static library is linked
+// twice, and the Flutter side needs one dylib and one launcher instead of
+// one per helper.
 #include <string.h>
-#include <openssl/crypto.h>
-
-static void tvm_openssl_cleanup(void)
-{
-	OPENSSL_cleanup();
-}
 
 int git_cmd_main(int argc, const char **argv);
 int remote_curl_cmd_main(int argc, const char **argv);
@@ -52,14 +33,10 @@ int cmd_main(int argc, const char **argv)
 
 	// upstream: git-remote-http plus the git-remote-{https,ftp,ftps} links
 	if (!strcmp(name, "git-remote-http") || !strcmp(name, "git-remote-https") ||
-	    !strcmp(name, "git-remote-ftp") || !strcmp(name, "git-remote-ftps")) {
-		atexit(tvm_openssl_cleanup);
+	    !strcmp(name, "git-remote-ftp") || !strcmp(name, "git-remote-ftps"))
 		return remote_curl_cmd_main(argc, argv);
-	}
-	if (!strcmp(name, "git-http-fetch")) {
-		atexit(tvm_openssl_cleanup);
+	if (!strcmp(name, "git-http-fetch"))
 		return http_fetch_cmd_main(argc, argv);
-	}
 	// "git" and the dashed built-in names (git-add, ...), which git.c's
 	// cmd_main resolves itself
 	return git_cmd_main(argc, argv);

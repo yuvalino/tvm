@@ -14496,12 +14496,11 @@ FUNCTION_DEFINE_NORET0(abort) {
 // record is pushed for it, and can_enter_tvm(NULL) -- which takes the
 // caller's address from that record -- found none and said no: every
 // guest's atexit() returned 0 and registered nothing, and no guest exit
-// handler ever ran. (curl_main.c works around exactly that by calling
-// OPENSSL_cleanup() after main instead.) git's curl helpers register
-// OPENSSL_cleanup() with atexit() so that OpenSSL's thread-state destructor
-// does not fire during the task thread's teardown -- where it aborts in
-// libmalloc and leaves the helper's parent waiting forever, so every
-// `git clone https://...` hung -- on every exit path, die() included. The
+// handler ever ran. OpenSSL registers OPENSSL_cleanup() with atexit() (curl,
+// git's curl helpers) so that its thread-state destructor does not fire
+// during the task thread's teardown -- where it aborts in libmalloc and
+// leaves the caller waiting forever, so every `git clone https://...` hung
+// -- on every exit path, die() included. The
 // caller is now taken from the return address, as the interposer wrappers
 // record it, so a guest's registration is kept and exit() runs it.
 static int tvm_atexit(exit_t function, void *arg, void *lr);
