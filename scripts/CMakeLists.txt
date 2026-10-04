@@ -66,16 +66,19 @@ function(mkinitrd_target NAME)
 
     # ── Binaries ──
     if(ARG_FLUTTER)
-        string(APPEND SCRIPT "cp '${BIN_OUT}/bash_launcher' \"$ROOTFS/bin/bash\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/dropbear_launcher' \"$ROOTFS/bin/dropbear\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/sftpserver_launcher' \"$ROOTFS/bin/sftp-server\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/toybox_launcher' \"$ROOTFS/bin/toybox\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/vim_launcher' \"$ROOTFS/bin/vim\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/curl_launcher' \"$ROOTFS/bin/curl\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/less_launcher' \"$ROOTFS/bin/less\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/nano_launcher' \"$ROOTFS/bin/nano\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/sqlite_launcher' \"$ROOTFS/bin/sqlite3\"\n")
-        string(APPEND SCRIPT "cp '${BIN_OUT}/git_launcher' \"$ROOTFS/bin/git\"\n")
+        # The apps load each tool as lib<tool>.dylib from the bundle's
+        # Frameworks directory, which is outside the initrd. /tvm/bin/<tool>
+        # is an image reference: an executable text file naming the image by
+        # its install name, which TVM's execve() resolves through TVM_RPATH
+        # (set by the app bindings to the Frameworks directory) and runs with
+        # the caller's argv. See tvm_resolve_image_ref() in tvm/tvm.c.
+        foreach(pair "bash:bash" "dropbear:dropbear" "sftpserver:sftp-server" "toybox:toybox"
+                     "vim:vim" "curl:curl" "less:less" "nano:nano" "sqlite:sqlite3" "git:git")
+            string(REPLACE ":" ";" pair "${pair}")
+            list(GET pair 0 lib)
+            list(GET pair 1 name)
+            string(APPEND SCRIPT "printf '@rpath/lib${lib}.dylib\\n' > \"$ROOTFS/bin/${name}\" && chmod 755 \"$ROOTFS/bin/${name}\"\n")
+        endforeach()
     else()
         # Real binaries for CLI
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/dropbear/dropbearmulti' \"$ROOTFS/bin/dropbear\"\n")
@@ -223,8 +226,8 @@ mkinitrd_target(initrd_cli
     DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )
 
-# Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
-# the apple *_cmds modules)
+# Flutter initrd (image references for the dylib-backed tools, real binaries
+# for the apple *_cmds modules; git_exe for the exec-path name lists)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )
