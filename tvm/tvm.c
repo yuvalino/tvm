@@ -27,6 +27,7 @@
 #include <sys/resource.h>
 #ifdef __APPLE__
 #include <mach/mach_init.h>
+#include <mach/mach_host.h>
 #include <mach/mach_port.h>
 #include <mach/thread_act.h>
 #include <mach/thread_info.h>
@@ -62,6 +63,8 @@
 #include <sys/fileport.h>
 #include <mach-o/getsect.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <sys/sysctl.h>
+#include <net/if_mib.h>
 #elif defined(__linux__)
 #include <pty.h>
 #include <sys/vfs.h>
@@ -516,6 +519,9 @@ DECL_FUNC(sigaction);
 DECL_FUNC(raise);
 DECL_FUNC(kill);
 DECL_FUNC(killpg);
+#if defined(__APPLE__)
+DECL_FUNC(sysctl);
+#endif
 DECL_FUNC(sigprocmask);
 DECL_FUNC(pthread_sigmask);
 DECL_FUNC(sigpending);
@@ -2047,6 +2053,10 @@ struct tvm_tls {
     compar_t tls_qsort_compar;
 #if defined(__APPLE__)
     CFDictionaryApplierFunction tls_CFDictionaryApplyFunction_function;
+    // sysctl(): the last name-to-mib translation, see the interposer
+    int    tls_sysctl_mib[CTL_MAXNAME];
+    u_int  tls_sysctl_miblen;
+    char   tls_sysctl_name[256];
 #endif
 
     char tls_tty_name[PATH_MAX];
@@ -14961,6 +14971,206 @@ FUNCTION_DEFINE_VOID_VA1(warn, const char *, fmt) {
 FUNCTION_DEFINE_VOID_VA1(warnx, const char *, fmt) {
     vwarnx(fmt, __ap);
 }
+
+#if defined(__APPLE__)
+/*
+ * sysctl(2) under the iOS app sandbox.
+ *
+ * The sandbox lets an app read most values (kern.boottime, hw.memsize,
+ * hw.machine, ... are read by every app) and translate a name to a mib
+ * (CTL_SYSCTL_NAME2OID, "0.3"), but denies with EPERM the other meta
+ * queries sysctl(8) makes before it prints anything: the format of a mib
+ * (CTL_SYSCTL_OIDFMT, "0.4.<mib>") and its name (CTL_SYSCTL_NAME,
+ * "0.1.<mib>"), so on a device every `sysctl name` died with "sysctl fmt
+ * -1 1024 1: Operation not permitted". A few values are denied outright
+ * too. sysctl(8) is upstream's unpatched source, so the answers come from
+ * here (they used to be a header force-included into that one program;
+ * the kernel answers for every guest):
+ *  - the last name-to-mib translation of the thread is remembered, and a
+ *    denied mib-to-name query for that mib is answered from it;
+ *  - a denied format query is answered by fetching the value and inferring
+ *    the format oidfmt() expects (a u_int kind, then the format string)
+ *    from its size and content: string, timeval, int, quad; anything else
+ *    is an opaque, which sysctl(8) refuses to print rather than misprints;
+ *  - vm.page_pageable_internal_count and vm.page_purgeable_count, denied as
+ *    values, are the kernel's vm_page_pageable_internal_count and
+ *    vm_page_purgeable_count, which host_statistics64() also reports
+ *    (internal_page_count, purgeable_count; vm_stat prints them) and the
+ *    sandbox allows: answered from there;
+ *  - ifconfig's per-interface IFDATA_SUPPLEMENTAL table (net.link.generic
+ *    .ifdata.<index>.5) is denied, and upstream ifconfig err()s out after
+ *    the first interface. The table is informational (unaligned packets,
+ *    data milestone interval, printed only when non-zero): a denied read
+ *    is answered with zeros, and upstream ifconfig enumerates on.
+ * Every other call, and every query the kernel does answer (macOS, or a
+ * future iOS that permits them), passes straight through: only an EPERM
+ * is ever acted on.
+ */
+#define TVM_CTL_SYSCTL          0   // the meta node; sysctl(8) defines these itself
+#define TVM_CTL_SYSCTL_NAME     1
+#define TVM_CTL_SYSCTL_NAME2OID 3
+#define TVM_CTL_SYSCTL_OIDFMT   4
+#define TVM_IFDATA_SUPPLEMENTAL 5   // net/if_mib_private.h, not in the SDK
+
+static int tvm_sysctl_value_fallback(int *oid, u_int len, void *oldp, size_t *oldlenp)
+{
+    struct tvm_tls *tls = tvm_tls();
+    if (len == 6 && oid[0] == CTL_NET && oid[1] == PF_LINK && oid[2] == NETLINK_GENERIC &&
+        oid[3] == IFMIB_IFDATA && oid[5] == TVM_IFDATA_SUPPLEMENTAL) {
+        if (oldp)
+            memset(oldp, 0, *oldlenp);
+        return 0;
+    }
+    if (len != tls->tls_sysctl_miblen || tls->tls_sysctl_miblen == 0 ||
+        memcmp(oid, tls->tls_sysctl_mib, len * sizeof(int)) != 0) {
+        errno = EPERM;
+        return -1;
+    }
+    int internal = strcmp(tls->tls_sysctl_name, "vm.page_pageable_internal_count") == 0;
+    int purgeable = strcmp(tls->tls_sysctl_name, "vm.page_purgeable_count") == 0;
+    if (!internal && !purgeable) {
+        errno = EPERM;
+        return -1;
+    }
+    vm_statistics64_data_t vs;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &cnt) != KERN_SUCCESS) {
+        errno = EPERM;
+        return -1;
+    }
+    unsigned int v = internal ? (unsigned int)vs.internal_page_count
+                              : (unsigned int)vs.purgeable_count;
+    if (oldp) {
+        if (*oldlenp < sizeof(v)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        memcpy(oldp, &v, sizeof(v));
+    }
+    *oldlenp = sizeof(v);
+    return 0;
+}
+
+// sysctl(2) for a plain value, with the sandbox fallback.
+static int tvm_sysctl_value(int *oid, u_int len, void *oldp, size_t *oldlenp)
+{
+    int r = CALL_FUNC(sysctl, oid, len, oldp, oldlenp, NULL, 0);
+    if (r != 0 && errno == EPERM)
+        r = tvm_sysctl_value_fallback(oid, len, oldp, oldlenp);
+    return r;
+}
+
+static int tvm_sysctl_infer_fmt(int *oid, u_int len, void *oldp, size_t *oldlenp)
+{
+    size_t vlen = 0;
+    if (tvm_sysctl_value(oid, len, NULL, &vlen) != 0)
+        return -1;
+    unsigned char *val = calloc(1, vlen + 1);
+    if (!val)
+        return -1;
+    size_t got = vlen;
+    if (vlen && tvm_sysctl_value(oid, len, val, &got) != 0) {
+        int e = errno;
+        free(val);
+        errno = e;
+        return -1;
+    }
+
+    u_int kind = CTLFLAG_RD;
+    const char *fmt = "";
+
+    // A string first: a NUL-terminated run of printable characters with at
+    // least one alphanumeric. Size alone cannot tell a 4- or 8-byte string
+    // ("iPad8,1", "16.7.10") from an int or a quad, and checking sizes first
+    // printed those as numbers. An int/quad/timeval whose bytes all happen to
+    // be printable-then-NUL would be misread the other way, which needs
+    // every byte but the last to be printable text -- not a real value.
+    if (got >= 2 && val[got - 1] == '\0') {
+        size_t i;
+        int alnum = 0;
+        for (i = 0; i + 1 < got; i++) {
+            if (!isprint(val[i]) && !isspace(val[i]))
+                break;
+            if (isalnum(val[i]))
+                alnum = 1;
+        }
+        if (i + 1 == got && alnum) {
+            kind |= CTLTYPE_STRING;
+            fmt = "A";
+        }
+    }
+    if (!*fmt && got == sizeof(struct timeval)) {
+        struct timeval tv;
+        memcpy(&tv, val, sizeof(tv));
+        if (tv.tv_sec > 0 && tv.tv_usec >= 0 && tv.tv_usec < 1000000) {
+            kind |= CTLTYPE_OPAQUE;
+            fmt = "S,timeval";
+        }
+    }
+    if (!*fmt && got == sizeof(int)) {
+        kind |= CTLTYPE_INT;
+        fmt = "I";
+    } else if (!*fmt && got == sizeof(long long)) {
+        kind |= CTLTYPE_QUAD;
+        fmt = "Q";
+    }
+    if (!*fmt)
+        kind |= CTLTYPE_OPAQUE;
+    free(val);
+
+    size_t need = sizeof(kind) + strlen(fmt) + 1;
+    if (*oldlenp < need) {
+        errno = ENOMEM;
+        return -1;
+    }
+    memcpy(oldp, &kind, sizeof(kind));
+    memcpy((char *)oldp + sizeof(kind), fmt, strlen(fmt) + 1);
+    *oldlenp = need;
+    return 0;
+}
+
+FUNCTION_DEFINE6(int, sysctl, int *, name, u_int, namelen, void *, oldp, size_t *, oldlenp, void *, newp, size_t, newlen) {
+    struct tvm_tls *tls = tvm_tls();
+    int r = CALL_FUNC(sysctl, name, namelen, oldp, oldlenp, newp, newlen);
+    if (!oldlenp)
+        return r;
+    if (namelen < 2 || name[0] != TVM_CTL_SYSCTL) {
+        if (r != 0 && errno == EPERM && !newp)
+            r = tvm_sysctl_value_fallback(name, namelen, oldp, oldlenp);
+        return r;
+    }
+    if (!oldp)
+        return r;
+
+    if (r == 0 && namelen == 2 && name[1] == TVM_CTL_SYSCTL_NAME2OID &&
+        newp && newlen < sizeof(tls->tls_sysctl_name) &&
+        *oldlenp <= sizeof(tls->tls_sysctl_mib)) {
+        memcpy(tls->tls_sysctl_name, newp, newlen);
+        tls->tls_sysctl_name[newlen] = '\0';
+        memcpy(tls->tls_sysctl_mib, oldp, *oldlenp);
+        tls->tls_sysctl_miblen = (u_int)(*oldlenp / sizeof(int));
+        return r;
+    }
+    if (r == 0 || errno != EPERM || namelen < 3)
+        return r;
+
+    if (name[1] == TVM_CTL_SYSCTL_NAME) {
+        size_t need = strlen(tls->tls_sysctl_name) + 1;
+        if (namelen - 2 != tls->tls_sysctl_miblen || tls->tls_sysctl_miblen == 0 ||
+            memcmp(name + 2, tls->tls_sysctl_mib, tls->tls_sysctl_miblen * sizeof(int)) != 0 ||
+            *oldlenp < need) {
+            errno = EPERM;
+            return -1;
+        }
+        memcpy(oldp, tls->tls_sysctl_name, need);
+        *oldlenp = need;
+        return 0;
+    }
+    if (name[1] == TVM_CTL_SYSCTL_OIDFMT)
+        return tvm_sysctl_infer_fmt(name + 2, namelen - 2, oldp, oldlenp);
+    return r;
+}
+#endif
 
 #if defined(__APPLE__)  // warnc/errc/getprogname/setprogname are BSD-only
 FUNCTION_DEFINE_VOID_VA2(warnc, int, code, const char *, fmt) {

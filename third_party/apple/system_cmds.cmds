@@ -31,7 +31,7 @@ purge|purge||
 pwd_mkdb|pwd_mkdb||
 stackshot|stackshot||
 sync|sync||
-sysctl|sysctl||-include @APPLE@/sysctl_oidfmt_shim.h
+sysctl|sysctl||
 vifs|vifs||
 vipw|vipw||
 vm_purgeable_stat|vm_purgeable_stat||
