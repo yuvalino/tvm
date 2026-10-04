@@ -112,12 +112,14 @@ def main():
     nsegs = len([c for c in b.commands if c.command == M.LoadCommand.TYPE.SEGMENT_64])
     b.add(M.DylibCommand.id_dylib(install_name, 2, 0x10000, 0x10000), nsegs)
 
+    if os.path.lexists(dst):
+        os.remove(dst)  # a previous output may be read-only
     b.write(dst)
     if removed_index is not None:
         fix_chained_starts(dst, removed_index)
-    # LIEF writes 0644; keep the executable's mode, as ld gives dylibs 0755
-    # and TVM's execve wants the x bit
-    os.chmod(dst, os.stat(src).st_mode & 0o7777)
+    # LIEF writes 0644; ld gives dylibs 0755, and TVM's execve wants the x
+    # bit (not the source's mode: toybox's executable is read-only)
+    os.chmod(dst, 0o755)
 
 
 if __name__ == "__main__":
