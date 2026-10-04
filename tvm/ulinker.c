@@ -2229,7 +2229,7 @@ struct dlinfo_macho64 {
     struct mach_header_64 dlm64_hdr;
     size_t dlm64_sizeoflc;
     uintptr_t dlm64_load_bias;
-    uintptr_t dlm64_pagezero;
+    uintptr_t dlm64_hdr_vmaddr;   // vmaddr of the segment mapping the mach header (__TEXT)
     const struct load_command *dlm64_lc;
 
     struct nlist_64 *dlm64_symtab;
@@ -3660,9 +3660,18 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
 
         // skip page zero
         if (curr_sc->initprot == 0 && curr_sc->maxprot == 0 && curr_sc->vmaddr == 0) {
-            dl->dlm64_pagezero += curr_sc->vmsize;
             continue;
         }
+
+        // Chained-fixup offsets (segment_offset, DYLD_CHAINED_PTR_64_OFFSET
+        // targets) are relative to the mach header, i.e. to this segment's
+        // vmaddr: 0 in a dylib, 0x100000000 in an executable (just past
+        // __PAGEZERO), and still 0x100000000 in an executable converted to a
+        // dylib by scripts/exe2lib.py, which drops __PAGEZERO. The size of
+        // __PAGEZERO used to stand in for it, which only holds while
+        // __PAGEZERO is present.
+        if (curr_sc->fileoff == 0 && curr_sc->filesize)
+            dl->dlm64_hdr_vmaddr = curr_sc->vmaddr;
 
         found_lc_segment = 1;
 
@@ -4070,7 +4079,7 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
         }
 
         const struct dyld_chained_starts_in_segment *seg_starts = (const struct dyld_chained_starts_in_segment *)(starts_base + seg_offset);
-        uintptr_t segment_address = dl->dlm64_load_bias + seg_starts->segment_offset + dl->dlm64_pagezero;
+        uintptr_t segment_address = dl->dlm64_load_bias + dl->dlm64_hdr_vmaddr + seg_starts->segment_offset;
 
         switch (seg_starts->pointer_format) {
             case DYLD_CHAINED_PTR_64:
@@ -4115,7 +4124,11 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                         }
                         else {
                             next = p.ptr_64_rebase->next * 4;
-                            *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target + dl->dlm64_pagezero;
+                            // DYLD_CHAINED_PTR_64 targets are vmaddrs,
+                            // DYLD_CHAINED_PTR_64_OFFSET ones offsets from
+                            // the mach header
+                            *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target +
+                                (seg_starts->pointer_format == DYLD_CHAINED_PTR_64_OFFSET ? dl->dlm64_hdr_vmaddr : 0);
                         }
                         break;
                 }
