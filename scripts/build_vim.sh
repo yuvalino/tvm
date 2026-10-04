@@ -1,7 +1,23 @@
 #!/bin/sh
+# Build vim for TVM (unpatched upstream, out-of-tree build in a tree of
+# symlinks).
+#
+# usage: build_vim.sh <srcdir> <builddir> <ncurses-prefix>
+# env:   CC (the target compiler, e.g. ios-cc.sh when cross-compiling),
+#        TVM_IOS_CROSS=1 when building for iOS
+#
+# Terminal library: the static ncursesw of build_ncurses.sh with the
+# terminfo database shipped in the initrd (/tvm/share/terminfo), the same as
+# bash, less and nano use, on every platform. vim therefore talks terminfo
+# (TERMINFO) everywhere and emits the terminal's own control sequences; it
+# used to link stub termcap functions on iOS, which swallowed every
+# sequence, and the host's libncurses on macOS and Linux.
 set -e
 SRCDIR="$1"
 BUILDDIR="$2"
+NCURSES_PREFIX="$3"
+. "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$NCURSES_PREFIX/lib/libncursesw.a"
 
 # Vim's build system lives in src/
 SRC="$SRCDIR/src"
@@ -30,16 +46,21 @@ ln -sf "$SRC/configure" .
 ln -sf "$SRC/auto/configure" auto/
 
 CROSS_FLAGS=""
-TLIB_FLAG="--with-tlib=ncurses"
 CC_FLAG=""
-CFLAGS_EXTRA=""
 if [ -n "$TVM_IOS_CROSS" ]; then
-    CROSS_FLAGS="--host=aarch64-apple-darwin vim_cv_toupper_strstrprogram=yes vim_cv_terminfo=no vim_cv_tgetent=zero vim_cv_getcwd_broken=no vim_cv_stat_ignores_slash=yes vim_cv_memmove_handles_overlap=yes"
-    TLIB_FLAG=""
+    CROSS_FLAGS="--host=aarch64-apple-darwin vim_cv_toupper_strstrprogram=yes vim_cv_getcwd_broken=no vim_cv_stat_ignores_slash=yes vim_cv_memmove_handles_overlap=yes"
     CC_FLAG="${CC:+CC=$CC}"
-    CFLAGS_EXTRA="${TVM_STUBS_DIR:+-I$TVM_STUBS_DIR}"
 fi
 
+# Configure:
+#  --with-tlib=ncursesw: -lncursesw, found through LDFLAGS; with the library
+#     named, configure only link-tests it (the automatic selection runs a
+#     test program, impossible when cross-compiling). CPPFLAGS puts our
+#     <termcap.h> ahead of the SDK's (the iPhoneOS SDK has none).
+#  vim_cv_terminfo=yes, vim_cv_tgetent=zero: what ncurses answers (tgoto
+#     speaks terminfo; tgetent() returns 0 for an unknown terminal). Run-time
+#     probes that cannot execute when cross-compiling; pinned on every
+#     platform so the builds are configured alike.
 if [ ! -f auto/config.mk ]; then
     EXTRA_FLAGS=""
     if [ "$(uname)" = "Darwin" ]; then
@@ -56,26 +77,22 @@ if [ ! -f auto/config.mk ]; then
         --disable-xattr \
         --disable-selinux \
         --disable-smack \
-        $TLIB_FLAG \
+        --with-tlib=ncursesw \
         --without-wayland \
         ac_cv_header_iconv_h=no \
+        vim_cv_terminfo=yes vim_cv_tgetent=zero \
         $EXTRA_FLAGS \
         $CROSS_FLAGS \
         $CC_FLAG \
-        CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA"
+        CPPFLAGS="-I$NCURSES_PREFIX/include -I$NCURSES_PREFIX/include/ncursesw" \
+        LDFLAGS="-L$NCURSES_PREFIX/lib" \
+        CFLAGS="-g -gdwarf-4"
 fi
-# iOS: link the termcap stubs (TVM_STUBS_LIB, third_party/CMakeLists.txt)
-# instead of the SDK's libncurses that configure found; vim's own builtin
-# terminal descriptions do the work. LIBS on the command line overrides
-# auto/config.mk; make does not relink when only LIBS changes, so drop the
-# old binary.
-if [ -n "$TVM_STUBS_LIB" ]; then
-    rm -f vim
-    make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA" LIBS="-lm $TVM_STUBS_LIB" MAKEOVERRIDES=
-    if otool -L vim | grep -q ncurses; then
-        echo "error: vim still links libncurses" >&2
-        exit 1
-    fi
-else
-    make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4 $CFLAGS_EXTRA" MAKEOVERRIDES=
+make VIMRUNTIMEDIR=/tvm/share/vim CFLAGS="-g -gdwarf-4" MAKEOVERRIDES=
+
+# Build-time assertion: the terminal library must be our ncursesw, not a host
+# library (which the iOS device has no database for).
+if nm -u vim | grep -q 'tputs'; then
+    echo "error: vim imports tputs from a host library" >&2
+    exit 1
 fi

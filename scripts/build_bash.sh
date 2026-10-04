@@ -1,19 +1,27 @@
 #!/bin/sh
 # Build GNU bash for TVM (unpatched upstream, out-of-tree autotools build).
 #
-# usage: build_bash.sh <srcdir> <builddir>
+# usage: build_bash.sh <srcdir> <builddir> <ncurses-prefix>
 # env:   CC (the target compiler, e.g. ios-cc.sh when cross-compiling),
 #        TVM_IOS_CROSS=1 when building for iOS
 #
 # Everything TVM-specific is a configure cache variable or a -D on CFLAGS;
 # bash's sources are not touched. The Flutter apps get the same `bash`,
 # converted to libbash.dylib (third_party/CMakeLists.txt, add_shared_lib).
+#
+# Terminal library: readline links the static ncursesw of build_ncurses.sh,
+# with the terminfo database shipped in the initrd (/tvm/share/terminfo) --
+# the same library and database as vim, less and nano, on every platform.
+# Nothing depends on a host curses library or terminfo (absent on iOS, where
+# a tgetent() failure used to make readline's first tputs() fault).
 set -e
 SRCDIR="$1"
 BUILDDIR="$2"
+NCURSES_PREFIX="$3"
 INCLUDE_SHIM="$(cd "$(dirname "$0")/.." && pwd)/third_party/include-shim"
 . "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
-tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$INCLUDE_SHIM/tvm_stdio_unlocked.h"
+tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$INCLUDE_SHIM/tvm_stdio_unlocked.h" \
+    "$NCURSES_PREFIX/lib/libncursesw.a"
 
 mkdir -p "$BUILDDIR"
 cd "$BUILDDIR"
@@ -91,22 +99,6 @@ if [ -n "$TVM_IOS_CROSS" ]; then
     # CC_FOR_BUILD: mksyntax/mksignames/buildversion run on the build host.
     CROSS_FLAGS="--host=aarch64-apple-darwin CC_FOR_BUILD=cc"
     CC_FLAG="${CC:+CC=$CC}"
-    # Termcap: the iPhoneOS SDK has libtermcap.tbd (-> libncurses.5.4.dylib,
-    # present in the dyld shared cache) but the device has no terminfo
-    # database, so tgetent() fails and readline's first tputs() into ncurses
-    # faults (SIGBUS in tputs from _rl_cr, seen as "crash in signal handler"
-    # panics on pan1c). Use the GNU termcap bundled with bash instead and
-    # point it at a termcap file shipped in the initrd (TERMCAP_FILE is
-    # lib/termcap/termcap.c's #ifndef'd default, /etc/termcap).
-    CROSS_FLAGS="$CROSS_FLAGS bash_cv_termcap_lib=gnutermcap"
-    TVM_CFLAGS="$TVM_CFLAGS -DTERMCAP_FILE=\\\"/tvm/etc/termcap\\\""
-    TVM_MAKE_CFLAGS="$TVM_MAKE_CFLAGS -DTERMCAP_FILE=\\\"/tvm/etc/termcap\\\""
-else
-    case "$(uname)" in
-        # macOS: the SDK's libtermcap.tbd (-> libncurses.5.4.dylib) with the
-        # host terminfo database.
-        Darwin) CROSS_FLAGS="$CROSS_FLAGS bash_cv_termcap_lib=libtermcap" ;;
-    esac
 fi
 # ac_cv_func_getentropy=no: the iPhoneOS SDK exports the symbol but has no
 # <sys/random.h> declaring it, so lib/sh/random.c fails to compile with
@@ -116,6 +108,11 @@ case "$(uname)" in
     Darwin) CROSS_FLAGS="$CROSS_FLAGS ac_cv_func_getentropy=no" ;;
 esac
 
+# Configure:
+#  bash_cv_termcap_lib=libncursesw: TERMCAP_LIB=-lncursesw (aclocal.m4,
+#     BASH_CHECK_LIB_TERMCAP), found through LDFLAGS; the probe would
+#     otherwise take the first host library with tgetent(). CPPFLAGS puts
+#     our <termcap.h> ahead of the SDK's (the iPhoneOS SDK has none).
 if [ ! -f Makefile ]; then
     "$SRCDIR/configure" \
         --without-bash-malloc \
@@ -123,9 +120,22 @@ if [ ! -f Makefile ]; then
         $CROSS_FLAGS \
         $CC_FLAG \
         $CACHE_VARS \
+        bash_cv_termcap_lib=libncursesw \
+        CPPFLAGS="-I$NCURSES_PREFIX/include -I$NCURSES_PREFIX/include/ncursesw" \
+        LDFLAGS="-L$NCURSES_PREFIX/lib" \
         CFLAGS="$TVM_CFLAGS"
 fi
+# Build-time assertion: the terminal library must be our ncursesw, not a host
+# library (which the iOS device has no database for).
+if ! grep -q '^TERMCAP_LIB = -lncursesw' Makefile; then
+    echo "error: bash was not configured against libncursesw" >&2
+    exit 1
+fi
 make CFLAGS="$TVM_MAKE_CFLAGS"
+if nm -u bash | grep -q 'tputs'; then
+    echo "error: bash imports tputs from a host library" >&2
+    exit 1
+fi
 
 # Build-time assertion: the login-shell profile path must have made it into
 # the binary. If a future bash release renames pathnames.h's include guard,

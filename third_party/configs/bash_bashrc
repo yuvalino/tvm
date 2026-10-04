@@ -1,4 +1,17 @@
-# /tvm/etc/bash.bashrc — read by bash for interactive non-login shells.
+# /tvm/etc/bash.bashrc — read by bash for interactive non-login shells, and
+# sourced by /tvm/etc/profile for login shells.
 
-# mksh-style prompt, as in /tvm/etc/profile: "$ " (or "# " for root).
+# mksh-style prompt: "$ " (or "# " for root) instead of bash's built-in
+# default, which shows the shell name and version ("-bash-5.3$ " for a login
+# shell).
 PS1='\$ '
+
+# bash (readline), vim, less and nano look terminals up in the bundled
+# terminfo database (/tvm/share/terminfo, the entries listed in
+# scripts/CMakeLists.txt). If the ssh client announced a terminal that is not
+# in it, fall back to xterm-256color so line editing and full-screen programs
+# still work. ${TERM%"${TERM#?}"} is the first character of $TERM, the
+# database's directory letter.
+if [ -n "$TERM" ] && [ ! -e "/tvm/share/terminfo/${TERM%"${TERM#?}"}/$TERM" ]; then
+    export TERM=xterm-256color
+fi

@@ -8,7 +8,9 @@ setenv TVM_SHELL=/tvm/bin/bash
 setenv SHELL=/tvm/bin/bash
 setenv PATH=/tvm/bin:$PATH
 setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git
-# Terminfo database for less/nano (static ncursesw, see scripts/build_ncurses.sh)
+# Terminfo database of the static ncursesw bash, vim, less and nano link
+# (scripts/build_ncurses.sh); also its compiled-in default, exported so a
+# host TERMINFO in the environment cannot redirect it
 setenv TERMINFO=/tvm/share/terminfo
 # Pager/editor defaults, kept if the environment already has them
 setenv? PAGER=less

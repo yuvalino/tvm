@@ -1029,6 +1029,22 @@ def test_vim_opens_and_quits(forkless: Forkless):
         p.sendline(":q!")
         p.expect(r'\$\s*$', timeout=5)
 
+def test_vim_terminal_sequences(forkless: Forkless):
+    """vim drives the terminal through terminfo: the raw session must carry
+    the control sequences of the announced terminal (xterm-256color's smcup,
+    ESC [ ? 1049 h, when the full-screen editor starts). Every platform links
+    the one static ncursesw and reads the initrd's terminfo database; the
+    iOS build used to link stub termcap functions that swallowed every
+    sequence, so vim drew nothing on a device."""
+    with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:
+        p.sendline("export TERM=xterm-256color; vim -n -u NONE $TMPDIR/vt_seq.txt")
+        idx = p.expect([r"\x1b\[\?1049h", TIMEOUT], timeout=5)
+        p.send("\x1b")
+        time.sleep(0.3)
+        p.sendline(":q!")
+        p.expect(r'\$\s*$', timeout=5)
+        assert idx == 0, "vim emitted no smcup (ESC[?1049h) control sequence"
+
 def test_vim_insert_mode(forkless: Forkless):
     """Insert text in vim using insert mode, save and verify."""
     with ssh_interactive(forkless.port, address=forkless.address, user=forkless.user) as p:

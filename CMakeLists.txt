@@ -3,7 +3,6 @@ project(tvm C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_subdirectory(stubs)
 add_subdirectory(third_party)
 add_subdirectory(tvm)
 add_subdirectory(scripts)
