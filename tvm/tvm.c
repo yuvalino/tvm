@@ -64,7 +64,6 @@
 #include <mach-o/getsect.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <sys/sysctl.h>
-#include <net/if_mib.h>
 #elif defined(__linux__)
 #include <pty.h>
 #include <sys/vfs.h>
@@ -15027,13 +15026,16 @@ FUNCTION_DEFINE_VOID_VA1(warnx, const char *, fmt) {
 #define TVM_CTL_SYSCTL_NAME     1
 #define TVM_CTL_SYSCTL_NAME2OID 3
 #define TVM_CTL_SYSCTL_OIDFMT   4
-#define TVM_IFDATA_SUPPLEMENTAL 5   // net/if_mib_private.h, not in the SDK
+// net/if_mib.h (not in the iPhoneOS SDK) and net/if_mib_private.h (in none)
+#define TVM_NETLINK_GENERIC     0
+#define TVM_IFMIB_IFDATA        2
+#define TVM_IFDATA_SUPPLEMENTAL 5
 
 static int tvm_sysctl_value_fallback(int *oid, u_int len, void *oldp, size_t *oldlenp)
 {
     struct tvm_tls *tls = tvm_tls();
-    if (len == 6 && oid[0] == CTL_NET && oid[1] == PF_LINK && oid[2] == NETLINK_GENERIC &&
-        oid[3] == IFMIB_IFDATA && oid[5] == TVM_IFDATA_SUPPLEMENTAL) {
+    if (len == 6 && oid[0] == CTL_NET && oid[1] == PF_LINK && oid[2] == TVM_NETLINK_GENERIC &&
+        oid[3] == TVM_IFMIB_IFDATA && oid[5] == TVM_IFDATA_SUPPLEMENTAL) {
         if (oldp)
             memset(oldp, 0, *oldlenp);
         return 0;
