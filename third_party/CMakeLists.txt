@@ -299,13 +299,18 @@ endif()
 
 cmake_host_system_information(RESULT TVM_NPROC QUERY NUMBER_OF_LOGICAL_CORES)
 
+# OpenSSL keeps per-thread state behind a pthread_key whose destructor frees
+# it at thread exit; under TVM that fires during the task thread's teardown,
+# after TVM's own state is gone. OpenSSL registers OPENSSL_cleanup() with
+# atexit() unless built no-atexit, and TVM runs a guest's atexit handlers
+# from exit(), before the teardown -- so curl and git need no wrapper for it.
 ExternalProject_Add(openssl_ext
     SOURCE_DIR ${THIRDPARTY_SRC}/openssl
     BINARY_DIR ${OPENSSL_BUILD}
     CONFIGURE_COMMAND perl ${THIRDPARTY_SRC}/openssl/Configure ${OPENSSL_TARGET}
         --prefix=${TVM_OPENSSL_PREFIX} --libdir=lib
         no-shared no-dso no-module no-engine no-dynamic-engine no-legacy no-fips
-        no-async no-thread-pool no-default-thread-pool no-secure-memory no-atexit
+        no-async no-thread-pool no-default-thread-pool no-secure-memory
         no-apps no-tests no-docs no-sctp no-ktls --with-rand-seed=os
         ${OPENSSL_CONFIGURE_EXTRA} -g -gdwarf-4
     BUILD_COMMAND make -j${TVM_NPROC} build_libs
@@ -316,13 +321,9 @@ ExternalProject_Add(openssl_ext
 ###############################################################################
 # curl
 #
-# Its own CMake builds libcurl.a and compiles the tool objects; the tool is
-# then relinked by scripts/build_curl_tool.sh with the TVM main() wrapper
-# (third_party/curl_main.c), as a static executable for the CLI initrd and as
-# libcurl.dylib (exporting main) for the Flutter initrd.
+# Its own CMake builds libcurl.a (git links it too) and the `curl` tool.
 ###############################################################################
 set(CURL_BUILD ${THIRDPARTY_BUILD}/curl)
-set(CURL_TOOL_BUILD ${THIRDPARTY_BUILD}/curl_tool)
 
 set(CURL_CMAKE_ARGS
     "-DCMAKE_C_FLAGS=-g -gdwarf-4"
@@ -357,9 +358,12 @@ else()
     list(APPEND CURL_CMAKE_ARGS -DCURL_CA_BUNDLE=/tvm/etc/ssl/cacert.pem)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # CMAKE_MACOSX_BUNDLE=OFF: a plain src/curl, not CMake's iOS default of an
+    # app bundle (src/curl.app/curl)
     list(APPEND CURL_CMAKE_ARGS
         -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64
-        -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_OSX_SYSROOT=iphoneos)
+        -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_OSX_SYSROOT=iphoneos
+        -DCMAKE_MACOSX_BUNDLE=OFF)
 endif()
 
 ExternalProject_Add(curl_ext
@@ -371,15 +375,10 @@ ExternalProject_Add(curl_ext
     EXCLUDE_FROM_ALL TRUE
 )
 
-add_custom_target(curl_exe
-    COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_curl_tool.sh
-        ${CURL_BUILD} ${TVM_OPENSSL_PREFIX} ${CURL_TOOL_BUILD} ${CURL_TOOL_BUILD}/curl
-    DEPENDS curl_ext
-    COMMENT "Linking curl (TVM main wrapper)"
-)
+add_custom_target(curl_exe DEPENDS curl_ext)
 set_target_properties(curl_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(curl curl_exe ${CURL_TOOL_BUILD}/curl)
+add_shared_lib(curl curl_exe ${CURL_BUILD}/src/curl)
 add_launcher(curl)
 
 ###############################################################################

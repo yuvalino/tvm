@@ -18,16 +18,16 @@
 # Makefile only probes the compiler (`cc -MMD` support) and never runs a
 # compiled program, so the iOS build differs from the macOS one in CC alone.
 #
-# HTTPS is the static libcurl + OpenSSL that scripts/build_curl_tool.sh links
-# the curl tool with (CURL_CFLAGS/CURL_LDFLAGS below, so curl-config is not
-# consulted); on Apple the certificate verification is SecTrust, no CA file.
+# HTTPS is the static libcurl + OpenSSL the curl tool is built with
+# (CURL_CFLAGS/CURL_LDFLAGS below, so curl-config is not consulted); on Apple
+# the certificate verification is SecTrust, no CA file.
 #
 # Output: git dispatches most commands in-process but execs a few programs
 # from its exec path, above all git-remote-https (remote-curl.c, a separate
 # executable upstream). Instead of one image per program, git.o,
 # remote-curl.o and http-fetch.o have their cmd_main() renamed at link time
-# (ld -alias / objcopy --redefine-sym, as build_curl_tool.sh does for curl's
-# main) and third_party/git_main.c dispatches on argv[0]; the helper names
+# (ld -alias / objcopy --redefine-sym) and third_party/git_main.c
+# dispatches on argv[0]; the helper names
 # in the exec path are links to /tvm/bin/git (scripts/CMakeLists.txt).
 # The build makes upstream's own git, git-remote-http and git-http-fetch too
 # (the link that validates the object set) and then links the multi-call
@@ -51,8 +51,8 @@ tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$CONFIGS_DIR/git_config.mak" "$INCLU
     "$ROOT/third_party/git_main.c" "$CURL_BUILD/lib/libcurl.a" "$OPENSSL_PREFIX/lib/libssl.a" "$OPENSSL_PREFIX/lib/libcrypto.a"
 TVMDIR="$BUILDDIR/tvm"   # renamed objects, wrapper, exec-path name lists
 
-# The libcurl link line of the curl tool (build_curl_tool.sh): the static
-# libraries plus what they need from the system.
+# libcurl's link line: the static libraries plus what they need from the
+# system.
 CURL_LDFLAGS="$CURL_BUILD/lib/libcurl.a $OPENSSL_PREFIX/lib/libssl.a $OPENSSL_PREFIX/lib/libcrypto.a -lz"
 case "$(uname)" in
     Darwin)
@@ -148,8 +148,7 @@ fi
 # ── the multi-call image ──
 rm -rf "$TVMDIR"
 mkdir -p "$TVMDIR"
-# The wrapper's OPENSSL_cleanup() comes from OpenSSL's headers.
-"$CC" -g -gdwarf-4 -I"$OPENSSL_PREFIX/include" -c "$WRAP_SRC" -o "$TVMDIR/git_main.o"
+"$CC" -g -gdwarf-4 -c "$WRAP_SRC" -o "$TVMDIR/git_main.o"
 
 # Rename each program's cmd_main -> <program>_cmd_main without touching the
 # sources: ld -r with an alias, then the original made private so the
