@@ -3861,8 +3861,11 @@ struct file_stream_list_entry {
 
 static struct file *file_for_task_stream_locked(struct task *t, struct file_stream *fs, int fs_type);
 
-void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
+// Returns EOF, with errno set, when the fclose-time flush of a FILE stream
+// failed (fclose() reports it, as libc's does); 0 otherwise.
+int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
 {
+    int ret = 0, flush_errno = 0;
     struct file_stream_list_entry *fsle;
     list_for_each_entry(fsle, &t->tsk_filestreams, fsle_list) {
         if (fsle->fsle_stream == fs)
@@ -3894,8 +3897,14 @@ void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
             if (t == current && !(t->tsk_state & TS_EXITING) && !fs->fs_discard && fs->fs_nfd >= 0) {
                 struct file *file = file_for_task_stream_locked(t, fs, FS_FILE);
                 if (file) {
-                    if (CALL_FUNC(fflush, fs->fs_fp) == EOF && errno == EPIPE)
+                    // A failed flush is fclose()'s failure: the buffered
+                    // output is lost, and the caller's check of fclose() is
+                    // how it learns of EPIPE/ENOSPC/EIO on the final write.
+                    if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                        ret = EOF;
+                        flush_errno = errno;
                         epipe_signal_locked(t);  // t is locked here
+                    }
                     file_unlock(file, 1);
                 }
             }
@@ -3917,6 +3926,9 @@ void task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
 
     fs->fs_type = FS_UNSPEC;
     rmem_arena_free(t->tsk_ar, fs);
+    if (ret == EOF)
+        errno = flush_errno;
+    return ret;
 }
 
 struct file_stream *task_filestreamalloc_locked(struct task *t) {
@@ -11163,11 +11175,21 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     }
 
     int nfd = fs->fs_nfd;
-    task_filestreamdealloc_locked(current, fs);
+    // The fclose-time flush failed: EOF with its errno, like libc's fclose
+    // (this returned close()'s 0 and the caller never learned of the lost
+    // output, e.g. EPIPE with SIGPIPE ignored).
+    int ret = task_filestreamdealloc_locked(current, fs);
+    int flush_errno = errno;
     task_unlock(current);
     tvm_sig_leave();
-    
-    return close(nfd);
+
+    if (close(nfd) == -1)
+        return EOF;
+    if (ret == EOF) {
+        errno = flush_errno;
+        return EOF;
+    }
+    return 0;
 }
 
 FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FILE *, stream)
