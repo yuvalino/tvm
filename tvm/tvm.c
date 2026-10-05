@@ -6351,10 +6351,20 @@ static void vfs_build_path_locked(struct vfs_node *root, struct vfs_node *vn, ch
     kfree(names);
 }
 
+/* Symlinks followed during one lookup, counted across restarts: a loop
+   (loop -> /tvm/loop, a -> b -> a) used to restart the lookup forever and
+   overflow the stack, so `cat /tvm/loop` took the whole VM down with
+   SIGSEGV instead of failing with ELOOP. The platform's limit (32 on
+   Darwin, 40 on Linux) is what the host's own namei applies. */
+#ifndef MAXSYMLINKS
+#define MAXSYMLINKS 40
+#endif
+
 static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *relpath, int create, int nofollow, mode_t mode, uid_t uid, gid_t gid)
 {
     char tmp[PATH_MAX];
     struct vfs_node *cur = root;
+    int nlinks = 0;
 
     strncpy(tmp, relpath, sizeof(tmp)-1);
     tmp[PATH_MAX-1] = 0;
@@ -6368,6 +6378,26 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
         next_tok = strtok_r(NULL, "/", &saveptr);
 
         if (strcmp(tok, ".") == 0) {
+            tok = next_tok;
+            continue;
+        }
+
+        /* ".." used to be looked up as a child literally named "..", so a
+           link target such as ../bin/f or /tvm/sub/../bin/f was ENOENT:
+           a path from a caller arrives normalized (normalize_path), but a
+           link's target is spliced in verbatim. Step to the parent, kept
+           at root the way ".." at "/" is. The lock order of the walk is
+           parent before child: release cur before taking its parent,
+           which outlives it, since the child list references both ends
+           (vfs_add_child_locked) and nothing ever unlinks a node. */
+        if (strcmp(tok, "..") == 0) {
+            if (cur != root) {
+                struct vfs_node *parent = cur->vn_parent;
+                vn_unlock(cur, 1);
+                cur = parent;
+                if (cur != root)
+                    vn_lock(cur, 1);
+            }
             tok = next_tok;
             continue;
         }
@@ -6412,6 +6442,13 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
                 return NULL;
             }
 
+            if (++nlinks > MAXSYMLINKS) {
+                vn_unlock(child, 1);
+                if (cur != root) vn_unlock(cur, 1);
+                errno = ELOOP;
+                return NULL;
+            }
+
             char link_target[PATH_MAX];
             memcpy(link_target, child->vn_data, child->vn_size);
             link_target[child->vn_size] = 0;
@@ -6425,7 +6462,6 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
                resolved from its directory: the rest of the path is
                appended and the lookup restarts. A target outside the mount
                (a host path) still cannot be reached from here. */
-            char newpath[PATH_MAX];
             char cur_path[PATH_MAX];
             if (link_target[0] == '/') {
                 size_t vnlen = strlen(root->vn_name);
@@ -6437,8 +6473,8 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
                     return NULL;
                 }
                 /* drop the mount prefix: the target is relative to root */
-                memmove(link_target, link_target + vnlen + (link_target[vnlen] == '/' ? 1 : 0),
-                        strlen(link_target + vnlen + (link_target[vnlen] == '/' ? 1 : 0)) + 1);
+                size_t skip = vnlen + (link_target[vnlen] == '/' ? 1 : 0);
+                memmove(link_target, link_target + skip, strlen(link_target + skip) + 1);
                 cur_path[0] = 0;
             }
             else {
@@ -6449,29 +6485,44 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
 
             vn_unlock(child, 1);
 
-            /* reconstruct remaining components after the symlink */
+            /* reconstruct remaining components after the symlink, before
+               the new path overwrites tmp, where next_tok and saveptr point */
+            char rest[PATH_MAX];
+            rest[0] = 0;
             if (next_tok) {
-                char rest[PATH_MAX];
                 if (saveptr && saveptr[0])
                     snprintf(rest, sizeof(rest), "%s/%s", next_tok, saveptr);
                 else
                     strncpy(rest, next_tok, sizeof(rest)-1);
-
-                if (cur_path[0])
-                    snprintf(newpath, sizeof(newpath), "%s/%s/%s", cur_path, link_target, rest);
-                else
-                    snprintf(newpath, sizeof(newpath), "%s/%s", link_target, rest);
-            } else {
-                if (cur_path[0])
-                    snprintf(newpath, sizeof(newpath), "%s/%s", cur_path, link_target);
-                else
-                    strncpy(newpath, link_target, sizeof(newpath)-1);
             }
 
+            if (rest[0]) {
+                if (cur_path[0])
+                    snprintf(tmp, sizeof(tmp), "%s/%s/%s", cur_path, link_target, rest);
+                else
+                    snprintf(tmp, sizeof(tmp), "%s/%s", link_target, rest);
+            } else {
+                if (cur_path[0])
+                    snprintf(tmp, sizeof(tmp), "%s/%s", cur_path, link_target);
+                else
+                    strncpy(tmp, link_target, sizeof(tmp)-1);
+            }
+
+            /* Restart from the mount root, in place rather than by
+               recursion, so a chain of links cannot pile up PATH_MAX
+               buffers on the stack. The caller's create/nofollow/mode
+               travel with it: the restart used to pass zeros, so the final
+               component after an intermediate link was always followed
+               (lstat /tvm/dirlink/x reported x's target) and a cpio entry
+               under a linked directory could not be created. nofollow
+               still applies only to the final component: a link met with
+               more path behind it (next_tok) is followed regardless, and
+               a final one only when the caller follows. */
             if (cur != root)
                 vn_unlock(cur, 1);
-
-            return vfs_lookup_locked(root, newpath, 0, 0, 0, 0, 0);
+            cur = root;
+            tok = strtok_r(tmp, "/", &saveptr);
+            continue;
         }
 
         if (next_tok && !S_ISDIR(child->vn_st.st_mode)) {
