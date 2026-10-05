@@ -17178,8 +17178,10 @@ static void *tvm_calloc(size_t nmemb, size_t size) {
         total = 1;
 
     struct rmem_arena *ar = arena_for_task(current);
-    if (!ar)
+    if (!ar) {
+        errno = ENOMEM;
         return NULL;
+    }
 
     void *p = rmem_arena_alloc(ar, total);
     if (NULL == p)
@@ -17208,8 +17210,10 @@ FUNCTION_DEFINE_VOID1(free, void *, ptr) {
 static void *tvm_memalign(size_t alignment, size_t size)
 {
     struct rmem_arena *ar = arena_for_task(current);
-    if (!ar)
+    if (!ar) {
+        errno = ENOMEM;
         return NULL;
+    }
     return rmem_arena_memalign(ar, alignment, size);
 }
 
