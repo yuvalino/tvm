@@ -2360,7 +2360,11 @@ struct rlock {
 #define RLOCK_EOF ((off_t)INT64_MAX)
 
 static LIST_HEAD(rlocks);
-static pthread_mutex_t rlocks_lock = PTHREAD_MUTEX_INITIALIZER; // leaf: never held while taking another lock
+// Lock order: tasks_lock / a task lock -> rlocks_lock -> the global arena's
+// lock (close() and taskfreelastref release under their task locks; kalloc,
+// kfree and the CALL_FUNC(fcntl) syscalls run under rlocks_lock). Nothing
+// takes a task lock under rlocks_lock.
+static pthread_mutex_t rlocks_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rlocks_cond = PTHREAD_COND_INITIALIZER;   // broadcast on every release, for F_SETLKW waiters
 
 // F_SETLKW waiters, each "waiter is blocked on a lock owner holds", for
@@ -2398,7 +2402,12 @@ static int rlock_would_deadlock_locked(struct task *self, struct task *owner)
 }
 
 // The byte range [*start, *end] a struct flock denotes, SEEK_CUR/SEEK_END
-// resolved against the real descriptor. -1 with errno on a bad range.
+// resolved against the real descriptor. -1 with errno on a bad range: EINVAL
+// for one that begins before byte 0, EOVERFLOW for one that runs past off_t
+// -- as the kernel (xnu check_file_seek_range / lf_advlock, Linux
+// flock_to_posix_lock). `base + l_start` and `s + l_len - 1` were plain
+// additions, which on l_start = INT64_MAX - 1, l_len = 10 overflow signed
+// off_t: undefined behaviour where the kernel says EOVERFLOW.
 static int rlock_range(int rfd, const struct flock *fl, off_t *start, off_t *end)
 {
     off_t base;
@@ -2422,22 +2431,83 @@ static int rlock_range(int rfd, const struct flock *fl, off_t *start, off_t *end
         return -1;
     }
 
-    off_t s = base + fl->l_start, e;
-    if (fl->l_len > 0)
-        e = s + fl->l_len - 1;
+    off_t s, e;
+    if (__builtin_add_overflow(base, fl->l_start, &s)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (s < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fl->l_len > 0) {
+        if (__builtin_add_overflow(s, fl->l_len - 1, &e)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
     else if (fl->l_len == 0)
         e = RLOCK_EOF;
     else {
+        // s >= 0 here, so neither sum can overflow
         e = s - 1;
         s += fl->l_len;
-    }
-    if (s < 0 || e < s) {
-        errno = EINVAL;
-        return -1;
+        if (s < 0) {
+            errno = EINVAL;
+            return -1;
+        }
     }
     *start = s;
     *end = e;
     return 0;
+}
+
+// The checks the kernel makes before it looks at any lock, in the kernel's
+// order (xnu fcntl: check_file_seek_range on a SEEK_SET/SEEK_CUR range, then
+// the l_type switch, then lf_advlock for the whence and a SEEK_END range;
+// Linux resolves the whole range first, so it differs only in reporting a
+// bad whence or SEEK_END range ahead of a bad l_type or access mode), with
+// the range resolved into [*start, *end]. The table used to be consulted
+// first, so what the kernel refuses outright -- F_WRLCK through a
+// descriptor open O_RDONLY (EBADF), an l_type it does not know (EINVAL) --
+// was answered EAGAIN whenever another task held the range, and F_SETLKW
+// slept for a lock the kernel would never have granted, for as long as the
+// other task kept its lock. F_GETLK takes any descriptor (neither kernel
+// checks the access mode for it).
+static int rlock_validate(int rfd, int cmd, const struct flock *fl, off_t *start, off_t *end)
+{
+    int range_first = (fl->l_whence == SEEK_SET || fl->l_whence == SEEK_CUR);
+    if (range_first && -1 == rlock_range(rfd, fl, start, end))
+        return -1;
+    switch (fl->l_type) {
+    case F_RDLCK:
+    case F_WRLCK:
+        if (cmd != F_GETLK) {
+            int flags = CALL_FUNC(fcntl, rfd, F_GETFL);
+            if (-1 == flags)
+                return -1;
+            int acc = flags & O_ACCMODE;
+            if (fl->l_type == F_RDLCK ? acc == O_WRONLY : acc == O_RDONLY) {
+                errno = EBADF;
+                return -1;
+            }
+        }
+        break;
+    case F_UNLCK:
+#if defined(__linux__)
+        // fcntl_getlk takes F_RDLCK and F_WRLCK only; xnu answers an F_UNLCK
+        // query (see fcntl_rlock).
+        if (cmd == F_GETLK) {
+            errno = EINVAL;
+            return -1;
+        }
+#endif
+        break;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    return range_first ? 0 : rlock_range(rfd, fl, start, end);
 }
 
 // A lock of another task that `type` on [start, end] of the file cannot
@@ -2456,9 +2526,45 @@ static struct rlock *rlock_conflict_locked(dev_t dev, ino_t ino, struct task *ow
     return NULL;
 }
 
+// What rlock_apply_locked may have to add to the table: the lock itself and,
+// when the range cuts a hole into an entry, that entry's tail (an owner's
+// entries never overlap -- every apply trims them first -- so one tail is
+// the most). Taken before the kernel is asked, so that nothing can fail once
+// the kernel has granted the request: with the kalloc inside the apply, an
+// ENOLCK after the kernel's F_SETLK had succeeded left the kernel holding
+// (for F_UNLCK: having dropped) what the table did not say, and the entries
+// trimmed before the failed allocation stayed trimmed. The kernel side could
+// not have been undone exactly anyway -- it merges every task's locks into
+// one owner, so this task's previous state there is unknown -- hence the
+// failure is moved ahead of the kernel call rather than reverted after it.
+struct rlock_spare {
+    struct rlock *rs_lock;  // the new entry; none for F_UNLCK
+    struct rlock *rs_tail;  // the tail of a split entry
+};
+
+static void rlock_spare_free(struct rlock_spare *sp)
+{
+    kfree(sp->rs_lock);
+    kfree(sp->rs_tail);
+    sp->rs_lock = sp->rs_tail = NULL;
+}
+
+static int rlock_spare_alloc(struct rlock_spare *sp, short type)
+{
+    sp->rs_tail = kalloc(sizeof(*sp->rs_tail));
+    sp->rs_lock = (type == F_UNLCK) ? NULL : kalloc(sizeof(*sp->rs_lock));
+    if (!sp->rs_tail || (type != F_UNLCK && !sp->rs_lock)) {
+        rlock_spare_free(sp);
+        errno = ENOLCK;
+        return -1;
+    }
+    return 0;
+}
+
 // Replace whatever `owner` holds on [start, end] of the file by `type`
 // (F_UNLCK: by nothing), splitting an entry that sticks out on both sides.
-static int rlock_apply_locked(dev_t dev, ino_t ino, struct task *owner, short type, off_t start, off_t end)
+// Takes what it needs from `sp` (see rlock_spare_alloc); cannot fail.
+static void rlock_apply_locked(struct rlock_spare *sp, dev_t dev, ino_t ino, struct task *owner, short type, off_t start, off_t end)
 {
     struct rlock *rl, *next;
     for (rl = list_first_entry(&rlocks, struct rlock, rl_list);
@@ -2469,11 +2575,9 @@ static int rlock_apply_locked(dev_t dev, ino_t ino, struct task *owner, short ty
         if (rl->rl_end < start || rl->rl_start > end)
             continue;
         if (rl->rl_start < start && rl->rl_end > end) {
-            struct rlock *tail = kalloc(sizeof(*tail));
-            if (!tail) {
-                errno = ENOLCK;
-                return -1;
-            }
+            struct rlock *tail = sp->rs_tail;
+            VERIFY(tail);
+            sp->rs_tail = NULL;
             *tail = *rl;
             tail->rl_start = end + 1;
             rl->rl_end = start - 1;
@@ -2492,13 +2596,11 @@ static int rlock_apply_locked(dev_t dev, ino_t ino, struct task *owner, short ty
     }
 
     if (type == F_UNLCK)
-        return 0;
+        return;
 
-    rl = kalloc(sizeof(*rl));
-    if (!rl) {
-        errno = ENOLCK;
-        return -1;
-    }
+    rl = sp->rs_lock;
+    VERIFY(rl);
+    sp->rs_lock = NULL;
     rl->rl_dev = dev;
     rl->rl_ino = ino;
     rl->rl_owner = owner;
@@ -2507,7 +2609,6 @@ static int rlock_apply_locked(dev_t dev, ino_t ino, struct task *owner, short ty
     rl->rl_end = end;
     list_add(&rl->rl_list, &rlocks);
     owner->tsk_rlocks++;
-    return 0;
 }
 
 // Drop every lock `t` holds on the file behind `rfd` (a close of any of the
@@ -12656,6 +12757,26 @@ FUNCTION_DEFINE2(int, dup2, int, oldfd, int, newfd) {
         return -1;
     }
 
+    // newfd outside the table is EBADF (POSIX); it used to index tsk_files
+    // and then panic in task_assign_file_locked.
+    if (newfd < 0 || newfd >= MAX_FILES) {
+        task_unlock(current);
+        file_unlock(oldfile, 1);
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+
+    // dup2(fd, fd) with fd open does nothing (POSIX). Carrying on replaced
+    // the descriptor by a copy of itself, and the close of the one replaced
+    // took the task's record locks on the file with it.
+    if (oldfd == newfd) {
+        task_unlock(current);
+        file_unlock(oldfile, 1);
+        tvm_sig_leave();
+        return newfd;
+    }
+
     // we can't unlock with nonzero ref while task it locked
     // hence the unlock kerfuffle
 
@@ -13083,13 +13204,17 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
     int ret = -1;
     struct stat st;
     off_t start, end;
+    struct rlock_spare spare;
     if (!emulate || -1 == CALL_FUNC(fstat, rfd, &st) || !S_ISREG(st.st_mode))
         ret = CALL_FUNC(fcntl, rfd, cmd, fl);
-    else if (0 == rlock_range(rfd, fl, &start, &end)) {
+    else if (0 == rlock_validate(rfd, cmd, fl, &start, &end)) {
         if (cmd == F_GETLK) {
+            // An F_UNLCK query is answered as a read lock's would be (xnu
+            // lf_getblock: anything but a write lock is blocked only by a
+            // write lock; the table skipped it and reported the range free
+            // while another task held it for writing).
             pthread_mutex_lock(&rlocks_lock);
-            struct rlock *c = (fl->l_type == F_UNLCK) ? NULL :
-                rlock_conflict_locked(st.st_dev, st.st_ino, current, fl->l_type, start, end);
+            struct rlock *c = rlock_conflict_locked(st.st_dev, st.st_ino, current, fl->l_type, start, end);
             if (c) {
                 fl->l_type = c->rl_type;
                 fl->l_whence = SEEK_SET;
@@ -13102,7 +13227,7 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
             if (!c) // no task holds one; a process outside TVM may
                 ret = CALL_FUNC(fcntl, rfd, F_GETLK, fl);
         }
-        else {
+        else if (0 == rlock_spare_alloc(&spare, fl->l_type)) {
             for (;;) {
                 pthread_mutex_lock(&rlocks_lock);
                 struct rlock *c = (fl->l_type == F_UNLCK) ? NULL :
@@ -13110,11 +13235,12 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                 if (!c) {
                     // Kernel first -- inside the process it cannot refuse on
                     // account of another task, only of an outside process --
-                    // then the table. Always F_SETLK: a kernel F_SETLKW would
-                    // sleep with rlocks_lock held.
+                    // then the table, which cannot fail (its entries were
+                    // taken up front). Always F_SETLK: a kernel F_SETLKW
+                    // would sleep with rlocks_lock held.
                     ret = CALL_FUNC(fcntl, rfd, F_SETLK, fl);
                     if (0 == ret)
-                        ret = rlock_apply_locked(st.st_dev, st.st_ino, current, fl->l_type, start, end);
+                        rlock_apply_locked(&spare, st.st_dev, st.st_ino, current, fl->l_type, start, end);
                     if (fl->l_type == F_UNLCK)
                         pthread_cond_broadcast(&rlocks_cond);
                     int held_outside = (-1 == ret && cmd == F_SETLKW && (errno == EAGAIN || errno == EACCES));
@@ -13171,6 +13297,7 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                     break;
                 }
             }
+            rlock_spare_free(&spare);
         }
     }
 
@@ -13570,8 +13697,43 @@ FUNCTION_DEFINE2(int, flock, int, fd, int, operation) {
     return CURRENT_RFD(fd, CALL_FUNC(flock, __rfd, operation));
 }
 
+// lockf() is fcntl() record locking under another name -- Apple's Libc and
+// glibc both build the struct flock below and call fcntl() -- so it goes
+// through the record-lock table like fcntl() does. Forwarded to the host's
+// lockf() it saw TVM's one process: a task's F_TLOCK succeeded on a range
+// another task held, by fcntl() or by lockf().
 FUNCTION_DEFINE3(int, lockf, int, fd, int, cmd, off_t, len) {
-    return CURRENT_RFD(fd, CALL_FUNC(lockf, __rfd, cmd, len));
+    struct flock fl = { .l_whence = SEEK_CUR, .l_start = 0, .l_len = len };
+    switch (cmd) {
+    case F_ULOCK:
+        fl.l_type = F_UNLCK;
+        return fcntl_rlock(fd, F_SETLK, &fl);
+    case F_LOCK:
+        fl.l_type = F_WRLCK;
+        return fcntl_rlock(fd, F_SETLKW, &fl);
+    case F_TLOCK:
+        fl.l_type = F_WRLCK;
+        return fcntl_rlock(fd, F_SETLK, &fl);
+    case F_TEST:
+        // Free, or the caller's own: 0. The libcs also accept a lock whose
+        // l_pid is the caller's, but neither the table nor the kernel ever
+        // reports the caller's own locks to it. Taken by someone else: the
+        // host libc's errno -- POSIX allows either.
+        fl.l_type = F_WRLCK;
+        if (-1 == fcntl_rlock(fd, F_GETLK, &fl))
+            return -1;
+        if (fl.l_type == F_UNLCK)
+            return 0;
+#ifdef __APPLE__
+        errno = EAGAIN;
+#else
+        errno = EACCES;
+#endif
+        return -1;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
 }
 
 FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t, bufsiz) {
