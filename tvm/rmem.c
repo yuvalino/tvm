@@ -409,8 +409,10 @@ static struct rmem_slab *rmem_slab_create(size_t slabsize, size_t objsize) {
         nobj--;
     }
 
-    if (!nobj)
+    if (!nobj) {
+        errno = ENOMEM;  // not even one object of this size fits
         return NULL;
+    }
 
     void *mem = rops.ro_mmap(NULL, slabsize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED)
@@ -759,10 +761,9 @@ int rmem_arena_duplicate(struct rmem_arena *dst_ar, struct rmem_arena *src_ar, v
             // unmapped the arena and then unlocked the mutex inside it: a
             // fault in the fork child while holding the parent's arena lock,
             // which deadlocked the VM instead of reporting the failure.
-            int last_errno = errno;
+            // errno is rmem_slab_create's.
             pthread_mutex_unlock(&src_ar->ar_lock);
             pthread_mutex_unlock(&dst_ar->ar_lock);
-            errno = last_errno;
             return -1;
         }
 
