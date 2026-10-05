@@ -936,7 +936,7 @@ ssize_t fd_getpath(int fd, char *out, size_t outsize)
     char filepath[PATH_MAX];
     filepath[0] = 0;
 
-    if (-1 == CALL_FUNC(fcntl, F_GETPATH, (uint64_t)&filepath))
+    if (-1 == CALL_FUNC(fcntl, fd, F_GETPATH, filepath))
         return -1;
 
     size_t len = strlen(filepath);
@@ -948,7 +948,7 @@ ssize_t fd_getpath(int fd, char *out, size_t outsize)
     memcpy(out, filepath, len + 1);
     return len;
 #elif defined(__linux__)
-        if (!out || outsize == 0) {
+    if (!out || outsize == 0) {
         errno = EINVAL;
         return -1;
     }
@@ -960,7 +960,8 @@ ssize_t fd_getpath(int fd, char *out, size_t outsize)
     if (n < 0)
         return -1;
 
-    if ((size_t)n >= outsize) {
+    // readlink truncates silently: a full buffer may be a cut-off path
+    if ((size_t)n >= outsize - 1) {
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -3453,57 +3454,48 @@ char *normalize_path(const char *dirname, const char *file_name, char *out_path)
     return out_path;
 }
 
+// The path of an open file as the task knows it: the name file_open()
+// recorded, else the host's path of its descriptor. The recorded name comes
+// first: a /tvm VFS file's host descriptor is "/" or /dev/null, so the host
+// cannot name it. The caller holds a reference on `file`.
+static ssize_t file_getpath(struct file *file, char *out, size_t outsize)
+{
+    if (!file->f_pathname)
+        return fd_getpath(file->f_rfd, out, outsize);
+
+    size_t len = strlen(file->f_pathname);
+    if (len + 1 > outsize) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, file->f_pathname, len + 1);
+    return len;
+}
+
 char *dirfd_normalize_path(int dirnfd, const char *file_name, char *out_path)
 {
-    struct file *dir = NULL;
-    const char *dirname = NULL;
-    if (dirnfd != AT_FDCWD) {
-        dir = file_for_task(current, dirnfd);
-        if (!dir)
-            return NULL;
+    if (dirnfd == AT_FDCWD)
+        return normalize_path(NULL, file_name, out_path);
 
-        if (!dir->f_pathname) {
-            // A directory descriptor with no recorded name (opened before
-            // file_open recorded relative opens, or adopted from the host).
-            // This used to hand back the bare relative name, which the
-            // path-based callers (fstatat, faccessat, fchmodat, fchownat,
-            // readlinkat) then resolved against the task's cwd -- silently
-            // the wrong directory. Ask the host for the descriptor's path
-            // instead, and fail rather than guess when it has none.
-            char dirbuf[PATH_MAX];
-#if defined(__APPLE__)
-            if (-1 == CALL_FUNC(fcntl, dir->f_rfd, F_GETPATH, dirbuf)) {
-                file_unlock(dir, 1);
-                errno = EBADF;
-                return NULL;
-            }
-#else
-            char proc[64];
-            snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dir->f_rfd);
-            ssize_t n = CALL_FUNC(readlink, proc, dirbuf, sizeof(dirbuf) - 1);
-            if (n <= 0) {
-                file_unlock(dir, 1);
-                errno = EBADF;
-                return NULL;
-            }
-            dirbuf[n] = 0;
-#endif
-            file_unlock(dir, 1);
-            return normalize_path(dirbuf, file_name, out_path);
-        }
-
-        dirname = dir->f_pathname;
-        file_unlock(dir, 0);
+    struct file *dir = file_for_task(current, dirnfd);
+    if (!dir) {
+        errno = EBADF;
+        return NULL;
     }
 
-    char *ret = normalize_path(dirname, file_name, out_path);
+    // A directory descriptor with no recorded name (adopted from the host)
+    // used to hand back the bare relative name, which the path-based callers
+    // (fstatat, faccessat, fchmodat, fchownat, readlinkat) then resolved
+    // against the task's cwd -- silently the wrong directory. file_getpath()
+    // asks the host for its path instead, and this fails rather than guess
+    // when there is none.
+    char dirbuf[PATH_MAX];
+    ssize_t n = file_getpath(dir, dirbuf, sizeof(dirbuf));
+    file_unlock(dir, 1);
+    if (n < 0)
+        return NULL;
 
-    if (dir) {
-        file_lock(dir, 0);
-        file_unlock(dir, 1);
-    }
-
-    return ret;
+    return normalize_path(dirbuf, file_name, out_path);
 }
 
 int copy_pthread_attr(const pthread_attr_t *src, pthread_attr_t *dest)
@@ -17883,10 +17875,25 @@ FUNCTION_DEFINE1(int, chdir, const char *, path) {
     return 0;
 }
 
+// By the file's recorded name first (file_getpath): asking only the host
+// took a /tvm VFS directory, whose host descriptor is "/", to the root.
 FUNCTION_DEFINE1(int, fchdir, int, fildes) {
     char tmp[PATH_MAX];
-    if (0 > CURRENT_RFD(fildes, fd_getpath(__rfd, tmp, sizeof(tmp))))
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fildes);
+    ssize_t n = -1;
+    if (file) {
+        n = file_getpath(file, tmp, sizeof(tmp));
+        file_unlock(file, 1);
+    }
+    else
+        errno = EBADF;
+    int last_errno = errno;
+    tvm_sig_leave();
+    if (n < 0) {
+        errno = last_errno;
         return -1;
+    }
 
     return chdir(tmp);
 }
