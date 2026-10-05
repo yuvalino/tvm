@@ -874,6 +874,38 @@ def _sh(sshi: spawn, cmd: str, timeout: float = CURL_TIMEOUT) -> tuple[str, int]
 def _lines(out: str) -> list[str]:
     return [l.strip() for l in out.splitlines() if l.strip()]
 
+# curl's exit codes that say the request never got an answer: name resolution,
+# connection, and the -m 20 deadline. Everything else, rc=60 (verification)
+# in particular, is a verdict about TLS and the tests assert on it.
+_CURL_NO_ANSWER = {6: "could not resolve host", 7: "could not connect", 28: "timed out"}
+
+def _runner_reaches(url: str) -> tuple[bool, str]:
+    """Whether the runner itself completes a request to url right now
+    (unverified: -k, so an expired or self-signed certificate still counts
+    as reachable). Returns (ok, diagnostic)."""
+    r = subprocess.run(["curl", "-sSk", "-m", "20", "-o", "/dev/null", url],
+                       capture_output=True, text=True)
+    return r.returncode == 0, f"runner curl rc={r.returncode}{': ' + r.stderr.strip() if r.stderr.strip() else ''}"
+
+def _curl(sshi: spawn, cmd: str, url: str) -> tuple[str, int]:
+    """Run a curl command line in the guest, like _sh. The hosts here
+    (badssl.com, example.com) are outside anyone's control, and a stalled
+    connection used to fail the test with a bare rc=28. When the guest got no
+    answer at all (rc 6/7/28, or such a curl diagnostic in the output of a
+    pipeline), the runner probes the same URL: if it cannot reach it either
+    the test is skipped, with both diagnostics -- that is the network -- and
+    if it can, the test fails: the guest could not do what the runner can."""
+    out, rc = _sh(sshi, cmd)
+    m = re.search(r"curl: \((6|7|28)\)", out)
+    code = rc if rc in _CURL_NO_ANSWER else int(m.group(1)) if m else None
+    if code is not None:
+        ok, diag = _runner_reaches(url)
+        why = f"guest curl rc={code} ({_CURL_NO_ANSWER[code]})"
+        if not ok:
+            pytest.skip(f"{url} unreachable: {why}; {diag}")
+        pytest.fail(f"{url}: {why}, but the runner reaches it ({diag}):\n{out}")
+    return out, rc
+
 @network_required
 def test_curl_version(sshi: spawn):
     """curl --version — the tool links libcurl 8.x against OpenSSL 3.x and
@@ -896,14 +928,14 @@ def test_curl_version(sshi: spawn):
 def test_curl_https_get(sshi: spawn):
     """curl over HTTPS — OpenSSL handshake plus certificate verification
     (Apple SecTrust on Darwin, Mozilla bundle on Linux)."""
-    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null -w '%{http_code} %{ssl_verify_result}\\n' https://example.com")
+    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null -w '%{http_code} %{ssl_verify_result}\\n' https://example.com", "https://example.com")
     assert rc == 0, out
     assert "200 0" in _lines(out), out
 
 @network_required
 def test_curl_http_get(sshi: spawn):
     """Plain HTTP — the socket/resolver path with no TLS involved."""
-    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' http://example.com")
+    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' http://example.com", "http://example.com")
     assert rc == 0, out
     assert "200" in _lines(out), out
 
@@ -911,34 +943,34 @@ def test_curl_http_get(sshi: spawn):
 def test_curl_verify_self_signed_fails(sshi: spawn):
     """An untrusted chain must be rejected: curl exits 60 (peer cert failed
     verification), proving verification is really on."""
-    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://self-signed.badssl.com/")
+    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null https://self-signed.badssl.com/", "https://self-signed.badssl.com/")
     assert rc == 60, f"rc={rc}: {out}"
 
 @network_required
 def test_curl_insecure_self_signed_ok(sshi: spawn):
     """The same host with -k succeeds, so the previous failure was the
     verifier's decision and not a broken connection."""
-    out, rc = _sh(sshi, "curl -sS -k -m 20 -o /dev/null -w '%{http_code}\\n' https://self-signed.badssl.com/")
+    out, rc = _curl(sshi, "curl -sS -k -m 20 -o /dev/null -w '%{http_code}\\n' https://self-signed.badssl.com/", "https://self-signed.badssl.com/")
     assert rc == 0, out
     assert "200" in _lines(out), out
 
 @network_required
 def test_curl_expired_fails(sshi: spawn):
     """Validity period is checked, not just chain trust."""
-    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://expired.badssl.com/")
+    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null https://expired.badssl.com/", "https://expired.badssl.com/")
     assert rc == 60, f"rc={rc}: {out}"
 
 @network_required
 def test_curl_wrong_host_fails(sshi: spawn):
     """Hostname is matched against the certificate's SANs."""
-    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://wrong.host.badssl.com/")
+    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null https://wrong.host.badssl.com/", "https://wrong.host.badssl.com/")
     assert rc == 60, f"rc={rc}: {out}"
 
 @network_required
 def test_curl_download_to_file(sshi: spawn):
     """-o into the guest's writable TMPDIR — the response body goes through
     the VFS write path, not the pty."""
-    out, rc = _sh(sshi, 'curl -sS -m 20 -o "$TMPDIR/curl_out.html" https://example.com && wc -c < "$TMPDIR/curl_out.html"')
+    out, rc = _curl(sshi, 'curl -sS -m 20 -o "$TMPDIR/curl_out.html" https://example.com && wc -c < "$TMPDIR/curl_out.html"', "https://example.com")
     assert rc == 0, out
     sizes = [int(l) for l in _lines(out) if l.isdigit()]
     assert sizes and sizes[-1] > 0, out
@@ -973,7 +1005,7 @@ def test_curl_repeated(sshi: spawn):
     task, so this exercises OpenSSL's per-thread state being set up and torn
     down repeatedly (the thread-exit hazard OpenSSL's atexit cleanup handles,
     see the openssl_ext comment in third_party/CMakeLists.txt)."""
-    out, rc = _sh(sshi, "for i in 1 2 3 4 5; do curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' https://example.com; done")
+    out, rc = _curl(sshi, "for i in 1 2 3 4 5; do curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' https://example.com; done", "https://example.com")
     assert rc == 0, out
     codes = [l for l in _lines(out) if l == "200"]
     assert len(codes) == 5, f"got {len(codes)} x 200: {out}"
@@ -981,7 +1013,7 @@ def test_curl_repeated(sshi: spawn):
 @network_required
 def test_curl_pipeline(sshi: spawn):
     """curl's stdout through a TVM pipe into toybox grep."""
-    out, rc = _sh(sshi, "curl -sS -m 20 https://example.com | grep -c '<html'")
+    out, rc = _curl(sshi, "curl -sS -m 20 https://example.com | grep -c '<html'", "https://example.com")
     assert rc == 0, out
     assert _lines(out)[-1] == "1", out
 
@@ -989,7 +1021,7 @@ def test_curl_pipeline(sshi: spawn):
 def test_curl_in_background_job(sshi: spawn):
     """curl as a background job, reaped with wait — job control around a
     task that spawns its own resolver thread."""
-    out, rc = _sh(sshi, "curl -sS -m 20 -o /dev/null https://example.com & wait $!")
+    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null https://example.com & wait $!", "https://example.com")
     assert rc == 0, out
 
 # ── Vim (ex mode) ────────────────────────────────────────────
