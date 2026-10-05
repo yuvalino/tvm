@@ -94,8 +94,14 @@ def _start_device_backend(device: str) -> subprocess.Popen:
 
 _device_forkless = None
 
+def _test_failed(request) -> bool:
+    """Whether the test using the fixture failed in setup or call (reports
+    are attached by conftest's pytest_runtest_makereport)."""
+    return any(getattr(getattr(request.node, "rep_" + when, None), "failed", False)
+               for when in ("setup", "call"))
+
 @pytest.fixture()
-def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
+def forkless(request, device, backend, ssh_user) -> Iterator[Forkless]:
     global _device_forkless
 
     # Device mode: launch once, reuse across tests
@@ -141,8 +147,17 @@ def forkless(device, backend, ssh_user) -> Iterator[Forkless]:
     if not device:
         proc.kill()
         proc.wait()
-        proc._logfile.close()
-        os.unlink(proc._logpath)
+        if _test_failed(request):
+            # The backend's kernel log (stdout+stderr of tvm / the app) is
+            # the only trace of what happened inside TVM: show it in the
+            # failure report and keep the file.
+            proc._logfile.seek(0)
+            print(f"--- backend log (kept at {proc._logpath}) ---")
+            print(proc._logfile.read())
+            proc._logfile.close()
+        else:
+            proc._logfile.close()
+            os.unlink(proc._logpath)
 
 @contextmanager
 def ssh(port: int, command: str | None = None, exe="ssh", address: str = "localhost", user: str = "", legacy_scp: bool = False) -> Iterator[spawn]:

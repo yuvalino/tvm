@@ -3,6 +3,16 @@ import pwd
 import pytest
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Record each phase's report on the item so a fixture's teardown knows
+    whether the test failed (the forkless fixture prints the backend's log
+    into the report of a failed test instead of deleting it)."""
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, "rep_" + rep.when, rep)
+
+
 def pytest_addoption(parser):
     parser.addoption("--backend", default="tvm", choices=["tvm", "flutter"],
                      help="TVM backend: 'tvm' (standalone) or 'flutter' (app)")
