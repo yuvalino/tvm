@@ -22,17 +22,13 @@
 # (CURL_CFLAGS/CURL_LDFLAGS below, so curl-config is not consulted); on Apple
 # the certificate verification is SecTrust, no CA file.
 #
-# Output: git dispatches most commands in-process but execs a few programs
-# from its exec path, above all git-remote-https (remote-curl.c, a separate
-# executable upstream). Instead of one image per program, git.o,
-# remote-curl.o and http-fetch.o have their cmd_main() renamed at link time
-# (ld -alias / objcopy --redefine-sym) and third_party/git_main.c
-# dispatches on argv[0]; the helper names
-# in the exec path are links to /tvm/bin/git (scripts/CMakeLists.txt).
-# The build makes upstream's own git, git-remote-http and git-http-fetch too
-# (the link that validates the object set) and then links the multi-call
-# `git` (the Flutter apps get it converted to libgit.dylib,
-# third_party/CMakeLists.txt).
+# Output: upstream's own programs in $BUILDDIR/src: `git`, and the two curl
+# helpers git execs from its exec path, git-remote-http (remote-curl.c; the
+# https/ftp/ftps names are links to it, as upstream installs them) and
+# git-http-fetch. Only the helpers link libcurl and OpenSSL, so plain git
+# commands do not map them. scripts/CMakeLists.txt lays them out in the
+# initrd; the Flutter apps get each converted to a dylib
+# (third_party/CMakeLists.txt).
 set -e
 SRCDIR="$1"
 BUILDDIR="$2"
@@ -43,13 +39,12 @@ CC="${CC:-cc}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIGS_DIR="$ROOT/third_party/configs"
-WRAP_SRC="$ROOT/third_party/git_main.c"
 INCLUDE_SHIM="$ROOT/third_party/include-shim"
 SHADOW="$BUILDDIR/src"
 . "$(cd "$(dirname "$0")" && pwd)/tvm_stamp.sh"
 tvm_stamp_begin "$BUILDDIR" "$0" "$SRCDIR" "$CONFIGS_DIR/git_config.mak" "$INCLUDE_SHIM/tvm_stdio_unlocked.h" \
-    "$ROOT/third_party/git_main.c" "$CURL_BUILD/lib/libcurl.a" "$OPENSSL_PREFIX/lib/libssl.a" "$OPENSSL_PREFIX/lib/libcrypto.a"
-TVMDIR="$BUILDDIR/tvm"   # renamed objects, wrapper, exec-path name lists
+    "$CURL_BUILD/lib/libcurl.a" "$OPENSSL_PREFIX/lib/libssl.a" "$OPENSSL_PREFIX/lib/libcrypto.a"
+TVMDIR="$BUILDDIR/tvm"   # exec-path name lists for the initrd
 
 # libcurl's link line: the static libraries plus what they need from the
 # system.
@@ -145,46 +140,8 @@ if [ "$(uname)" = Darwin ]; then
     fi
 fi
 
-# ── the multi-call image ──
 rm -rf "$TVMDIR"
 mkdir -p "$TVMDIR"
-"$CC" -g -gdwarf-4 -c "$WRAP_SRC" -o "$TVMDIR/git_main.o"
-
-# Rename each program's cmd_main -> <program>_cmd_main without touching the
-# sources: ld -r with an alias, then the original made private so the
-# wrapper's cmd_main is the only global one (objcopy on Linux).
-rename_cmd_main() {
-    case "$(uname)" in
-        Darwin)
-            "$CC" -nostdlib -r \
-                -Wl,-alias,_cmd_main,"_$2" -Wl,-unexported_symbol,_cmd_main \
-                "$SHADOW/$1" -o "$TVMDIR/$1"
-            ;;
-        *)
-            objcopy --redefine-sym cmd_main="$2" "$SHADOW/$1" "$TVMDIR/$1"
-            ;;
-    esac
-}
-rename_cmd_main git.o git_cmd_main
-rename_cmd_main remote-curl.o remote_curl_cmd_main
-rename_cmd_main http-fetch.o http_fetch_cmd_main
-
-# The link inputs, in the order of git's own link rules: the program objects,
-# the built-in commands, the http objects git-remote-http and git-http-fetch
-# share, common-main.o (main), then libcurl and git's libraries + EXTLIBS.
-OBJS="$TVMDIR/git_main.o $TVMDIR/git.o $TVMDIR/remote-curl.o $TVMDIR/http-fetch.o"
-for o in $(gitvar BUILTIN_OBJS) http.o http-walker.o common-main.o; do
-    OBJS="$OBJS $SHADOW/$o"
-done
-LIBS="$(gitvar ALL_LDFLAGS) $CURL_LDFLAGS"
-for l in $(gitvar LIBS); do
-    case "$l" in
-        -*) LIBS="$LIBS $l" ;;
-        *)  LIBS="$LIBS $SHADOW/$l" ;;
-    esac
-done
-# The executable.
-"$CC" -g -o "$BUILDDIR/git" $OBJS $LIBS
 
 # What the initrd links into the exec path (scripts/CMakeLists.txt):
 # upstream's dashed built-in names and the generated scripts.
