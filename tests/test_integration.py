@@ -245,14 +245,32 @@ def test_connect_echo(forkless: Forkless):
         p.expect(EOF)
         assert 0 == p.wait()
 
-@pytest.mark.parametrize("legacy_scp", [False, True], ids=["sftp", "legacy"])
-def test_scp(forkless: Forkless, device, legacy_scp):
-    # Get a writable dir inside TVM for SCP source/dest
-    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
-        p.expect(r"(/\S+)")
+@contextmanager
+def remote_test_dir(forkless: Forkless, name: str) -> Iterator[str]:
+    """A fresh, empty directory of the guest's own for a transfer test,
+    under its TMPDIR (or HOME), removed afterwards. The tests used to work
+    directly in TMPDIR: the non-interactive sessions inherit the runner's,
+    and a developer Mac's /var/folders/.../T holds tens of thousands of
+    entries, so test_sftp's `ls` of it took a minute and timed out."""
+    # the physical path (pwd -P): sftp's realpath reports it that way, and
+    # a TMPDIR with a trailing slash would otherwise show up as "T//name"
+    with ssh(forkless.port, f"d=${{TMPDIR:-$HOME}}/{name}; rm -rf $d && mkdir -p $d && cd $d && echo DIR=$(pwd -P)",
+             address=forkless.address, user=forkless.user) as p:
+        p.expect(r"DIR=(/\S+)")
         remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
         p.expect(EOF)
+    try:
+        yield remote_dir
+    finally:
+        with ssh(forkless.port, f"rm -rf {remote_dir}", address=forkless.address, user=forkless.user) as p:
+            p.expect(EOF)
 
+@pytest.mark.parametrize("legacy_scp", [False, True], ids=["sftp", "legacy"])
+def test_scp(forkless: Forkless, device, legacy_scp):
+    with remote_test_dir(forkless, "tvm_test_scp") as remote_dir:
+        _test_scp(forkless, device, legacy_scp, remote_dir)
+
+def _test_scp(forkless: Forkless, device, legacy_scp, remote_dir):
     f1 = f"{remote_dir}/scp_src"
     f2 = tempfile.mktemp(prefix="scp_dst_") if device else f"{remote_dir}/scp_dst"
 
@@ -275,11 +293,10 @@ def test_scp(forkless: Forkless, device, legacy_scp):
 def test_sftp(forkless: Forkless):
     """The sftp client exercises the subsystem directly: realpath, opendir,
     readdir, open/write, open/read and remove."""
-    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
-        p.expect(r"(/\S+)")
-        remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
-        p.expect(EOF)
+    with remote_test_dir(forkless, "tvm_test_sftp") as remote_dir:
+        _test_sftp(forkless, remote_dir)
 
+def _test_sftp(forkless: Forkless, remote_dir: str):
     local_src = tempfile.mktemp(prefix="sftp_src_")
     local_dst = tempfile.mktemp(prefix="sftp_dst_")
     with open(local_src, "w") as f:
@@ -299,6 +316,11 @@ def test_sftp(forkless: Forkless):
                      "ls", f"get sftp_put {local_dst}", "rm sftp_put"):
             p.sendline(line)
             p.expect("sftp> ")
+            if line == "pwd":
+                assert f"Remote working directory: {remote_dir}" in p.before, p.before
+            if line == "ls":
+                # the directory is the test's own: the listing is exactly the file put
+                assert _lines(clean_ansi(p.before))[-1] == "sftp_put", p.before
         p.sendline("quit")
         p.expect(EOF)
 
@@ -716,11 +738,10 @@ def test_concurrent_interactive(forkless: Forkless):
 
 def test_scp_large_file(forkless: Forkless, device):
     """SCP a larger file — exercises pipe buffering and stdio with bulk data."""
-    with ssh(forkless.port, "echo ${TMPDIR:-$HOME}", address=forkless.address, user=forkless.user) as p:
-        p.expect(r"(/\S+)")
-        remote_dir = p.match.group(1).decode() if isinstance(p.match.group(1), bytes) else p.match.group(1)
-        p.expect(EOF)
+    with remote_test_dir(forkless, "tvm_test_scp_large") as remote_dir:
+        _test_scp_large_file(forkless, device, remote_dir)
 
+def _test_scp_large_file(forkless: Forkless, device, remote_dir):
     f1 = f"{remote_dir}/scp_large_src"
     f2 = tempfile.mktemp(prefix="scp_large_dst_") if device else f"{remote_dir}/scp_large_dst"
 
