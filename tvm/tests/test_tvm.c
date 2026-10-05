@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 
@@ -583,6 +584,60 @@ TEST(FDsPoll) {
     ASSERT_EQ(select(nfds, &rfds, &wfds, NULL, &t), 2);
     ASSERT_NEQ(FD_ISSET(pp[1], &wfds), 0);
     ASSERT_NEQ(FD_ISSET(pp[0], &rfds), 0);
+}
+
+// --- fork's pointer fixup and adjacent ints ---
+
+/*
+ * fork's pointer fixup rewrites every 8-byte word of a copied region whose
+ * value lies inside a copied region, so two adjacent small ints {a, b} --
+ * the word b<<32 | a -- must never be an address inside the heap. A slab
+ * mapped across a 4 GB boundary made git's pipe pair {3, 4}, 0x400000003,
+ * "relocate" in the child and its dup2()/close() fail with EBADF (see
+ * tvm_mmap_guarded). Walk the heap across a 4 GB boundary -- the blocks are
+ * never touched, so nothing is committed -- and check that no block comes
+ * within 16 MB above one; then fork with a pipe pair and see it survive.
+ */
+TEST(ForkFixupAdjacentInts) {
+    enum { BLK = 1 << 20, MAXBLKS = 8192 };     // up to 8 GB of address space
+    const uintptr_t guard = (uintptr_t)16 << 20;
+
+    int fd[2];
+    ASSERT_EQ(0, pipe(fd));
+    long fd0 = fd[0], fd1 = fd[1];              // separate words: never an address
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        if (fd[0] != fd0 || fd[1] != fd1) {
+            fprintf(stderr, "pipe pair changed in the child: {%d, %d} -> {%d, %d}\n", (int)fd0, (int)fd1, fd[0], fd[1]);
+            _exit(2);
+        }
+        if (dup2(fd[0], 0) < 0 || write(fd[1], "x", 1) != 1)
+            _exit(3);
+        _exit(0);
+    }
+    char c;
+    ASSERT_EQ(1, read(fd[0], &c, 1));
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+
+    uintptr_t first_bucket = 0;
+    int crossed = 0;
+    for (int i = 0; i < MAXBLKS && !crossed; i++) {
+        char *blk = malloc(BLK);
+        ASSERT_NEQ(blk, NULL);
+        uintptr_t lo = (uintptr_t)blk, hi = lo + BLK;
+        if (!i)
+            first_bucket = lo >> 32;
+        if ((lo >> 32) != ((hi - 1) >> 32) || (lo & 0xffffffffu) < guard)
+            FAIL("block %d at %p-%p lies within 16 MB above a 4 GB boundary", i, (void *)lo, (void *)hi);
+        if ((lo >> 32) != first_bucket)
+            crossed = 1;                        // crossed a boundary cleanly
+    }
+    ASSERT_EQ(1, crossed);
+    // the blocks are left to exit: freeing them would clear 4+ GB
 }
 
 // --- killpg, pselect, shm_open (what bash relies on since it is no longer

@@ -10120,8 +10120,134 @@ static void ulinker_print_cb(char *msg) {
     log_write(__msgbuf, __num);
 }
 
+/*
+ * fork's pointer fixup (cow_fixup_process) rewrites every 8-byte word of a
+ * copied region whose value falls inside a copied region: it cannot tell a
+ * pointer from two adjacent ints. Two small ints {a, b} read as the address
+ * b<<32 | a, so a copied region covering [N<<32, N<<32 + small) turns every
+ * such pair in the child into garbage. git's start_command() keeps its pipe
+ * ends in an int[2] on the stack: with a heap slab mapped across
+ * 0x400000000 the pair {3, 4}, read as 0x400000003, was "relocated", and
+ * the child's dup2()/close() failed with EBADF ("fatal: dup2() in child
+ * failed: Bad file descriptor", "unable to execute pager 'less'"). The
+ * kernel packs large anonymous mappings bottom-up on macOS, so a slab lands
+ * on a 4 GB boundary once the process has mapped ~4 GB of them: in a
+ * long-lived sshd backend, after enough tasks.
+ *
+ * Two defenses. tvm_mmap_guarded() places the regions TVM maps and copies
+ * (heap slabs, image segments) clear of [N<<32, N<<32 + TVM_MMAP_GUARD) for
+ * every N, and tvm_reserve_boundary_pages() pins a PROT_NONE page at N<<32
+ * for every N a descriptor number can be, so no mapping at all -- the
+ * thread stacks libpthread places included -- can hold the address a pair
+ * of descriptors forms. What stays ambiguous is a pair whose first int is
+ * at least TVM_MMAP_GUARD (a page, on a stack) next to an int equal to the
+ * 4 GB bucket of a copied region, and memory the emulator maps itself.
+ */
+#define TVM_MMAP_GUARD ((uintptr_t)16 << 20)
+
+// The guard window [w, w + TVM_MMAP_GUARD) intersecting [start, start + len),
+// if any; the caller keeps len small enough for at most one.
+static int tvm_mmap_window_in(uintptr_t start, size_t len, uintptr_t *w)
+{
+    uintptr_t bucket = (uintptr_t)1 << 32;
+    uintptr_t below = start & ~(bucket - 1);
+    if (below + TVM_MMAP_GUARD > start) {
+        *w = below;
+        return 1;
+    }
+    if (below + bucket < start + len) {
+        *w = below + bucket;
+        return 1;
+    }
+    return 0;
+}
+
+// Unmap [lo, hi), except that the part inside the guard window [w, w + GUARD)
+// (if `have_w`) stays mapped PROT_NONE, so the kernel never hands it out again.
+static void tvm_mmap_release(uintptr_t lo, uintptr_t hi, int have_w, uintptr_t w)
+{
+    uintptr_t wlo = w > lo ? w : lo;
+    uintptr_t whi = w + TVM_MMAP_GUARD < hi ? w + TVM_MMAP_GUARD : hi;
+    if (!have_w || wlo >= whi) {
+        if (lo < hi)
+            CALL_FUNC(munmap, (void *)lo, hi - lo);
+        return;
+    }
+    if (lo < wlo)
+        CALL_FUNC(munmap, (void *)lo, wlo - lo);
+    CALL_FUNC(mprotect, (void *)wlo, whi - wlo, PROT_NONE);
+    if (whi < hi)
+        CALL_FUNC(munmap, (void *)whi, hi - whi);
+}
+
+// An anonymous private mapping of `size` bytes that contains no address in
+// a guard window. When the kernel's choice does, a reservation of twice the
+// size plus a window is taken instead: one of its two sides of the window is
+// big enough, the rest is given back (the window itself stays, PROT_NONE).
+static void *tvm_mmap_guarded(size_t size, int prot, int flags)
+{
+    void *map = CALL_FUNC(mmap, NULL, size, prot, flags, -1, 0);
+    if (map == MAP_FAILED)
+        return map;
+
+    uintptr_t w;
+    if (!tvm_mmap_window_in((uintptr_t)map, size, &w))
+        return map;
+
+    size_t rsize = 2 * size + TVM_MMAP_GUARD;
+    if (rsize + TVM_MMAP_GUARD > ((uintptr_t)1 << 32)) {
+        // cannot fit between two windows: nothing to be done for it
+        INFO("mmap %p-%p: %zu bytes crosses a 4 GB boundary, unguarded", map, (uintptr_t)map + size, size);
+        return map;
+    }
+
+    CALL_FUNC(munmap, map, size);
+    uintptr_t r = (uintptr_t)CALL_FUNC(mmap, NULL, rsize, prot, flags, -1, 0);
+    if (r == (uintptr_t)MAP_FAILED) {
+        // out of address space for the reservation: better unguarded than
+        // ENOMEM for a mapping that was just possible
+        return CALL_FUNC(mmap, NULL, size, prot, flags, -1, 0);
+    }
+
+    uintptr_t start;
+    int have_w = tvm_mmap_window_in(r, rsize, &w);
+    if (!have_w || w >= r + size)
+        start = r;                       // no window, or room below it
+    else
+        start = w + TVM_MMAP_GUARD;      // room above it
+    VERIFY(start + size <= r + rsize);
+
+    tvm_mmap_release(r, start, have_w, w);
+    tvm_mmap_release(start + size, r + rsize, have_w, w);
+#ifdef TRACE_MMAP
+    INFO("mmap %p-%p moved off the guard window at %p", (void *)start, (void *)(start + size), (void *)w);
+#endif
+    return (void *)start;
+}
+
+// A PROT_NONE page at N<<32 for every N a descriptor number can be (see
+// tvm_mmap_guarded). Pages already in use stay as they are: whatever is
+// there is not a region fork copies, and keeps our mappings out just the
+// same. Called once, before the first arena.
+static void tvm_reserve_boundary_pages(void)
+{
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    for (uintptr_t n = 1; n < MAX_FILES; n++) {
+        void *hint = (void *)(n << 32);
+        void *p = CALL_FUNC(mmap, hint, pg, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            continue;
+        if (p != hint)
+            CALL_FUNC(munmap, p, pg);
+    }
+}
+
 void *rmem_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
-    void *map = CALL_FUNC(mmap, hint, size, prot, flags, fd, offset);
+    void *map;
+    if (!hint && fd == -1 && !(flags & MAP_FIXED))
+        map = tvm_mmap_guarded(size, prot, flags);
+    else
+        map = CALL_FUNC(mmap, hint, size, prot, flags, fd, offset);
 #ifdef TRACE_MMAP
     INFO("mmap %p-%p (rmem)", map, (uintptr_t)map + size);
 #endif
@@ -10155,6 +10281,9 @@ static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { VERIFY
 
 static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) {
     VERIFY(arg == current);
+    // an image's address range (its writable segments are copied by fork)
+    if (!hint && fd == -1 && !(flags & MAP_FIXED))
+        return tvm_mmap_guarded(length, prot, flags);
     return mmap(hint, length, prot, flags, fd, offset);
 }
 static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            {
@@ -10505,6 +10634,8 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
     rmem_setopt(RMEM_OPS, (void *)&rmem_ops);
+
+    tvm_reserve_boundary_pages();
 
     global_arena = rmem_arena_create(NULL);
     if (!global_arena)
