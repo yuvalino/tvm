@@ -2882,10 +2882,6 @@ static int task_set_pgid(struct task *t, int pgid)
     return 0;
 }
 
-/**
- * needs tasks_lock and t locked.
- * Prefers delivering to a thread that isn't in a signal-deferred section.
- */
 // SIGSTOP cannot be caught, so pthread_kill()ing it never reaches
 // signal_handler: the kernel stops the whole host process — every task, every
 // session, the embedding app's UI — and only an outside SIGCONT resumes it.
@@ -2905,6 +2901,10 @@ static int stop_signal_dropped(int signum, pid_t pid)
 
 static int task_signal_ignored_locked(struct task *t, int signum);
 
+/**
+ * needs tasks_lock and t locked.
+ * Prefers delivering to a thread that isn't in a signal-deferred section.
+ */
 static int task_kill_locked(struct task *t, int signum) {
     int r;
 
@@ -2999,10 +2999,6 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
     return childt;
 }
 
-/**
- * both tasks_lock and current are locked
- * both are unlocked before returning
- */
 /**
  * Detach the calling (non-last) thread from its task and terminate it: remove
  * it from the thread list, drop the task's thread/ref counts, and pthread_exit.
