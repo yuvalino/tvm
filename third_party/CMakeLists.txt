@@ -504,12 +504,10 @@ add_launcher(sqlite)
 #
 # Unpatched upstream built in a shadow tree by scripts/build_git.sh with the
 # knobs in third_party/configs/git_config.mak (its config.mak); HTTPS through
-# the static libcurl/OpenSSL of the curl tool above. One multi-call image
-# (third_party/git_main.c dispatches on argv[0]) serves git and the helpers
-# git execs from its exec path (git-remote-https, git-http-fetch): the exe
-# `git` (converted to libgit.dylib for the Flutter apps), with the helper
-# names linked to /tvm/bin/git in /tvm/libexec/git-core by
-# scripts/CMakeLists.txt.
+# the static libcurl/OpenSSL of the curl tool above. Upstream's programs as
+# upstream builds them: `git`, and the curl helpers git execs from its exec
+# path, git-remote-http and git-http-fetch (each converted to a dylib for the
+# Flutter apps); scripts/CMakeLists.txt lays them out in /tvm/libexec/git-core.
 ###############################################################################
 set(GIT_BUILD ${THIRDPARTY_BUILD}/git)
 
@@ -524,10 +522,14 @@ ExternalProject_Add(git_ext
     EXCLUDE_FROM_ALL TRUE
 )
 ExternalProject_Add_StepDependencies(git_ext build
-    ${SCRIPTS_DIR}/build_git.sh ${THIRDPARTY_SRC}/configs/git_config.mak ${THIRDPARTY_SRC}/git_main.c)
+    ${SCRIPTS_DIR}/build_git.sh ${THIRDPARTY_SRC}/configs/git_config.mak)
 tvm_ext_inputs(git_ext SUBMODULE:third_party/git ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h)
 add_custom_target(git_exe DEPENDS git_ext)
 set_target_properties(git_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-add_shared_lib(git git_exe ${GIT_BUILD}/git)
+add_shared_lib(git git_exe ${GIT_BUILD}/src/git)
 add_launcher(git)
+add_shared_lib(git-remote-http git_exe ${GIT_BUILD}/src/git-remote-http)
+add_launcher(git-remote-http)
+add_shared_lib(git-http-fetch git_exe ${GIT_BUILD}/src/git-http-fetch)
+add_launcher(git-http-fetch)

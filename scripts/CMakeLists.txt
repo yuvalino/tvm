@@ -87,7 +87,7 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/less/src/less' \"$ROOTFS/bin/less\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/nano/build/src/nano' \"$ROOTFS/bin/nano\"\n")
         string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/sqlite/sqlite3' \"$ROOTFS/bin/sqlite3\"\n")
-        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/git/git' \"$ROOTFS/bin/git\"\n")
+        string(APPEND SCRIPT "cp '${THIRDPARTY_BUILD}/git/src/git' \"$ROOTFS/bin/git\"\n")
     endif()
     string(APPEND SCRIPT "ln -sf vim \"$ROOTFS/bin/vi\"\n")
     # /bin/sh is bash invoked as `sh`: POSIX mode, reads $ENV when interactive
@@ -127,18 +127,29 @@ function(mkinitrd_target NAME)
 
     # ── git ──
     # The exec path (git --exec-path = /tvm/libexec/git-core, compiled in; see
-    # third_party/configs/git_config.mak): everything git execs by name. The
-    # curl helpers and upstream's dashed built-in names are links to the one
-    # multi-call /tvm/bin/git (third_party/git_main.c) -- absolute, so that
-    # TVM_NOEMU's symlink resolution lands on /tvm/bin/git -- and git itself
-    # is there too because git prepends the exec path to PATH and runs its
-    # subcommands as `git <cmd>`. Next to them the generated shell scripts
-    # (#!/tvm/bin/sh), the mergetool definitions they source, and the `git
-    # init` templates at the compiled-in template_dir.
+    # third_party/configs/git_config.mak): everything git execs by name, as
+    # upstream installs it. The curl helpers git-remote-http (https, ftp and
+    # ftps are links to it) and git-http-fetch are programs of their own --
+    # real executables in the CLI initrd, launcher stubs for their dylibs in
+    # the Flutter one. Upstream's dashed built-in names and git itself are
+    # links to /tvm/bin/git -- absolute, so that TVM_NOEMU's symlink
+    # resolution lands on /tvm/bin/git; git is there because git prepends the
+    # exec path to PATH and runs its subcommands as `git <cmd>`. Next to them
+    # the generated shell scripts (#!/tvm/bin/sh), the mergetool definitions
+    # they source, and the `git init` templates at the compiled-in
+    # template_dir.
     set(GIT_BUILD ${THIRDPARTY_BUILD}/git)
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/libexec/git-core\" \"$ROOTFS/share/git-core\"\n")
-    foreach(prog git git-remote-http git-remote-https git-remote-ftp git-remote-ftps git-http-fetch)
-        string(APPEND SCRIPT "ln -sf /tvm/bin/git \"$ROOTFS/libexec/git-core/${prog}\"\n")
+    string(APPEND SCRIPT "ln -sf /tvm/bin/git \"$ROOTFS/libexec/git-core/git\"\n")
+    foreach(prog git-remote-http git-http-fetch)
+        if(ARG_FLUTTER)
+            string(APPEND SCRIPT "cp '${BIN_OUT}/${prog}_launcher' \"$ROOTFS/libexec/git-core/${prog}\"\n")
+        else()
+            string(APPEND SCRIPT "cp '${GIT_BUILD}/src/${prog}' \"$ROOTFS/libexec/git-core/${prog}\"\n")
+        endif()
+    endforeach()
+    foreach(prog git-remote-https git-remote-ftp git-remote-ftps)
+        string(APPEND SCRIPT "ln -sf git-remote-http \"$ROOTFS/libexec/git-core/${prog}\"\n")
     endforeach()
     string(APPEND SCRIPT "for n in $(cat '${GIT_BUILD}/tvm/built_ins'); do ln -sf /tvm/bin/git \"$ROOTFS/libexec/git-core/$n\"; done\n")
     string(APPEND SCRIPT "for n in $(cat '${GIT_BUILD}/tvm/scripts'); do cp '${GIT_BUILD}/src/'\"$n\" \"$ROOTFS/libexec/git-core/$n\"; done\n")
@@ -226,5 +237,5 @@ mkinitrd_target(initrd_cli
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git-remote-http_launcher git-http-fetch_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
 )
