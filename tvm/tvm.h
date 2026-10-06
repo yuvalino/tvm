@@ -2,17 +2,21 @@
 
 #include <stddef.h>
 
+enum { TVM_MOUNT_CPIO = 0, TVM_MOUNT_BIND = 1 };
+
 struct tvm_mount {
     const char *path;   // absolute, normalized guest mount point, e.g. "/tvm"
-    const void *data;   // cpio archive bytes; consumed synchronously, caller may free after
-    size_t      size;
+    int         type;   // TVM_MOUNT_CPIO (the default) or TVM_MOUNT_BIND
+    const void *data;   // cpio: archive bytes; consumed synchronously, caller may free after
+    size_t      size;   // cpio: byte count
+    const char *source; // bind: absolute guest path the mount point shows (mount --bind)
 };
 
 struct tvm_config {
     int                     log_fd;   // kernel log fd; -1 disables logging
     const char             *cwd;      // init task working directory; NULL = host cwd
     const char             *initrc;   // init script to run before exec; NULL = none
-    const struct tvm_mount *mounts;   // cpio archives to mount before anything runs
+    const struct tvm_mount *mounts;   // archives and binds to mount before anything runs
     size_t                  nmounts;
 };
 
@@ -34,7 +38,8 @@ struct tvm_config {
  * per process.
  *
  * Mount order: config mounts first, then the initrc; an initrc `mount` of the
- * same path shadows the config mount.
+ * same path shadows the config mount. A TVM_MOUNT_BIND lays `source` over
+ * `path` the way the initrc's `mount --bind` does (INITRC.md).
  */
 int tvm_start(const char *file, char *const argv[], char *const envp[],
               const struct tvm_config *cfg);

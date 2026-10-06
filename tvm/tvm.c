@@ -6595,6 +6595,24 @@ static void vfs_add_root(struct vfs_node *root) {
     VFS_UNLOCK();
 }
 
+// `mount --bind SOURCE MOUNTPOINT`: both absolute and normalized, the
+// mount point neither "/" nor the source. The VFS has no node yet that
+// resolves to another path, so a well-formed bind is refused with ENOTSUP
+// and the caller says so; the syntax (initrc, the builtin, a config mount)
+// is in place for when it does.
+static int vfs_bind(const char *source, const char *mountpoint)
+{
+    char s[PATH_MAX], m[PATH_MAX];
+    if (source[0] != '/' || mountpoint[0] != '/' ||
+        !normalize_path("/", source, s) || !normalize_path("/", mountpoint, m) ||
+        0 == strcmp(m, "/") || 0 == strcmp(m, s)) {
+        errno = EINVAL;
+        return -1;
+    }
+    errno = ENOTSUP;
+    return -1;
+}
+
 struct vfs_file {
     int vf_oflags;
     int vf_cursor;
@@ -9902,14 +9920,56 @@ static int tvm_mount_cpio(const char *pathname, const void *buf, unsigned long s
     return 0;
 }
 
+// mount(8)'s way of saying what is mounted, shared by the builtin and the
+// initrc: `-t cpio` (an archive, the default), `--bind`, `-B` or `-o bind`
+// (a path laid over another). Returns the tokens the option at `tok` takes
+// (`next` is the one after it, or NULL), 0 when `tok` is no option, -1 for
+// one it does not know.
+static int mount_opt(const char *tok, const char *next, int *type)
+{
+    if (0 == strcmp(tok, "--bind") || 0 == strcmp(tok, "-B")) {
+        *type = TVM_MOUNT_BIND;
+        return 1;
+    }
+    if (0 == strcmp(tok, "-o") && next && 0 == strcmp(next, "bind")) {
+        *type = TVM_MOUNT_BIND;
+        return 2;
+    }
+    if (0 == strcmp(tok, "-t") && next && 0 == strcmp(next, "cpio")) {
+        *type = TVM_MOUNT_CPIO;
+        return 2;
+    }
+    return tok[0] == '-' ? -1 : 0;
+}
+
 static int tvm_mount(int argc, char **argv)
 {
-    if (argc < 3)
-        errx(1, "USAGE: tvm mount [CPIO] [TARGET]");
+    int type = TVM_MOUNT_CPIO, i = 1, n;
+    while (i < argc && 0 != (n = mount_opt(argv[i], argv[i + 1], &type))) {
+        if (n < 0)
+            errx(1, "mount: unknown option '%s'", argv[i]);
+        i += n;
+    }
+    if (argc - i != 2)
+        errx(1, "USAGE: tvm mount [-t cpio] FILE TARGET\n"
+                "       tvm mount --bind|-B|-o bind SOURCE TARGET");
 
-    int fd = open(argv[1], O_RDONLY);
+    char target_abs[PATH_MAX];
+    if (!normalize_path(NULL, argv[i + 1], target_abs))
+        err(1, "%s", argv[i + 1]);
+
+    if (type == TVM_MOUNT_BIND) {
+        char source_abs[PATH_MAX];
+        if (!normalize_path(NULL, argv[i], source_abs))
+            err(1, "%s", argv[i]);
+        if (0 != vfs_bind(source_abs, target_abs))
+            err(1, "mount --bind %s %s", source_abs, target_abs);
+        return 0;
+    }
+
+    int fd = open(argv[i], O_RDONLY);
     if (fd == -1)
-        err(1, "%s", argv[1]);
+        err(1, "%s", argv[i]);
 
     size_t size;
     void *buf = read_all(fd, &size);
@@ -9918,14 +9978,8 @@ static int tvm_mount(int argc, char **argv)
 
     close(fd);
 
-    char pathname_abs[PATH_MAX];
-    if (!normalize_path(NULL, argv[2], pathname_abs)) {
-        err(1, "normalize_path(NULL, \"%s\")", argv[2]);
-        return 1;
-    }
-
-    if (0 != tvm_mount_cpio(pathname_abs, buf, size))
-        err(1, "tvm_mount_cpio");
+    if (0 != tvm_mount_cpio(target_abs, buf, size))
+        err(1, "mount %s %s", argv[i], target_abs);
 
     return 0;
 }
@@ -10046,19 +10100,73 @@ static int initrc_expand_vars(const char *input, char *output, size_t output_siz
     return 0;
 }
 
+// The word at `p` into `out` (cut to fit: it is only compared against the
+// short option names), returning where the next one starts.
+static const char *initrc_word(const char *p, char *out, size_t outsize)
+{
+    size_t n = strcspn(p, " \t");
+    size_t c = n < outsize ? n : outsize - 1;
+    memcpy(out, p, c);
+    out[c] = 0;
+    p += n;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return p;
+}
+
+// mount [-t cpio] FILE:TARGET, or mount --bind SOURCE:TARGET (mount_opt).
+// Only leading options are words of their own: the spec after them is taken
+// whole, so a host path with blanks in it still works.
 static void initrc_cmd_mount(const char *arg)
 {
     char expanded[PATH_MAX * 2];
     initrc_expand_vars(arg, expanded, sizeof(expanded));
 
-    char *colon = strchr(expanded, ':');
+    int type = TVM_MOUNT_CPIO;
+    const char *spec = expanded;
+    for (;;) {
+        char w1[16], w2[16];
+        const char *after1 = initrc_word(spec, w1, sizeof(w1));
+        const char *after2 = initrc_word(after1, w2, sizeof(w2));
+        if (!*after1)   // the last word is the spec
+            break;
+        int n = mount_opt(w1, w2, &type);
+        if (n == 0)
+            break;
+        if (n < 0) {
+            INFO("initrc: mount: unknown option '%s'", w1);
+            return;
+        }
+        spec = n == 1 ? after1 : after2;
+    }
+
+    char *colon = strchr(expanded + (spec - expanded), ':');
     if (!colon) {
-        INFO("initrc: mount: expected hostpath:guestpath, got '%s'", expanded);
+        INFO("initrc: mount: expected [--bind] source:target, got '%s'", expanded);
         return;
     }
     *colon = 0;
-    const char *hostpath = expanded;
-    const char *guestpath = colon + 1;
+    const char *hostpath = spec;
+    // The mount point used to be taken as written: vfs_lookup matches a
+    // root's name verbatim, so "/tvm/" or a relative one mounted nowhere.
+    char guestpath[PATH_MAX];
+    if (colon[1] != '/' || !normalize_path("/", colon + 1, guestpath)) {
+        INFO("initrc: mount: mount point must be absolute, got '%s'", colon + 1);
+        return;
+    }
+
+    if (type == TVM_MOUNT_BIND) {
+        char source[PATH_MAX];
+        if (hostpath[0] != '/' || !normalize_path("/", hostpath, source)) {
+            INFO("initrc: mount: bind source must be absolute, got '%s'", hostpath);
+            return;
+        }
+        if (0 != vfs_bind(source, guestpath))
+            INFO("initrc: mount: cannot bind '%s' on '%s': %s", source, guestpath, strerror(errno));
+        else
+            INFO("initrc: mounted '%s' on '%s'", source, guestpath);
+        return;
+    }
 
     int fd = open(hostpath, O_RDONLY);
     if (fd == -1) {
@@ -10666,12 +10774,21 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     for (size_t i = 0; i < cfg->nmounts; i++) {
         const struct tvm_mount *m = &cfg->mounts[i];
-        char abs[PATH_MAX];
+        char abs[PATH_MAX], src[PATH_MAX];
         // vfs_lookup() prefix-matches a root's name verbatim, so the mount
         // point must be absolute and normalized ("/tvm", never "/tvm/" or
         // "//tvm"). normalize_path() with an explicit dirname needs no task.
-        if (!m->path || m->path[0] != '/' || !m->data || !m->size ||
+        if (!m->path || m->path[0] != '/' ||
             !normalize_path("/", m->path, abs) || 0 == strcmp(abs, "/")) {
+            errno = EINVAL;
+            return -1;
+        }
+        // an archive needs bytes; a bind an absolute source other than its
+        // mount point (vfs_bind checks it again, as the initrc's goes there)
+        if (m->type == TVM_MOUNT_CPIO ? (!m->data || !m->size) :
+            m->type == TVM_MOUNT_BIND ? (!m->source || m->source[0] != '/' ||
+                                         !normalize_path("/", m->source, src) ||
+                                         0 == strcmp(src, abs)) : 1) {
             errno = EINVAL;
             return -1;
         }
@@ -10728,10 +10845,17 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     for (size_t i = 0; i < cfg->nmounts; i++) {
         const struct tvm_mount *m = &cfg->mounts[i];
-        char abs[PATH_MAX];
+        char abs[PATH_MAX], src[PATH_MAX];
         normalize_path("/", m->path, abs);
-        if (0 != tvm_mount_cpio(abs, m->data, m->size)) {
-            INFO("tvm_start: mount %s failed", abs);
+        int r;
+        if (m->type == TVM_MOUNT_BIND) {
+            normalize_path("/", m->source, src);
+            r = vfs_bind(src, abs);
+        }
+        else
+            r = tvm_mount_cpio(abs, m->data, m->size);
+        if (0 != r) {
+            INFO("tvm_start: mount %s failed: %s", abs, strerror(errno));
             errno = EINVAL;
             return -1;
         }
@@ -13786,15 +13910,21 @@ FUNCTION_DEFINE2(int, symlink, const char *, target, const char *, linkpath) {
     return CALL_FUNC(symlink, target, linkpath);
 }
 
+// The *at() forms that create, link, rename and remove used to hand the host
+// the directory descriptor's host descriptor with the relative name. For a
+// directory the VFS serves that descriptor is the host's "/" (vfsop_open),
+// so mkdirat(open("/tvm"), "x") reached the host's /x -- EROFS only because
+// macOS seals its root; as root on Linux it is created. Each resolves the
+// name against the descriptor's recorded path instead (dirfd_normalize_path,
+// the policy fstatat and the other path-answered *at() calls already take)
+// and hands the host the absolute path; the host then says ENOENT for a
+// /tvm path, which has no host object.
 FUNCTION_DEFINE3(int, symlinkat, const char *, target, int, newdirfd, const char *, linkpath) {
     char linkpath_abs[PATH_MAX];
-    if (newdirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, linkpath, linkpath_abs))
-            return -1;
-        linkpath = linkpath_abs;
-    }
+    if (!dirfd_normalize_path(newdirfd, linkpath, linkpath_abs))
+        return -1;
 
-    return CURRENT_RFD(newdirfd, CALL_FUNC(symlinkat, target, __rfd, linkpath));
+    return CALL_FUNC(symlinkat, target, AT_FDCWD, linkpath_abs);
 }
 
 FUNCTION_DEFINE2(int, link, const char *, oldpath, const char *, newpath) {
@@ -13812,51 +13942,12 @@ FUNCTION_DEFINE2(int, link, const char *, oldpath, const char *, newpath) {
 }
 
 FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath, int, flags) {
-    char oldpath_abs[PATH_MAX];
-    if (olddirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, oldpath, oldpath_abs))
-            return -1;
-        oldpath = oldpath_abs;
-    }
+    char oldpath_abs[PATH_MAX], newpath_abs[PATH_MAX];
+    if (!dirfd_normalize_path(olddirfd, oldpath, oldpath_abs) ||
+        !dirfd_normalize_path(newdirfd, newpath, newpath_abs))
+        return -1;
 
-    char newpath_abs[PATH_MAX];
-    if (newdirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, newpath, newpath_abs))
-            return -1;
-        newpath = newpath_abs;
-    }
-
-    tvm_sig_enter();
-
-    int olddirrfd = -1;
-    struct file *olddirfile = file_for_task(current, olddirfd);
-    if (olddirfile) {
-        olddirrfd = olddirfile->f_rfd;
-        file_unlock(olddirfile, 0);
-    }
-
-    int newdirrfd = -1;
-    struct file *newdirfile = file_for_task(current, newdirfd);
-    if (newdirfile) {
-        newdirrfd = newdirfile->f_rfd;
-        file_unlock(newdirfile, 0);
-    }
-
-    int ret = CALL_FUNC(linkat, olddirrfd, oldpath, newdirrfd, newpath, flags);
-
-    if (newdirfile) {
-        file_lock(newdirfile, 0);
-        file_unlock(newdirfile, 1);
-    }
-
-    if (olddirfile) {
-        file_lock(olddirfile, 0);
-        file_unlock(olddirfile, 1);
-    }
-
-    tvm_sig_leave();
-
-    return ret;
+    return CALL_FUNC(linkat, AT_FDCWD, oldpath_abs, AT_FDCWD, newpath_abs, flags);
 }
 
 FUNCTION_DEFINE2(int, rename, const char *, oldpath, const char *, newpath) {
@@ -13874,51 +13965,12 @@ FUNCTION_DEFINE2(int, rename, const char *, oldpath, const char *, newpath) {
 }
 
 FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath) {
-    char oldpath_abs[PATH_MAX];
-    if (olddirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, oldpath, oldpath_abs))
-            return -1;
-        oldpath = oldpath_abs;
-    }
+    char oldpath_abs[PATH_MAX], newpath_abs[PATH_MAX];
+    if (!dirfd_normalize_path(olddirfd, oldpath, oldpath_abs) ||
+        !dirfd_normalize_path(newdirfd, newpath, newpath_abs))
+        return -1;
 
-    char newpath_abs[PATH_MAX];
-    if (newdirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, newpath, newpath_abs))
-            return -1;
-        newpath = newpath_abs;
-    }
-
-    tvm_sig_enter();
-
-    int olddirrfd = -1;
-    struct file *olddirfile = file_for_task(current, olddirfd);
-    if (olddirfile) {
-        olddirrfd = olddirfile->f_rfd;
-        file_unlock(olddirfile, 0);
-    }
-
-    int newdirrfd = -1;
-    struct file *newdirfile = file_for_task(current, newdirfd);
-    if (newdirfile) {
-        newdirrfd = newdirfile->f_rfd;
-        file_unlock(newdirfile, 0);
-    }
-
-    int ret = CALL_FUNC(renameat, olddirrfd, oldpath, newdirrfd, newpath);
-
-    if (newdirfile) {
-        file_lock(newdirfile, 0);
-        file_unlock(newdirfile, 1);
-    }
-
-    if (olddirfile) {
-        file_lock(olddirfile, 0);
-        file_unlock(olddirfile, 1);
-    }
-
-    tvm_sig_leave();
-    
-    return ret;
+    return CALL_FUNC(renameat, AT_FDCWD, oldpath_abs, AT_FDCWD, newpath_abs);
 }
 
 FUNCTION_DEFINE1(int, unlink, const char *, pathname) {
@@ -13932,13 +13984,10 @@ FUNCTION_DEFINE1(int, unlink, const char *, pathname) {
 
 FUNCTION_DEFINE3(int, unlinkat, int, dirfd, const char *, pathname, int, flags) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(unlinkat, __rfd, pathname, flags));
+    return CALL_FUNC(unlinkat, AT_FDCWD, pathname_abs, flags);
 }
 
 FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
@@ -13952,13 +14001,10 @@ FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
 
 FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(mkdirat, __rfd, pathname, mode & ~current->tsk_umask));
+    return CALL_FUNC(mkdirat, AT_FDCWD, pathname_abs, mode & ~current->tsk_umask);
 }
 
 FUNCTION_DEFINE1(int, rmdir, const char *, pathname) {
@@ -13981,13 +14027,10 @@ FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
 
 FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(mkfifoat, __rfd, pathname, mode & ~current->tsk_umask));
+    return CALL_FUNC(mkfifoat, AT_FDCWD, pathname_abs, mode & ~current->tsk_umask);
 }
 
 // Copy the characters the host generated for the template's trailing X run
@@ -18334,13 +18377,10 @@ FUNCTION_DEFINE3(int, mknod, const char *, pathname, mode_t, mode, dev_t, dev) {
 
 FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode, dev_t, dev) {
     char pathname_abs[PATH_MAX];
-    if (dirfd == AT_FDCWD) {
-        if (!normalize_path(NULL, pathname, pathname_abs))
-            return -1;
-        pathname = pathname_abs;
-    }
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
 
-    return CURRENT_RFD(dirfd, CALL_FUNC(mknodat, __rfd, pathname, mode & ~current->tsk_umask, dev));
+    return CALL_FUNC(mknodat, AT_FDCWD, pathname_abs, mode & ~current->tsk_umask, dev);
 }
 
 FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {

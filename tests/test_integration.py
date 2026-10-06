@@ -2202,6 +2202,26 @@ def test_fork_bomb_limited(sshi: spawn):
     sshi.expect("burst_done")
     sshi.expect(r"\$ ")
 
+def test_mount_builtin(sshi: spawn):
+    """`tvm mount` takes mount(8)'s spelling: `[-t cpio] FILE TARGET` mounts
+    an archive at runtime (here one toybox's cpio just wrote), `--bind
+    SOURCE TARGET` is parsed but refused while the VFS cannot serve a bind,
+    and too few operands is the usage, rc 1."""
+    out, rc = _sh(sshi, "tvm mount")
+    assert rc == 1 and "USAGE" in out, out
+    out, rc = _sh(sshi, "tvm mount --bind /tvm/bin/env")
+    assert rc == 1 and "USAGE" in out, out
+    out, rc = _sh(sshi, "tvm mount -x a b")
+    assert rc == 1 and "unknown option" in out, out
+    out, rc = _sh(sshi, "d=$(mktemp -d) && mkdir $d/x && echo from_cpio > $d/x/f && cd $d && "
+                        "find x | cpio -o -H newc > $d/t.cpio && cd / && "
+                        "tvm mount -t cpio $d/t.cpio /mnt_builtin && cat /mnt_builtin/x/f; rm -rf $d")
+    assert rc == 0 and "from_cpio" in out, out
+    out, rc = _sh(sshi, "tvm mount --bind /tvm/bin/env /usr/local/bin/env2")
+    assert rc == 1 and "not supported" in out, out
+    out, rc = _sh(sshi, "tvm mount -o bind /tvm/bin/env /usr/local/bin/env2")
+    assert rc == 1 and "not supported" in out, out
+
 def test_exec_nonexistent(sshi: spawn):
     """exec a nonexistent program — exercises ENOENT in execve."""
     sshi.sendline("/nonexistent/program 2>/dev/null; echo rc=$?")
