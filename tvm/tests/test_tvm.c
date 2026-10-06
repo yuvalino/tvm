@@ -1012,24 +1012,29 @@ TEST(AtVfsDirfd) {
     struct stat st;
 
     ASSERT_EQ(-1, mkdirat(fd, "zz_at_test", 0755));
+    ASSERT_EQ(errno, EROFS);
     ASSERT_EQ(-1, stat("/zz_at_test", &st));
     ASSERT_EQ(errno, ENOENT);
 
     ASSERT_EQ(-1, unlinkat(fd, "etc", AT_REMOVEDIR));
+    ASSERT_EQ(errno, EROFS);
     ASSERT_EQ(0, stat("/tvm/etc", &st));
     ASSERT_EQ(1, S_ISDIR(st.st_mode));
 
     ASSERT_EQ(-1, symlinkat("x", fd, "l_at_test"));
+    ASSERT_EQ(errno, EROFS);
     ASSERT_EQ(-1, lstat("/l_at_test", &st));
     ASSERT_EQ(errno, ENOENT);
 
     ASSERT_EQ(-1, mkfifoat(fd, "f_at_test", 0644));
+    ASSERT_EQ(errno, EROFS);
     ASSERT_EQ(-1, stat("/f_at_test", &st));
     ASSERT_EQ(errno, ENOENT);
 
     char dst[PATH_MAX];
     snprintf(dst, sizeof(dst), "/tmp/tvm_at_test_%d", (int)getpid());
     ASSERT_EQ(-1, renameat(fd, "etc", AT_FDCWD, dst));
+    ASSERT_EQ(errno, EROFS);
     ASSERT_EQ(-1, stat(dst, &st));
     ASSERT_EQ(errno, ENOENT);
     ASSERT_EQ(0, stat("/tvm/etc", &st));
@@ -1323,6 +1328,118 @@ TEST(VfsOverlayStat) {
     ASSERT_EQ(0, fstatat(fd, "x/f", &st, 0));
     ASSERT_EQ(2, st.st_size);
     ASSERT_EQ(0, close(fd));
+}
+
+// Creating and removing under a cpio mount is refused as on a read-only
+// filesystem, before the host sees a path it has not got (it said ENOENT).
+TEST(VfsMutateErofs) {
+    struct stat st;
+    ASSERT_EQ(-1, mkdir("/tvm/x_erofs", 0755));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, unlink("/tvm/etc/profile"));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(0, stat("/tvm/etc/profile", &st));
+    ASSERT_EQ(-1, unlink("/tvm/etc/none"));
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(-1, rmdir("/tvm/etc"));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, symlink("x", "/tvm/l_erofs"));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, mkfifo("/tvm/f_erofs", 0644));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, link("/tvm/etc/profile", "/tvm/etc/profile2"));
+    ASSERT_EQ(errno, EXDEV);
+    ASSERT_EQ(-1, link("/tvm/etc/profile", "/tmp/tvm_profile_link"));
+    ASSERT_EQ(errno, EXDEV);
+    ASSERT_EQ(-1, open("/tvm/etc/new_erofs", O_WRONLY | O_CREAT, 0644));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, mkdir("/tvm/etc", 0755));
+    ASSERT_EQ(errno, EEXIST);
+
+    char tmpl[] = "/tvm/etc/XXXXXX";
+    ASSERT_EQ(-1, mkstemp(tmpl));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(NULL, mkdtemp(tmpl));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(0, strcmp(tmpl, "/tvm/etc/XXXXXX"));
+
+    // a directory the VM made for a mount point, with no host directory
+    static const struct cpio_ent ents[] = {
+        { "f", S_IFREG | 0644, "x\n" },
+        { NULL, 0, NULL },
+    };
+    vfs_test_mount("erofs", ents, "/mnt_erofs_test/x");
+    ASSERT_EQ(-1, mkdir("/mnt_erofs_test/y", 0755));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, open("/mnt_erofs_test/f", O_WRONLY | O_CREAT, 0644));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, unlink("/mnt_erofs_test/none"));
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(-1, rename("/mnt_erofs_test/x/f", "/tmp/tvm_erofs_moved"));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, rename("/tmp/tvm_erofs_src", "/mnt_erofs_test/x/g"));
+    ASSERT_EQ(errno, EROFS);
+}
+
+// A mount point, and the directories the VM holds them in, cannot be
+// removed or renamed away: busy, as a mount point is on Linux.
+TEST(VfsBusy) {
+    ASSERT_EQ(-1, rmdir("/tvm"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, unlink("/tvm"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rename("/tvm", "/tmp/tvm_busy"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rename("/tmp/tvm_busy_src", "/tvm"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, mkdir("/tvm", 0755));
+    ASSERT_EQ(errno, EEXIST);
+
+    static const struct cpio_ent ents[] = {
+        { "f", S_IFREG | 0644, "x\n" },
+        { NULL, 0, NULL },
+    };
+    vfs_test_mount("busy", ents, "/mnt_busy_test/x");
+    ASSERT_EQ(-1, rmdir("/mnt_busy_test"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rmdir("/mnt_busy_test/x"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rename("/mnt_busy_test/x", "/mnt_busy_test/y"));
+    ASSERT_EQ(errno, EBUSY);
+    struct stat st;
+    ASSERT_EQ(0, stat("/mnt_busy_test/x/f", &st));
+}
+
+// The host's directories are the host's: everything lands there
+TEST(VfsMutateHost) {
+    char dir[] = "/tmp/tvm_mut_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char a[PATH_MAX], b[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    int fd = open(a, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(-1, open(a, O_WRONLY | O_CREAT | O_EXCL, 0644));
+    ASSERT_EQ(errno, EEXIST);
+    ASSERT_EQ(0, link(a, b));
+    ASSERT_EQ(0, unlink(a));
+    ASSERT_EQ(0, rename(b, a));
+    ASSERT_EQ(0, symlink("a", b));
+    struct stat st;
+    ASSERT_EQ(0, lstat(b, &st));
+    ASSERT_EQ(1, S_ISLNK(st.st_mode));
+    ASSERT_EQ(0, unlink(b));
+    ASSERT_EQ(0, unlink(a));
+    snprintf(a, sizeof(a), "%s/XXXXXX", dir);
+    fd = mkstemp(a);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, unlink(a));
+    snprintf(a, sizeof(a), "%s/dXXXXXX", dir);
+    ASSERT_NEQ(mkdtemp(a), NULL);
+    ASSERT_EQ(0, rmdir(a));
+    ASSERT_EQ(0, rmdir(dir));
 }
 
 static int cow_int;

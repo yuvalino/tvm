@@ -6968,6 +6968,7 @@ static struct vfs_node *vn_for_file_locked(struct file *file) {
 
 static struct fops *vfsops();
 static int vn_stat_locked(struct vfs_node *vn, struct stat *st);
+static int vfs_overlay_without_host(const char *abspath);
 
 /* The stat of a resolved node, which is released. An overlay directory is
    the host's directory of the same path when there is one, else a
@@ -7197,6 +7198,8 @@ static int vfs_open_path(struct file *out, const char *abspath, int flags, mode_
 
     if (res.kind == VR_HOST) {
         int rfd = CALL_FUNC(openat, AT_FDCWD, res.path, flags, mode);
+        if (rfd == -1 && (flags & O_CREAT) && errno == ENOENT && vfs_overlay_without_host(abspath))
+            errno = EROFS;
         file_lock(out, 0);
         if (rfd == -1)
             return -1;
@@ -7206,6 +7209,150 @@ static int vfs_open_path(struct file *out, const char *abspath, int flags, mode_
 
     return vfsop_open_node(res.vn, res.path, flags, mode, out);
 }
+
+/*
+ * The calls that create, link, rename and remove went to the host with the
+ * guest path as it was, so under a cpio mount they got the host's answer
+ * for a path the host has not got (mkdir /tvm/x: ENOENT), and a mount
+ * point was the host's entry of that name (rm /bin/sh on Linux reaches the
+ * host's). Each now asks for a verdict on its path: the directory it is in
+ * (vfs_resolve VR_PARENT, links followed) and the leaf itself (looked at
+ * without following it, as it may be a link to remove or a mount point).
+ */
+enum vfs_leaf { VL_MISSING, VL_HOST, VL_NODE, VL_MOUNTPOINT };
+
+struct vfs_mut {
+    char path[PATH_MAX];        /* the host path the operation goes to */
+    int mount_id;               /* the mount that path lives in */
+    enum vfs_kind parent_kind;  /* VN_CPIO, VN_OVERLAY; VN_BIND stands for the host's */
+    int parent_host;            /* an overlay parent: its host directory exists */
+    enum vfs_leaf leaf;         /* VL_HOST: no node of that name, the host may have one */
+};
+
+static int vfs_mutate_path(const char *abspath, struct vfs_mut *m)
+{
+    memset(m, 0, sizeof(*m));
+
+    struct vfs_res parent;
+    if (0 != vfs_resolve(abspath, VR_PARENT, &parent))
+        return -1;
+    m->parent_kind = VN_BIND;
+    m->mount_id = parent.mount_id;
+    if (parent.kind == VR_NODE) {
+        m->parent_kind = parent.vn->vn_kind;
+        vn_unlock(parent.vn, 1);
+        if (m->parent_kind == VN_OVERLAY) {
+            struct stat st;
+            m->parent_host = 0 == CALL_FUNC(fstatat, AT_FDCWD, parent.path, &st, 0) && S_ISDIR(st.st_mode);
+        }
+    }
+    snprintf(m->path, sizeof(m->path), "%s", parent.path);
+    if (vfs_path_join(m->path, parent.leaf))
+        return -1;
+
+    struct vfs_res leaf;
+    if (0 != vfs_resolve(abspath, VR_NOFOLLOW, &leaf)) {
+        if (errno != ENOENT)
+            return -1;
+        m->leaf = VL_MISSING;
+        return 0;
+    }
+    if (leaf.kind == VR_NODE) {
+        m->leaf = leaf.is_mountpoint ? VL_MOUNTPOINT : VL_NODE;
+        vn_unlock(leaf.vn, 1);
+    }
+    else
+        m->leaf = leaf.is_mountpoint ? VL_MOUNTPOINT : VL_HOST;
+    return 0;
+}
+
+/* Creating `abspath`: 0 and the host path in m, or -1 with the refusal. A
+   cpio directory is read-only (EROFS); so is an overlay directory with no
+   host directory behind it, a directory that exists for the VM alone; a
+   mount point or a cpio entry of that name is there already (EEXIST). */
+static int vfs_create_path(const char *abspath, struct vfs_mut *m)
+{
+    if (0 != vfs_mutate_path(abspath, m))
+        return -1;
+    if (m->leaf == VL_NODE || m->leaf == VL_MOUNTPOINT) {
+        errno = EEXIST;
+        return -1;
+    }
+    if (m->parent_kind == VN_CPIO || (m->parent_kind == VN_OVERLAY && !m->parent_host)) {
+        errno = EROFS;
+        return -1;
+    }
+    return 0;
+}
+
+/* Removing `abspath`, or renaming it away: a mount point is busy (EBUSY,
+   as for a mount point on Linux, and for the overlay directories that
+   hold them), a cpio entry read-only, a name missing in a cpio directory
+   or in an overlay without a host directory ENOENT. */
+static int vfs_remove_path(const char *abspath, struct vfs_mut *m)
+{
+    if (0 != vfs_mutate_path(abspath, m))
+        return -1;
+    if (m->leaf == VL_MOUNTPOINT) {
+        errno = EBUSY;
+        return -1;
+    }
+    if (m->leaf == VL_NODE) {
+        errno = EROFS;
+        return -1;
+    }
+    if (m->parent_kind == VN_CPIO || (m->parent_kind == VN_OVERLAY && !m->parent_host)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
+/* The destination of a rename: created, or replaced when it is the host's;
+   a mount point cannot be replaced (EBUSY), nor a cpio entry (EROFS). */
+static int vfs_replace_path(const char *abspath, struct vfs_mut *m)
+{
+    if (0 != vfs_mutate_path(abspath, m))
+        return -1;
+    if (m->leaf == VL_MOUNTPOINT) {
+        errno = EBUSY;
+        return -1;
+    }
+    if (m->leaf == VL_NODE || m->parent_kind == VN_CPIO ||
+        (m->parent_kind == VN_OVERLAY && !m->parent_host)) {
+        errno = EROFS;
+        return -1;
+    }
+    return 0;
+}
+
+/* The directory of a mkstemp/mkdtemp template, as a host path, with the
+   template's last component behind it: a cpio directory, or an overlay
+   with no host directory, cannot hold the file (EROFS). */
+static int vfs_template_path(const char *abspath, char *out)
+{
+    struct vfs_mut m;
+    if (0 != vfs_mutate_path(abspath, &m))
+        return -1;
+    if (m.parent_kind == VN_CPIO || (m.parent_kind == VN_OVERLAY && !m.parent_host)) {
+        errno = EROFS;
+        return -1;
+    }
+    strcpy(out, m.path);
+    return 0;
+}
+
+/* Whether the directory `abspath` is in is an overlay with no host
+   directory behind it: the host's ENOENT for creating there is EROFS. */
+static int vfs_overlay_without_host(const char *abspath)
+{
+    int last_errno = errno;
+    struct vfs_mut m;
+    int r = 0 == vfs_mutate_path(abspath, &m) && m.parent_kind == VN_OVERLAY && !m.parent_host;
+    errno = last_errno;
+    return r;
+}
+
 
 static int vfsop_dup(struct file *oldfile, struct file *newfile) {
 
@@ -14346,44 +14493,76 @@ FUNCTION_DEFINE4(ssize_t, readlinkat, int, dirfd, const char *, pathname, char *
     return ret;
 }
 
+// The calls that create, link, rename and remove, by absolute path, each
+// with the VFS's verdict first (vfs_create_path and the others): read-only
+// under a cpio mount, busy on a mount point, EXDEV across mounts, else the
+// host's call on the host path behind it. The *at() forms resolve the name
+// against the descriptor's recorded path (dirfd_normalize_path, the policy
+// fstatat and the other path-answered *at() calls take): they used to hand
+// the host the descriptor's host descriptor, which for a directory the VFS
+// serves is the host's "/", so mkdirat(open("/tvm"), "x") reached the
+// host's /x -- EROFS only because macOS seals its root; as root on Linux
+// it was created.
+static int tvm_symlink(const char *target, const char *linkpath_abs)
+{
+    struct vfs_mut m;
+    tvm_sig_enter();
+    int ret = vfs_create_path(linkpath_abs, &m);
+    if (0 == ret)
+        ret = CALL_FUNC(symlink, target, m.path);
+    tvm_sig_leave();
+    return ret;
+}
+
 FUNCTION_DEFINE2(int, symlink, const char *, target, const char *, linkpath) {
     char linkpath_abs[PATH_MAX];
     if (!normalize_path(NULL, linkpath, linkpath_abs))
         return -1;
-    linkpath = linkpath_abs;
-
-    return CALL_FUNC(symlink, target, linkpath);
+    return tvm_symlink(target, linkpath_abs);
 }
 
-// The *at() forms that create, link, rename and remove used to hand the host
-// the directory descriptor's host descriptor with the relative name. For a
-// directory the VFS serves that descriptor is the host's "/" (vfsop_open),
-// so mkdirat(open("/tvm"), "x") reached the host's /x -- EROFS only because
-// macOS seals its root; as root on Linux it is created. Each resolves the
-// name against the descriptor's recorded path instead (dirfd_normalize_path,
-// the policy fstatat and the other path-answered *at() calls already take)
-// and hands the host the absolute path; the host then says ENOENT for a
-// /tvm path, which has no host object.
 FUNCTION_DEFINE3(int, symlinkat, const char *, target, int, newdirfd, const char *, linkpath) {
     char linkpath_abs[PATH_MAX];
     if (!dirfd_normalize_path(newdirfd, linkpath, linkpath_abs))
         return -1;
+    return tvm_symlink(target, linkpath_abs);
+}
 
-    return CALL_FUNC(symlinkat, target, AT_FDCWD, linkpath_abs);
+// A hard link: the existing name (followed when AT_SYMLINK_FOLLOW, else
+// taken as is) must be the host's -- a cpio entry or a mount point is on
+// another filesystem (EXDEV) -- and the new one in the same mount.
+static int tvm_link(const char *oldpath_abs, const char *newpath_abs, int flags)
+{
+    tvm_sig_enter();
+    int ret = -1;
+    struct vfs_res old;
+    struct vfs_mut m;
+    if (0 != vfs_resolve(oldpath_abs, (flags & AT_SYMLINK_FOLLOW) ? 0 : VR_NOFOLLOW, &old))
+        goto out;
+    if (old.kind == VR_NODE || old.is_mountpoint) {
+        if (old.kind == VR_NODE)
+            vn_unlock(old.vn, 1);
+        errno = EXDEV;
+        goto out;
+    }
+    if (0 != vfs_create_path(newpath_abs, &m))
+        goto out;
+    if (old.mount_id != m.mount_id) {
+        errno = EXDEV;
+        goto out;
+    }
+    ret = CALL_FUNC(linkat, AT_FDCWD, old.path, AT_FDCWD, m.path, flags);
+out:
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, link, const char *, oldpath, const char *, newpath) {
-    char oldpath_abs[PATH_MAX];
-    if (!normalize_path(NULL, oldpath, oldpath_abs))
+    char oldpath_abs[PATH_MAX], newpath_abs[PATH_MAX];
+    if (!normalize_path(NULL, oldpath, oldpath_abs) ||
+        !normalize_path(NULL, newpath, newpath_abs))
         return -1;
-    oldpath = oldpath_abs;
-
-    char newpath_abs[PATH_MAX];
-    if (!normalize_path(NULL, newpath, newpath_abs))
-        return -1;
-    newpath = newpath_abs;
-
-    return CALL_FUNC(link, oldpath, newpath);
+    return tvm_link(oldpath_abs, newpath_abs, 0);
 }
 
 FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath, int, flags) {
@@ -14391,22 +14570,32 @@ FUNCTION_DEFINE5(int, linkat, int, olddirfd, const char *, oldpath, int, newdirf
     if (!dirfd_normalize_path(olddirfd, oldpath, oldpath_abs) ||
         !dirfd_normalize_path(newdirfd, newpath, newpath_abs))
         return -1;
+    return tvm_link(oldpath_abs, newpath_abs, flags);
+}
 
-    return CALL_FUNC(linkat, AT_FDCWD, oldpath_abs, AT_FDCWD, newpath_abs, flags);
+// Either side may be refused; a destination in another mount is EXDEV,
+// the mounts being different filesystems to the host too (mv then copies).
+static int tvm_rename(const char *oldpath_abs, const char *newpath_abs)
+{
+    struct vfs_mut src, dst;
+    tvm_sig_enter();
+    int ret = -1;
+    if (0 == vfs_remove_path(oldpath_abs, &src) && 0 == vfs_replace_path(newpath_abs, &dst)) {
+        if (src.mount_id != dst.mount_id)
+            errno = EXDEV;
+        else
+            ret = CALL_FUNC(rename, src.path, dst.path);
+    }
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, rename, const char *, oldpath, const char *, newpath) {
-    char oldpath_abs[PATH_MAX];
-    if (!normalize_path(NULL, oldpath, oldpath_abs))
+    char oldpath_abs[PATH_MAX], newpath_abs[PATH_MAX];
+    if (!normalize_path(NULL, oldpath, oldpath_abs) ||
+        !normalize_path(NULL, newpath, newpath_abs))
         return -1;
-    oldpath = oldpath_abs;
-
-    char newpath_abs[PATH_MAX];
-    if (!normalize_path(NULL, newpath, newpath_abs))
-        return -1;
-    newpath = newpath_abs;
-
-    return CALL_FUNC(rename, oldpath, newpath);
+    return tvm_rename(oldpath_abs, newpath_abs);
 }
 
 FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath) {
@@ -14414,68 +14603,89 @@ FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdi
     if (!dirfd_normalize_path(olddirfd, oldpath, oldpath_abs) ||
         !dirfd_normalize_path(newdirfd, newpath, newpath_abs))
         return -1;
+    return tvm_rename(oldpath_abs, newpath_abs);
+}
 
-    return CALL_FUNC(renameat, AT_FDCWD, oldpath_abs, AT_FDCWD, newpath_abs);
+static int tvm_unlink(const char *pathname_abs, int flags)
+{
+    struct vfs_mut m;
+    tvm_sig_enter();
+    int ret = vfs_remove_path(pathname_abs, &m);
+    if (0 == ret)
+        ret = CALL_FUNC(unlinkat, AT_FDCWD, m.path, flags);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE1(int, unlink, const char *, pathname) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    pathname = pathname_abs;
-
-    return CALL_FUNC(unlink, pathname);
+    return tvm_unlink(pathname_abs, 0);
 }
 
 FUNCTION_DEFINE3(int, unlinkat, int, dirfd, const char *, pathname, int, flags) {
     char pathname_abs[PATH_MAX];
     if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
         return -1;
-
-    return CALL_FUNC(unlinkat, AT_FDCWD, pathname_abs, flags);
-}
-
-FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
-    char pathname_abs[PATH_MAX];
-    if (!normalize_path(NULL, pathname, pathname_abs))
-        return -1;
-    pathname = pathname_abs;
-
-    return CALL_FUNC(mkdir, pathname, mode & ~current->tsk_umask);
-}
-
-FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode) {
-    char pathname_abs[PATH_MAX];
-    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
-        return -1;
-
-    return CALL_FUNC(mkdirat, AT_FDCWD, pathname_abs, mode & ~current->tsk_umask);
+    return tvm_unlink(pathname_abs, flags);
 }
 
 FUNCTION_DEFINE1(int, rmdir, const char *, pathname) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    pathname = pathname_abs;
+    return tvm_unlink(pathname_abs, AT_REMOVEDIR);
+}
 
-    return CALL_FUNC(rmdir, pathname);
+static int tvm_mkdir(const char *pathname_abs, mode_t mode)
+{
+    struct vfs_mut m;
+    tvm_sig_enter();
+    int ret = vfs_create_path(pathname_abs, &m);
+    if (0 == ret)
+        ret = CALL_FUNC(mkdir, m.path, mode & ~current->tsk_umask);
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE2(int, mkdir, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    return tvm_mkdir(pathname_abs, mode);
+}
+
+FUNCTION_DEFINE3(int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode) {
+    char pathname_abs[PATH_MAX];
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    return tvm_mkdir(pathname_abs, mode);
+}
+
+static int tvm_mkfifo(const char *pathname_abs, mode_t mode)
+{
+    struct vfs_mut m;
+    tvm_sig_enter();
+    int ret = vfs_create_path(pathname_abs, &m);
+    if (0 == ret)
+        ret = CALL_FUNC(mkfifo, m.path, mode & ~current->tsk_umask);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, mkfifo, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    pathname = pathname_abs;
-
-    return CALL_FUNC(mkfifo, pathname, mode & ~current->tsk_umask);
+    return tvm_mkfifo(pathname_abs, mode);
 }
 
 FUNCTION_DEFINE3(int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode) {
     char pathname_abs[PATH_MAX];
     if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
         return -1;
-
-    return CALL_FUNC(mkfifoat, AT_FDCWD, pathname_abs, mode & ~current->tsk_umask);
+    return tvm_mkfifo(pathname_abs, mode);
 }
 
 // Copy the characters the host generated for the template's trailing X run
@@ -14491,16 +14701,17 @@ static void mktemp_copyback(char *template, const char *abs)
 FUNCTION_DEFINE1(int, mkstemp, char *, template) {
     int r, f;
     // Resolve a relative template against the task's cwd, not the host
-    // process's (see mkdtemp), and hand the generated suffix back.
-    char abs[PATH_MAX];
+    // process's (see mkdtemp), then its directory through the VFS to the
+    // host directory it stands for, and hand the generated suffix back.
+    char abs[PATH_MAX], host[PATH_MAX];
     if (!normalize_path(NULL, template, abs))
         return -1;
     tvm_sig_enter();
-    if (-1 == (r = CALL_FUNC(mkstemp, abs))) {
+    if (0 != vfs_template_path(abs, host) || -1 == (r = CALL_FUNC(mkstemp, host))) {
         tvm_sig_leave();
         return -1;
     }
-    mktemp_copyback(template, abs);
+    mktemp_copyback(template, host);
 
     if (-1 == (f = task_new_fd(current, r))) {
         VERIFY(0 == CALL_FUNC(close, r));
@@ -14523,12 +14734,15 @@ FUNCTION_DEFINE1(int, mkstemp, char *, template) {
 // the generated suffix copied back into the caller's template, which is
 // what the caller reads (mkdtemp returns it).
 FUNCTION_DEFINE1(char *, mkdtemp, char *, template) {
-    char abs[PATH_MAX];
+    char abs[PATH_MAX], host[PATH_MAX];
     if (!normalize_path(NULL, template, abs))
         return NULL;
-    if (!CALL_FUNC(mkdtemp, abs))
+    tvm_sig_enter();
+    char *ret = 0 == vfs_template_path(abs, host) ? CALL_FUNC(mkdtemp, host) : NULL;
+    tvm_sig_leave();
+    if (!ret)
         return NULL;
-    mktemp_copyback(template, abs);
+    mktemp_copyback(template, host);
     return template;
 }
 
@@ -18811,21 +19025,30 @@ FUNCTION_DEFINE2(int, getitimer, ITIMER_WHICH_T, which, struct itimerval *, curr
 // MARK: Linux-specific hooks
 /////////////
 
+// As mkdir: the VFS's verdict, then the host on the path behind it
+static int tvm_mknod(const char *pathname_abs, mode_t mode, dev_t dev)
+{
+    struct vfs_mut m;
+    tvm_sig_enter();
+    int ret = vfs_create_path(pathname_abs, &m);
+    if (0 == ret)
+        ret = CALL_FUNC(mknod, m.path, mode & ~current->tsk_umask, dev);
+    tvm_sig_leave();
+    return ret;
+}
+
 FUNCTION_DEFINE3(int, mknod, const char *, pathname, mode_t, mode, dev_t, dev) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    pathname = pathname_abs;
-
-    return CALL_FUNC(mknod, pathname, mode & ~current->tsk_umask, dev);
+    return tvm_mknod(pathname_abs, mode, dev);
 }
 
 FUNCTION_DEFINE4(int, mknodat, int, dirfd, const char *, pathname, mode_t, mode, dev_t, dev) {
     char pathname_abs[PATH_MAX];
     if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
         return -1;
-
-    return CALL_FUNC(mknodat, AT_FDCWD, pathname_abs, mode & ~current->tsk_umask, dev);
+    return tvm_mknod(pathname_abs, mode, dev);
 }
 
 FUNCTION_DEFINE3(int, execvpe, const char *, file, char * const *, argv, char * const *, envp) {
