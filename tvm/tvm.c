@@ -12679,19 +12679,19 @@ FUNCTION_DEFINE1(int, fsync, int, fd) {
  * so they are the same functions.
  */
 FUNCTION_DEFINE4(ssize_t, pread64, int, fd, void *, buf, size_t, count, off64_t, offset) {
-    return __tvm_pread(fd, buf, count, offset);
+    return pread(fd, buf, count, offset);
 }
 
 FUNCTION_DEFINE4(ssize_t, pwrite64, int, fd, const void *, buf, size_t, count, off64_t, offset) {
-    return __tvm_pwrite(fd, buf, count, offset);
+    return pwrite(fd, buf, count, offset);
 }
 
 FUNCTION_DEFINE4(ssize_t, preadv64, int, fd, const struct iovec *, iov, int, iovcnt, off64_t, offset) {
-    return __tvm_preadv(fd, iov, iovcnt, offset);
+    return preadv(fd, iov, iovcnt, offset);
 }
 
 FUNCTION_DEFINE4(ssize_t, pwritev64, int, fd, const struct iovec *, iov, int, iovcnt, off64_t, offset) {
-    return __tvm_pwritev(fd, iov, iovcnt, offset);
+    return pwritev(fd, iov, iovcnt, offset);
 }
 
 // sqlite on Linux syncs with fdatasync (HAVE_FDATASYNC), not fsync.
@@ -13349,7 +13349,8 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
 // glibc >= 2.28 with _FILE_OFFSET_BITS=64: fcntl is fcntl64 (see pread64).
 // struct flock is struct flock64 and F_*LK64 are F_*LK on x86-64.
 FUNCTION_DEFINE_VA2(int, fcntl64, int, fd, int, cmd/*, ...  arg */ ) {
-    return __tvm_fcntl_va(fd, cmd, __ap);
+    void *arg = va_arg(__ap, void *);
+    return fcntl(fd, cmd, arg);
 }
 #endif
 
@@ -18410,23 +18411,23 @@ FUNCTION_DEFINE2(int, eventfd_write, int, fd, eventfd_t, value) {
  * stream in place of a glibc FILE (fseeko64/ftello64: curl).
  */
 FUNCTION_DEFINE6(void *, mmap64, void *, addr, size_t, length, int, prot, int, flags, int, fd, off64_t, offset) {
-    return __tvm_mmap(addr, length, prot, flags, fd, offset);
+    return mmap(addr, length, prot, flags, fd, offset);
 }
 
 FUNCTION_DEFINE2(int, statfs64, const char *, pathname, struct statfs64 *, buf) {
-    return __tvm_statfs(pathname, (struct statfs *)buf);
+    return statfs(pathname, (struct statfs *)buf);
 }
 
 FUNCTION_DEFINE1(int, mkstemp64, char *, template) {
-    return __tvm_mkstemp(template);
+    return mkstemp(template);
 }
 
 FUNCTION_DEFINE3(int, fseeko64, FILE *, stream, off64_t, offset, int, whence) {
-    return __tvm_fseeko(stream, offset, whence);
+    return fseeko(stream, offset, whence);
 }
 
 FUNCTION_DEFINE1(off64_t, ftello64, FILE *, stream) {
-    return __tvm_ftello(stream);
+    return ftello(stream);
 }
 
 FUNCTION_DEFINE3(int, posix_fallocate, int, fd, off_t, offset, off_t, len) {
@@ -18436,7 +18437,7 @@ FUNCTION_DEFINE3(int, posix_fallocate, int, fd, off_t, offset, off_t, len) {
 }
 
 FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len) {
-    return __tvm_posix_fallocate(fd, offset, len);
+    return posix_fallocate(fd, offset, len);
 }
 
 /*
