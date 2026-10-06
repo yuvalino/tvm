@@ -1493,6 +1493,39 @@ TEST(VfsBindFileStat) {
     ASSERT_EQ(DT_REG, type);
 }
 
+// opendir of a file bind is ENOTDIR, as of its source. The errno used to
+// be left as the caller had it when the source was a node (/bin/sh is
+// bash's cpio entry): EINTR here, while opendir("/tvm/bin/sh") said
+// ENOTDIR. A bind of a host file says it through the host's open.
+TEST(VfsBindOpendirFile) {
+    errno = EINTR;
+    ASSERT_EQ(NULL, opendir("/bin/sh"));
+    ASSERT_EQ(errno, ENOTDIR);
+    errno = EINTR;
+    ASSERT_EQ(-1, open("/bin/sh", O_RDONLY | O_DIRECTORY));
+    ASSERT_EQ(errno, ENOTDIR);
+    ASSERT_EQ(NULL, opendir("/tvm/bin/sh"));
+    ASSERT_EQ(errno, ENOTDIR);
+
+    char dir[] = "/tmp/tvm_bindf_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char f[PATH_MAX];
+    snprintf(f, sizeof(f), "%s/f", dir);
+    ASSERT_EQ(0, close(open(f, O_WRONLY | O_CREAT, 0644)));
+    tvm_mount_bind(f, "/mnt_bindf_test");
+    errno = EINTR;
+    ASSERT_EQ(NULL, opendir("/mnt_bindf_test"));
+    ASSERT_EQ(errno, ENOTDIR);
+    int fd = open("/mnt_bindf_test", O_RDONLY);
+    ASSERT_NEQ(fd, -1);
+    struct stat st;
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(1, S_ISREG(st.st_mode));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, unlink(f));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
 TEST(VfsBindBusy) {
     ASSERT_EQ(-1, unlink("/bin/sh"));
     ASSERT_EQ(errno, EBUSY);
@@ -1619,6 +1652,114 @@ TEST(VfsBindNested) {
     ASSERT_EQ(0, rmdir(dir));
 }
 
+// A bound directory opened without O_DIRECTORY is the bind's node too,
+// whose listing has the mounts under it. The node was asked for on
+// O_DIRECTORY alone (opendir's), and toybox's dirtree opens a directory
+// with openat(.., O_CLOEXEC) and fdopendir()s it, so `ls /mnt` went
+// through the bind to the host directory and printed nothing, while
+// `echo /mnt/*` (bash's opendir) had the nested bind. Opened for writing
+// the directory is still a directory (EISDIR, the host's answer).
+TEST(VfsBindDirOpen) {
+    char dir[] = "/tmp/tvm_dopen_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char a[PATH_MAX], b[PATH_MAX], p[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    ASSERT_EQ(0, mkdir(a, 0755));
+    ASSERT_EQ(0, mkdir(b, 0755));
+    snprintf(p, sizeof(p), "%s/own", a);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    snprintf(p, sizeof(p), "%s/inner", b);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+
+    tvm_mount_bind(a, "/mnt_dopen_test");
+    tvm_mount_bind(b, "/mnt_dopen_test/nested");
+
+    // dirtree's way: openat without O_DIRECTORY, fstatat and openat
+    // relative to it, fdopendir
+    int fd = openat(AT_FDCWD, "/mnt_dopen_test", O_RDONLY | O_CLOEXEC);
+    ASSERT_NEQ(fd, -1);
+    struct stat st, hst;
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, stat(a, &hst));
+    ASSERT_EQ(hst.st_ino, st.st_ino);
+    ASSERT_EQ(0, fstatat(fd, "nested/inner", &st, 0));
+    ASSERT_EQ(0, fstatat(fd, "own", &st, 0));
+    int sub = openat(fd, "nested", O_RDONLY | O_CLOEXEC);
+    ASSERT_NEQ(sub, -1);
+    DIR *d = fdopendir(sub);
+    ASSERT_NEQ(d, NULL);
+    int inner = 0, n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        inner += 0 == strcmp(e->d_name, "inner");
+        n++;
+    }
+    ASSERT_EQ(1, inner);
+    ASSERT_EQ(3, n);
+    ASSERT_EQ(0, closedir(d));
+    d = fdopendir(fd);
+    ASSERT_NEQ(d, NULL);
+    int nested = 0, own = 0;
+    n = 0;
+    while ((e = readdir(d))) {
+        if (0 == strcmp(e->d_name, "nested")) {
+            nested++;
+            ASSERT_EQ(DT_DIR, e->d_type);
+        }
+        own += 0 == strcmp(e->d_name, "own");
+        n++;
+    }
+    ASSERT_EQ(1, nested);
+    ASSERT_EQ(1, own);
+    ASSERT_EQ(4, n);
+    ASSERT_EQ(0, closedir(d));
+
+    // the descriptor is the mount point's: fchdir lands there, a read
+    // of it is a directory's
+    fd = open("/mnt_dopen_test", O_RDONLY);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, fchdir(fd));
+    char r[PATH_MAX];
+    ASSERT_NEQ(getcwd(r, sizeof(r)), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_dopen_test"));
+    ASSERT_EQ(0, stat("nested/inner", &st));
+    ASSERT_EQ(-1, read(fd, r, 1));
+    ASSERT_EQ(errno, EISDIR);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, chdir("/"));
+    fd = open("/mnt_dopen_test", O_RDONLY | O_NOFOLLOW);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, close(fd));
+
+    ASSERT_EQ(-1, open("/mnt_dopen_test", O_WRONLY));
+    ASSERT_EQ(errno, EISDIR);
+    ASSERT_EQ(-1, open("/mnt_dopen_test", O_RDWR));
+    ASSERT_EQ(errno, EISDIR);
+    ASSERT_EQ(-1, open("/mnt_dopen_test/nested", O_RDWR | O_CREAT, 0644));
+    ASSERT_EQ(errno, EISDIR);
+    // O_CREAT of the existing directory, for reading: the host's verdict
+    int h = open(a, O_RDONLY | O_CREAT, 0644);
+    int herrno = errno;
+    int m = open("/mnt_dopen_test", O_RDONLY | O_CREAT, 0644);
+    ASSERT_EQ(h == -1, m == -1);
+    if (h == -1)
+        ASSERT_EQ(errno, herrno);
+    else {
+        ASSERT_EQ(0, close(h));
+        ASSERT_EQ(0, close(m));
+    }
+
+    snprintf(p, sizeof(p), "%s/inner", b);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/own", a);
+    ASSERT_EQ(0, unlink(p));
+    ASSERT_EQ(0, rmdir(a));
+    ASSERT_EQ(0, rmdir(b));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
 TEST(VfsBindLoop) {
     tvm_mount_bind("/la_loop_test", "/lb_loop_test");
     tvm_mount_bind("/lb_loop_test", "/la_loop_test");
@@ -1626,6 +1767,10 @@ TEST(VfsBindLoop) {
     ASSERT_EQ(-1, stat("/la_loop_test", &st));
     ASSERT_EQ(errno, ELOOP);
     ASSERT_EQ(-1, open("/lb_loop_test/x", O_RDONLY));
+    ASSERT_EQ(errno, ELOOP);
+    ASSERT_EQ(-1, open("/la_loop_test", O_RDONLY));
+    ASSERT_EQ(errno, ELOOP);
+    ASSERT_EQ(NULL, opendir("/la_loop_test"));
     ASSERT_EQ(errno, ELOOP);
 }
 
@@ -1676,6 +1821,32 @@ TEST(VfsAtCalls) {
     ASSERT_EQ(1, S_ISREG(st.st_mode));
     ASSERT_EQ(0, close(f));
     ASSERT_EQ(0, close(fd));
+}
+
+// chown and lchown of a relative path: against the task's cwd, which
+// chdir sets for the task alone, the host's staying where it was. They
+// went to the host with the path as given, so the file was looked for in
+// the host's cwd (ENOENT), as if the task had not chdir'ed.
+TEST(ChownRelative) {
+    char dir[] = "/tmp/tvm_chown_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/tvm_chown_rel_f", dir);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    snprintf(p, sizeof(p), "%s/tvm_chown_rel_l", dir);
+    ASSERT_EQ(0, symlink("tvm_chown_rel_none", p));
+    ASSERT_EQ(0, chdir(dir));
+    ASSERT_EQ(0, chown("tvm_chown_rel_f", getuid(), getgid()));
+    ASSERT_EQ(0, lchown("tvm_chown_rel_l", getuid(), getgid()));
+    ASSERT_EQ(-1, chown("tvm_chown_rel_l", getuid(), getgid()));   // followed: no such target
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(-1, lchown("tvm_chown_rel_none", getuid(), getgid()));
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(0, chdir("/"));
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/tvm_chown_rel_f", dir);
+    ASSERT_EQ(0, unlink(p));
+    ASSERT_EQ(0, rmdir(dir));
 }
 
 // /bin/sh execs the VM's shell under that name

@@ -7385,22 +7385,30 @@ static int vfsop_open_node(struct vfs_node *vn, const char *path, int flags, mod
         struct vfs_res res;
         int ok = 0 == vfs_resolve(target, 0, &res);
         if (ok && res.kind == VR_NODE) {
-            ok = S_ISDIR(res.vn->vn_st.st_mode);
+            // A source that is a node but no directory (/bin/sh: bash's
+            // cpio entry) used to clear `ok` here, so the ENOTDIR below
+            // was skipped and errno stayed as the caller had left it:
+            // `errno = EINTR; opendir("/bin/sh")` failed with EINTR,
+            // while opendir("/tvm/bin/sh") said ENOTDIR. No host open
+            // follows to say it, so it is said here.
+            int isdir = S_ISDIR(res.vn->vn_st.st_mode);
             vn_unlock(res.vn, 1);
-            if (ok)
+            if (isdir)
                 rfd = CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
+            else
+                errno = ENOTDIR;
         }
         else if (ok)
             rfd = CALL_FUNC(open, res.path, (flags & O_ACCMODE) | O_DIRECTORY);
         if (ok && rfd == -1 && errno != ENOTDIR)
             rfd = CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
         if (!ok || rfd == -1) {
+            int last_errno = errno;     /* the resolver's (ENOENT, ELOOP) for a source that is not there */
             vn_lock(vn, 0);
             vf_unlock(vf, 1);
             vn_unlock(vn, 1);
             file_lock(out, 0);
-            if (ok)
-                errno = ENOTDIR;
+            errno = ok ? ENOTDIR : last_errno;
             return -1;
         }
     }
@@ -7438,6 +7446,20 @@ static int vfsop_open_node(struct vfs_node *vn, const char *path, int flags, mod
     return 0;
 }
 
+/* The bind `vn` (locked, kept) names a directory: its source's stat,
+   taken with the node lock dropped (the resolver takes the nodes on the
+   source's path, which may lead back to this one: a bind loop). */
+static int vfs_bind_names_dir(struct vfs_node *vn)
+{
+    char target[PATH_MAX];
+    snprintf(target, sizeof(target), "%s", vn->vn_target);
+    vn_unlock(vn, 0);
+    struct stat st;
+    int isdir = 0 == vfs_stat_path(target, &st, 0) && S_ISDIR(st.st_mode);
+    vn_lock(vn, 0);
+    return isdir;
+}
+
 /* open() of an absolute path the devices did not claim: the VFS node it
    resolves to, or the host path behind it. O_CREAT of a missing entry in a
    cpio directory is EROFS (the resolver's ENOENT comes from a cpio
@@ -7448,11 +7470,28 @@ static int vfs_open_path(struct file *out, const char *abspath, int flags, mode_
 {
     file_unlock(out, 0);
 
-    // A directory open (opendir) of a bind gets the bind node, whose
-    // listing is the source's merged with the mounts under it.
+    // A read-only open of a bind whose source is a directory gets the bind
+    // node, whose listing is the source's merged with the mounts under it.
+    // The node was asked for on O_DIRECTORY alone (opendir's), but
+    // toybox's dirtree opens a directory with openat(.., O_CLOEXEC) and
+    // fdopendir()s it, so `ls` went through the bind to the host directory
+    // and listed that: with b bound at /mnt_x/nested under a bound /mnt_x,
+    // `ls /mnt_x` printed nothing while `echo /mnt_x/*` (bash's opendir)
+    // had nested. The node is asked for first; a bind of anything but a
+    // directory is its source (/bin/sh opens bash), as is one opened for
+    // writing or creating, which the host answers for a directory as for
+    // any directory (EISDIR). With O_DIRECTORY the node answers itself
+    // (ENOTDIR for a source that is no directory).
     struct vfs_res res;
-    unsigned rflags = ((flags & O_NOFOLLOW) ? VR_NOFOLLOW : 0) | ((flags & O_DIRECTORY) ? VR_BIND : 0);
-    if (0 != vfs_resolve(abspath, rflags, &res)) {
+    unsigned rflags = ((flags & O_NOFOLLOW) ? VR_NOFOLLOW : 0) | VR_BIND;
+    int rdonly = (flags & O_ACCMODE) == O_RDONLY && !(flags & (O_CREAT | O_TRUNC));
+    int r = vfs_resolve(abspath, rflags, &res);
+    if (r == 0 && res.kind == VR_NODE && res.vn->vn_kind == VN_BIND && !(flags & O_DIRECTORY) &&
+        !(rdonly && vfs_bind_names_dir(res.vn))) {
+        vn_unlock(res.vn, 1);
+        r = vfs_resolve(abspath, rflags & ~VR_BIND, &res);
+    }
+    if (r != 0) {
         if ((flags & O_CREAT) && errno == ENOENT)
             errno = EROFS;
         file_lock(out, 0);
@@ -14715,11 +14754,14 @@ FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode
     return ret;
 }
 
+// pathname_abs, the path against the task's cwd: a relative one went to
+// the host as given, resolved against the host's cwd (chown("f") from a
+// task that had chdir'ed elsewhere was ENOENT, or the host's f).
 FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    pathname = pathname;
+    pathname = pathname_abs;
 
     tvm_sig_enter();
     int ret = file_chown(pathname, owner, group, 0);
@@ -14731,7 +14773,7 @@ FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    pathname = pathname;
+    pathname = pathname_abs;
 
     tvm_sig_enter();
     int ret = file_chown(pathname, owner, group, AT_SYMLINK_NOFOLLOW);
