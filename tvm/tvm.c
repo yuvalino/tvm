@@ -14635,9 +14635,6 @@ pid_t fork(void) {
         errno = ENOMEM;
         goto out;
     }
-    // kalloc does not zero: an uninitialized fixup.ptrs was handed to
-    // krealloc (a reused block's stale pointer to a never-freed table)
-    memset(&arg->fixup, 0, sizeof(arg->fixup));
 
     arg->pid = 0;
     arg->tsk = tsk;
