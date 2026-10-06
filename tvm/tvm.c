@@ -4172,6 +4172,8 @@ struct file_stream *file_stream_fp(FILE *fp) {
     return fs;
 }
 
+// The libc FILE behind a guest stream; NULL for a stream a failed freopen()
+// left closed (as glibc does, the stream stays valid and every use fails).
 FILE *real_fp(FILE *fp) {
     return file_stream_fp(fp)->fs_fp;
 }
@@ -4188,15 +4190,19 @@ static struct file *file_for_task_stream_locked(struct task *t, struct file_stre
     else if ((FILE *)fs == stderr)
         fs = t->tsk_io_filestreams[2];
 
-    if (!fs)
+    // EBADF, as libc reports for a stream it has closed: no stream, the
+    // wrong kind, or one without a descriptor (closed by fclose(stdout), or
+    // left behind by a failed freopen(), whose fs_fp is NULL).
+    if (!fs || fs_type != fs->fs_type) {
+        errno = EBADF;
         return NULL;
-
-    if (fs_type != fs->fs_type)
-        return NULL;
+    }
 
     struct file *file = file_for_task_locked(t, fs->fs_nfd);
-    if (!file)
+    if (!file) {
+        errno = EBADF;
         return NULL;
+    }
 
     /**
      * If a `file`'s NFD was dupped recently, it updated the underlying fd -> update info
@@ -11491,6 +11497,7 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     fs->fs_nfd = -1;
 
     int fd = open(pathname, flags, 0666);
+    int open_errno = errno;
 
     tvm_sig_enter();
 
@@ -11505,6 +11512,8 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     if (-1 == fd) {
         task_unlock(current);
         tvm_sig_leave();
+        // open()'s, not what closing the old FILE above left behind
+        errno = open_errno;
         return NULL;
     }
 
@@ -11838,10 +11847,13 @@ FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
 
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
-        int last_fd = CALL_FUNC(fileno, real_fp(stream));
-        fp_setfileno(real_fp(stream), -1);
-        CALL_FUNC(setbuf, real_fp(stream), buf);
-        fp_setfileno(real_fp(stream), last_fd);
+        FILE *fp = real_fp(stream);
+        if (fp) {
+            int last_fd = CALL_FUNC(fileno, fp);
+            fp_setfileno(fp, -1);
+            CALL_FUNC(setbuf, fp, buf);
+            fp_setfileno(fp, last_fd);
+        }
         tvm_sig_leave();
         return;
     }
@@ -11861,10 +11873,13 @@ FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
     tvm_sig_enter();
     struct file *file = file_for_task_fp(current, stream);
     if (!file) {
-        int last_fd = CALL_FUNC(fileno, real_fp(stream));
-        fp_setfileno(real_fp(stream), -1);
-        CALL_FUNC(setbuffer, real_fp(stream), buf, size);
-        fp_setfileno(real_fp(stream), last_fd);
+        FILE *fp = real_fp(stream);
+        if (fp) {
+            int last_fd = CALL_FUNC(fileno, fp);
+            fp_setfileno(fp, -1);
+            CALL_FUNC(setbuffer, fp, buf, size);
+            fp_setfileno(fp, last_fd);
+        }
         tvm_sig_leave();
         return;
     }
@@ -12106,25 +12121,41 @@ FUNCTION_DEFINE0(int, getchar) {
     return fgetc(stdin);
 }
 
+// A stream a failed freopen() left closed has no libc FILE (real_fp() is
+// NULL): it reports what glibc's closed stream does -- an error, no EOF,
+// EBADF where an errno is due -- instead of handing NULL to libc.
+
 FUNCTION_DEFINE2(int, ungetc, int, c, FILE *, stream) {
     // TODO support for file->f_ops
-    return CALL_FUNC(ungetc, c, real_fp(stream));
+    FILE *fp = real_fp(stream);
+    if (!fp) {
+        errno = EBADF;
+        return EOF;
+    }
+    return CALL_FUNC(ungetc, c, fp);
 }
 
 FUNCTION_DEFINE_VOID1(clearerr, FILE *, stream) {
-    CALL_FUNC(clearerr, real_fp(stream));
+    FILE *fp = real_fp(stream);
+    if (fp)
+        CALL_FUNC(clearerr, fp);
 }
 
 FUNCTION_DEFINE1(int, feof, FILE *, stream) {
-    return CALL_FUNC(feof, real_fp(stream));
+    FILE *fp = real_fp(stream);
+    return fp ? CALL_FUNC(feof, fp) : 0;
 }
 
 FUNCTION_DEFINE1(int, ferror, FILE *, stream) {
-    return CALL_FUNC(ferror, real_fp(stream));
+    FILE *fp = real_fp(stream);
+    return fp ? CALL_FUNC(ferror, fp) : 1;
 }
 
 FUNCTION_DEFINE1(int, fileno, FILE *, stream) {
-    return file_stream_fp(stream)->fs_nfd;
+    int nfd = file_stream_fp(stream)->fs_nfd;
+    if (nfd < 0)
+        errno = EBADF;
+    return nfd;
 }
 
 FUNCTION_DEFINE_VA1(int, printf, const char *, format) {
