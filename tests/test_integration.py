@@ -2258,6 +2258,19 @@ def test_bind_mounts(sshi: spawn):
     out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh 2>&1; [ -f /bin/sh ] && echo still_there")
     assert out.lower().count("busy") == 2 and "still_there" in out, out
 
+def test_bind_dir_listing(sshi: spawn):
+    """A bound directory is listed with the mounts under it whatever opens
+    it: toybox's ls (dirtree) opens a directory with openat(.., O_CLOEXEC)
+    and fdopendir, no O_DIRECTORY, and used to get the host directory
+    behind the bind, so with b bound at /mnt/nested under a bound /mnt,
+    `ls /mnt` printed nothing while `echo /mnt/*` (bash's opendir) had
+    nested and [ -d /mnt/nested ] was true (-1: the session is a tty)."""
+    out, rc = _sh(sshi, "d=$(mktemp -d) && mkdir $d/a $d/b && touch $d/a/own $d/b/inner && "
+                        "tvm mount --bind $d/a /mnt_lsdir && tvm mount --bind $d/b /mnt_lsdir/nested && "
+                        "ls -1 /mnt_lsdir && ls -1 /mnt_lsdir/nested && echo /mnt_lsdir/* && [ -d /mnt_lsdir/nested ] && "
+                        "ls -d /mnt_lsdir/nested; rm -rf $d")
+    assert rc == 0 and _lines(out)[-5:] == ["nested", "own", "inner", "/mnt_lsdir/nested /mnt_lsdir/own", "/mnt_lsdir/nested"], out
+
 def test_realpath_namespace(sshi: spawn):
     """realpath and pwd -P answer in the guest namespace: a cpio link is
     followed, a mount point keeps its own name (its source is hidden), and
