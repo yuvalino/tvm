@@ -86,6 +86,14 @@ mount --bind /tvm/bin/env:/usr/bin/env
 The guest-side builtin takes the same options with two operands:
 `tvm mount [-t cpio] FILE TARGET`, `tvm mount --bind SOURCE TARGET`.
 
+On iOS the app runs in its sandbox, and whether a host `/bin` or
+`/usr/bin` exists or is listable there has not been verified (the device
+was offline when this was written): the design does not depend on it -- a
+mount point exists without a host directory, an unreadable host directory
+adds nothing to the merged listing, and a host `/usr/bin/env` is covered
+either way. To record the facts, from the app's ssh:
+`ls -ld /bin /usr/bin; ls /bin; stat /bin/sh; readlink /tvm/bin/bash`.
+
 ### setenv
 
 Set an environment variable (always overwrites).
