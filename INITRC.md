@@ -54,6 +54,33 @@ mount initrd.cpio:/tvm
 mount $HOME/extra.cpio:/opt
 ```
 
+### bind
+
+Lay a symbolic link over a host path, pointing at another path (typically
+one of the VM's own programs).
+
+```
+bind <target>:<link>
+```
+
+- `target` — absolute path the link points to; a VFS path (`/tvm/...`) or a host path
+- `link` — absolute path the link appears at; it may exist on the host (it is hidden) or not
+
+To every path call that goes through TVM's devices — `open`, `execve`,
+`stat`, `access`, `readlink`, `chmod`, `chown` and their `*at` forms — the
+link behaves like a symlink: it is followed to the target, `lstat()` reports
+a link and `readlink()` returns the target. Only the last component of a
+path is matched (`/bin/sh`, not `/bin/sh/x`), and calls that do not go
+through the devices (`unlink`, `rename`, `realpath`, ...) see the host's
+file. Directory listings do not show links. Links may point at other links.
+
+Example: scripts name their interpreter by host path (`#!/bin/sh`,
+`#!/usr/bin/env bash`), and the host's are not loadable in TVM:
+```
+bind /tvm/bin/sh:/bin/sh
+bind /tvm/bin/env:/usr/bin/env
+```
+
 ### setenv
 
 Set an environment variable (always overwrites).
