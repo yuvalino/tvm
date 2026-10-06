@@ -428,7 +428,6 @@ DECL_FUNC(pselect);
 DECL_FUNC(ppoll);
 #endif
 DECL_FUNC(shm_open);
-DECL_FUNC(shm_unlink);
 DECL_FUNC(fcntl);
 DECL_FUNC(ftruncate);
 DECL_FUNC(stat);
@@ -14007,7 +14006,7 @@ static int tvm_task_adopt_fd(int r)
 // its nofork command substitution (lib/sh/anonfile.c) opens and at once
 // unlinks such an object for its scratch file, and the host descriptor it
 // got was not a guest one. (On Linux it asks memfd_create first.)
-// shm_unlink is a plain pass-through, interposed so the pair stays together.
+// shm_unlink takes only the name, so the host's serves the guest as is.
 #if defined(__APPLE__)
 FUNCTION_DEFINE_VA2(int, shm_open, const char *, name, int, oflag) {
     mode_t mode = (oflag & O_CREAT) ? (mode_t)va_arg(__ap, int) : 0;
@@ -14018,10 +14017,6 @@ FUNCTION_DEFINE3(int, shm_open, const char *, name, int, oflag, mode_t, mode) {
     int f = tvm_task_adopt_fd(CALL_FUNC(shm_open, name, oflag, mode));
     tvm_sig_leave();
     return f;
-}
-
-FUNCTION_DEFINE1(int, shm_unlink, const char *, name) {
-    return CALL_FUNC(shm_unlink, name);
 }
 
 FUNCTION_DEFINE3(int, socket, int, domain, int, type, int, protocol) {
