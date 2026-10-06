@@ -1489,6 +1489,24 @@ def test_nano_syntax_rc(sshi: spawn):
     sshi.expect(r"[\r\n]0\r\n")
     sshi.expect(r"\$ ")
 
+def test_nano_file_browser(sshi: spawn):
+    """nano's file browser (^R, then ^T) reads a directory twice with a
+    rewinddir() in between, which took the editor down with SIGSEGV when
+    rewinddir reached the host libc with TVM's stream. The browser shows
+    the directory and its entries, and leaves nano in one piece."""
+    sshi.sendline("export TERM=xterm-256color; d=$(mktemp -d) && touch $d/browsed_file && cd $d && nano; echo RC=$?")
+    sshi.expect("Write Out")
+    sshi.send("\x12")            # ^R  Read File
+    sshi.expect("File to insert")
+    sshi.send("\x14")            # ^T  To Files
+    _expect_all(sshi, "DIR:", "browsed_file")
+    sshi.send("\x03")            # ^C  Cancel the browser
+    sshi.expect("File to insert")
+    sshi.send("\x03")            # ^C  Cancel the prompt
+    sshi.send("\x18")            # ^X
+    sshi.expect("RC=0")
+    sshi.expect(r"\$ ")
+
 # ── sqlite3 ──────────────────────────────────────────────────
 
 def test_sqlite3_version(sshi: spawn):

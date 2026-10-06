@@ -341,7 +341,9 @@ DECL_FUNC(fdopendir);
 DECL_FUNC(closedir);
 DECL_FUNC(readdir);
 DECL_FUNC(dirfd);
-// rewinddir, seekdir, telldir
+DECL_FUNC(rewinddir);
+DECL_FUNC(telldir);
+DECL_FUNC(seekdir);
 
 
 DECL_FUNC(fopen);
@@ -11107,6 +11109,62 @@ FUNCTION_DEFINE1(struct dirent *, readdir, DIR *, dir) {
 FUNCTION_DEFINE1(int, dirfd, DIR *, dir) {
     struct file_stream *fs = (struct file_stream *)dir;
     return fs->fs_nfd;
+}
+
+// rewinddir(3), telldir(3) and seekdir(3) were not interposed, so the libc
+// got the guest's DIR * -- TVM's struct file_stream -- and dereferenced it
+// as one of its own: SIGSEGV on any directory, host or VFS (nano's file
+// browser lists a directory, rewinds and lists it again). A stream a
+// device serves (f_readdir) is positioned through its f_lseek, which moves
+// the same cursor vfsop_readdir indexes the entries by; any other is the
+// host's DIR, handed to the host's own function the way readdir() does.
+// The three stay distinct for the host: its telldir cookie is opaque (Darwin
+// hands out 0 for a position past the first entry), so seekdir(0) is not
+// a rewind.
+enum { DIR_REWIND, DIR_TELL, DIR_SEEK };
+
+static long dir_seek(DIR *dir, int op, long loc)
+{
+    tvm_sig_enter();
+    struct file *file = file_for_task_dp(current, dir);
+    if (!file) {
+        tvm_sig_leave();
+        return -1;
+    }
+
+    long ret = 0;
+    if (file->f_ops && file->f_ops->f_readdir && file->f_ops->f_lseek) {
+        if (op == DIR_TELL)
+            ret = (long)file->f_ops->f_lseek(file, 0, SEEK_CUR);
+        else
+            ret = (long)file->f_ops->f_lseek(file, op == DIR_SEEK ? loc : 0, SEEK_SET);
+    }
+    else {
+        file_unlock(file, 0);
+        if (op == DIR_TELL)
+            ret = CALL_FUNC(telldir, real_dp(dir));
+        else if (op == DIR_SEEK)
+            CALL_FUNC(seekdir, real_dp(dir), loc);
+        else
+            CALL_FUNC(rewinddir, real_dp(dir));
+        file_lock(file, 0);
+    }
+
+    file_unlock(file, 1);
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE_VOID1(rewinddir, DIR *, dir) {
+    dir_seek(dir, DIR_REWIND, 0);
+}
+
+FUNCTION_DEFINE1(long, telldir, DIR *, dir) {
+    return dir_seek(dir, DIR_TELL, 0);
+}
+
+FUNCTION_DEFINE_VOID2(seekdir, DIR *, dir, long, loc) {
+    dir_seek(dir, DIR_SEEK, loc);
 }
 
 /**
