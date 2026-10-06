@@ -2208,6 +2208,14 @@ def test_ls_root_shows_tvm(sshi: spawn):
     out, rc = _sh(sshi, "ls / | grep -x tvm; [ -d /tvm ] && [ -d /usr ] && echo both_dirs")
     assert rc == 0 and _lines(out)[-2:] == ["tvm", "both_dirs"], out
 
+def test_vfs_readonly(sshi: spawn):
+    """A cpio mount is read-only: creating in it is "Read-only file system"
+    (the host used to answer for a path it has not got, ENOENT), and the
+    mount point itself is busy."""
+    out, rc = _sh(sshi, "mkdir /tvm/x 2>&1; touch /tvm/etc/x 2>&1; rm /tvm/etc/profile 2>&1; rmdir /tvm 2>&1; true")
+    assert out.count("Read-only file system") == 3, out
+    assert "busy" in out.lower(), out
+
 def test_mount_builtin(sshi: spawn):
     """`tvm mount` takes mount(8)'s spelling: `[-t cpio] FILE TARGET` mounts
     an archive at runtime (here one toybox's cpio just wrote), `--bind
