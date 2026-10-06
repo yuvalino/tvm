@@ -2218,9 +2218,9 @@ def test_vfs_readonly(sshi: spawn):
 
 def test_mount_builtin(sshi: spawn):
     """`tvm mount` takes mount(8)'s spelling: `[-t cpio] FILE TARGET` mounts
-    an archive at runtime (here one toybox's cpio just wrote), `--bind
-    SOURCE TARGET` is parsed but refused while the VFS cannot serve a bind,
-    and too few operands is the usage, rc 1."""
+    an archive at runtime (here one toybox's cpio just wrote), `--bind` or
+    `-o bind SOURCE TARGET` binds a file or a directory, and too few
+    operands is the usage, rc 1."""
     out, rc = _sh(sshi, "tvm mount")
     assert rc == 1 and "USAGE" in out, out
     out, rc = _sh(sshi, "tvm mount --bind /tvm/bin/env")
@@ -2231,10 +2231,39 @@ def test_mount_builtin(sshi: spawn):
                         "find x | cpio -o -H newc > $d/t.cpio && cd / && "
                         "tvm mount -t cpio $d/t.cpio /mnt_builtin && cat /mnt_builtin/x/f; rm -rf $d")
     assert rc == 0 and "from_cpio" in out, out
-    out, rc = _sh(sshi, "tvm mount --bind /tvm/bin/env /usr/local/bin/env2")
-    assert rc == 1 and "not supported" in out, out
-    out, rc = _sh(sshi, "tvm mount -o bind /tvm/bin/env /usr/local/bin/env2")
-    assert rc == 1 and "not supported" in out, out
+    # toybox dispatches on argv[0], so the bind keeps the applet's name
+    out, rc = _sh(sshi, "tvm mount --bind /tvm/bin/env /usr/local/bin/env && [ -x /usr/local/bin/env ] && /usr/local/bin/env true && echo env_runs")
+    assert rc == 0 and "env_runs" in out, out
+    out, rc = _sh(sshi, "d=$(mktemp -d) && echo bound > $d/x && tvm mount -o bind $d /mnt_obind && cat /mnt_obind/x; rm -rf $d")
+    assert rc == 0 and "bound" in out, out
+
+def test_bind_mounts(sshi: spawn):
+    """The initrc's bind mounts (/bin/sh, /bin/bash, /usr/bin/env from
+    /tvm/bin) are the VM's programs under the host paths: regular files,
+    not links (readlink fails, ls -l has no arrow), listed once in /bin,
+    busy to mv and rm, and scripts naming their interpreter by host path
+    run through them -- there is no PATH retry of a #! interpreter."""
+    out, rc = _sh(sshi, "readlink /bin/sh; echo RL=$?; [ -f /bin/sh ] && ! [ -L /bin/sh ] && [ -f /bin/bash ] && [ -f /usr/bin/env ] && echo files_not_links")
+    assert "RL=1" in out and "files_not_links" in out, out
+    out, rc = _sh(sshi, "ls -l /bin/sh")
+    assert rc == 0 and "->" not in out.split("\n")[-2] and "/bin/sh" in out, out
+    out, rc = _sh(sshi, "ls /bin | grep -c '^sh$'")
+    assert rc == 0 and _lines(out)[-1] == "1", out
+    out, rc = _sh(sshi, "[ -x /bin/bash ] && /bin/bash -c 'echo BASH=${BASH_VERSINFO[0]}' && /bin/sh -c 'echo SH0=$0'")
+    assert rc == 0 and "BASH=5" in out and "SH0=/bin/sh" in out, out
+    out, rc = _sh(sshi, "d=$(mktemp -d) && printf '#!/bin/bash\\narr=(x y); echo ARR=${arr[1]}\\n' > $d/b && "
+                        "printf '#!/bin/sh\\necho SH_OK\\n' > $d/s && printf '#!/usr/bin/env bash\\necho ENV_OK\\n' > $d/e && "
+                        "chmod +x $d/b $d/s $d/e && $d/b && $d/s && $d/e; rm -rf $d")
+    assert rc == 0 and "ARR=y" in out and "SH_OK" in out and "ENV_OK" in out, out
+    out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh 2>&1; [ -f /bin/sh ] && echo still_there")
+    assert out.lower().count("busy") == 2 and "still_there" in out, out
+
+def test_exec_bad_interpreter(sshi: spawn):
+    """A #! interpreter that does not exist is a bad interpreter, as on
+    Linux: bash reports it and the status is 126 (no PATH retry)."""
+    out, rc = _sh(sshi, "d=$(mktemp -d) && printf '#!/nonexistent/interp\\necho never\\n' > $d/s && "
+                        "chmod +x $d/s && $d/s; echo RC=$?; rm -rf $d")
+    assert "bad interpreter" in out and "RC=126" in out and "never" not in out.replace("echo never", ""), out
 
 def test_exec_nonexistent(sshi: spawn):
     """exec a nonexistent program — exercises ENOENT in execve."""

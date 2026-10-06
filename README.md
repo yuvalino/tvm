@@ -159,7 +159,7 @@ pytest tests/test_integration.py --device <device-name> --backend flutter
 - `tvm env` - environment variables
 - `tvm sorunner` - run shared object
 - `tvm cpio` - CPIO archive reader
-- `tvm mount` - VFS mount
+- `tvm mount [-t cpio] FILE TARGET`, `tvm mount --bind SOURCE TARGET` - mount a CPIO archive, or bind a path over another (see [INITRC.md](INITRC.md))
 - `tvm shell` - execute command via `system()`
 
 ### Third-party (`third_party/`)
@@ -219,6 +219,7 @@ Commands:
 
 ```sh
 mount <hostpath>:<guestpath>   # Mount a CPIO archive into the VFS
+mount --bind <source>:<mountpoint>  # Bind a guest path (file or directory) over another
 setenv <name>=<value>          # Set environment variable (overwrites)
 setenv? <name>=<value>         # Set only if not already set
 mkdir <path>                   # Create directory (mkdir -p semantics)

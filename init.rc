@@ -3,6 +3,13 @@
 # Mount rootfs
 mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 
+# Host paths scripts and programs name for their interpreter (#!/bin/sh,
+# #!/usr/bin/env bash, system(3)): bind the VM's own over them, since the
+# host's are not loadable in TVM (see INITRC.md, mount)
+mount --bind /tvm/bin/sh:/bin/sh
+mount --bind /tvm/bin/bash:/bin/bash
+mount --bind /tvm/bin/env:/usr/bin/env
+
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/bash
 setenv SHELL=/tvm/bin/bash

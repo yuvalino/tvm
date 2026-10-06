@@ -1442,6 +1442,264 @@ TEST(VfsMutateHost) {
     ASSERT_EQ(0, rmdir(dir));
 }
 
+//////////
+//// Bind mounts (the initrc's: /bin/sh, /bin/bash, /usr/bin/env from /tvm/bin)
+//////////
+
+// `tvm mount --bind SOURCE TARGET` through the builtin
+static void tvm_mount_bind(const char *source, const char *target)
+{
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        execl("/usr/bin/tvm", "tvm", "mount", "--bind", source, target, NULL);
+        _exit(127);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// A file bind is the file its source names, links resolved: a regular
+// file to lstat, no link to readlink, bash's inode.
+TEST(VfsBindFileStat) {
+    struct stat st, bash;
+    ASSERT_EQ(0, stat("/tvm/bin/bash", &bash));
+    ASSERT_EQ(0, lstat("/bin/sh", &st));
+    ASSERT_EQ(1, S_ISREG(st.st_mode));
+    ASSERT_EQ(bash.st_ino, st.st_ino);
+    ASSERT_EQ(0, stat("/bin/bash", &st));
+    ASSERT_EQ(bash.st_ino, st.st_ino);
+    ASSERT_EQ(-1, readlink("/bin/sh", (char[16]){0}, 16));
+    ASSERT_EQ(errno, EINVAL);
+    int fd = open("/bin/sh", O_RDONLY | O_NOFOLLOW);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(bash.st_ino, st.st_ino);
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, access("/bin/sh", X_OK));
+    ASSERT_EQ(0, access("/usr/bin/env", F_OK));
+    ASSERT_EQ(-1, open("/bin/sh", O_WRONLY));
+    ASSERT_EQ(errno, EROFS);
+
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/bin", "sh", &type));
+    ASSERT_EQ(DT_REG, type);
+    ASSERT_EQ(1, dir_has("/usr/bin", "env", &type));
+    ASSERT_EQ(DT_REG, type);
+}
+
+TEST(VfsBindBusy) {
+    ASSERT_EQ(-1, unlink("/bin/sh"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rename("/bin/sh", "/tmp/tvm_bind_moved"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rename("/bin/sh", "/tvm/bin/x"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rmdir("/bin"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, rmdir("/bin/sh"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, open("/bin/sh", O_WRONLY | O_CREAT | O_EXCL, 0644));
+    ASSERT_EQ(errno, EEXIST);
+    struct stat st;
+    ASSERT_EQ(0, stat("/bin/sh", &st));
+}
+
+// A directory bind of a host directory: everything inside lands there; a
+// rename or link across its boundary is EXDEV, as across a mount.
+TEST(VfsBindExdev) {
+    char dir[] = "/tmp/tvm_bind_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char a[PATH_MAX], h[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    ASSERT_EQ(0, mkdir(a, 0755));
+    tvm_mount_bind(a, "/mnt_bind_test");
+
+    struct stat st;
+    int fd = open("/mnt_bind_test/f", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(3, write(fd, "hi\n", 3));
+    ASSERT_EQ(0, close(fd));
+    snprintf(h, sizeof(h), "%s/f", a);
+    ASSERT_EQ(0, stat(h, &st));
+    ASSERT_EQ(3, st.st_size);
+    ASSERT_EQ(0, stat("/mnt_bind_test", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, mkdir("/mnt_bind_test/d", 0755));
+    ASSERT_EQ(0, symlink("f", "/mnt_bind_test/l"));
+    ASSERT_EQ(0, lstat("/mnt_bind_test/l", &st));
+    ASSERT_EQ(1, S_ISLNK(st.st_mode));
+    ASSERT_EQ(0, stat("/mnt_bind_test/l", &st));
+    ASSERT_EQ(3, st.st_size);
+    ASSERT_EQ(0, rename("/mnt_bind_test/f", "/mnt_bind_test/f2"));
+    snprintf(h, sizeof(h), "%s/f2", a);
+    ASSERT_EQ(0, stat(h, &st));
+    ASSERT_EQ(0, chmod("/mnt_bind_test/f2", 0600));
+    ASSERT_EQ(0, stat(h, &st));
+    ASSERT_EQ(0600, st.st_mode & 07777);
+
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/mnt_bind_test", "f2", &type));
+    ASSERT_EQ(DT_REG, type);
+    ASSERT_EQ(1, dir_has("/mnt_bind_test", "d", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(1, dir_has("/mnt_bind_test", ".", NULL));
+    ASSERT_EQ(1, dir_has("/", "mnt_bind_test", &type));
+    ASSERT_EQ(DT_DIR, type);
+
+    snprintf(h, sizeof(h), "%s/g", dir);
+    ASSERT_EQ(-1, rename("/mnt_bind_test/f2", h));
+    ASSERT_EQ(errno, EXDEV);
+    ASSERT_EQ(-1, link("/mnt_bind_test/f2", h));
+    ASSERT_EQ(errno, EXDEV);
+    snprintf(h, sizeof(h), "%s/f2", a);
+    ASSERT_EQ(-1, rename(h, "/mnt_bind_test/f3"));  // the other way too
+    ASSERT_EQ(errno, EXDEV);
+    ASSERT_EQ(0, rename("/mnt_bind_test/f2", "/mnt_bind_test/d/f2"));
+
+    int dfd = open("/mnt_bind_test", O_RDONLY | O_DIRECTORY);
+    ASSERT_NEQ(dfd, -1);
+    ASSERT_EQ(0, fstatat(dfd, "d/f2", &st, 0));
+    ASSERT_EQ(0, unlinkat(dfd, "d/f2", 0));
+    ASSERT_EQ(0, unlinkat(dfd, "l", 0));
+    ASSERT_EQ(0, unlinkat(dfd, "d", AT_REMOVEDIR));
+    ASSERT_EQ(0, close(dfd));
+    ASSERT_EQ(-1, rmdir("/mnt_bind_test"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(0, rmdir(a));
+    ASSERT_EQ(-1, stat("/mnt_bind_test", &st));   // dangling now
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+// A bind under a bind shadows the source's entry of that name
+TEST(VfsBindNested) {
+    char dir[] = "/tmp/tvm_nest_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char a[PATH_MAX], b[PATH_MAX], p[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    ASSERT_EQ(0, mkdir(a, 0755));
+    ASSERT_EQ(0, mkdir(b, 0755));
+    snprintf(p, sizeof(p), "%s/sub", a);
+    ASSERT_EQ(0, mkdir(p, 0755));
+    snprintf(p, sizeof(p), "%s/sub/hostfile", a);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    snprintf(p, sizeof(p), "%s/nested", b);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+
+    tvm_mount_bind(a, "/mnt_nested_test");
+    tvm_mount_bind(b, "/mnt_nested_test/sub");
+
+    struct stat st;
+    ASSERT_EQ(0, stat("/mnt_nested_test/sub/nested", &st));
+    ASSERT_EQ(-1, stat("/mnt_nested_test/sub/hostfile", &st));
+    ASSERT_EQ(errno, ENOENT);
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/mnt_nested_test", "sub", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(1, dir_has("/mnt_nested_test/sub", "nested", NULL));
+    ASSERT_EQ(0, dir_has("/mnt_nested_test/sub", "hostfile", NULL));
+    ASSERT_EQ(-1, rmdir("/mnt_nested_test/sub"));
+    ASSERT_EQ(errno, EBUSY);
+
+    snprintf(p, sizeof(p), "%s/sub/hostfile", a);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/sub", a);
+    ASSERT_EQ(0, rmdir(p));
+    snprintf(p, sizeof(p), "%s/nested", b);
+    ASSERT_EQ(0, unlink(p));
+    ASSERT_EQ(0, rmdir(a));
+    ASSERT_EQ(0, rmdir(b));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+TEST(VfsBindLoop) {
+    tvm_mount_bind("/la_loop_test", "/lb_loop_test");
+    tvm_mount_bind("/lb_loop_test", "/la_loop_test");
+    struct stat st;
+    ASSERT_EQ(-1, stat("/la_loop_test", &st));
+    ASSERT_EQ(errno, ELOOP);
+    ASSERT_EQ(-1, open("/lb_loop_test/x", O_RDONLY));
+    ASSERT_EQ(errno, ELOOP);
+}
+
+// A bind of a cpio directory: the same entries, still read-only
+TEST(VfsBindCpioDir) {
+    tvm_mount_bind("/tvm/etc", "/etc_bind_test");
+    DIR *d = opendir("/tvm/etc");
+    ASSERT_NEQ(d, NULL);
+    struct dirent *e;
+    int n = 0;
+    while ((e = readdir(d))) {
+        ASSERT_EQ(1, dir_has("/etc_bind_test", e->d_name, NULL));
+        n++;
+    }
+    ASSERT_EQ(0, closedir(d));
+    d = opendir("/etc_bind_test");
+    ASSERT_NEQ(d, NULL);
+    ASSERT_EQ(n, dir_count(d));
+    ASSERT_EQ(0, closedir(d));
+
+    struct stat a, b;
+    ASSERT_EQ(0, stat("/etc_bind_test/profile", &a));
+    ASSERT_EQ(0, stat("/tvm/etc/profile", &b));
+    ASSERT_EQ(a.st_ino, b.st_ino);
+    ASSERT_EQ(-1, mkdir("/etc_bind_test/x", 0755));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, unlink("/etc_bind_test/profile"));
+    ASSERT_EQ(errno, EROFS);
+    int fd = open("/etc_bind_test/profile", O_RDONLY);
+    ASSERT_NEQ(fd, -1);
+    char buf[2];
+    ASSERT_EQ(2, read(fd, buf, 2));
+    ASSERT_EQ(0, close(fd));
+}
+
+TEST(VfsAtCalls) {
+    int fd = open("/bin", O_RDONLY | O_DIRECTORY);
+    ASSERT_NEQ(fd, -1);
+    struct stat st;
+    ASSERT_EQ(0, fstatat(fd, "sh", &st, AT_SYMLINK_NOFOLLOW));
+    ASSERT_EQ(1, S_ISREG(st.st_mode));
+    ASSERT_EQ(-1, unlinkat(fd, "sh", 0));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(0, faccessat(fd, "sh", R_OK, 0));
+    int f = openat(fd, "sh", O_RDONLY);
+    ASSERT_NEQ(f, -1);
+    ASSERT_EQ(0, fstat(f, &st));
+    ASSERT_EQ(1, S_ISREG(st.st_mode));
+    ASSERT_EQ(0, close(f));
+    ASSERT_EQ(0, close(fd));
+}
+
+// /bin/sh execs the VM's shell under that name
+TEST(ExecBoundShell) {
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        dup2(pp[1], 1);
+        close(pp[0]);
+        close(pp[1]);
+        execl("/bin/sh", "sh", "-c", "echo $0 ${BASH_VERSINFO[0]}", NULL);
+        _exit(127);
+    }
+    close(pp[1]);
+    char buf[64] = {0};
+    ssize_t n = read(pp[0], buf, sizeof(buf) - 1);
+    ASSERT_EQ(n, 5);
+    ASSERT_EQ(0, strcmp(buf, "sh 5\n"));
+    close(pp[0]);
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
 static int cow_int;
 
 TEST(COWSingleThreaded) {
