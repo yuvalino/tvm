@@ -6962,6 +6962,117 @@ static int vfs_physical_path(const char *abspath, char *out)
     return 0;
 }
 
+/*
+ * realpath(3) in the guest namespace. The host's realpath was handed the
+ * guest path: ENOENT for anything under a mount (/tvm), and the host's
+ * answer for a bind (/bin/sh, only because macOS has one). Every prefix
+ * of the normalized path is resolved with its last component taken as
+ * is: a cpio symlink is spliced and the walk restarts; a bind is kept by
+ * its mount point, which hides the source (Linux: /t/mnt/sub, never
+ * /t/src/sub); a host object is lstat'ed and, when a link, read and
+ * spliced from the guest prefix -- so here a relative host link under a
+ * bind that climbs out does go through the mount point's parent, as on
+ * Linux (vfs_resolve itself does not; a TODO) -- else kept. A component
+ * that is nothing is ENOENT, as realpath reports.
+ */
+static int tvm_realpath(const char *abspath, char *out)
+{
+    char tmp[PATH_MAX], cur[PATH_MAX], cand[PATH_MAX], rest[PATH_MAX], link[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", abspath);
+    int nlinks = 0;
+
+restart:
+    strcpy(cur, "/");
+    char *saveptr;
+    for (char *tok = strtok_r(tmp, "/", &saveptr); tok; ) {
+        char *next = strtok_r(NULL, "/", &saveptr);
+        strcpy(cand, cur);
+        if (vfs_path_join(cand, tok))
+            return -1;
+
+        struct vfs_res res;
+        if (0 != vfs_resolve(cand, VR_NOFOLLOW | VR_BIND, &res))
+            return -1;
+
+        int islink = 0;
+        if (res.kind == VR_NODE) {
+            if (res.vn->vn_kind == VN_CPIO && S_ISLNK(res.vn->vn_st.st_mode)) {
+                islink = 1;
+                size_t n = res.vn->vn_size < PATH_MAX - 1 ? res.vn->vn_size : PATH_MAX - 1;
+                memcpy(link, res.vn->vn_data, n);
+                link[n] = 0;
+            }
+            vn_unlock(res.vn, 1);
+        }
+        else {
+            struct stat st;
+            if (0 != CALL_FUNC(fstatat, AT_FDCWD, res.path, &st, res.is_mountpoint ? 0 : AT_SYMLINK_NOFOLLOW))
+                return -1;
+            if (S_ISLNK(st.st_mode)) {
+                ssize_t n = CALL_FUNC(readlink, res.path, link, sizeof(link) - 1);
+                if (n < 0)
+                    return -1;
+                link[n] = 0;
+                islink = 1;
+            }
+        }
+
+        if (!islink) {
+            strcpy(cur, cand);
+            tok = next;
+            continue;
+        }
+
+        if (++nlinks > MAXSYMLINKS) {
+            errno = ELOOP;
+            return -1;
+        }
+        vfs_rest(next, saveptr, rest);
+        if (vfs_path_join(link, rest) || !normalize_path(cur, link, tmp))
+            return -1;
+        goto restart;
+    }
+
+    strcpy(out, cur);
+    return 0;
+}
+
+/* statfs of a VFS node: an overlay directory is the host's directory of
+   its path when there is one (as its stat is); otherwise a filesystem of
+   its own, with nothing to count, named by the mount it is in -- its cpio
+   root, or the overlay itself. */
+static int vfs_statfs_node(struct vfs_node *vn, struct statfs *buf)
+{
+    struct vfs_node *mount = vn;
+    while (mount->vn_kind == VN_CPIO && mount->vn_parent && mount->vn_parent->vn_kind == VN_CPIO)
+        mount = mount->vn_parent;
+    char path[PATH_MAX];
+    vfs_node_path_locked(mount, path, sizeof(path));
+    enum vfs_kind kind = vn->vn_kind;
+    vn_unlock(vn, 1);
+
+    if (kind == VN_OVERLAY) {
+        struct stat st;
+        if (0 == CALL_FUNC(fstatat, AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode))
+            return CALL_FUNC(statfs, path, buf);
+    }
+
+    memset(buf, 0, sizeof(*buf));
+    buf->f_bsize = 4096;
+#if defined(__APPLE__)
+    buf->f_iosize = 4096;
+    buf->f_flags = MNT_RDONLY | MNT_LOCAL;
+    snprintf(buf->f_fstypename, sizeof(buf->f_fstypename), "tvmfs");
+    snprintf(buf->f_mntonname, sizeof(buf->f_mntonname), "%s", path);
+    snprintf(buf->f_mntfromname, sizeof(buf->f_mntfromname), "tvmfs");
+#else
+    buf->f_type = 0x74766d66;   /* "tvmf" */
+    buf->f_namelen = NAME_MAX;
+    buf->f_frsize = 4096;
+#endif
+    return 0;
+}
+
 /* One entry of a directory's listing, as readdir hands it out */
 struct vfs_dirent {
     ino_t vd_ino;
@@ -14444,11 +14555,20 @@ FUNCTION_DEFINE2(int, fstatfs, int, fd, struct statfs *, buf) {
     return CURRENT_RFD(fd, CALL_FUNC(fstatfs, __rfd, buf));
 }
 
+// Through the VFS: the host's answer for the host path behind a guest
+// one, a synthetic read-only filesystem for a node (a cpio entry, an
+// overlay directory; the host used to say ENOENT for /tvm/bin).
 FUNCTION_DEFINE2(int, statfs, const char *, pathname, struct statfs *, buf) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    return CALL_FUNC(statfs, pathname_abs, buf);
+    tvm_sig_enter();
+    struct vfs_res res;
+    int ret = vfs_resolve(pathname_abs, 0, &res);
+    if (0 == ret)
+        ret = res.kind == VR_HOST ? CALL_FUNC(statfs, res.path, buf) : vfs_statfs_node(res.vn, buf);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *, statbuf, int, flag) {
@@ -18772,20 +18892,26 @@ FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_nam
         errno = ENAMETOOLONG;
         return NULL;
     }
-    
-    char *tmp2 = CALL_FUNC(realpath, tmp, resolved_name);
-    if (!tmp2)
+
+    // In the guest namespace (tvm_realpath): the host's realpath was given
+    // the guest path and said ENOENT for anything under a mount.
+    char abs[PATH_MAX], phys[PATH_MAX];
+    if (!normalize_path("/", tmp, abs))
+        return NULL;
+    tvm_sig_enter();
+    int r = tvm_realpath(abs, phys);
+    tvm_sig_leave();
+    if (r)
         return NULL;
 
     if (resolved_name)
-        return tmp2;
+        return strcpy(resolved_name, phys);
 
     // strlen + 1: the terminator (this used to allocate one byte short and
     // strcpy() wrote past the end of the guest's allocation)
-    char *ret = malloc(strlen(tmp2) + 1);
+    char *ret = malloc(strlen(phys) + 1);
     if (ret)
-        strcpy(ret, tmp2);
-    CALL_FUNC(free, tmp2);
+        strcpy(ret, phys);
     return ret;
 }
 
@@ -18849,10 +18975,11 @@ FUNCTION_DEFINE1(int, fchdir, int, fildes) {
 // (run by every `git fsck`) dereferenced the NULL store it then got: SIGSEGV
 // at 0x8. The recorded cwd stays as it is -- it is what relative paths are
 // resolved against, on the cpio VFS as well -- and getcwd() now answers the
-// host's physical path for it. A cwd on the VFS, which the host cannot
-// resolve, is returned as recorded (the VFS has no symlinked directories on
-// the way to a cwd: chdir() normalizes). Also: a buffer too small is ERANGE
-// as POSIX says, rather than a silently unterminated string.
+// physical path for it in the guest namespace (tvm_realpath: the host's
+// for a host directory, the mount point's for one under a bind). A cwd
+// that no longer resolves is returned as recorded. Also: a buffer too
+// small is ERANGE as POSIX says, rather than a silently unterminated
+// string.
 FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
     char cwd[PATH_MAX], phys[PATH_MAX];
     tvm_sig_enter();
@@ -18860,7 +18987,7 @@ FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
     snprintf(cwd, sizeof(cwd), "%s", current->tsk_cwd);
     task_unlock(current);
     int last_errno = errno;
-    const char *path = CALL_FUNC(realpath, cwd, phys) ? phys : cwd;
+    const char *path = 0 == tvm_realpath(cwd, phys) ? phys : cwd;
     errno = last_errno;
     tvm_sig_leave();
 
@@ -19609,13 +19736,26 @@ FUNCTION_DEFINE2(int, futimens, int, fd, const struct timespec *, times) {
     return CURRENT_RFD(fd, CALL_FUNC(futimens, __rfd, times));
 }
 
+// The path through the VFS: a node is the VM's (EROFS for times, no
+// attributes), a host path the host's.
 FUNCTION_DEFINE4(int, utimensat, int, dirfd, const char *, pathname, const struct timespec *, times, int, flags) {
     if (!pathname)  // Linux: the descriptor itself, as futimens
         return CURRENT_RFD(dirfd, CALL_FUNC(utimensat, __rfd, NULL, times, flags));
     char pathname_abs[PATH_MAX];
     if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
         return -1;
-    return CALL_FUNC(utimensat, AT_FDCWD, pathname_abs, times, flags);
+    tvm_sig_enter();
+    struct vfs_res res;
+    int ret = vfs_resolve(pathname_abs, (flags & AT_SYMLINK_NOFOLLOW) ? VR_NOFOLLOW : 0, &res);
+    if (0 == ret && res.kind == VR_HOST)
+        ret = CALL_FUNC(utimensat, AT_FDCWD, res.path, times, vfs_host_flags(&res, flags));
+    else if (0 == ret) {
+        vn_unlock(res.vn, 1);
+        errno = EROFS;
+        ret = -1;
+    }
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE3(int, futimesat, int, dirfd, const char *, pathname, const struct timeval *, times) {
@@ -19624,7 +19764,18 @@ FUNCTION_DEFINE3(int, futimesat, int, dirfd, const char *, pathname, const struc
     char pathname_abs[PATH_MAX];
     if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
         return -1;
-    return CALL_FUNC(futimesat, AT_FDCWD, pathname_abs, times);
+    tvm_sig_enter();
+    struct vfs_res res;
+    int ret = vfs_resolve(pathname_abs, 0, &res);
+    if (0 == ret && res.kind == VR_HOST)
+        ret = CALL_FUNC(futimesat, AT_FDCWD, res.path, times);
+    else if (0 == ret) {
+        vn_unlock(res.vn, 1);
+        errno = EROFS;
+        ret = -1;
+    }
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE4(ssize_t, fgetxattr, int, fd, const char *, name, void *, value, size_t, size) {
@@ -19643,33 +19794,57 @@ FUNCTION_DEFINE2(int, fremovexattr, int, fd, const char *, name) {
     return CURRENT_RFD(fd, CALL_FUNC(fremovexattr, __rfd, name));
 }
 
-FUNCTION_DEFINE4(ssize_t, getxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
+static ssize_t tvm_getxattr(const char *pathname, const char *name, void *value, size_t size, int nofollow)
+{
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    return CALL_FUNC(getxattr, pathname_abs, name, value, size);
+    tvm_sig_enter();
+    struct vfs_res res;
+    ssize_t ret = vfs_resolve(pathname_abs, nofollow ? VR_NOFOLLOW : 0, &res);
+    if (0 == ret && res.kind == VR_HOST)
+        ret = nofollow && !res.is_mountpoint ? CALL_FUNC(lgetxattr, res.path, name, value, size)
+                                             : CALL_FUNC(getxattr, res.path, name, value, size);
+    else if (0 == ret) {
+        vn_unlock(res.vn, 1);
+        errno = ENOTSUP;
+        ret = -1;
+    }
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE4(ssize_t, getxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
+    return tvm_getxattr(pathname, name, value, size, 0);
 }
 
 FUNCTION_DEFINE4(ssize_t, lgetxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
-    char pathname_abs[PATH_MAX];
-    if (!normalize_path(NULL, pathname, pathname_abs))
-        return -1;
-    return CALL_FUNC(lgetxattr, pathname_abs, name, value, size);
+    return tvm_getxattr(pathname, name, value, size, 1);
 }
 
-// As statfs: the host's answer for the resolved path.
+// As statfs: the host's answer for the host path, a synthetic one for a node.
 FUNCTION_DEFINE2(int, statvfs, const char *, pathname, struct statvfs *, buf) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    return CALL_FUNC(statvfs, pathname_abs, buf);
+    tvm_sig_enter();
+    struct vfs_res res;
+    int ret = vfs_resolve(pathname_abs, 0, &res);
+    if (0 == ret && res.kind == VR_HOST)
+        ret = CALL_FUNC(statvfs, res.path, buf);
+    else if (0 == ret) {
+        vn_unlock(res.vn, 1);
+        memset(buf, 0, sizeof(*buf));
+        buf->f_bsize = buf->f_frsize = 4096;
+        buf->f_namemax = NAME_MAX;
+        buf->f_flag = ST_RDONLY;
+    }
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE2(int, statvfs64, const char *, pathname, struct statvfs64 *, buf) {
-    char pathname_abs[PATH_MAX];
-    if (!normalize_path(NULL, pathname, pathname_abs))
-        return -1;
-    return CALL_FUNC(statvfs64, pathname_abs, buf);
+    return statvfs(pathname, (struct statvfs *)buf);
 }
 
 FUNCTION_DEFINE2(int, fstatvfs, int, fd, struct statvfs *, buf) {

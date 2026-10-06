@@ -22,8 +22,11 @@
 
 #if defined(__linux__)
 #include <pty.h>
+#include <sys/vfs.h>
 #elif defined(__APPLE__)
 #include <util.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #endif
 
 //////////
@@ -1698,6 +1701,113 @@ TEST(ExecBoundShell) {
     ASSERT_EQ(p, waitpid(p, &s, 0));
     ASSERT_EQ(1, WIFEXITED(s));
     ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// realpath and getcwd answer in the guest namespace: a mount point hides
+// its source, a cpio link is followed, a host link too.
+TEST(VfsRealpath) {
+    char r[PATH_MAX];
+    ASSERT_NEQ(realpath("/bin/sh", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/bin/sh"));
+    ASSERT_NEQ(realpath("/tvm/bin/../bin", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/tvm/bin"));
+    ASSERT_NEQ(realpath("/tvm", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/tvm"));
+    ASSERT_NEQ(realpath("/tvm/bin/sh", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/tvm/bin/bash"));
+    ASSERT_EQ(NULL, realpath("/tvm/none", r));
+    ASSERT_EQ(errno, ENOENT);
+    char *m = realpath("/tvm/etc/", NULL);
+    ASSERT_NEQ(m, NULL);
+    ASSERT_EQ(0, strcmp(m, "/tvm/etc"));
+    free(m);
+
+    char dir[] = "/tmp/tvm_rp_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char a[PATH_MAX], p[PATH_MAX], want[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    ASSERT_EQ(0, mkdir(a, 0755));
+    snprintf(p, sizeof(p), "%s/sub", a);
+    ASSERT_EQ(0, mkdir(p, 0755));
+    snprintf(p, sizeof(p), "%s/lnk", a);
+    ASSERT_EQ(0, symlink("sub", p));
+    snprintf(p, sizeof(p), "%s/outside", dir);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    snprintf(p, sizeof(p), "%s/up", a);
+    ASSERT_EQ(0, symlink("../outside", p));
+
+    // a host link under a host directory, through the host's own links
+    // on the way (/tmp -> /private/tmp on macOS)
+    snprintf(p, sizeof(p), "%s/lnk", a);
+    ASSERT_NEQ(realpath(p, r), NULL);
+    snprintf(p, sizeof(p), "%s/sub", a);
+    ASSERT_NEQ(realpath(p, want), NULL);
+    ASSERT_EQ(0, strcmp(r, want));
+    ASSERT_EQ(0, strcmp(want + strlen(want) - 6, "/a/sub"));
+
+    tvm_mount_bind(a, "/mnt_rp_test");
+    ASSERT_NEQ(realpath("/mnt_rp_test", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_rp_test"));
+    ASSERT_NEQ(realpath("/mnt_rp_test/lnk", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_rp_test/sub"));
+    ASSERT_NEQ(realpath("/mnt_rp_test/sub/..", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_rp_test"));
+    // a relative host link climbing out of the bind: through the mount
+    // point's parent here, as on Linux, where it names nothing...
+    ASSERT_EQ(NULL, realpath("/mnt_rp_test/up", r));
+    ASSERT_EQ(errno, ENOENT);
+    // ...while the path calls resolve it on the host side (the known deviation)
+    struct stat st;
+    ASSERT_EQ(0, stat("/mnt_rp_test/up", &st));
+
+    ASSERT_EQ(0, chdir("/mnt_rp_test/sub"));
+    ASSERT_NEQ(getcwd(r, sizeof(r)), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_rp_test/sub"));
+    ASSERT_EQ(0, chdir(".."));
+    ASSERT_NEQ(getcwd(r, sizeof(r)), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_rp_test"));
+    ASSERT_EQ(0, chdir(".."));
+    ASSERT_NEQ(getcwd(r, sizeof(r)), NULL);
+    ASSERT_EQ(0, strcmp(r, "/"));
+    ASSERT_EQ(0, chdir("/tvm/bin"));
+    ASSERT_NEQ(getcwd(r, sizeof(r)), NULL);
+    ASSERT_EQ(0, strcmp(r, "/tvm/bin"));
+    ASSERT_EQ(0, chdir("/bin"));
+    ASSERT_NEQ(getcwd(r, sizeof(r)), NULL);
+    ASSERT_EQ(0, strcmp(r, "/bin"));
+    ASSERT_EQ(0, chdir(a));
+    ASSERT_NEQ(getcwd(r, sizeof(r)), NULL);
+    ASSERT_EQ(0, strcmp(r + strlen(r) - 2, "/a"));   // the host's physical path
+
+    ASSERT_EQ(0, chdir("/"));
+    snprintf(p, sizeof(p), "%s/up", a);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/lnk", a);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/sub", a);
+    ASSERT_EQ(0, rmdir(p));
+    snprintf(p, sizeof(p), "%s/outside", dir);
+    ASSERT_EQ(0, unlink(p));
+    ASSERT_EQ(0, rmdir(a));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+TEST(VfsStatfs) {
+    struct statfs sf;
+    ASSERT_EQ(0, statfs("/tvm/bin", &sf));
+    ASSERT_EQ(4096, sf.f_bsize);
+    ASSERT_EQ(0, sf.f_blocks);
+#if defined(__APPLE__)
+    ASSERT_EQ(0, strcmp(sf.f_mntonname, "/tvm"));
+    ASSERT_EQ(0, strcmp(sf.f_fstypename, "tvmfs"));
+#endif
+    ASSERT_EQ(0, statfs("/bin/sh", &sf));     // the file behind the bind: /tvm's
+    ASSERT_EQ(4096, sf.f_bsize);
+    ASSERT_EQ(0, statfs("/", &sf));           // the host's
+    ASSERT_NEQ(0, sf.f_blocks);
+    ASSERT_EQ(0, statfs("/bin", &sf));
+    ASSERT_EQ(-1, statfs("/tvm/none", &sf));
+    ASSERT_EQ(errno, ENOENT);
 }
 
 static int cow_int;

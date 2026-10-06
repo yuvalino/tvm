@@ -2258,6 +2258,13 @@ def test_bind_mounts(sshi: spawn):
     out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh 2>&1; [ -f /bin/sh ] && echo still_there")
     assert out.lower().count("busy") == 2 and "still_there" in out, out
 
+def test_realpath_namespace(sshi: spawn):
+    """realpath and pwd -P answer in the guest namespace: a cpio link is
+    followed, a mount point keeps its own name (its source is hidden), and
+    a path under a mount is no longer the host's ENOENT."""
+    out, rc = _sh(sshi, "realpath /tvm/bin/sh /bin/sh /tvm/etc/../bin; cd /bin && pwd -P; cd /tvm/bin && pwd -P")
+    assert rc == 0 and _lines(out)[-5:] == ["/tvm/bin/bash", "/bin/sh", "/tvm/bin", "/bin", "/tvm/bin"], out
+
 def test_exec_bad_interpreter(sshi: spawn):
     """A #! interpreter that does not exist is a bad interpreter, as on
     Linux: bash reports it and the status is 126 (no PATH retry)."""
