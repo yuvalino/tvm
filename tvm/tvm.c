@@ -1687,6 +1687,18 @@ void file_unlock(struct file *file, int refcount) {
 
 char *normalize_path(const char *dirname, const char *file_name, char *out_path);
 
+static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath, const char *devpath, int flags, mode_t mode, uid_t uid, gid_t gid);
+
+// The VFS's path operations (see "VFS"): every absolute path the devices
+// do not claim resolves through the tree, to a node of its own or to the
+// host path behind it.
+static int vfs_open_path(struct file *file, const char *abspath, int flags, mode_t mode, uid_t uid, gid_t gid);
+static int vfs_stat_path(const char *abspath, struct stat *st, int flag);
+static int vfs_access_path(const char *abspath, int mode, int flags);
+static int vfs_chmod_path(const char *abspath, mode_t mode, int flag);
+static int vfs_chown_path(const char *abspath, uid_t owner, gid_t group, int flag);
+static ssize_t vfs_readlink_path(const char *abspath, char *buf, size_t bufsiz);
+
 /**
  * returns locked with refcnt
  */
@@ -1711,10 +1723,14 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
     // then "Directory not empty"), which every git working tree is. The
     // name is now the directory's recorded name joined with the relative
     // one (normalized, so ".." components fold), and that absolute name is
-    // also what the devices (tty, cpio VFS) are asked about, so a
-    // dirfd-relative open of a /tvm entry finds it too. The host open keeps
-    // the (dirfd, relative) form, so the kernel's own semantics -- following
-    // a directory across a rename, say -- are unchanged.
+    // what the devices (tty) and the VFS are asked about, so a dirfd-relative
+    // open of a /tvm entry finds it too. The host is opened by that absolute
+    // name as well: the descriptor's own host directory is not it for a
+    // directory the VFS serves (its descriptor is the host's "/", or a host
+    // directory of another name under a bind), the policy the other *at()
+    // calls take (dirfd_normalize_path). Only a name relative to a
+    // descriptor with no recorded path still goes to the host as (dirfd,
+    // relative): nothing else can resolve it.
     char pathname_abs[PATH_MAX];
     if (pathname[0] != '/' && dirfd != AT_FDCWD && dirpath) {
         if (!normalize_path(dirpath, pathname, pathname_abs)) {
@@ -1732,29 +1748,43 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
         }
     }
 
+    if (0 != file_open_dispatch(file, dirfd, pathname, devpath, flags, mode, uid, gid)) {
+        filedealloc_locked(file);
+        return NULL;
+    }
+    return file;
+}
+
+/**
+ * Open into `file` (locked, still unopened): the first device that claims
+ * `devpath`, else the VFS, which opens its own node or the host path behind
+ * it. -1 with errno, `file` left for the caller to dispose of.
+ */
+static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath, const char *devpath, int flags, mode_t mode, uid_t uid, gid_t gid)
+{
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
-        if (0 == dev->dev_fops.f_open(devpath, flags, mode, uid, gid, file)) {
-            return file;
-        }
+        if (0 == dev->dev_fops.f_open(devpath, flags, mode, uid, gid, file))
+            return 0;
 
-        if (errno != ENOTSUP) {
-            filedealloc_locked(file);
-            return NULL;
-        }
+        if (errno != ENOTSUP)
+            return -1;
 
         errno = last_errno;
     };
 
-    int rfd = CALL_FUNC(openat, dirfd, pathname, flags, mode);
-    if (rfd == -1) {
-        filedealloc_locked(file);
-        return NULL;
+    if (devpath[0] != '/') {
+        // relative to a descriptor with no recorded path: the host's
+        int rfd = CALL_FUNC(openat, dirfd, hostpath, flags, mode);
+        if (rfd == -1)
+            return -1;
+
+        file->f_rfd = rfd_adopt(rfd);
+        return 0;
     }
 
-    file->f_rfd = rfd_adopt(rfd);
-    return file;
+    return vfs_open_path(file, devpath, flags, mode, uid, gid);
 }
 
 /**
@@ -1795,23 +1825,29 @@ struct file *file_dup_locked(struct file *oldfile) {
     return newfile;
 }
 
+// Whether `st` grants `mode` (F_OK, or any of R_OK, W_OK, X_OK), the way a
+// device's or VFS node's stat answers access().
+static int stat_access(const struct stat *st, int mode)
+{
+    if (mode == 0 || mode == F_OK)
+        return 0;
+    if ((mode & X_OK) && (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
+        return 0;
+    if ((mode & W_OK) && (st->st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
+        return 0;
+    if ((mode & R_OK) && (st->st_mode & (S_IRUSR | S_IRGRP | S_IROTH)))
+        return 0;
+    errno = EACCES;
+    return -1;
+}
+
 int file_access(const char *pathname, int mode, int flags) {
     struct stat st;
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
-        if (0 == dev->dev_fops.f_stat(pathname, &st, flags)) {
-            if (mode == 0 || mode == F_OK)
-                return 0;
-            if ((mode & X_OK) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
-                return 0;
-            if ((mode & W_OK) && (st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
-                return 0;
-            if ((mode & R_OK) && (st.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)))
-                return 0;
-            errno = EACCES;
-            return -1;
-        }
+        if (0 == dev->dev_fops.f_stat(pathname, &st, flags))
+            return stat_access(&st, mode);
 
         if (errno != ENOTSUP) {
             return -1;
@@ -1820,7 +1856,9 @@ int file_access(const char *pathname, int mode, int flags) {
         errno = last_errno;
     };
 
-    return CALL_FUNC(faccessat, AT_FDCWD, pathname, mode, flags);
+    if (pathname[0] != '/')
+        return CALL_FUNC(faccessat, AT_FDCWD, pathname, mode, flags);
+    return vfs_access_path(pathname, mode, flags);
 }
 
 int file_stat(const char *pathname, struct stat *statbuf, int flag)
@@ -1839,7 +1877,9 @@ int file_stat(const char *pathname, struct stat *statbuf, int flag)
         errno = last_errno;
     };
 
-    return CALL_FUNC(fstatat, AT_FDCWD, pathname, statbuf, flag);
+    if (pathname[0] != '/')
+        return CALL_FUNC(fstatat, AT_FDCWD, pathname, statbuf, flag);
+    return vfs_stat_path(pathname, statbuf, flag);
 }
 
 int file_chmod(const char *pathname, mode_t mode, int flag)
@@ -1858,7 +1898,9 @@ int file_chmod(const char *pathname, mode_t mode, int flag)
         errno = last_errno;
     };
 
-    return CALL_FUNC(fchmodat, AT_FDCWD, pathname, mode, flag);
+    if (pathname[0] != '/')
+        return CALL_FUNC(fchmodat, AT_FDCWD, pathname, mode, flag);
+    return vfs_chmod_path(pathname, mode, flag);
 }
 
 int file_chown(const char *pathname, uid_t owner, gid_t group, int flag)
@@ -1877,7 +1919,9 @@ int file_chown(const char *pathname, uid_t owner, gid_t group, int flag)
         errno = last_errno;
     };
 
-    return CALL_FUNC(fchownat, AT_FDCWD, pathname, owner, group, flag);
+    if (pathname[0] != '/')
+        return CALL_FUNC(fchownat, AT_FDCWD, pathname, owner, group, flag);
+    return vfs_chown_path(pathname, owner, group, flag);
 }
 
 ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
@@ -1898,7 +1942,9 @@ ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
         errno = last_errno;
     };
 
-    return CALL_FUNC(readlink, pathname, buf, bufsiz);
+    if (pathname[0] != '/')
+        return CALL_FUNC(readlink, pathname, buf, bufsiz);
+    return vfs_readlink_path(pathname, buf, bufsiz);
 }
 
 /////////////
@@ -6207,6 +6253,23 @@ static int tty_slavename_locked(struct tty *tt, char *buf, size_t buflen)
 
 #define VFS_NAME_MAX 256
 
+/*
+ * One tree, one root. Every path resolves from the root, an overlay
+ * directory standing for the host's "/": a cpio mount is a VN_CPIO
+ * directory attached where it was mounted, the directories on the way to
+ * it that nothing provides are VN_OVERLAY ("/", "/mnt" for a mount at
+ * /mnt/x), and a bind mount is a VN_BIND node naming the path it shows. A
+ * directory's entries are its own children first, then its underlay: none
+ * for a cpio directory (a missing child is ENOENT), the host directory of
+ * the same path for an overlay, the target's for a bind. So `ls /` is the
+ * host's listing plus `tvm`, a path that meets no node is the host's, and
+ * a mount over a host entry covers it. The roots used to be matched by
+ * prefix against the path (/tvm only ever existed to a path starting with
+ * it): `ls /` did not list it, and a cpio link to a path outside its own
+ * mount was dead.
+ */
+enum vfs_kind { VN_CPIO = 0, VN_OVERLAY, VN_BIND };
+
 struct vfs_node {
     struct list_head vn_list;
     char vn_name[VFS_NAME_MAX];
@@ -6221,9 +6284,20 @@ struct vfs_node {
 
     size_t vn_refcnt;
     pthread_mutex_t vn_lock;
+
+    enum vfs_kind vn_kind;
+    char *vn_target;            /* VN_BIND: the absolute, normalized guest path it shows */
+    int vn_mount_id;            /* 0 the host namespace; a cpio root or a bind has its own,
+                                   a cpio entry its root's (rename across them is EXDEV) */
 };
 
-static LIST_HEAD(vfs_list);
+static struct vfs_node *vfs_root;   /* the "/" overlay, made by vfs_init() */
+static int vfs_next_mount_id;       /* under vfs_lock */
+
+/* The tree-mutation lock: mounting, binding, making a mount point's
+   directories, replacing a child. A lookup never takes it, and it is never
+   held across a host call: lookups take the node locks, parent before
+   child, and mutators take them in the same order under it. */
 static pthread_mutex_t vfs_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define VFS_LOCK()   pthread_mutex_lock(&vfs_lock);
@@ -6284,6 +6358,8 @@ static void vndealloc_locked(struct vfs_node *vn)
         vn->vn_data = NULL;
     }
     vn->vn_size = 0;
+    kfree(vn->vn_target);
+    vn->vn_target = NULL;
 
     pthread_mutex_unlock(&vn->vn_lock);
     pthread_mutex_destroy(&vn->vn_lock);
@@ -6330,27 +6406,32 @@ static struct vfs_node *vfs_find_child_locked(struct vfs_node *dir, const char *
     return NULL;
 }
 
-/* build the path from root to vn by walking vn_parent pointers.
-   root must be an ancestor of vn. result does NOT include root's name.
-   vn must be locked. returns path in out (e.g. "bin" for /tvm/bin). */
-static void vfs_build_path_locked(struct vfs_node *root, struct vfs_node *vn, char *out, size_t outlen)
+/* The canonical guest path of vn ("/" for the root): its ancestors' names
+   from the root down, so no link is in it. vn is locked; the names up the
+   chain never change and a node keeps its parent for good (a replaced
+   child only leaves the list), so they are read without their locks. */
+static void vfs_node_path_locked(struct vfs_node *vn, char *out, size_t outlen)
 {
-    if (vn == root) { out[0] = 0; return; }
-
     int depth = 0;
-    for (struct vfs_node *p = vn; p && p != root; p = p->vn_parent)
+    for (struct vfs_node *p = vn; p && p != vfs_root; p = p->vn_parent)
         depth++;
 
+    out[0] = '/';
+    out[1] = 0;
+    if (!depth)
+        return;
+
     const char **names = kalloc(depth * sizeof(*names));
-    if (!names) { out[0] = 0; return; }
+    if (!names)
+        return;
 
     int i = 0;
-    for (struct vfs_node *p = vn; p && p != root && i < depth; p = p->vn_parent)
+    for (struct vfs_node *p = vn; p && p != vfs_root && i < depth; p = p->vn_parent)
         names[i++] = p->vn_name;
 
     out[0] = 0;
     for (i = depth - 1; i >= 0; i--) {
-        if (out[0]) strncat(out, "/", outlen - strlen(out) - 1);
+        strncat(out, "/", outlen - strlen(out) - 1);
         strncat(out, names[i], outlen - strlen(out) - 1);
     }
 
@@ -6366,15 +6447,18 @@ static void vfs_build_path_locked(struct vfs_node *root, struct vfs_node *vn, ch
 #define MAXSYMLINKS 40
 #endif
 
-static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *relpath, int create, int nofollow, mode_t mode, uid_t uid, gid_t gid)
+/* The cpio loader's walker: `relpath` under `root` (locked, and left so),
+   creating the leaf. Only directories are descended: an archive lists a
+   directory before its entries, and a link met on the way is ENOTDIR
+   (none of ours has entries under a linked directory). The guests' path
+   resolution is vfs_resolve, which follows links from the global root. */
+static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *relpath, mode_t mode, uid_t uid, gid_t gid)
 {
     char tmp[PATH_MAX];
     struct vfs_node *cur = root;
-    int nlinks = 0;
 
     strncpy(tmp, relpath, sizeof(tmp)-1);
     tmp[PATH_MAX-1] = 0;
-
 
     char *saveptr;
     char *tok = strtok_r(tmp, "/", &saveptr);
@@ -6388,14 +6472,11 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
             continue;
         }
 
-        /* ".." used to be looked up as a child literally named "..", so a
-           link target such as ../bin/f or /tvm/sub/../bin/f was ENOENT:
-           a path from a caller arrives normalized (normalize_path), but a
-           link's target is spliced in verbatim. Step to the parent, kept
-           at root the way ".." at "/" is. The lock order of the walk is
-           parent before child: release cur before taking its parent,
-           which outlives it, since the child list references both ends
-           (vfs_add_child_locked) and nothing ever unlinks a node. */
+        /* ".." steps to the parent, kept at root the way ".." at "/" is.
+           The lock order of the walk is parent before child: release cur
+           before taking its parent, which outlives it, since the child
+           list references both ends (vfs_add_child_locked) and nothing
+           ever unlinks a node. */
         if (strcmp(tok, "..") == 0) {
             if (cur != root) {
                 struct vfs_node *parent = cur->vn_parent;
@@ -6411,15 +6492,16 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
         struct vfs_node *child = vfs_find_child_locked(cur, tok);
 
         if (!child) {
-            if (create && next_tok == NULL) {
-                /* Only create the leaf */
+            if (next_tok == NULL) {
+                /* Only create the leaf, as an entry of its mount */
                 child = vnalloc(tok, mode, uid, gid);
                 if (!child) {
                     if (cur != root)
                         vn_unlock(cur, 1);
                     return NULL;
                 }
-                child->vn_parent = cur;
+                child->vn_kind = VN_CPIO;
+                child->vn_mount_id = cur->vn_mount_id;
                 vfs_add_child_locked(cur, child);
                 if (cur != root)
                     vn_unlock(cur, 1);
@@ -6427,108 +6509,9 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
             } else {
                 if (cur != root)
                     vn_unlock(cur, 1);
-                // Set errno explicitly: every vfsop_* returns -1 straight from
-                // this NULL, and the device dispatch loops (file_open/file_stat/
-                // ...) treat any errno other than ENOTSUP as the VFS's verdict.
-                // Leaving errno untouched leaked the caller's stale value (ls
-                // reported ENOTTY, cat EBADEXEC, cd EINTR), and a stale ENOTSUP
-                // would fall through to the host filesystem for a /tvm path.
                 errno = ENOENT;
                 return NULL;
             }
-        }
-
-        /* resolve symlinks for intermediate components, and for the
-           final component when not creating */
-        if (S_ISLNK(child->vn_st.st_mode) && (next_tok || (!create && !nofollow))) {
-            if (!child->vn_data || child->vn_size >= PATH_MAX) {
-                vn_unlock(child, 1);
-                if (cur != root) vn_unlock(cur, 1);
-                errno = EINVAL;
-                return NULL;
-            }
-
-            if (++nlinks > MAXSYMLINKS) {
-                vn_unlock(child, 1);
-                if (cur != root) vn_unlock(cur, 1);
-                errno = ELOOP;
-                return NULL;
-            }
-
-            char link_target[PATH_MAX];
-            memcpy(link_target, child->vn_data, child->vn_size);
-            link_target[child->vn_size] = 0;
-
-            /* An absolute symlink used to be refused outright (ENOTSUP,
-               "can't resolve within VFS root"), so a cpio entry such as
-               /tvm/libexec/git-core/git-remote-https -> /tvm/bin/git was
-               a dead link: stat() followed it to ENOENT and git could not
-               exec its own helper. One that points back into this mount
-               is resolved from the mount root, the way a relative one is
-               resolved from its directory: the rest of the path is
-               appended and the lookup restarts. A target outside the mount
-               (a host path) still cannot be reached from here. */
-            char cur_path[PATH_MAX];
-            if (link_target[0] == '/') {
-                size_t vnlen = strlen(root->vn_name);
-                if (strncmp(link_target, root->vn_name, vnlen) != 0 ||
-                    (link_target[vnlen] != '/' && link_target[vnlen] != 0)) {
-                    vn_unlock(child, 1);
-                    if (cur != root) vn_unlock(cur, 1);
-                    errno = ENOTSUP;
-                    return NULL;
-                }
-                /* drop the mount prefix: the target is relative to root */
-                size_t skip = vnlen + (link_target[vnlen] == '/' ? 1 : 0);
-                memmove(link_target, link_target + skip, strlen(link_target + skip) + 1);
-                cur_path[0] = 0;
-            }
-            else {
-                /* relative symlink: resolve against cur (the parent dir)
-                   build new path = path_to_cur/target[/remaining...] */
-                vfs_build_path_locked(root, cur, cur_path, sizeof(cur_path));
-            }
-
-            vn_unlock(child, 1);
-
-            /* reconstruct remaining components after the symlink, before
-               the new path overwrites tmp, where next_tok and saveptr point */
-            char rest[PATH_MAX];
-            rest[0] = 0;
-            if (next_tok) {
-                if (saveptr && saveptr[0])
-                    snprintf(rest, sizeof(rest), "%s/%s", next_tok, saveptr);
-                else
-                    strncpy(rest, next_tok, sizeof(rest)-1);
-            }
-
-            if (rest[0]) {
-                if (cur_path[0])
-                    snprintf(tmp, sizeof(tmp), "%s/%s/%s", cur_path, link_target, rest);
-                else
-                    snprintf(tmp, sizeof(tmp), "%s/%s", link_target, rest);
-            } else {
-                if (cur_path[0])
-                    snprintf(tmp, sizeof(tmp), "%s/%s", cur_path, link_target);
-                else
-                    strncpy(tmp, link_target, sizeof(tmp)-1);
-            }
-
-            /* Restart from the mount root, in place rather than by
-               recursion, so a chain of links cannot pile up PATH_MAX
-               buffers on the stack. The caller's create/nofollow/mode
-               travel with it: the restart used to pass zeros, so the final
-               component after an intermediate link was always followed
-               (lstat /tvm/dirlink/x reported x's target) and a cpio entry
-               under a linked directory could not be created. nofollow
-               still applies only to the final component: a link met with
-               more path behind it (next_tok) is followed regardless, and
-               a final one only when the caller follows. */
-            if (cur != root)
-                vn_unlock(cur, 1);
-            cur = root;
-            tok = strtok_r(tmp, "/", &saveptr);
-            continue;
         }
 
         if (next_tok && !S_ISDIR(child->vn_st.st_mode)) {
@@ -6548,51 +6531,137 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
     return cur;
 }
 
-static struct vfs_node *vfs_lookup(const char *abspath, int create, int nofollow, mode_t mode, uid_t uid, gid_t gid)
+static void vfs_init(void)
 {
-    int pathlen = strlen(abspath);
-
-    VFS_LOCK();
-    struct vfs_node *root;
-    list_for_each_entry(root, &vfs_list, vn_list) {
-        int vnlen = strlen(root->vn_name);
-        if (pathlen < vnlen)
-            continue;
-
-        if (0 == strncmp(root->vn_name, abspath, vnlen) &&
-            (abspath[vnlen] == 0 || abspath[vnlen] == '/')) {
-            vn_lock(root, 1);
-            VFS_UNLOCK();
-
-            if (abspath[vnlen] == 0)
-                return root;
-
-            struct vfs_node *vn = vfs_lookup_locked(root, abspath + vnlen + 1, create, nofollow, mode, uid, gid);
-            // vfs_lookup_locked returns the root itself, without a reference
-            // of its own, when the path resolves to it ("/tvm/.", a symlink
-            // to "/tvm"): hand over the reference taken above instead of
-            // dropping it, or the caller's release is a second one (refcount
-            // underflow on the mount root).
-            if (vn != root)
-                vn_unlock(root, 1);
-            return vn;
-        }
-    }
-    VFS_UNLOCK();
-
-    // not root was found, not even in vfs
-    errno = ENOTSUP;
-    return NULL;
+    vfs_root = vnalloc("", S_IFDIR | 0755, 0, 0);
+    if (!vfs_root)
+        panic("vfs_init");
+    vfs_root->vn_kind = VN_OVERLAY;
+    vn_unlock(vfs_root, 0);
 }
 
-static void vfs_add_root(struct vfs_node *root) {
+/* Mount points are created: `mount X /a/b/c` makes /a and /a/b overlay
+   directories when nothing provides them (mount(8) wants them to exist;
+   iOS has no /bin, which is the point of binding over it). Here so the
+   policy is one line. */
+#define VFS_CREATE_MOUNTPOINTS 1
+
+/* The directory a mount point's leaf goes in, with the leaf's name: the
+   components of `abspath` but the last, walked from the root under
+   vfs_lock, each missing one made an overlay directory. A cpio file on the
+   way is ENOTDIR; a bind node is descended as a directory (a mount under
+   it hangs off it, as a nested mount). *parent is returned locked with a
+   reference. */
+static int vfs_mkpath_locked(const char *abspath, struct vfs_node **parent, char *leaf)
+{
+    char tmp[PATH_MAX];
+    strncpy(tmp, abspath, sizeof(tmp)-1);
+    tmp[PATH_MAX-1] = 0;
+
+    char *saveptr;
+    char *tok = strtok_r(tmp, "/", &saveptr);
+    if (!tok) {
+        errno = EINVAL;     /* "/" is no mount point */
+        return -1;
+    }
+
+    struct vfs_node *cur = vfs_root;
+    vn_lock(cur, 1);
+
+    for (;;) {
+        char *next = strtok_r(NULL, "/", &saveptr);
+        if (!next) {
+            if (strlen(tok) > NAME_MAX) {
+                vn_unlock(cur, 1);
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            strcpy(leaf, tok);
+            *parent = cur;
+            return 0;
+        }
+
+        struct vfs_node *child = vfs_find_child_locked(cur, tok);
+        if (!child) {
+            if (!VFS_CREATE_MOUNTPOINTS) {
+                vn_unlock(cur, 1);
+                errno = ENOENT;
+                return -1;
+            }
+            child = vnalloc(tok, S_IFDIR | 0755, 0, 0);
+            if (!child) {
+                vn_unlock(cur, 1);
+                return -1;
+            }
+            child->vn_kind = VN_OVERLAY;
+            child->vn_mount_id = cur->vn_mount_id;
+            vfs_add_child_locked(cur, child);
+        }
+        else if (!S_ISDIR(child->vn_st.st_mode)) {
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
+            errno = ENOTDIR;
+            return -1;
+        }
+
+        vn_unlock(cur, 1);
+        cur = child;
+        tok = next;
+    }
+}
+
+/* Attach `child` (locked) under `parent` (locked), in place of an own
+   child of that name: the last mount at a path wins. The replaced node
+   leaves the list but keeps its parent and its references -- an open file
+   on it, a walk in flight -- and goes when the last of those does. */
+static void vfs_attach_locked(struct vfs_node *parent, struct vfs_node *child)
+{
+    struct vfs_node *old = vfs_find_child_locked(parent, child->vn_name);
+    if (old) {
+        list_del(&old->vn_list);
+        INIT_LIST_HEAD(&old->vn_list);
+        vn_unlock(old, 2);  /* the list's reference and the lookup's */
+    }
+    vfs_add_child_locked(parent, child);
+}
+
+/* Mount the cpio archive at `abspath` (absolute, normalized, not "/"):
+   its root is a VN_CPIO directory named by the last component, loaded
+   with the archive, attached under vfs_lock. */
+static int vfs_load_cpio(struct vfs_node *vn, const void *buf, size_t len);
+
+static int vfs_mount_cpio(const char *abspath, const void *buf, size_t size)
+{
     VFS_LOCK();
-    vn_lock(root, 1);
-    VERIFY(!root->vn_parent);
-    root->vn_refcnt++;
-    list_add(&root->vn_list, &vfs_list);
+    struct vfs_node *parent;
+    char leaf[NAME_MAX + 1];
+    if (0 != vfs_mkpath_locked(abspath, &parent, leaf)) {
+        VFS_UNLOCK();
+        return -1;
+    }
+
+    struct vfs_node *root = vnalloc(leaf, S_IFDIR | 0766, getuid(), getgid());
+    if (!root) {
+        vn_unlock(parent, 1);
+        VFS_UNLOCK();
+        return -1;
+    }
+    root->vn_kind = VN_CPIO;
+    root->vn_mount_id = ++vfs_next_mount_id;
+
+    if (0 != vfs_load_cpio(root, buf, size)) {
+        vn_unlock(root, 1);
+        vn_unlock(parent, 1);
+        VFS_UNLOCK();
+        errno = EINVAL;
+        return -1;
+    }
+
+    vfs_attach_locked(parent, root);
     vn_unlock(root, 1);
+    vn_unlock(parent, 1);
     VFS_UNLOCK();
+    return 0;
 }
 
 // `mount --bind SOURCE MOUNTPOINT`: both absolute and normalized, the
@@ -6613,14 +6682,220 @@ static int vfs_bind(const char *source, const char *mountpoint)
     return -1;
 }
 
+/*
+ * Path resolution. The input is an absolute, normalized guest path
+ * (normalize_path), walked from the root: at each directory node the next
+ * component is looked for among its own children; a cpio symlink met on
+ * the way, or last unless VR_NOFOLLOW, is spliced in -- its target, then
+ * the rest of the path, folded lexically from the directory it is in --
+ * and the walk restarts from the root, so a link may name any guest path
+ * (/tvm/bin/sh, a host file, another mount). A component no own child
+ * answers is the underlay's: ENOENT in a cpio directory, and for an
+ * overlay the host path of the same name with the rest of the path behind
+ * it, which the host resolves in its own namespace from there (host links
+ * included). The result is a node, locked with a reference, or a host path.
+ */
+#define VR_NOFOLLOW 0x1     /* a cpio symlink as the final component is the result itself */
+#define VR_PARENT   0x2     /* resolve the directory part; the final component's name in leaf */
+
+struct vfs_res {
+    enum { VR_NODE, VR_HOST } kind;
+    struct vfs_node *vn;        /* VR_NODE: locked, +1; released with vn_unlock(vn, 1) */
+    char path[PATH_MAX];        /* VR_HOST: the host path to operate on; VR_NODE: the node's canonical guest path */
+    char leaf[NAME_MAX + 1];    /* VR_PARENT: the final component */
+    int mount_id;               /* the mount the result lives in, 0 for the host namespace */
+    int is_mountpoint;          /* the final component is a mount point: a bind, a cpio root, an overlay directory */
+    int crossed_vfs;            /* 0: the walk fell through overlays only, and path is the input */
+};
+
+/* The components strtok_r has not handed out yet, `next` first */
+static void vfs_rest(const char *next, const char *saveptr, char *rest)
+{
+    rest[0] = 0;
+    if (!next)
+        return;
+    if (saveptr && saveptr[0])
+        snprintf(rest, PATH_MAX, "%s/%s", next, saveptr);
+    else
+        snprintf(rest, PATH_MAX, "%s", next);
+}
+
+static int vfs_path_join(char *path, const char *name)
+{
+    if (!name[0])
+        return 0;
+    size_t len = strlen(path);
+    int n = snprintf(path + len, PATH_MAX - len, "%s%s", len > 1 ? "/" : "", name);
+    if (n < 0 || (size_t)n >= PATH_MAX - len) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int vfs_resolve(const char *abspath, unsigned flags, struct vfs_res *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (abspath[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (flags & VR_PARENT) {
+        /* the directory part, links followed; the leaf by name, for the
+           caller to look at itself (it may not exist, or be a mount point) */
+        const char *slash = strrchr(abspath, '/');
+        if (!slash[1]) {
+            errno = EINVAL;     /* "/" has no leaf */
+            return -1;
+        }
+        if (strlen(slash + 1) > NAME_MAX) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        char dir[PATH_MAX];
+        size_t dlen = slash == abspath ? 1 : (size_t)(slash - abspath);
+        memcpy(dir, abspath, dlen);
+        dir[dlen] = 0;
+        if (0 != vfs_resolve(dir, flags & ~(VR_PARENT | VR_NOFOLLOW), out))
+            return -1;
+        strcpy(out->leaf, slash + 1);
+        out->is_mountpoint = 0;
+        return 0;
+    }
+
+    if (!vfs_root) {
+        /* before vfs_init: nothing is mounted, every path is the host's */
+        out->kind = VR_HOST;
+        snprintf(out->path, sizeof(out->path), "%s", abspath);
+        return 0;
+    }
+
+    char tmp[PATH_MAX], rest[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", abspath);
+    int nlinks = 0;
+    int host_mount_id = 0;      /* the bind a host result lives in, once binds exist */
+
+restart:;
+    struct vfs_node *cur = vfs_root;
+    vn_lock(cur, 1);
+    char *saveptr;
+    char *tok = strtok_r(tmp, "/", &saveptr);
+
+    while (tok) {
+        char *next = strtok_r(NULL, "/", &saveptr);
+        struct vfs_node *child = vfs_find_child_locked(cur, tok);
+
+        if (!child) {
+            if (cur->vn_kind == VN_CPIO) {
+                vn_unlock(cur, 1);
+                /* Set errno explicitly: the callers return -1 straight from
+                   this verdict, and a stale value leaked (ls reported ENOTTY,
+                   cat EBADEXEC, cd EINTR). */
+                errno = ENOENT;
+                return -1;
+            }
+            /* an overlay's underlay is the host directory of its own path */
+            vfs_node_path_locked(cur, out->path, sizeof(out->path));
+            vn_unlock(cur, 1);
+            vfs_rest(next, saveptr, rest);
+            if (vfs_path_join(out->path, tok) || vfs_path_join(out->path, rest))
+                return -1;
+            out->kind = VR_HOST;
+            out->mount_id = host_mount_id;
+            return 0;
+        }
+
+        if (child->vn_kind == VN_CPIO && S_ISLNK(child->vn_st.st_mode) && (next || !(flags & VR_NOFOLLOW))) {
+            if (!child->vn_data || child->vn_size >= PATH_MAX) {
+                vn_unlock(child, 1);
+                vn_unlock(cur, 1);
+                errno = EINVAL;
+                return -1;
+            }
+            if (++nlinks > MAXSYMLINKS) {
+                vn_unlock(child, 1);
+                vn_unlock(cur, 1);
+                errno = ELOOP;
+                return -1;
+            }
+
+            char target[PATH_MAX], base[PATH_MAX];
+            memcpy(target, child->vn_data, child->vn_size);
+            target[child->vn_size] = 0;
+            /* a relative target is from the directory the link is in */
+            vfs_node_path_locked(cur, base, sizeof(base));
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
+
+            /* The target with the rest of the path behind it, folded the way
+               the caller's path was (".." steps over the link's directory,
+               as the host's namei does). Restart from the root, in place
+               rather than by recursion, so a chain of links cannot pile up
+               PATH_MAX buffers on the stack. */
+            vfs_rest(next, saveptr, rest);
+            if (vfs_path_join(target, rest))
+                return -1;
+            if (!normalize_path(base, target, tmp))
+                return -1;
+            out->crossed_vfs = 1;
+            host_mount_id = 0;  /* a link is followed in the namespace it names */
+            goto restart;
+        }
+
+        if (next && !S_ISDIR(child->vn_st.st_mode)) {
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
+            errno = ENOTDIR;
+            return -1;
+        }
+
+        if (child->vn_kind != VN_OVERLAY)
+            out->crossed_vfs = 1;
+        vn_unlock(cur, 1);
+        cur = child;
+        tok = next;
+    }
+
+    out->kind = VR_NODE;
+    out->vn = cur;
+    vfs_node_path_locked(cur, out->path, sizeof(out->path));
+    out->mount_id = cur->vn_mount_id;
+    /* a cpio entry is one of its mount; an overlay, a bind or a cpio root is a mount point */
+    out->is_mountpoint = cur->vn_kind != VN_CPIO || !cur->vn_parent || cur->vn_parent->vn_kind != VN_CPIO;
+    return 0;
+}
+
+/* One entry of a directory's listing, as readdir hands it out */
+struct vfs_dirent {
+    ino_t vd_ino;
+    unsigned char vd_type;
+    char vd_name[NAME_MAX + 1];
+};
+
+struct vfs_dir {
+    struct vfs_dirent *vd_ents;
+    int vd_n;
+    int vd_cap;
+};
+
 struct vfs_file {
     int vf_oflags;
-    int vf_cursor;
+    int vf_cursor;              /* file: the offset; directory: the index into vf_dir */
     struct vfs_node *vf_vn;
+    struct vfs_dir *vf_dir;     /* the listing, taken at the first readdir, dropped by a rewind */
 
     size_t vf_refcnt;
     pthread_mutex_t vf_lock;
 };
+
+static void vfs_dir_free(struct vfs_dir *d)
+{
+    if (!d)
+        return;
+    kfree(d->vd_ents);
+    kfree(d);
+}
 
 static struct vfs_file * vfalloc()
 {
@@ -6640,6 +6915,8 @@ static void vfdealloc_locked(struct vfs_file *vf)
 {
     VERIFY(!vf->vf_refcnt);
     VERIFY(!vf->vf_vn);
+    vfs_dir_free(vf->vf_dir);
+    vf->vf_dir = NULL;
 
     pthread_mutex_unlock(&vf->vf_lock);
     pthread_mutex_destroy(&vf->vf_lock);
@@ -6689,19 +6966,131 @@ static struct vfs_node *vn_for_file_locked(struct file *file) {
     return vn;
 }
 
-static struct vfs_node *vn_for_pathname(const char *pathname) {
-    return vfs_lookup(pathname, 0, 0, 0, 0, 0);
-}
-
-static struct vfs_node *vn_for_pathname_nofollow(const char *pathname) {
-    return vfs_lookup(pathname, 0, 1, 0, 0, 0);
-}
-
 static struct fops *vfsops();
+static int vn_stat_locked(struct vfs_node *vn, struct stat *st);
 
-static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out) {
-    file_unlock(out, 0);
+/* The stat of a resolved node, which is released. An overlay directory is
+   the host's directory of the same path when there is one, else a
+   synthetic directory (root, 0755, two links, the node's inode): /bin on
+   iOS exists without a host /bin. The host is asked after the node lock
+   is dropped. */
+static int vfs_stat_node(struct vfs_node *vn, const char *path, struct stat *st)
+{
+    if (vn->vn_kind != VN_OVERLAY) {
+        int ret = vn_stat_locked(vn, st);
+        vn_unlock(vn, 1);
+        return ret;
+    }
 
+    struct stat own;
+    vn_stat_locked(vn, &own);
+    vn_unlock(vn, 1);
+    if (0 == CALL_FUNC(fstatat, AT_FDCWD, path, st, 0) && S_ISDIR(st->st_mode))
+        return 0;
+    *st = own;
+    st->st_mode = S_IFDIR | 0755;
+    st->st_nlink = 2;
+    return 0;
+}
+
+static int vfs_stat_path(const char *abspath, struct stat *st, int flag)
+{
+    struct vfs_res res;
+    if (0 != vfs_resolve(abspath, (flag & AT_SYMLINK_NOFOLLOW) ? VR_NOFOLLOW : 0, &res))
+        return -1;
+    if (res.kind == VR_HOST)
+        return CALL_FUNC(fstatat, AT_FDCWD, res.path, st, flag);
+    return vfs_stat_node(res.vn, res.path, st);
+}
+
+static int vfs_access_path(const char *abspath, int mode, int flags)
+{
+    struct vfs_res res;
+    if (0 != vfs_resolve(abspath, (flags & AT_SYMLINK_NOFOLLOW) ? VR_NOFOLLOW : 0, &res))
+        return -1;
+    if (res.kind == VR_HOST)
+        return CALL_FUNC(faccessat, AT_FDCWD, res.path, mode, flags);
+
+    struct stat st;
+    if (0 != vfs_stat_node(res.vn, res.path, &st))
+        return -1;
+    return stat_access(&st, mode);
+}
+
+static int vn_chmod_locked(struct vfs_node *vn, mode_t mode)
+{
+    vn->vn_st.st_mode = (vn->vn_st.st_mode & ~07777) | (mode & 07777);
+    return 0;
+}
+
+static int vn_chown_locked(struct vfs_node *vn, uid_t owner, gid_t group)
+{
+    vn->vn_st.st_uid = owner;
+    vn->vn_st.st_gid = group;
+    return 0;
+}
+
+/* chmod/chown of a cpio entry is in memory, as before; an overlay directory
+   belongs to the VM (EPERM); the host's is the host's. */
+static int vfs_chmod_path(const char *abspath, mode_t mode, int flag)
+{
+    struct vfs_res res;
+    if (0 != vfs_resolve(abspath, (flag & AT_SYMLINK_NOFOLLOW) ? VR_NOFOLLOW : 0, &res))
+        return -1;
+    if (res.kind == VR_HOST)
+        return CALL_FUNC(fchmodat, AT_FDCWD, res.path, mode, flag);
+    if (res.vn->vn_kind == VN_OVERLAY) {
+        vn_unlock(res.vn, 1);
+        errno = EPERM;
+        return -1;
+    }
+    int ret = vn_chmod_locked(res.vn, mode);
+    vn_unlock(res.vn, 1);
+    return ret;
+}
+
+static int vfs_chown_path(const char *abspath, uid_t owner, gid_t group, int flag)
+{
+    struct vfs_res res;
+    if (0 != vfs_resolve(abspath, (flag & AT_SYMLINK_NOFOLLOW) ? VR_NOFOLLOW : 0, &res))
+        return -1;
+    if (res.kind == VR_HOST)
+        return CALL_FUNC(fchownat, AT_FDCWD, res.path, owner, group, flag);
+    if (res.vn->vn_kind == VN_OVERLAY) {
+        vn_unlock(res.vn, 1);
+        errno = EPERM;
+        return -1;
+    }
+    int ret = vn_chown_locked(res.vn, owner, group);
+    vn_unlock(res.vn, 1);
+    return ret;
+}
+
+static ssize_t vfs_readlink_path(const char *abspath, char *buf, size_t bufsiz)
+{
+    struct vfs_res res;
+    if (0 != vfs_resolve(abspath, VR_NOFOLLOW, &res))
+        return -1;
+    if (res.kind == VR_HOST)
+        return CALL_FUNC(readlink, res.path, buf, bufsiz);
+
+    struct vfs_node *vn = res.vn;
+    if (!S_ISLNK(vn->vn_st.st_mode)) {
+        vn_unlock(vn, 1);
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t len = vn->vn_size;
+    if (len > bufsiz) len = bufsiz;
+    memcpy(buf, vn->vn_data, len);
+    vn_unlock(vn, 1);
+    return (ssize_t)len;
+}
+
+/* Open the node `vn` (locked, +1, consumed) into `out` (unlocked here, locked on return). */
+static int vfsop_open_node(struct vfs_node *vn, const char *path, int flags, mode_t mode, struct file *out)
+{
     // The VFS holds cpio mounts and is read-only: vfsop_write is unimplemented
     // (ENOTSUP) and nothing in it ever persists. Opens for writing used to
     // succeed anyway, and O_CREAT even minted a phantom in-memory node, so a
@@ -6715,16 +7104,6 @@ static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, g
     // and creation with EROFS, as a read-only mount does, so callers take
     // their read-only paths (an existing file opens read-only, and a write to
     // it is then reported as such: "attempt to write a readonly database").
-    // The lookup comes first: a path outside every mount is ENOTSUP, which
-    // file_open() takes as "not ours" and hands to the host filesystem.
-    int nofollow = !!(flags & O_NOFOLLOW);
-    struct vfs_node *vn = vfs_lookup(pathname, 0, nofollow, mode, uid, gid);
-    if (!vn) {
-        if ((flags & O_CREAT) && errno == ENOENT)
-            errno = EROFS;
-        file_lock(out, 0);
-        return -1;
-    }
     if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_TRUNC | O_APPEND)) ||
         (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
         int last_errno = ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) ? EEXIST : EROFS;
@@ -6734,10 +7113,17 @@ static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, g
         return -1;
     }
 
-    if (nofollow && S_ISLNK(vn->vn_st.st_mode)) {
+    if ((flags & O_NOFOLLOW) && S_ISLNK(vn->vn_st.st_mode)) {
         vn_unlock(vn, 1);
         file_lock(out, 0);
         errno = ELOOP;
+        return -1;
+    }
+
+    if ((flags & O_DIRECTORY) && !S_ISDIR(vn->vn_st.st_mode)) {
+        vn_unlock(vn, 1);
+        file_lock(out, 0);
+        errno = ENOTDIR;
         return -1;
     }
 
@@ -6748,11 +7134,24 @@ static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, g
         return -1;
     }
 
-    int rfd;
-    if (S_ISDIR(vn->vn_st.st_mode))
-        rfd = CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
+    // The host descriptor behind the file: nothing for a cpio entry
+    // (/dev/null, or "/" for a directory, whichever call reaches it answers
+    // for a read-only mount); for an overlay directory the host directory
+    // of the same path when there is one, so fchdir() and the like land
+    // there, else "/". The host is asked with the node lock dropped.
+    int rfd = -1;
+    enum vfs_kind kind = vn->vn_kind;
+    int isdir = S_ISDIR(vn->vn_st.st_mode);
+    vn_unlock(vn, 0);
+    if (isdir) {
+        if (kind == VN_OVERLAY)
+            rfd = CALL_FUNC(open, path, (flags & O_ACCMODE) | O_DIRECTORY);
+        if (rfd == -1)
+            rfd = CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
+    }
     else
         rfd = CALL_FUNC(open, "/dev/null", (flags & O_ACCMODE));
+    vn_lock(vn, 0);
 
     if (-1 == rfd) {
         vf_unlock(vf, 1);
@@ -6776,6 +7175,36 @@ static int vfsop_open(const char *pathname, int flags, mode_t mode, uid_t uid, g
     out->f_ops = vfsops();
 
     return 0;
+}
+
+/* open() of an absolute path the devices did not claim: the VFS node it
+   resolves to, or the host path behind it. O_CREAT of a missing entry in a
+   cpio directory is EROFS (the resolver's ENOENT comes from a cpio
+   directory alone: an overlay falls through to the host, which creates
+   there). `out` is locked; released while the tree is walked, as the lock
+   order is file, then vfs_file, then node. */
+static int vfs_open_path(struct file *out, const char *abspath, int flags, mode_t mode, uid_t uid, gid_t gid)
+{
+    file_unlock(out, 0);
+
+    struct vfs_res res;
+    if (0 != vfs_resolve(abspath, (flags & O_NOFOLLOW) ? VR_NOFOLLOW : 0, &res)) {
+        if ((flags & O_CREAT) && errno == ENOENT)
+            errno = EROFS;
+        file_lock(out, 0);
+        return -1;
+    }
+
+    if (res.kind == VR_HOST) {
+        int rfd = CALL_FUNC(openat, AT_FDCWD, res.path, flags, mode);
+        file_lock(out, 0);
+        if (rfd == -1)
+            return -1;
+        out->f_rfd = rfd_adopt(rfd);
+        return 0;
+    }
+
+    return vfsop_open_node(res.vn, res.path, flags, mode, out);
 }
 
 static int vfsop_dup(struct file *oldfile, struct file *newfile) {
@@ -6838,47 +7267,12 @@ static int vfsop_fstat(struct file *file, struct stat *st)
     if (!vn)
         return -1;
 
-    int ret = vn_stat_locked(vn, st);
-    vn_unlock(vn, 1);
+    char path[PATH_MAX];
+    vfs_node_path_locked(vn, path, sizeof(path));
+    file_unlock(file, 0);
+    int ret = vfs_stat_node(vn, path, st);
+    file_lock(file, 0);
     return ret;
-}
-
-static int vfsop_stat(const char *pathname, struct stat *st, int flag)
-{
-    struct vfs_node *vn = (flag & AT_SYMLINK_NOFOLLOW)
-        ? vn_for_pathname_nofollow(pathname)
-        : vn_for_pathname(pathname);
-    if (!vn)
-        return -1;
-
-    int ret = vn_stat_locked(vn, st);
-    vn_unlock(vn, 1);
-    return ret;
-}
-
-static ssize_t vfsop_readlink(const char *pathname, char *buf, size_t bufsiz)
-{
-    struct vfs_node *vn = vn_for_pathname_nofollow(pathname);
-    if (!vn)
-        return -1;
-
-    if (!S_ISLNK(vn->vn_st.st_mode)) {
-        vn_unlock(vn, 1);
-        errno = EINVAL;
-        return -1;
-    }
-
-    size_t len = vn->vn_size;
-    if (len > bufsiz) len = bufsiz;
-    memcpy(buf, vn->vn_data, len);
-    vn_unlock(vn, 1);
-    return (ssize_t)len;
-}
-
-static int vn_chmod_locked(struct vfs_node *vn, mode_t mode)
-{
-    vn->vn_st.st_mode = (vn->vn_st.st_mode & ~07777) | (mode & 07777);
-    return 0;
 }
 
 static int vfsop_fchmod(struct file *file, mode_t mode)
@@ -6892,38 +7286,9 @@ static int vfsop_fchmod(struct file *file, mode_t mode)
     return ret;
 }
 
-static int vfsop_chmod(const char *pathname, mode_t mode, int flag)
-{
-    struct vfs_node *vn = vn_for_pathname(pathname);
-    if (!vn)
-        return -1;
-
-    int ret = vn_chmod_locked(vn, mode);
-    vn_unlock(vn, 1);
-    return ret;
-}
-
-static int vn_chown_locked(struct vfs_node *vn, uid_t owner, gid_t group)
-{
-    vn->vn_st.st_uid = owner;
-    vn->vn_st.st_gid = group;
-    return 0;
-}
-
 static int vfsop_fchown(struct file *file, uid_t owner, gid_t group)
 {
     struct vfs_node *vn = vn_for_file_locked(file);
-    if (!vn)
-        return -1;
-
-    int ret = vn_chown_locked(vn, owner, group);
-    vn_unlock(vn, 1);
-    return ret;
-}
-
-static int vfsop_chown(const char *pathname, uid_t owner, gid_t group, int flag)
-{
-    struct vfs_node *vn = vn_for_pathname(pathname);
     if (!vn)
         return -1;
 
@@ -7032,9 +7397,124 @@ static off_t vfsop_lseek(struct file *file, off_t offset, int whence)
         return -1;
     }
 
+    // rewinddir: the next readdir takes the listing afresh
+    if (whence == SEEK_SET && offset == 0 && vf->vf_dir) {
+        vfs_dir_free(vf->vf_dir);
+        vf->vf_dir = NULL;
+    }
+
     vf->vf_cursor = new_pos;
     vf_unlock(vf, 1);
     return new_pos;
+}
+
+static int vfs_dir_add(struct vfs_dir *d, const char *name, ino_t ino, unsigned char type)
+{
+    if (d->vd_n == d->vd_cap) {
+        int cap = d->vd_cap ? d->vd_cap * 2 : 16;
+        struct vfs_dirent *ents = krealloc(d->vd_ents, cap * sizeof(*ents));
+        if (!ents) {
+            errno = ENOMEM;
+            return -1;
+        }
+        d->vd_ents = ents;
+        d->vd_cap = cap;
+    }
+    struct vfs_dirent *e = &d->vd_ents[d->vd_n++];
+    e->vd_ino = ino;
+    e->vd_type = type;
+    snprintf(e->vd_name, sizeof(e->vd_name), "%s", name);
+    return 0;
+}
+
+static unsigned char vfs_dirent_type(const struct vfs_node *vn)
+{
+    if (vn->vn_kind == VN_OVERLAY)
+        return DT_DIR;
+    if (vn->vn_kind == VN_BIND)
+        return DT_UNKNOWN;
+    if (S_ISDIR(vn->vn_st.st_mode))
+        return DT_DIR;
+    if (S_ISLNK(vn->vn_st.st_mode))
+        return DT_LNK;
+    if (S_ISREG(vn->vn_st.st_mode))
+        return DT_REG;
+    return DT_UNKNOWN;
+}
+
+/* The listing of the directory `vn` (locked, +1, released), taken whole:
+   "." and "..", the own children, then the underlay's entries no own
+   child covers -- for an overlay, the host directory of the same path,
+   read on a private host DIR after the node lock is dropped (missing or
+   unreadable, as /bin on iOS: nothing); none for a cpio directory. The
+   host's d_ino and d_type for its entries. One snapshot per opendir and
+   rewinddir, which POSIX allows: an entry made after it is not listed
+   until the next, and telldir/seekdir positions are indexes into it. The
+   entries used to be the own children by index, without "." and "..",
+   d_type 0 and no host entries, so `ls /` had no tvm. */
+static struct vfs_dir *vfs_dir_snapshot(struct vfs_node *vn)
+{
+    if (!S_ISDIR(vn->vn_st.st_mode)) {
+        vn_unlock(vn, 1);
+        errno = ENOTDIR;
+        return NULL;
+    }
+
+    struct vfs_dir *d = kalloc(sizeof(*d));
+    if (!d) {
+        vn_unlock(vn, 1);
+        errno = ENOMEM;
+        return NULL;
+    }
+    memset(d, 0, sizeof(*d));
+
+    char path[PATH_MAX];
+    vfs_node_path_locked(vn, path, sizeof(path));
+    enum vfs_kind kind = vn->vn_kind;
+    /* the parent's inode, read without its lock: it never changes */
+    ino_t parent_ino = vn->vn_parent ? vn->vn_parent->vn_st.st_ino : vn->vn_st.st_ino;
+
+    int r = vfs_dir_add(d, ".", vn->vn_st.st_ino, DT_DIR) ||
+            vfs_dir_add(d, "..", parent_ino, DT_DIR);
+    struct vfs_node *child;
+    list_for_each_entry(child, &vn->vn_children, vn_list) {
+        if (r)
+            break;
+        /* name, inode and kind are fixed at creation; the type bits of
+           st_mode too, chmod keeping them */
+        r = vfs_dir_add(d, child->vn_name, child->vn_st.st_ino, vfs_dirent_type(child));
+    }
+    int nown = d->vd_n;
+    vn_unlock(vn, 1);
+
+    if (r) {
+        vfs_dir_free(d);
+        return NULL;
+    }
+
+    if (kind == VN_OVERLAY) {
+        DIR *hd = CALL_FUNC(opendir, path);
+        if (hd) {
+            struct dirent *e;
+            while (!r && (e = CALL_FUNC(readdir, hd))) {
+                if (0 == strcmp(e->d_name, ".") || 0 == strcmp(e->d_name, ".."))
+                    continue;
+                int covered = 0;
+                for (int i = 2; i < nown && !covered; i++)
+                    covered = 0 == strcmp(d->vd_ents[i].vd_name, e->d_name);
+                if (covered)
+                    continue;
+                r = vfs_dir_add(d, e->d_name, e->d_ino, e->d_type);
+            }
+            CALL_FUNC(closedir, hd);
+        }
+    }
+
+    if (r) {
+        vfs_dir_free(d);
+        return NULL;
+    }
+    return d;
 }
 
 static int vfsop_readdir(struct file *file, struct dirent *out)
@@ -7043,62 +7523,47 @@ static int vfsop_readdir(struct file *file, struct dirent *out)
     if (!vf)
         return -1;
 
-    file_unlock(file, 0);
-    struct vfs_node *vn = vn_for_vf_locked(vf);
-    file_lock(file, 0);
-    if (!vn) {
-        vf_unlock(vf, 1);
-        return -1;
-    }
-
-    if (!S_ISDIR(vn->vn_st.st_mode)) {
-        vf_unlock(vf, 1);
-        vn_unlock(vn, 1);
-        errno = ENOTDIR;
-        return -1;
-    }
-
-    int cursor = vf->vf_cursor;
-    file_unlock(file, 0);
-    vf_unlock(vf, 0);
-
-    int i = 0;
-    struct vfs_node *child;
-    list_for_each_entry(child, &vn->vn_children, vn_list) {
-        if (i == cursor)
-            break;
-        i++;
-    }
-
-    // end of children
-    if (list_is_head(&child->vn_list, &vn->vn_children)) {
-        vn_unlock(vn, 1);
-        file_lock(file, 0);
+    if (!vf->vf_dir) {
+        file_unlock(file, 0);
+        struct vfs_node *vn = vn_for_vf_locked(vf);
+        if (!vn) {
+            vf_unlock(vf, 1);
+            file_lock(file, 0);
+            return -1;
+        }
+        /* the listing is taken with neither the file nor vf held: it asks the host */
+        vf_unlock(vf, 0);
+        struct vfs_dir *d = vfs_dir_snapshot(vn);
         vf_lock(vf, 0);
-        vf_unlock(vf, 1);
-        return -1;
+        file_lock(file, 0);
+        if (!d) {
+            vf_unlock(vf, 1);
+            return -1;
+        }
+        if (vf->vf_dir)
+            vfs_dir_free(d);    /* a sharer of the file took one meanwhile */
+        else
+            vf->vf_dir = d;
     }
 
-    // inc cursor and release vf
-    vf_lock(vf, 0);
-    vf->vf_cursor++;
+    if (vf->vf_cursor < 0 || vf->vf_cursor >= vf->vf_dir->vd_n) {
+        vf_unlock(vf, 1);
+        return -1;  /* end of the listing: readdir returns NULL, errno untouched */
+    }
+
+    struct vfs_dirent *e = &vf->vf_dir->vd_ents[vf->vf_cursor++];
+    size_t namelen = strlen(e->vd_name);
+
+    memset(out, 0, sizeof(*out));
+    out->d_ino = e->vd_ino;
+    out->d_type = e->vd_type;
+    memcpy(out->d_name, e->vd_name, namelen + 1);
+#if defined(__APPLE__)
+    out->d_namlen = namelen;
+#endif
+    out->d_reclen = sizeof(*out);
+
     vf_unlock(vf, 1);
-
-    vn_lock(child, 1);
-    vn_unlock(vn, 1);
-
-    int namelen = strlen(child->vn_name);
-    if (namelen > NAME_MAX)
-        namelen = NAME_MAX;
-
-    // all other fields are not specified in POSIX readdir
-    out->d_ino = child->vn_st.st_ino;
-    memcpy(out->d_name, child->vn_name, namelen);
-    out->d_name[namelen] = 0;
-
-    vn_unlock(child, 1);
-    file_lock(file, 0);
-
     return 0;
 }
 
@@ -7140,20 +7605,17 @@ void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file
     return ret;
 }
 
+// Not a path-claiming device any more: the dispatchers resolve every path
+// the devices leave through the tree (vfs_open_path and the others), and
+// this table serves the open files of its nodes.
 static struct device devvfs = {
     .dev_type = DEV_VFS,
     .dev_fops = {
-        .f_open = vfsop_open,
         .f_dup = vfsop_dup,
 
         .f_fstat = vfsop_fstat,
         .f_fchown = vfsop_fchown,
         .f_fchmod = vfsop_fchmod,
-
-        .f_stat = vfsop_stat,
-        .f_chmod = vfsop_chmod,
-        .f_chown = vfsop_chown,
-        .f_readlink = vfsop_readlink,
 
         .f_ioctl = vfsop_ioctl,
         .f_read = vfsop_read,
@@ -7165,8 +7627,6 @@ static struct device devvfs = {
         .f_mmap = vfsop_mmap,
     }
 };
-
-REGISTER_DEV(devvfs);
 
 static struct fops *vfsops() {
     return &devvfs.dev_fops;
@@ -7182,7 +7642,7 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
         while (name[0] == '/') name++;
         if (name[0] == '.' && name[1] == '\0') return 0;
         if (name[0] == '\0') return 0;
-        struct vfs_node *child = vfs_lookup_locked(vn, name, 1, 0, cpio->c_mode, cpio->c_uid, cpio->c_gid);
+        struct vfs_node *child = vfs_lookup_locked(vn, name, cpio->c_mode, cpio->c_uid, cpio->c_gid);
         if (!child) {
             // TODO clear all children
             return -1;
@@ -9903,23 +10363,6 @@ static int tvm_cpio(int argc, char **argv)
     return 0;
 }
 
-static int tvm_mount_cpio(const char *pathname, const void *buf, unsigned long size) {
-    struct vfs_node *root = vnalloc(pathname, S_IFDIR | 0766, getuid(), getgid());
-    if (!root)
-        return -1;
-    
-    if (0 != vfs_load_cpio(root, buf, size)) {
-        vn_unlock(root, 1);
-        return -1;
-    }
-
-    vn_unlock(root, 0);
-    vfs_add_root(root);
-    vn_lock(root, 0);
-    vn_unlock(root, 1);
-    return 0;
-}
-
 // mount(8)'s way of saying what is mounted, shared by the builtin and the
 // initrc: `-t cpio` (an archive, the default), `--bind`, `-B` or `-o bind`
 // (a path laid over another). Returns the tokens the option at `tok` takes
@@ -9978,7 +10421,7 @@ static int tvm_mount(int argc, char **argv)
 
     close(fd);
 
-    if (0 != tvm_mount_cpio(target_abs, buf, size))
+    if (0 != vfs_mount_cpio(target_abs, buf, size))
         err(1, "mount %s %s", argv[i], target_abs);
 
     return 0;
@@ -10147,8 +10590,8 @@ static void initrc_cmd_mount(const char *arg)
     }
     *colon = 0;
     const char *hostpath = spec;
-    // The mount point used to be taken as written: vfs_lookup matches a
-    // root's name verbatim, so "/tvm/" or a relative one mounted nowhere.
+    // The mount point used to be taken as written, and matched verbatim,
+    // so "/tvm/" or a relative one mounted nowhere.
     char guestpath[PATH_MAX];
     if (colon[1] != '/' || !normalize_path("/", colon + 1, guestpath)) {
         INFO("initrc: mount: mount point must be absolute, got '%s'", colon + 1);
@@ -10182,7 +10625,7 @@ static void initrc_cmd_mount(const char *arg)
         return;
     }
 
-    if (tvm_mount_cpio(guestpath, buf, size) != 0)
+    if (vfs_mount_cpio(guestpath, buf, size) != 0)
         INFO("initrc: mount: failed to mount '%s' at '%s'", hostpath, guestpath);
     else
         INFO("initrc: mounted '%s' at '%s'", hostpath, guestpath);
@@ -10775,9 +11218,9 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     for (size_t i = 0; i < cfg->nmounts; i++) {
         const struct tvm_mount *m = &cfg->mounts[i];
         char abs[PATH_MAX], src[PATH_MAX];
-        // vfs_lookup() prefix-matches a root's name verbatim, so the mount
-        // point must be absolute and normalized ("/tvm", never "/tvm/" or
-        // "//tvm"). normalize_path() with an explicit dirname needs no task.
+        // The mount point is an absolute guest path, normalized ("/tvm",
+        // never "/tvm/" or "//tvm"). normalize_path() with an explicit
+        // dirname needs no task.
         if (!m->path || m->path[0] != '/' ||
             !normalize_path("/", m->path, abs) || 0 == strcmp(abs, "/")) {
             errno = EINVAL;
@@ -10841,7 +11284,9 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     // Config mounts. The VFS needs only the global arena, so a bad archive
     // is still reported to the caller before any task exists. A later
-    // initrc `mount` of the same path shadows these (vfs_add_root prepends).
+    // initrc `mount` of the same path replaces these (vfs_attach_locked).
+
+    vfs_init();
 
     for (size_t i = 0; i < cfg->nmounts; i++) {
         const struct tvm_mount *m = &cfg->mounts[i];
@@ -10853,7 +11298,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
             r = vfs_bind(src, abs);
         }
         else
-            r = tvm_mount_cpio(abs, m->data, m->size);
+            r = vfs_mount_cpio(abs, m->data, m->size);
         if (0 != r) {
             INFO("tvm_start: mount %s failed: %s", abs, strerror(errno));
             errno = EINVAL;

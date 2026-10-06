@@ -965,7 +965,7 @@ static int dir_count(DIR *d) {
 
 // A host directory and a VFS one (the initrc mounts /tvm): rewinddir used
 // to crash on either, the libc being handed TVM's stream.
-static const char *dir_test_dirs[] = { "/usr/share", "/tvm", NULL };
+static const char *dir_test_dirs[] = { "/usr/share", "/tvm", "/", NULL };
 
 TEST(DirRewind) {
     for (int i = 0; dir_test_dirs[i]; i++) {
@@ -998,6 +998,331 @@ TEST(DirTellSeek) {
         ASSERT_EQ(0, strcmp(name, e->d_name));
         ASSERT_EQ(0, closedir(d));
     }
+}
+
+// The *at() calls that create and remove used to hand the host the dirfd's
+// host descriptor, which for a VFS directory is the host's "/": the entry
+// was made or removed at the host's root (sealed on macOS, writable as root
+// on Linux). They now resolve the name against the directory's recorded
+// path, so a VFS directory gets the host's verdict for /tvm/x -- failure,
+// with nothing done on the host.
+TEST(AtVfsDirfd) {
+    int fd = open("/tvm", O_RDONLY | O_DIRECTORY);
+    ASSERT_NEQ(fd, -1);
+    struct stat st;
+
+    ASSERT_EQ(-1, mkdirat(fd, "zz_at_test", 0755));
+    ASSERT_EQ(-1, stat("/zz_at_test", &st));
+    ASSERT_EQ(errno, ENOENT);
+
+    ASSERT_EQ(-1, unlinkat(fd, "etc", AT_REMOVEDIR));
+    ASSERT_EQ(0, stat("/tvm/etc", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+
+    ASSERT_EQ(-1, symlinkat("x", fd, "l_at_test"));
+    ASSERT_EQ(-1, lstat("/l_at_test", &st));
+    ASSERT_EQ(errno, ENOENT);
+
+    ASSERT_EQ(-1, mkfifoat(fd, "f_at_test", 0644));
+    ASSERT_EQ(-1, stat("/f_at_test", &st));
+    ASSERT_EQ(errno, ENOENT);
+
+    char dst[PATH_MAX];
+    snprintf(dst, sizeof(dst), "/tmp/tvm_at_test_%d", (int)getpid());
+    ASSERT_EQ(-1, renameat(fd, "etc", AT_FDCWD, dst));
+    ASSERT_EQ(-1, stat(dst, &st));
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(0, stat("/tvm/etc", &st));
+
+    ASSERT_EQ(0, close(fd));
+}
+
+// The same calls on a host directory's descriptor land in that directory.
+TEST(AtHostDirfd) {
+    char dir[] = "/tmp/tvm_at_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    int fd = open(dir, O_RDONLY | O_DIRECTORY);
+    ASSERT_NEQ(fd, -1);
+    struct stat st;
+    char path[PATH_MAX];
+
+    ASSERT_EQ(0, mkdirat(fd, "sub", 0755));
+    snprintf(path, sizeof(path), "%s/sub", dir);
+    ASSERT_EQ(0, stat(path, &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+
+    ASSERT_EQ(0, symlinkat("sub", fd, "lnk"));
+    snprintf(path, sizeof(path), "%s/lnk", dir);
+    ASSERT_EQ(0, lstat(path, &st));
+    ASSERT_EQ(1, S_ISLNK(st.st_mode));
+
+    ASSERT_EQ(0, mkfifoat(fd, "fifo", 0644));
+    snprintf(path, sizeof(path), "%s/fifo", dir);
+    ASSERT_EQ(0, stat(path, &st));
+    ASSERT_EQ(1, S_ISFIFO(st.st_mode));
+
+    snprintf(path, sizeof(path), "%s/sub/f", dir);
+    int f = open(path, O_WRONLY | O_CREAT, 0644);
+    ASSERT_NEQ(f, -1);
+    ASSERT_EQ(0, close(f));
+    int sub = openat(fd, "sub", O_RDONLY | O_DIRECTORY);
+    ASSERT_NEQ(sub, -1);
+    ASSERT_EQ(0, linkat(sub, "f", fd, "g", 0));
+    snprintf(path, sizeof(path), "%s/g", dir);
+    ASSERT_EQ(0, stat(path, &st));
+    ASSERT_EQ(2, st.st_nlink);
+
+    ASSERT_EQ(0, renameat(fd, "g", sub, "h"));
+    snprintf(path, sizeof(path), "%s/sub/h", dir);
+    ASSERT_EQ(0, stat(path, &st));
+    snprintf(path, sizeof(path), "%s/g", dir);
+    ASSERT_EQ(-1, stat(path, &st));
+
+    ASSERT_EQ(0, unlinkat(sub, "h", 0));
+    ASSERT_EQ(0, unlinkat(sub, "f", 0));
+    ASSERT_EQ(0, unlinkat(fd, "fifo", 0));
+    ASSERT_EQ(0, unlinkat(fd, "lnk", 0));
+    ASSERT_EQ(0, unlinkat(fd, "sub", AT_REMOVEDIR));
+    ASSERT_EQ(0, close(sub));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+//////////
+//// VFS: one tree, mounts anywhere, directories merged with the host
+//////////
+
+// A newc cpio archive of `ents` (name, mode, contents or link target),
+// written at `path`, so a test can `tvm mount` a tree of its own.
+struct cpio_ent { const char *name; mode_t mode; const char *data; };
+
+static void write_newc_cpio(const char *path, const struct cpio_ent *ents)
+{
+    FILE *f = fopen(path, "w");
+    ASSERT_NEQ(f, NULL);
+    static const char zero[4] = {0};
+    unsigned ino = 1;
+    for (; ; ents++, ino++) {
+        const char *name = ents->name ? ents->name : "TRAILER!!!";
+        size_t dlen = ents->name && ents->data ? strlen(ents->data) : 0;
+        size_t nlen = strlen(name) + 1;
+        fprintf(f, "070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
+                ino, ents->name ? (unsigned)ents->mode : 0, 0, 0, 1, 0, (unsigned)dlen, 0, 0, 0, 0, (unsigned)nlen, 0);
+        fwrite(name, 1, nlen, f);
+        fwrite(zero, 1, (4 - (110 + nlen) % 4) % 4, f);
+        if (dlen) {
+            fwrite(ents->data, 1, dlen, f);
+            fwrite(zero, 1, (4 - dlen % 4) % 4, f);
+        }
+        if (!ents->name)
+            break;
+    }
+    ASSERT_EQ(0, fclose(f));
+}
+
+// `tvm mount FILE TARGET` through the builtin, as a guest would
+static void tvm_mount_cpio_file(const char *file, const char *target)
+{
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        execl("/usr/bin/tvm", "tvm", "mount", file, target, NULL);
+        _exit(127);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// A scratch directory holding a mounted archive; the file is unlinked at once
+static void vfs_test_mount(const char *tag, const struct cpio_ent *ents, const char *target)
+{
+    char dir[] = "/tmp/tvm_vfs_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char file[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/%s.cpio", dir, tag);
+    write_newc_cpio(file, ents);
+    tvm_mount_cpio_file(file, target);
+    ASSERT_EQ(0, unlink(file));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+static int dir_has(const char *dir, const char *name, unsigned char *type)
+{
+    DIR *d = opendir(dir);
+    ASSERT_NEQ(d, NULL);
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (0 == strcmp(e->d_name, name)) {
+            n++;
+            if (type)
+                *type = e->d_type;
+        }
+    }
+    ASSERT_EQ(0, closedir(d));
+    return n;
+}
+
+#define VFS_INODE_BASE 4141000000ULL  // the VFS's own inodes start here
+
+TEST(VfsRootLists) {
+    // "/" is the host's listing plus the mounts: tvm once, with its type
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/", "tvm", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(1, dir_has("/", ".", &type));
+    ASSERT_EQ(1, dir_has("/", "..", NULL));
+    ASSERT_EQ(1, dir_has("/", "usr", &type));
+    ASSERT_EQ(DT_DIR, type);
+
+    ASSERT_EQ(1, dir_has("/tvm", ".", NULL));
+    ASSERT_EQ(1, dir_has("/tvm", "..", NULL));
+    ASSERT_EQ(1, dir_has("/tvm", "bin", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(1, dir_has("/tvm/bin", "sh", &type));
+    ASSERT_EQ(DT_LNK, type);
+    ASSERT_EQ(1, dir_has("/tvm/bin", "toybox", &type));
+    ASSERT_EQ(DT_REG, type);
+
+    // every VFS entry has a type
+    DIR *d = opendir("/tvm/bin");
+    ASSERT_NEQ(d, NULL);
+    struct dirent *e;
+    while ((e = readdir(d)))
+        ASSERT_NEQ(e->d_type, DT_UNKNOWN);
+    ASSERT_EQ(0, closedir(d));
+}
+
+// A cpio link may name any guest path: another mount, a host path, a
+// relative one climbing out of its directory.
+TEST(VfsSymlinkOut) {
+    static const struct cpio_ent ents[] = {
+        { "out", S_IFLNK | 0777, "/tvm/bin" },
+        { "abs", S_IFLNK | 0777, "/etc" },
+        { "d",   S_IFDIR | 0755, NULL },
+        { "d/f", S_IFREG | 0644, "hello\n" },
+        { "lnk", S_IFLNK | 0777, "d/f" },
+        { "d/up", S_IFLNK | 0777, "../d/f" },
+        { "loop", S_IFLNK | 0777, "loop" },
+        { NULL, 0, NULL },
+    };
+    vfs_test_mount("out", ents, "/mnt_symlink_test");
+
+    struct stat st;
+    ASSERT_EQ(0, stat("/mnt_symlink_test/out", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, stat("/mnt_symlink_test/out/toybox", &st));
+    ASSERT_EQ(1, S_ISREG(st.st_mode));
+    ASSERT_EQ(0, lstat("/mnt_symlink_test/out", &st));
+    ASSERT_EQ(1, S_ISLNK(st.st_mode));
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/mnt_symlink_test/out", buf, sizeof(buf) - 1);
+    ASSERT_EQ(n, 8);
+    buf[n] = 0;
+    ASSERT_EQ(0, strcmp(buf, "/tvm/bin"));
+
+    ASSERT_EQ(0, stat("/mnt_symlink_test/abs", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, stat("/mnt_symlink_test/abs/passwd", &st));
+    ASSERT_EQ(1, S_ISREG(st.st_mode));
+
+    int fd = open("/mnt_symlink_test/lnk", O_RDONLY);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(6, read(fd, buf, sizeof(buf)));
+    ASSERT_EQ(0, memcmp(buf, "hello\n", 6));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(0, stat("/mnt_symlink_test/d/up", &st));
+    ASSERT_EQ(6, st.st_size);
+
+    ASSERT_EQ(-1, stat("/mnt_symlink_test/loop", &st));
+    ASSERT_EQ(errno, ELOOP);
+    ASSERT_EQ(-1, open("/mnt_symlink_test/lnk", O_RDONLY | O_NOFOLLOW));
+    ASSERT_EQ(errno, ELOOP);
+}
+
+// A mount inside a mount: the second hangs under the first and is listed
+// there; a mount point whose directories do not exist gets them.
+TEST(VfsMountNested) {
+    static const struct cpio_ent outer[] = {
+        { "a", S_IFREG | 0644, "outer\n" },
+        { "d", S_IFDIR | 0755, NULL },
+        { NULL, 0, NULL },
+    };
+    static const struct cpio_ent inner[] = {
+        { "g", S_IFREG | 0644, "nested\n" },
+        { NULL, 0, NULL },
+    };
+    vfs_test_mount("outer", outer, "/mnt_nest_test");
+    vfs_test_mount("inner", inner, "/mnt_nest_test/sub");
+    vfs_test_mount("inner", inner, "/mnt_nest_test/d/deep/er");
+
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/mnt_nest_test", "a", NULL));
+    ASSERT_EQ(1, dir_has("/mnt_nest_test", "sub", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(1, dir_has("/mnt_nest_test/sub", "g", NULL));
+
+    struct stat st;
+    ASSERT_EQ(0, stat("/mnt_nest_test/sub/g", &st));
+    ASSERT_EQ(7, st.st_size);
+    ASSERT_EQ(0, stat("/mnt_nest_test/d/deep", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(1, dir_has("/mnt_nest_test/d", "deep", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(0, stat("/mnt_nest_test/d/deep/er/g", &st));
+    ASSERT_EQ(-1, stat("/mnt_nest_test/d/deep/other", &st));
+    ASSERT_EQ(errno, ENOENT);
+
+    // a second mount at the same point replaces the first
+    vfs_test_mount("outer", outer, "/mnt_nest_test/sub");
+    ASSERT_EQ(-1, stat("/mnt_nest_test/sub/g", &st));
+    ASSERT_EQ(0, stat("/mnt_nest_test/sub/a", &st));
+}
+
+// "/" is the host's root; a directory the VFS makes for a mount point
+// exists without a host directory and is the VM's.
+TEST(VfsOverlayStat) {
+    struct stat st;
+    ASSERT_EQ(0, stat("/", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(1, (unsigned long long)st.st_ino < VFS_INODE_BASE);
+    ASSERT_EQ(0, stat("/etc", &st));   // falls through to the host
+    ASSERT_EQ(1, (unsigned long long)st.st_ino < VFS_INODE_BASE);
+
+    static const struct cpio_ent ents[] = {
+        { "f", S_IFREG | 0644, "x\n" },
+        { NULL, 0, NULL },
+    };
+    vfs_test_mount("ov", ents, "/newdir_vfs_test/x");
+
+    ASSERT_EQ(0, stat("/newdir_vfs_test", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(1, (unsigned long long)st.st_ino >= VFS_INODE_BASE);
+    ASSERT_EQ(0, lstat("/newdir_vfs_test", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, access("/newdir_vfs_test", R_OK | X_OK));
+    ASSERT_EQ(-1, chmod("/newdir_vfs_test", 0700));
+    ASSERT_EQ(errno, EPERM);
+    ASSERT_EQ(-1, readlink("/newdir_vfs_test", (char[16]){0}, 16));
+    ASSERT_EQ(errno, EINVAL);
+
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/newdir_vfs_test", "x", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(1, dir_has("/newdir_vfs_test", ".", NULL));
+    ASSERT_EQ(1, dir_has("/", "newdir_vfs_test", &type));
+    ASSERT_EQ(DT_DIR, type);
+
+    int fd = open("/newdir_vfs_test", O_RDONLY | O_DIRECTORY);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(1, (unsigned long long)st.st_ino >= VFS_INODE_BASE);
+    ASSERT_EQ(0, fstatat(fd, "x/f", &st, 0));
+    ASSERT_EQ(2, st.st_size);
+    ASSERT_EQ(0, close(fd));
 }
 
 static int cow_int;
