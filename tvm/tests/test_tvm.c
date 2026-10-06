@@ -17,6 +17,8 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <dirent.h>
+#include <limits.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -952,6 +954,50 @@ TEST(FDsCloseOnExit) {
     ASSERT_EQ(p, wait(&s));
     ASSERT_EQ(WIFEXITED(s), 1);
     ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+static int dir_count(DIR *d) {
+    int n = 0;
+    while (readdir(d))
+        n++;
+    return n;
+}
+
+// A host directory and a VFS one (the initrc mounts /tvm): rewinddir used
+// to crash on either, the libc being handed TVM's stream.
+static const char *dir_test_dirs[] = { "/usr/share", "/tvm", NULL };
+
+TEST(DirRewind) {
+    for (int i = 0; dir_test_dirs[i]; i++) {
+        DIR *d = opendir(dir_test_dirs[i]);
+        ASSERT_NEQ(d, NULL);
+        int n1 = dir_count(d);
+        ASSERT_NEQ(n1, 0);
+        ASSERT_EQ(NULL, readdir(d));
+        rewinddir(d);
+        ASSERT_EQ(n1, dir_count(d));
+        ASSERT_EQ(0, closedir(d));
+    }
+}
+
+TEST(DirTellSeek) {
+    for (int i = 0; dir_test_dirs[i]; i++) {
+        DIR *d = opendir(dir_test_dirs[i]);
+        ASSERT_NEQ(d, NULL);
+        ASSERT_NEQ(readdir(d), NULL);
+        long pos = telldir(d);
+        ASSERT_NEQ(pos, -1);
+        struct dirent *e = readdir(d);
+        ASSERT_NEQ(e, NULL);
+        char name[NAME_MAX + 1];
+        strcpy(name, e->d_name);
+        ASSERT_NEQ(readdir(d), NULL);
+        seekdir(d, pos);
+        e = readdir(d);
+        ASSERT_NEQ(e, NULL);
+        ASSERT_EQ(0, strcmp(name, e->d_name));
+        ASSERT_EQ(0, closedir(d));
+    }
 }
 
 static int cow_int;
