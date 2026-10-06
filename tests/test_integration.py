@@ -2202,6 +2202,12 @@ def test_fork_bomb_limited(sshi: spawn):
     sshi.expect("burst_done")
     sshi.expect(r"\$ ")
 
+def test_ls_root_shows_tvm(sshi: spawn):
+    """The VFS is one tree under the host's root: `ls /` is the host's
+    listing with the mount point in it, and /tvm is a directory to test."""
+    out, rc = _sh(sshi, "ls / | grep -x tvm; [ -d /tvm ] && [ -d /usr ] && echo both_dirs")
+    assert rc == 0 and _lines(out)[-2:] == ["tvm", "both_dirs"], out
+
 def test_mount_builtin(sshi: spawn):
     """`tvm mount` takes mount(8)'s spelling: `[-t cpio] FILE TARGET` mounts
     an archive at runtime (here one toybox's cpio just wrote), `--bind
