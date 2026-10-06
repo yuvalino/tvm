@@ -2184,28 +2184,6 @@ def test_fork_bomb_limited(sshi: spawn):
     sshi.expect("burst_done")
     sshi.expect(r"\$ ")
 
-def test_bind_links(sshi: spawn):
-    """The initrc's bind links (/bin/sh, /bin/bash, /usr/bin/env -> /tvm/bin)
-    act like symlinks: readlink and ls -l name the target, exec and stat
-    follow them, and a script naming its interpreter by host path runs."""
-    out, rc = _sh(sshi, "readlink /bin/sh /bin/bash /usr/bin/env")
-    assert rc == 0, out
-    assert _lines(out)[-3:] == ["/tvm/bin/sh", "/tvm/bin/bash", "/tvm/bin/env"], out
-    out, rc = _sh(sshi, "ls -l /bin/sh")
-    assert rc == 0 and "/bin/sh -> /tvm/bin/sh" in out, out
-    out, rc = _sh(sshi, "[ -x /bin/bash ] && [ -f /usr/bin/env ] && /bin/bash -c 'echo BASH=${BASH_VERSINFO[0]}'")
-    assert rc == 0 and "BASH=5" in out, out
-    out, rc = _sh(sshi, "d=$(mktemp -d) && printf '#!/bin/bash\\narr=(x y); echo ARR=${arr[1]}\\n' > $d/b && "
-                        "chmod +x $d/b && $d/b; rm -rf $d")
-    assert rc == 0 and "ARR=y" in out, out
-
-def test_exec_bad_interpreter(sshi: spawn):
-    """A #! interpreter that does not exist (and is no bind link) is a bad
-    interpreter, as on Linux: bash reports it and the status is 126."""
-    out, rc = _sh(sshi, "d=$(mktemp -d) && printf '#!/nonexistent/interp\\necho never\\n' > $d/s && "
-                        "chmod +x $d/s && $d/s; echo RC=$?; rm -rf $d")
-    assert "bad interpreter" in out and "RC=126" in out and "never" not in out.replace("echo never", ""), out
-
 def test_exec_nonexistent(sshi: spawn):
     """exec a nonexistent program — exercises ENOENT in execve."""
     sshi.sendline("/nonexistent/program 2>/dev/null; echo rc=$?")

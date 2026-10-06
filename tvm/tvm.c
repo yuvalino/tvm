@@ -1435,7 +1435,6 @@ static char **findenv(char **env, const char *name, size_t name_len)
 #define DEV_REG 0
 #define DEV_TTY 1
 #define DEV_VFS 2
-#define DEV_BIND 3 // never an open file's type: a bind link opens its target
 
 struct fops {
     /**
@@ -1686,8 +1685,6 @@ void file_unlock(struct file *file, int refcount) {
 
 char *normalize_path(const char *dirname, const char *file_name, char *out_path);
 
-static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath, const char *devpath, int flags, mode_t mode, uid_t uid, gid_t gid);
-
 /**
  * returns locked with refcnt
  */
@@ -1733,38 +1730,29 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
         }
     }
 
-    if (0 != file_open_dispatch(file, dirfd, pathname, devpath, flags, mode, uid, gid)) {
-        filedealloc_locked(file);
-        return NULL;
-    }
-    return file;
-}
-
-/**
- * Open into `file` (locked, still unopened): the first device that claims
- * `devpath`, else the host's openat(dirfd, hostpath). -1 with errno, `file`
- * left for the caller to dispose of.
- */
-static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath, const char *devpath, int flags, mode_t mode, uid_t uid, gid_t gid)
-{
     struct device *dev;
     list_for_each_entry(dev, &devices, dev_list) {
         int last_errno = errno;
-        if (0 == dev->dev_fops.f_open(devpath, flags, mode, uid, gid, file))
-            return 0;
+        if (0 == dev->dev_fops.f_open(devpath, flags, mode, uid, gid, file)) {
+            return file;
+        }
 
-        if (errno != ENOTSUP)
-            return -1;
+        if (errno != ENOTSUP) {
+            filedealloc_locked(file);
+            return NULL;
+        }
 
         errno = last_errno;
     };
 
-    int rfd = CALL_FUNC(openat, dirfd, hostpath, flags, mode);
-    if (rfd == -1)
-        return -1;
+    int rfd = CALL_FUNC(openat, dirfd, pathname, flags, mode);
+    if (rfd == -1) {
+        filedealloc_locked(file);
+        return NULL;
+    }
 
     file->f_rfd = rfd_adopt(rfd);
-    return 0;
+    return file;
 }
 
 /**
@@ -1910,207 +1898,6 @@ ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
 
     return CALL_FUNC(readlink, pathname, buf, bufsiz);
 }
-
-/////////////
-// MARK: Bind
-/////////////
-
-/*
- * Symbolic links the VM lays over host paths, from the initrc's `bind`
- * (see INITRC.md): /bin/sh -> /tvm/bin/sh. Scripts name their interpreter
- * by host path (#!/bin/sh, #!/usr/bin/env bash, a git hook) and programs
- * exec /bin/sh, but the host's are not loadable here: fat binaries on
- * macOS, absent on iOS, stripped on Linux (RTLD_NEEDMAIN). As links the
- * host path is the VM's own program to every path call that goes through
- * the devices (open and exec, stat, access, readlink, chmod, chown), and
- * says so: lstat() reports a link and readlink() its target, as on a
- * system whose /bin/sh is a link to dash or bash. Whichever device or the
- * host serves the target opens it; the link only renames the path. Only the
- * last component of a path is a link (/bin/sh, not /bin/sh/x), and calls
- * that bypass the devices (unlink, rename, ...) reach the host's file.
- * Filled by the initrc before any other task exists, read-only after.
- */
-struct bind_link {
-    char *bl_link;      // absolute, normalized
-    char *bl_target;    // absolute, normalized
-};
-
-#define BIND_MAX 64
-static struct bind_link bind_links[BIND_MAX];
-static int bind_nlinks;
-
-static const char *bind_lookup(const char *path)
-{
-    if (!path || path[0] != '/')
-        return NULL;
-    for (int i = 0; i < bind_nlinks; i++)
-        if (0 == strcmp(bind_links[i].bl_link, path))
-            return bind_links[i].bl_target;
-    return NULL;
-}
-
-// What the link at `path` finally names, through links to links. NULL with
-// ELOOP for a cycle, as path resolution reports one.
-static const char *bind_resolve(const char *path)
-{
-    const char *target = bind_lookup(path);
-    for (int n = 0; n < 40; n++) {
-        const char *next = bind_lookup(target);
-        if (!next)
-            return target;
-        target = next;
-    }
-    errno = ELOOP;
-    return NULL;
-}
-
-static int tvm_bind(const char *target, const char *link)
-{
-    char t[PATH_MAX], l[PATH_MAX];
-    if (target[0] != '/' || link[0] != '/' ||
-        !normalize_path("/", target, t) || !normalize_path("/", link, l) ||
-        0 == strcmp(l, "/") || 0 == strcmp(l, t)) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    for (int i = 0; i < bind_nlinks; i++) {
-        if (0 == strcmp(bind_links[i].bl_link, l)) {
-            errno = EEXIST;
-            return -1;
-        }
-    }
-    if (bind_nlinks == BIND_MAX) {
-        errno = ENOSPC;
-        return -1;
-    }
-
-    char *lc = kstrdup(l), *tc = kstrdup(t);
-    if (!lc || !tc) {
-        kfree(lc);
-        kfree(tc);
-        errno = ENOMEM;
-        return -1;
-    }
-    bind_links[bind_nlinks].bl_link = lc;
-    bind_links[bind_nlinks].bl_target = tc;
-    bind_nlinks++;
-    return 0;
-}
-
-static int bindop_open(const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid, struct file *out)
-{
-    if (!bind_lookup(pathname)) {
-        errno = ENOTSUP;
-        return -1;
-    }
-    if (flags & O_NOFOLLOW) {
-        errno = ELOOP;
-        return -1;
-    }
-#ifdef O_SYMLINK
-    if (flags & O_SYMLINK) {
-        // the link itself has no host object to open
-        errno = EPERM;
-        return -1;
-    }
-#endif
-    const char *target = bind_resolve(pathname);
-    if (!target)
-        return -1;
-
-    // the open file is the target's, by its name (as F_GETPATH reports a
-    // file opened through a host link)
-    char *name = kstrdup(target);
-    if (!name) {
-        errno = ENOMEM;
-        return -1;
-    }
-    kfree(out->f_pathname);
-    out->f_pathname = name;
-    return file_open_dispatch(out, AT_FDCWD, target, target, flags, mode, uid, gid);
-}
-
-static int bindop_stat(const char *pathname, struct stat *st, int flag)
-{
-    const char *target = bind_lookup(pathname);
-    if (!target) {
-        errno = ENOTSUP;
-        return -1;
-    }
-    if (!(flag & AT_SYMLINK_NOFOLLOW)) {
-        const char *final = bind_resolve(pathname);
-        return final ? file_stat(final, st, flag) : -1;
-    }
-
-    // lstat(): the link itself
-    memset(st, 0, sizeof(*st));
-    st->st_mode = S_IFLNK | 0755;
-    st->st_nlink = 1;
-    st->st_size = (off_t)strlen(target);
-    for (int i = 0; i < bind_nlinks; i++)
-        if (bind_links[i].bl_target == target)
-            st->st_ino = (ino_t)(0x7b000000 + i);   // stable and distinct per link
-    return 0;
-}
-
-static int bindop_chmod(const char *pathname, mode_t mode, int flag)
-{
-    if (!bind_lookup(pathname)) {
-        errno = ENOTSUP;
-        return -1;
-    }
-    if (flag & AT_SYMLINK_NOFOLLOW) {
-        errno = EPERM;  // the link belongs to the VM
-        return -1;
-    }
-    const char *final = bind_resolve(pathname);
-    return final ? file_chmod(final, mode, flag) : -1;
-}
-
-static int bindop_chown(const char *pathname, uid_t owner, gid_t group, int flag)
-{
-    if (!bind_lookup(pathname)) {
-        errno = ENOTSUP;
-        return -1;
-    }
-    if (flag & AT_SYMLINK_NOFOLLOW) {
-        errno = EPERM;
-        return -1;
-    }
-    const char *final = bind_resolve(pathname);
-    return final ? file_chown(final, owner, group, flag) : -1;
-}
-
-static ssize_t bindop_readlink(const char *pathname, char *buf, size_t bufsiz)
-{
-    const char *target = bind_lookup(pathname);
-    if (!target) {
-        errno = ENOTSUP;
-        return -1;
-    }
-    size_t len = strlen(target);
-    if (len > bufsiz)
-        len = bufsiz;   // truncated, no terminator, like readlink(2)
-    memcpy(buf, target, len);
-    return (ssize_t)len;
-}
-
-static struct device devbind = {
-    .dev_type = DEV_BIND,
-    .dev_fops = {
-        .f_open = bindop_open,
-        .f_stat = bindop_stat,
-        .f_chmod = bindop_chmod,
-        .f_chown = bindop_chown,
-        .f_readlink = bindop_readlink,
-    },
-};
-
-// First among the devices: a link may lie over a path another device
-// serves (a /tvm path), and must be followed before that device answers.
-__attribute__((constructor))
-static void _tvm_register_dev_devbind(void) { list_add(&devbind.dev_list, &devices); }
 
 /////////////
 // MARK: Task Data
@@ -10384,32 +10171,11 @@ static void initrc_cmd_umask(const char *arg)
     current->tsk_umask = mask & 0777;
 }
 
-static void initrc_cmd_bind(const char *arg)
-{
-    char expanded[PATH_MAX * 2];
-    initrc_expand_vars(arg, expanded, sizeof(expanded));
-
-    char *colon = strchr(expanded, ':');
-    if (!colon) {
-        INFO("initrc: bind: expected target:link, got '%s'", expanded);
-        return;
-    }
-    *colon = 0;
-    const char *target = expanded;
-    const char *link = colon + 1;
-
-    if (0 != tvm_bind(target, link))
-        INFO("initrc: bind: cannot link '%s' to '%s': %s", link, target, strerror(errno));
-    else
-        INFO("initrc: bound '%s' -> '%s'", link, target);
-}
-
 static struct {
     const char *name;
     void (*handler)(const char *arg);
 } initrc_cmds[] = {
     { "mount",   initrc_cmd_mount },
-    { "bind",    initrc_cmd_bind },
     { "setenv",  initrc_cmd_setenv },
     { "setenv?", initrc_cmd_setenv_default },
     { "echo",    initrc_cmd_echo },
@@ -16539,6 +16305,9 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         return -1;
     pathname = pathname_abs;
 
+    // A #! interpreter is tried as named, then as this (see the #! case)
+    char interp_alt[PATH_MAX];
+    interp_alt[0] = 0;
     int is_script = 0;
 
     INFO("execve(\"%s\")", pathname);
@@ -16715,11 +16484,20 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             return -1;
         }
 
-        // The interpreter must be something TVM can load (RTLD_NEEDMAIN
-        // below); the host's /bin/sh, /bin/bash, /usr/bin/env are not, and
-        // the initrc's `bind` lays links to the VM's own over those paths
-        // (see "Bind"). One that does not load is a missing interpreter
-        // (ENOENT, "bad interpreter"), as Linux reports it.
+        // The interpreter must be something TVM can load: an image that
+        // defines main. The host's /bin/bash, /bin/sh, /usr/bin/python3 ...
+        // are fat binaries on macOS, shared-cache stubs on iOS and stripped
+        // executables on Linux, so a plain "#!/bin/bash" script would fail
+        // with ENOEXEC -- which bash then handles by running the file
+        // in-process via longjmp, corrupting a TVM fork child (see the
+        // #!-less case above). The load below (RTLD_NEEDMAIN) tries it as
+        // named first and then the same name through PATH (e.g.
+        // /tvm/bin/bash); if both fail, a missing interpreter is reported
+        // (ENOENT), as Linux does.
+        const char *ibn = strrchr(interp, '/');
+        ibn = ibn ? ibn + 1 : interp;
+        if (0 != tvm_path_search(ibn, interp_alt) || 0 == strcmp(interp_alt, pathname_abs))
+            interp_alt[0] = 0;
         is_script = 1;
         pathname = pathname_abs;
 
@@ -16802,6 +16580,14 @@ do_exec:
             emulator_context_destroy(new_emulator);
             ulinker_destroy(new_linker);
             tvm_sig_leave();
+            if (interp_alt[0]) {
+                // the #! interpreter as named is not loadable: its PATH twin
+                INFO("execve shebang: %s not loadable, using %s", pathname, interp_alt);
+                snprintf(pathname_abs, sizeof(pathname_abs), "%s", interp_alt);
+                pathname = pathname_abs;
+                interp_alt[0] = 0;
+                goto do_exec;
+            }
             errno = is_script ? ENOENT : ENOEXEC;
             return -1;
         }
