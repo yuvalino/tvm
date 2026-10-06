@@ -14477,6 +14477,17 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // signal handlers contain function pointers that need translation
     if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_sighandlers, (void *)arg->parent->tsk_sighandlers, sizeof(arg->tsk->tsk_sighandlers), 1))
         goto fail;
+    // So do the atexit handlers and their arguments, which taskalloc_fork
+    // copied from the parent: addresses in the parent's image, while the
+    // child runs its own copy at another address. git's `maintenance run
+    // --auto --detach`, run after every commit, daemonizes with fork() +
+    // exit() in the parent, and the child's exit() called the parent's
+    // handler addresses -- unmapped by then -- and took the whole VM down
+    // with a hardware fault in TVM's exit path.
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_exits, (void *)arg->parent->tsk_exits, sizeof(arg->tsk->tsk_exits), 1))
+        goto fail;
+    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_exit_args, (void *)arg->parent->tsk_exit_args, sizeof(arg->tsk->tsk_exit_args), 1))
+        goto fail;
 
     if (0 != ulinker_duplicate(arg->parent->tsk_linker, arg->tsk->tsk_linker, (void (*)(void *arg, void *old_map, void *new_map, size_t size, int))fork_dup_linker_cb, (void *)arg))
         goto fail;
@@ -14546,21 +14557,6 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
 
     // include prologue (fp + lr) when adjusting jmpbuf context regs
     //jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
-
-    // The atexit handlers taskalloc_fork copied from the parent are
-    // addresses in the parent's image; the child runs its own copy of the
-    // image at another address. Nothing had noticed while guest atexit()
-    // registered nothing (see atexit): git's `maintenance run --auto
-    // --detach`, run after every commit, daemonizes with fork() + exit() in
-    // the parent, and the child's exit() then called the parent's handler
-    // addresses -- unmapped by then -- and took the whole VM down with a
-    // hardware fault in TVM's exit path.
-    for (int i = 0; i < (int)(sizeof(arg->tsk->tsk_exits)/sizeof(*arg->tsk->tsk_exits)); i++) {
-        if (arg->tsk->tsk_exits[i])
-            arg->tsk->tsk_exits[i] = (exit_t)cow_fixup_translate(&arg->fixup, (void *)arg->tsk->tsk_exits[i]);
-        if (arg->tsk->tsk_exit_args[i])
-            arg->tsk->tsk_exit_args[i] = cow_fixup_translate(&arg->fixup, arg->tsk->tsk_exit_args[i]);
-    }
 
     // fix the jmpbuf
     void **jb = (void **) (&arg->jmpbuf_parent);
