@@ -2966,6 +2966,10 @@ static void *lookup_symbol_elf64_all(struct dlinfo_elf64 *dl, const char *s)
         if (dl->dle64_shsymtab[i].st_name >= dl->dle64_shstrtab_size)
             continue;
         
+        // an undefined entry (an import) has no address in this image
+        if (dl->dle64_shsymtab[i].st_shndx == SHN_UNDEF)
+            continue;
+
         const char *name = dl->dle64_shstrtab + dl->dle64_shsymtab[i].st_name;
         if (strcmp(name, s) == 0) {
             return (void *)(dl->dle64_load_bias + dl->dle64_shsymtab[i].st_value);
@@ -4579,7 +4583,9 @@ static int load_dependency(struct ulinker *ulinker, struct dlinfo *dl, const cha
         is_file = dep_search(ulinker, dl, name, rpaths, nrpaths, path);
 
     if (is_file) {
-        struct dlinfo *dep = load_library(ulinker, path, dl->dl_flags);
+        // a dependency inherits the dlopen flags (RTLD_NOEMU), but is a
+        // library: only the executable itself must define main
+        struct dlinfo *dep = load_library(ulinker, path, dl->dl_flags & ~RTLD_NEEDMAIN);
         if (!dep) {
             if (weak)
                 return 0;
@@ -4720,6 +4726,16 @@ static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename
 
     if (!(dl = load_library_internal(ulinker, filename, flags)))
         goto out;
+
+    // RTLD_NEEDMAIN: an executable, entered at main (execve). Checked once the
+    // image is mapped, before its dependencies, imports and constructors, so
+    // one without main -- a stripped host executable such as Linux's /bin/sh
+    // (dash) -- is refused before any of its code or its libraries' runs.
+    if ((flags & RTLD_NEEDMAIN) && !lookup_symbol(dl, "main", 1, NULL)) {
+        ERROR("failed to load executable \"%s\": symbol \"main\" not found", filename);
+        ulinker_dlclose(dl);
+        return NULL;
+    }
 
     if (!ulinker->ul_exec_dir[0])
         dep_dirname(dl->dl_pathname, ulinker->ul_exec_dir, sizeof(ulinker->ul_exec_dir));

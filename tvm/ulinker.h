@@ -33,6 +33,7 @@ struct ulinker_load_event {
 #endif
 
 #define RTLD_NOEMU 0x40000000  // allow PROT_EXEC mappings
+#define RTLD_NEEDMAIN 0x20000000  // an executable: fail unless it defines main
 
 struct ulinker_ops {
     void *(*uo_malloc)(void *, size_t);

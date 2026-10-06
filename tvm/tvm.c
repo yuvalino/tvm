@@ -72,7 +72,6 @@
 #include <asm/prctl.h>
 #include <link.h>
 #include <malloc.h>   // memalign, pvalloc
-#include <elf.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/statvfs.h>
@@ -10615,88 +10614,6 @@ static void usershell_cache_init(void);
 static int tvm_path_search(const char *file, char *out);
 
 #if defined(__linux__)
-// True if the ELF open on `fd` defines `main` in its dynamic or regular
-// symbol table, where ulinker_dlsym(..., "main") finds it: execve starts an
-// image there. TVM's own builds keep it (unstripped); a host executable
-// (Linux /bin/sh is dash) is a perfectly good ELF that is stripped and
-// fails there ("symbol main not found").
-static int tvm_elf_exports_main(int fd)
-{
-    Elf64_Ehdr eh;
-    if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh) ||
-        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
-        eh.e_shentsize != sizeof(Elf64_Shdr) || !eh.e_shnum || eh.e_shnum > 4096)
-        return 0;
-
-    size_t shsize = (size_t)eh.e_shnum * sizeof(Elf64_Shdr);
-    Elf64_Shdr *sh = malloc(shsize);
-    if (!sh)
-        return 0;
-    int found = 0;
-    char *strtab = NULL;
-    Elf64_Sym *syms = NULL;
-    if (pread(fd, sh, shsize, (off_t)eh.e_shoff) != (ssize_t)shsize)
-        goto out;
-
-    for (int i = 0; i < eh.e_shnum && !found; i++) {
-        if ((sh[i].sh_type != SHT_DYNSYM && sh[i].sh_type != SHT_SYMTAB) ||
-            sh[i].sh_link >= eh.e_shnum ||
-            sh[i].sh_entsize != sizeof(Elf64_Sym))
-            continue;
-        Elf64_Shdr *str = &sh[sh[i].sh_link];
-        if (sh[i].sh_size > (256u << 20) || str->sh_size > (256u << 20) || !str->sh_size)
-            continue;
-        free(syms);
-        free(strtab);
-        syms = malloc(sh[i].sh_size);
-        strtab = malloc(str->sh_size);
-        if (!syms || !strtab ||
-            pread(fd, syms, sh[i].sh_size, (off_t)sh[i].sh_offset) != (ssize_t)sh[i].sh_size ||
-            pread(fd, strtab, str->sh_size, (off_t)str->sh_offset) != (ssize_t)str->sh_size)
-            break;
-        strtab[str->sh_size - 1] = 0;
-        size_t nsyms = sh[i].sh_size / sizeof(Elf64_Sym);
-        for (size_t k = 0; k < nsyms; k++) {
-            unsigned bind = ELF64_ST_BIND(syms[k].st_info);
-            if (syms[k].st_shndx != SHN_UNDEF && syms[k].st_name < str->sh_size &&
-                (bind == STB_GLOBAL || bind == STB_WEAK) &&
-                0 == strcmp(strtab + syms[k].st_name, "main")) {
-                found = 1;
-                break;
-            }
-        }
-    }
-out:
-    free(syms);
-    free(strtab);
-    free(sh);
-    return found;
-}
-#endif
-
-// True if `path` is an image TVM's linker can load: a thin 64-bit Mach-O,
-// or (Linux) an ELF that exports main. Fat Mach-O binaries (the host's
-// /bin/*, /usr/bin/* on macOS), shared-cache stubs (iOS), host ELF
-// executables (Linux) and anything else are not.
-static int tvm_loadable_image(const char *path)
-{
-    unsigned char magic[4] = {0};
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return 0;
-    ssize_t n = read(fd, magic, sizeof(magic));
-    int ok = n == 4 &&
-        (memcmp(magic, "\xcf\xfa\xed\xfe", 4) == 0 ||   /* MH_MAGIC_64 */
-         memcmp(magic, "\x7f" "ELF", 4) == 0);
-#if defined(__linux__)
-    if (ok && memcmp(magic, "\x7f" "ELF", 4) == 0)
-        ok = tvm_elf_exports_main(fd);
-#endif
-    close(fd);
-    return ok;
-}
-
-#if defined(__linux__)
 /*
  * gdb JIT registration of guest images (see ULINKER_GDB_JIT): TVM_GDB_JIT=1
  * or 0 decides; otherwise only when a tracer is attached at startup
@@ -16399,6 +16316,11 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         return -1;
     pathname = pathname_abs;
 
+    // A #! interpreter is tried as named, then as this (see the #! case)
+    char interp_alt[PATH_MAX];
+    interp_alt[0] = 0;
+    int is_script = 0;
+
     INFO("execve(\"%s\")", pathname);
 
     // since we zero out the callers here, this is a small snippet to get a quick stacktrace if crashes occur
@@ -16573,27 +16495,21 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             return -1;
         }
 
-        // The interpreter must be something TVM can load: a thin Mach-O or
-        // ELF. The host's /bin/bash, /bin/sh, /usr/bin/python3 ... are fat
-        // binaries on macOS and shared-cache stubs on iOS, so a plain
-        // "#!/bin/bash" script would fail with ENOEXEC — which bash then
-        // handles by running the file in-process via longjmp, corrupting a
-        // TVM fork child (see the #!-less case above). Fall back to the same
-        // interpreter name through PATH (e.g. /tvm/bin/bash); if that fails
-        // too, report a missing interpreter (ENOENT), as Linux does.
-        if (!tvm_loadable_image(pathname_abs)) {
-            const char *ibn = strrchr(interp, '/');
-            ibn = ibn ? ibn + 1 : interp;
-            char alt[PATH_MAX];
-            if (0 == tvm_path_search(ibn, alt) && 0 != strcmp(alt, pathname_abs) && tvm_loadable_image(alt)) {
-                INFO("execve shebang: %s not loadable, using %s", pathname_abs, alt);
-                snprintf(pathname_abs, sizeof(pathname_abs), "%s", alt);
-            } else {
-                INFO("execve shebang: interpreter %s not loadable (ENOENT)", pathname_abs);
-                errno = ENOENT;
-                return -1;
-            }
-        }
+        // The interpreter must be something TVM can load: an image that
+        // defines main. The host's /bin/bash, /bin/sh, /usr/bin/python3 ...
+        // are fat binaries on macOS, shared-cache stubs on iOS and stripped
+        // executables on Linux, so a plain "#!/bin/bash" script would fail
+        // with ENOEXEC -- which bash then handles by running the file
+        // in-process via longjmp, corrupting a TVM fork child (see the
+        // #!-less case above). The load below (RTLD_NEEDMAIN) tries it as
+        // named first and then the same name through PATH (e.g.
+        // /tvm/bin/bash); if both fail, a missing interpreter is reported
+        // (ENOENT), as Linux does.
+        const char *ibn = strrchr(interp, '/');
+        ibn = ibn ? ibn + 1 : interp;
+        if (0 != tvm_path_search(ibn, interp_alt) || 0 == strcmp(interp_alt, pathname_abs))
+            interp_alt[0] = 0;
+        is_script = 1;
         pathname = pathname_abs;
 
         // Rebuild argv: [interp, interp_arg?, script, original argv[1:]]
@@ -16667,15 +16583,23 @@ do_exec:
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
 
-        int dlflags = RTLD_NOW | (is_noemu_binary(pathname) ? RTLD_NOEMU : 0);
+        int dlflags = RTLD_NOW | RTLD_NEEDMAIN | (is_noemu_binary(pathname) ? RTLD_NOEMU : 0);
         void *handle = ulinker_dlopen(new_linker, pathname, dlflags);
         if (!handle) {
             current->tsk_linker = old_linker;
             current_thread->thr_emulator = old_emulator;
             emulator_context_destroy(new_emulator);
             ulinker_destroy(new_linker);
-            errno = ENOEXEC;
             tvm_sig_leave();
+            if (interp_alt[0]) {
+                // the #! interpreter as named is not loadable: its PATH twin
+                INFO("execve shebang: %s not loadable, using %s", pathname, interp_alt);
+                snprintf(pathname_abs, sizeof(pathname_abs), "%s", interp_alt);
+                pathname = pathname_abs;
+                interp_alt[0] = 0;
+                goto do_exec;
+            }
+            errno = is_script ? ENOENT : ENOEXEC;
             return -1;
         }
 
