@@ -6268,7 +6268,14 @@ static int tty_slavename_locked(struct tty *tt, char *buf, size_t buflen)
  * it): `ls /` did not list it, and a cpio link to a path outside its own
  * mount was dead.
  */
-enum vfs_kind { VN_CPIO = 0, VN_OVERLAY, VN_BIND };
+/* A cpio archive's entry, or the root of its mount: what the archive says
+   is all there is (a missing child is ENOENT), read-only */
+#define VN_CPIO     0
+/* A directory the VM made on the way to a mount point ("/", "/bin" for a
+   bind at /bin/sh): its own children, then the host directory of its path */
+#define VN_OVERLAY  1
+/* A bind mount point (mount --bind): shows the guest path in vn_target */
+#define VN_BIND     2
 
 struct vfs_node {
     struct list_head vn_list;
@@ -6285,7 +6292,7 @@ struct vfs_node {
     size_t vn_refcnt;
     pthread_mutex_t vn_lock;
 
-    enum vfs_kind vn_kind;
+    int vn_kind;                /* VN_CPIO, VN_OVERLAY or VN_BIND */
     char *vn_target;            /* VN_BIND: the absolute, normalized guest path it shows */
     int vn_mount_id;            /* 0 the host namespace; a cpio root or a bind has its own,
                                    a cpio entry its root's (rename across them is EXDEV) */
@@ -7048,7 +7055,7 @@ static int vfs_statfs_node(struct vfs_node *vn, struct statfs *buf)
         mount = mount->vn_parent;
     char path[PATH_MAX];
     vfs_node_path_locked(mount, path, sizeof(path));
-    enum vfs_kind kind = vn->vn_kind;
+    int kind = vn->vn_kind;
     vn_unlock(vn, 1);
 
     if (kind == VN_OVERLAY) {
@@ -7375,7 +7382,7 @@ static int vfsop_open_node(struct vfs_node *vn, const char *path, int flags, mod
     // directory its source resolves to, which must be a directory. The
     // host is asked with the node lock dropped.
     int rfd = -1;
-    enum vfs_kind kind = vn->vn_kind;
+    int kind = vn->vn_kind;
     int isdir = S_ISDIR(vn->vn_st.st_mode);
     char target[PATH_MAX];
     if (kind == VN_BIND)
@@ -7528,7 +7535,7 @@ enum vfs_leaf { VL_MISSING, VL_HOST, VL_NODE, VL_MOUNTPOINT };
 struct vfs_mut {
     char path[PATH_MAX];        /* the host path the operation goes to */
     int mount_id;               /* the mount that path lives in */
-    enum vfs_kind parent_kind;  /* VN_CPIO, VN_OVERLAY; VN_BIND stands for the host's */
+    int parent_kind;            /* VN_CPIO, VN_OVERLAY; VN_BIND stands for the host's */
     int parent_host;            /* an overlay parent: its host directory exists */
     enum vfs_leaf leaf;         /* VL_HOST: no node of that name, the host may have one */
 };
@@ -7954,7 +7961,7 @@ static int vfs_dir_add_underlay(struct vfs_dir *d, const char *abspath, int dept
             break;
         r = vfs_dir_add_covered(d, child->vn_name, child->vn_st.st_ino, vfs_dirent_type(child));
     }
-    enum vfs_kind kind = vn->vn_kind;
+    int kind = vn->vn_kind;
     char next[PATH_MAX];
     if (kind == VN_BIND)
         snprintf(next, sizeof(next), "%s", vn->vn_target);
@@ -7988,7 +7995,7 @@ static struct vfs_dir *vfs_dir_snapshot(struct vfs_node *vn)
 
     char path[PATH_MAX], target[PATH_MAX];
     vfs_node_path_locked(vn, path, sizeof(path));
-    enum vfs_kind kind = vn->vn_kind;
+    int kind = vn->vn_kind;
     if (kind == VN_BIND)
         snprintf(target, sizeof(target), "%s", vn->vn_target);
     /* the parent's inode, read without its lock: it never changes */
