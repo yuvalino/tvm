@@ -18382,7 +18382,11 @@ FUNCTION_DEFINE2(int, eventfd, unsigned int, initval, int, flags) {
 }
 
 // glibc's helpers read/write the descriptor internally, past the
-// interposed read()/write(): route them through those.
+// interposed read()/write(): route them through those. That is all glibc's
+// do (sysdeps/unix/sysv/linux/eventfd_read.c: `__read (fd, value,
+// sizeof (eventfd_t)) != sizeof (eventfd_t) ? -1 : 0`, and likewise
+// eventfd_write), so the semantics are unchanged and the task's descriptor
+// and TVM's EINTR handling come with read()/write().
 FUNCTION_DEFINE2(int, eventfd_read, int, fd, eventfd_t *, value) {
     return read(fd, value, sizeof(*value)) == sizeof(*value) ? 0 : -1;
 }
