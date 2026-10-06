@@ -11309,37 +11309,9 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
     if (!sh || !*sh)
         sh = "/bin/sh";
 
-    // The child must not read `command` from the caller's memory. TVM's
-    // fork() copies the arena, the image maps and this thread's host stack
-    // for the child and translates the pointers it finds in those copies,
-    // but the child's `command` came through untranslated: it still named
-    // the parent's buffer (same address on both sides), and popen's parent,
-    // unlike system()'s, does not wait -- it is back in the program by the
-    // time the child reaches execl(), which copies the string only then.
-    // sqlite3 hands popen the command out of its input-line buffer and goes
-    // on to read the next line into it, so the child's `sh -c` ran a
-    // fragment of whatever sqlite3 had put there since ("sh: line 1:
-    // $'\037': command not found", exit 127) and `.once |cmd`, `.output
-    // |cmd` and `.import "|cmd"` lost their pipe about every other run. So
-    // the parent copies the command into host memory before forking --
-    // nothing but the child ever touches that copy -- and the child moves
-    // it onto its own (private) stack and frees it before exec; the parent
-    // releases it only when there is no child.
-    size_t cmdlen = strlen(command) + 1;
-    char *cmdcopy = kalloc(cmdlen);
-    if (!cmdcopy) {
-        errno = ENOMEM;
-        return NULL;
-    }
-    memcpy(cmdcopy, command, cmdlen);
-
     int fds[2];
-    if (pipe(fds) == -1) {
-        int last_errno = errno;
-        kfree(cmdcopy);
-        errno = last_errno;
+    if (pipe(fds) == -1)
         return NULL;
-    }
     int parent_end = reading ? fds[0] : fds[1];
     int child_end  = reading ? fds[1] : fds[0];
 
@@ -11356,14 +11328,10 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
         int last_errno = errno;
         close(fds[0]);
         close(fds[1]);
-        kfree(cmdcopy);
         errno = last_errno;
         return NULL;
     }
     if (pid == 0) {
-        char *cmd = alloca(cmdlen);
-        memcpy(cmd, cmdcopy, cmdlen);
-        kfree(cmdcopy);
         close(parent_end);
         int target = reading ? STDOUT_FILENO : STDIN_FILENO;
         // with 0 and 1 closed, pipe() can hand out the target itself; dup2
@@ -11373,7 +11341,7 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
                 _exit(127);
             close(child_end);
         }
-        execl(sh, "sh", "-c", cmd, (char *)NULL);
+        execl(sh, "sh", "-c", command, (char *)NULL);
         _exit(127);
     }
 
