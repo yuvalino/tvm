@@ -2278,6 +2278,38 @@ def test_realpath_namespace(sshi: spawn):
     out, rc = _sh(sshi, "realpath /tvm/bin/sh /bin/sh /tvm/etc/../bin; cd /bin && pwd -P; cd /tvm/bin && pwd -P")
     assert rc == 0 and _lines(out)[-5:] == ["/tvm/bin/bash", "/bin/sh", "/tvm/bin", "/bin", "/tvm/bin"], out
 
+def test_tty_device_dir(sshi: spawn):
+    """The session's tty is an entry of the ptys' directory, a node of the
+    tree: the directory exists to ls, [ -d ] and stat (it used to be
+    ENOENT while its entries answered), lists the tty, the tty is a
+    character device that realpath and ".." resolve like any path, and
+    /dev is the host's directory with the VM's tty and ptmx in it, once
+    each."""
+    out, rc = _sh(sshi, "t=$(tty) && n=${t##*/} && [ -c $t ] && [ -d /tvm/pts ] && ls /tvm | grep -x pts && "
+                        "ls /tvm/pts | grep -x $n > /dev/null && echo listed && ls -l $t | cut -c1 && "
+                        "[ $(realpath /tvm/pts/../pts/$n) = $t ] && echo same && "
+                        "ls /dev | grep -cx -e tty -e ptmx && ls /dev | grep -x null")
+    assert rc == 0 and _lines(out)[-6:] == ["pts", "listed", "c", "same", "2", "null"], out
+
+def test_tty_device_bind(sshi: spawn):
+    """A bind of the session's tty is the tty: a write to the mount point
+    lands on the terminal, ls shows a character device, the mount point is
+    busy to rm; the ptys' directory gets no entries but the driver's, and
+    its entries cannot be removed."""
+    out, rc = _sh(sshi, "t=$(tty) && tvm mount --bind $t /mnt_tty_test && ls -l /mnt_tty_test | cut -c1 && "
+                        "echo through-the-bind > /mnt_tty_test && "
+                        "{ rm /mnt_tty_test 2>&1 || echo rm-bind-failed; } && "
+                        "{ touch /tvm/pts/x 2>&1 || echo touch-failed; } && "
+                        "{ mkdir /tvm/pts/d 2>&1 || echo mkdir-failed; } && "
+                        "{ rm $t 2>&1 || echo rm-tty-failed; }")
+    lines = _lines(out)
+    assert rc == 0 and "through-the-bind" in lines, out
+    assert lines[lines.index("through-the-bind") - 1] == "c", out
+    rest = "\n".join(lines[lines.index("through-the-bind") + 1:])
+    assert "busy" in rest.lower() and "rm-bind-failed" in rest, out
+    assert "Permission denied" in rest and "touch-failed" in rest, out
+    assert "Operation not permitted" in rest and "mkdir-failed" in rest and "rm-tty-failed" in rest, out
+
 def test_exec_bad_interpreter(sshi: spawn):
     """A #! interpreter that does not exist is a bad interpreter, as on
     Linux: bash reports it and the status is 126 (no PATH retry)."""

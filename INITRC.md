@@ -73,6 +73,16 @@ relative host symlink inside a bound directory that climbs above the mount
 point resolves where the host's would, not through the mount point's parent
 (a known deviation).
 
+The VM's devices are nodes of the same tree, mounted before the initrc runs:
+`/dev/tty` (the calling process's controlling tty; a process with none gets
+the host's `/dev/tty`), `/dev/ptmx` (a new pty on every open) and `/tvm/pts`,
+the directory of the ptys (`/tvm/pts/N`, what `tty` and `ptsname` say).
+`/dev` is the host's directory with these in it. A mount over `/tvm` keeps
+`/tvm/pts` (the CLI's `init.rc` mounts the rootfs there). The ptys'
+directory holds nothing but the driver's entries: creating, removing or
+renaming in it is refused (`EPERM`, `EACCES` for `open(O_CREAT)`), as devpts
+on Linux does.
+
 Example: scripts and programs name their interpreter by host path
 (`#!/bin/sh`, `#!/usr/bin/env bash`, `system(3)`), and the host's are not
 loadable in TVM, so both rc files mount the VM's own over them:
