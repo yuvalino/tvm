@@ -96,13 +96,12 @@ mount --bind /tvm/bin/env:/usr/bin/env
 The guest-side builtin takes the same options with two operands:
 `tvm mount [-t cpio] FILE TARGET`, `tvm mount --bind SOURCE TARGET`.
 
-On iOS the app runs in its sandbox, and whether a host `/bin` or
-`/usr/bin` exists or is listable there has not been verified (the device
-was offline when this was written): the design does not depend on it -- a
-mount point exists without a host directory, an unreadable host directory
-adds nothing to the merged listing, and a host `/usr/bin/env` is covered
-either way. To record the facts, from the app's ssh:
-`ls -ld /bin /usr/bin; ls /bin; stat /bin/sh; readlink /tvm/bin/bash`.
+On iOS (checked on an iPhone 12, iOS 18.1.1) the app's sandbox can stat
+the host's `/bin`, `/usr/bin` and `/dev` but not list them: `stat /bin`
+answers a host directory, `ls /bin` lists only the bind mounts (`bash`,
+`sh`), `ls /usr/bin` only `env`, and `ls /dev` only the VM's `tty` and
+`ptmx`, while `/dev/null` is still the host's. The merged listing simply
+adds nothing for an unreadable host directory.
 
 ### setenv
 

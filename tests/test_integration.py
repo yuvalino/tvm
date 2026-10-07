@@ -1493,13 +1493,15 @@ def test_nano_file_browser(sshi: spawn):
     """nano's file browser (^R, then ^T) reads a directory twice with a
     rewinddir() in between, which took the editor down with SIGSEGV when
     rewinddir reached the host libc with TVM's stream. The browser shows
-    the directory and its entries, and leaves nano in one piece."""
+    the directory and its entries, and leaves nano in one piece. (Its
+    title bar drops the "DIR:" prefix when the path does not fit, as the
+    app's sandbox paths do not, so the listing's "(parent dir)" marks it.)"""
     sshi.sendline("export TERM=xterm-256color; d=$(mktemp -d) && touch $d/browsed_file && cd $d && nano; echo RC=$?")
     sshi.expect("Write Out")
     sshi.send("\x12")            # ^R  Read File
     sshi.expect("File to insert")
     sshi.send("\x14")            # ^T  To Files
-    _expect_all(sshi, "DIR:", "browsed_file")
+    _expect_all(sshi, "(parent dir)", "browsed_file")
     sshi.send("\x03")            # ^C  Cancel the browser
     sshi.expect("File to insert")
     sshi.send("\x03")            # ^C  Cancel the prompt
@@ -2283,12 +2285,13 @@ def test_tty_device_dir(sshi: spawn):
     tree: the directory exists to ls, [ -d ] and stat (it used to be
     ENOENT while its entries answered), lists the tty, the tty is a
     character device that realpath and ".." resolve like any path, and
-    /dev is the host's directory with the VM's tty and ptmx in it, once
-    each."""
+    /dev lists the VM's tty and ptmx, once each, next to whatever the host
+    lets it list (nothing on iOS, whose sandbox stats /dev/null but does
+    not list /dev), and /dev/null is still the host's."""
     out, rc = _sh(sshi, "t=$(tty) && n=${t##*/} && [ -c $t ] && [ -d /tvm/pts ] && ls /tvm | grep -x pts && "
                         "ls /tvm/pts | grep -x $n > /dev/null && echo listed && ls -l $t | cut -c1 && "
                         "[ $(realpath /tvm/pts/../pts/$n) = $t ] && echo same && "
-                        "ls /dev | grep -cx -e tty -e ptmx && ls /dev | grep -x null")
+                        "ls /dev | grep -cx -e tty -e ptmx && [ -c /dev/null ] && echo null")
     assert rc == 0 and _lines(out)[-6:] == ["pts", "listed", "c", "same", "2", "null"], out
 
 def test_tty_device_bind(sshi: spawn):
