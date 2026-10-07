@@ -2592,6 +2592,238 @@ TEST(TTYDetachTIOCNOTTY) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+// Read exactly `n` bytes: the tty writes to its socket a character at a
+// time, so a read may come back short.
+static void read_full(int fd, char *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        ASSERT_NEQ(r, -1);
+        ASSERT_NEQ(r, 0);
+        got += r;
+    }
+}
+
+// The ptys' directory is a node of the tree: it exists to stat, opendir
+// and [ -d ] (it did not: the tty driver claimed its entries by string
+// comparison, and the directory itself was nothing), lists the ptys there
+// are, and its entries are the ptys -- character devices with the slave's
+// inode, answering stat, access, chmod, chown, ".." and realpath like any
+// path. Nothing is created, removed or renamed in it (EPERM, EACCES for
+// open(O_CREAT), as devpts on Linux), and the directory is a mount point
+// (EBUSY).
+TEST(TTYDevDir) {
+    struct stat st, fst;
+    ASSERT_EQ(0, stat("/tvm/pts", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, access("/tvm/pts", R_OK | X_OK));
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/tvm", "pts", &type));
+    ASSERT_EQ(DT_DIR, type);
+    ASSERT_EQ(1, dir_has("/tvm/pts", ".", NULL));
+    ASSERT_EQ(-1, stat("/tvm/pts/none", &st));
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(-1, stat("/tvm/pts/99999", &st));
+    ASSERT_EQ(errno, ENOENT);
+
+    int master, slave;
+    ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    char name[PATH_MAX];
+    snprintf(name, sizeof(name), "%s", ptsname(master));
+    const char *leaf = strrchr(name, '/') + 1;
+
+    ASSERT_EQ(1, dir_has("/tvm/pts", leaf, &type));
+    ASSERT_EQ(DT_CHR, type);
+    ASSERT_EQ(0, fstat(slave, &fst));
+    ASSERT_EQ(1, S_ISCHR(fst.st_mode));
+    ASSERT_EQ(0, stat(name, &st));
+    ASSERT_EQ(1, S_ISCHR(st.st_mode));
+    ASSERT_EQ(fst.st_ino, st.st_ino);
+    ASSERT_EQ(0, lstat(name, &st));
+    ASSERT_EQ(fst.st_ino, st.st_ino);
+    ASSERT_EQ(0, access(name, R_OK | W_OK));
+    ASSERT_EQ(-1, readlink(name, (char[16]){0}, 16));
+    ASSERT_EQ(errno, EINVAL);
+
+    // through ".." and realpath, as any path
+    char p[PATH_MAX], r[PATH_MAX];
+    snprintf(p, sizeof(p), "/tvm/pts/../pts/%s", leaf);
+    ASSERT_EQ(0, stat(p, &st));
+    ASSERT_EQ(fst.st_ino, st.st_ino);
+    ASSERT_NEQ(realpath(p, r), NULL);
+    ASSERT_EQ(0, strcmp(r, name));
+    ASSERT_NEQ(realpath("/tvm/pts", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/tvm/pts"));
+    snprintf(p, sizeof(p), "%s/x", name);
+    ASSERT_EQ(-1, stat(p, &st));
+    ASSERT_EQ(errno, ENOTDIR);
+
+    // chmod and chown reach the pty (dropbear sets its slave's)
+    ASSERT_EQ(0, chmod(name, 0600));
+    ASSERT_EQ(0, fstat(slave, &st));
+    ASSERT_EQ(0600, st.st_mode & 07777);
+    ASSERT_EQ(1, S_ISCHR(st.st_mode));
+    ASSERT_EQ(0, chown(name, getuid(), getgid()));
+    ASSERT_EQ(0, stat(name, &st));
+    ASSERT_EQ(getgid(), st.st_gid);
+
+    // the driver's entries alone
+    ASSERT_EQ(-1, mkdir("/tvm/pts/x", 0755));
+    ASSERT_EQ(errno, EPERM);
+    ASSERT_EQ(-1, open("/tvm/pts/x", O_WRONLY | O_CREAT, 0644));
+    ASSERT_EQ(errno, EACCES);
+    ASSERT_EQ(-1, symlink("x", "/tvm/pts/y"));
+    ASSERT_EQ(errno, EPERM);
+    ASSERT_EQ(-1, unlink(name));
+    ASSERT_EQ(errno, EPERM);
+    ASSERT_EQ(-1, rename(name, "/tvm/pts/99998"));
+    ASSERT_EQ(errno, EPERM);
+    ASSERT_EQ(-1, rmdir("/tvm/pts"));
+    ASSERT_EQ(errno, EBUSY);
+    ASSERT_EQ(-1, unlink("/tvm/pts/none"));
+    ASSERT_EQ(errno, ENOENT);
+
+    // opened by its path, as the slave it is
+    int fd = open(name, O_RDWR | O_NOCTTY);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(1, isatty(fd));
+    ASSERT_EQ(0, strcmp(ttyname(fd), name));
+    ASSERT_EQ(0, close(fd));
+
+    // gone with the pty
+    ASSERT_EQ(0, close(slave));
+    ASSERT_EQ(0, close(master));
+    ASSERT_EQ(-1, stat(name, &st));
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(0, dir_has("/tvm/pts", leaf, NULL));
+}
+
+// A bind of a pty's path is the pty: stat, open (the slave, by its own
+// name), realpath by the mount point, busy to remove; a bind of the
+// directory lists the ptys and resolves them.
+TEST(TTYDevBind) {
+    int master, slave;
+    ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    char name[PATH_MAX];
+    snprintf(name, sizeof(name), "%s", ptsname(master));
+    const char *leaf = strrchr(name, '/') + 1;
+
+    tvm_mount_bind(name, "/mnt_pts_test");
+    struct stat st, fst;
+    ASSERT_EQ(0, fstat(slave, &fst));
+    ASSERT_EQ(0, stat("/mnt_pts_test", &st));
+    ASSERT_EQ(1, S_ISCHR(st.st_mode));
+    ASSERT_EQ(fst.st_ino, st.st_ino);
+    ASSERT_EQ(0, lstat("/mnt_pts_test", &st));
+    ASSERT_EQ(fst.st_ino, st.st_ino);
+    unsigned char type = 0;
+    ASSERT_EQ(1, dir_has("/", "mnt_pts_test", &type));
+    ASSERT_EQ(DT_CHR, type);
+    char r[PATH_MAX];
+    ASSERT_NEQ(realpath("/mnt_pts_test", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_pts_test"));
+    ASSERT_EQ(-1, unlink("/mnt_pts_test"));
+    ASSERT_EQ(errno, EBUSY);
+
+    int fd = open("/mnt_pts_test", O_RDWR | O_NOCTTY);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(1, isatty(fd));
+    ASSERT_EQ(0, strcmp(ttyname(fd), name));
+    ASSERT_EQ(2, write(master, "a\n", 2));
+    char buf[8];
+    read_full(fd, buf, 2);
+    ASSERT_EQ(0, memcmp(buf, "a\n", 2));
+    ASSERT_EQ(0, close(fd));
+
+    tvm_mount_bind("/tvm/pts", "/mnt_pts_dir_test");
+    ASSERT_EQ(1, dir_has("/mnt_pts_dir_test", leaf, &type));
+    ASSERT_EQ(DT_CHR, type);
+    snprintf(r, sizeof(r), "/mnt_pts_dir_test/%s", leaf);
+    ASSERT_EQ(0, stat(r, &st));
+    ASSERT_EQ(fst.st_ino, st.st_ino);
+
+    ASSERT_EQ(0, close(slave));
+    ASSERT_EQ(0, close(master));
+    ASSERT_EQ(-1, stat("/mnt_pts_test", &st));   // a dangling bind now
+    ASSERT_EQ(errno, ENOENT);
+}
+
+// /dev/tty is the calling task's controlling tty, whichever it is when
+// asked: a child that takes a pty finds the pty there, by stat, access
+// and open; a task with none gets the host's /dev/tty, as before. /dev is
+// the host's directory with the VM's nodes in it.
+TEST(TTYDevCtty) {
+    struct stat st;
+    ASSERT_EQ(0, stat("/dev/tty", &st));
+    ASSERT_EQ(1, S_ISCHR(st.st_mode));
+    ASSERT_EQ(1, dir_has("/dev", "tty", NULL));
+    ASSERT_EQ(1, dir_has("/dev", "null", NULL));
+    ASSERT_EQ(-1, unlink("/dev/tty"));
+    ASSERT_EQ(errno, EBUSY);
+
+    int master, slave;
+    ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        ASSERT_EQ(getpid(), setsid());
+        ASSERT_EQ(0, ioctl(slave, TIOCSCTTY, 0));
+        struct stat fst;
+        ASSERT_EQ(0, fstat(slave, &fst));
+        ASSERT_EQ(0, stat("/dev/tty", &st));
+        ASSERT_EQ(fst.st_ino, st.st_ino);
+        ASSERT_EQ(0, access("/dev/tty", R_OK | W_OK));
+        int fd = open("/dev/tty", O_RDWR);
+        ASSERT_NEQ(fd, -1);
+        ASSERT_EQ(1, isatty(fd));
+        ASSERT_EQ(0, strcmp(ttyname(fd), ptsname(master)));
+        char r[PATH_MAX];
+        ASSERT_NEQ(realpath("/dev/tty", r), NULL);
+        ASSERT_EQ(0, strcmp(r, "/dev/tty"));
+        ASSERT_EQ(0, close(fd));
+        exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+    ASSERT_EQ(0, close(slave));
+    ASSERT_EQ(0, close(master));
+}
+
+// /dev/ptmx opens a new pty's master, as openpty does (it used to be the
+// host's ptmx): its slave is in the ptys' directory, by the name ptsname
+// gives, and the two ends talk through the line discipline.
+TEST(TTYDevPtmx) {
+    struct stat st;
+    ASSERT_EQ(0, stat("/dev/ptmx", &st));
+    ASSERT_EQ(1, S_ISCHR(st.st_mode));
+    ASSERT_EQ(1, dir_has("/dev", "ptmx", NULL));
+
+    int master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    ASSERT_NEQ(master, -1);
+    ASSERT_EQ(1, isatty(master));
+    ASSERT_EQ(0, strcmp(ttyname(master), "/dev/ptmx"));
+    ASSERT_EQ(0, strncmp(ptsname(master), "/tvm/pts/", 9));
+    char name[PATH_MAX];
+    snprintf(name, sizeof(name), "%s", ptsname(master));
+    ASSERT_EQ(1, dir_has("/tvm/pts", strrchr(name, '/') + 1, NULL));
+
+    int slave = open(name, O_RDWR | O_NOCTTY);
+    ASSERT_NEQ(slave, -1);
+    ASSERT_EQ(1, isatty(slave));
+    ASSERT_EQ(0, strcmp(ttyname(slave), name));
+    ASSERT_EQ(3, write(slave, "hi\n", 3));
+    char buf[8];
+    read_full(master, buf, 4);
+    ASSERT_EQ(0, memcmp(buf, "hi\r\n", 4));   // ONLCR
+    ASSERT_EQ(0, close(slave));
+    ASSERT_EQ(0, close(master));
+    ASSERT_EQ(-1, stat(name, &st));
+    ASSERT_EQ(errno, ENOENT);
+}
+
 // =========================================================================
 // Signal edge-case tests
 // =========================================================================
