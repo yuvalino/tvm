@@ -19,14 +19,24 @@
 #include <sys/time.h>
 #include <dirent.h>
 #include <limits.h>
+#include <utime.h>
+#include <sys/statvfs.h>
+#include <sys/xattr.h>
 
 #if defined(__linux__)
 #include <pty.h>
 #include <sys/vfs.h>
+// Darwin's xattr calls, with their position and options
+#define XATTR_GET(p, n, v, s)   getxattr(p, n, v, s)
+#define XATTR_LGET(p, n, v, s)  lgetxattr(p, n, v, s)
+#define XATTR_FSET(fd, n, v, s) fsetxattr(fd, n, v, s, 0)
 #elif defined(__APPLE__)
 #include <util.h>
 #include <sys/param.h>
 #include <sys/mount.h>
+#define XATTR_GET(p, n, v, s)   getxattr(p, n, v, s, 0, 0)
+#define XATTR_LGET(p, n, v, s)  getxattr(p, n, v, s, 0, XATTR_NOFOLLOW)
+#define XATTR_FSET(fd, n, v, s) fsetxattr(fd, n, v, s, 0, 0)
 #endif
 
 //////////
@@ -2338,6 +2348,131 @@ TEST(VfsStatfs) {
     ASSERT_EQ(0, statfs("/bin", &sf));
     ASSERT_EQ(-1, statfs("/tvm/none", &sf));
     ASSERT_EQ(errno, ENOENT);
+}
+
+// Times, sizes, attributes and filesystem statistics by path go through
+// the VFS on every platform: through a bind of a host directory the host
+// answers (utimensat, utimes, lutimes, utime, truncate -- on macOS and iOS
+// they reached the host with the guest path, ENOENT), a descriptor's
+// calls go to its host descriptor, a cpio entry is read-only (EROFS, a
+// directory EISDIR to truncate), has no attributes (ENOTSUP) and a
+// read-only synthetic filesystem (statvfs, as statfs).
+TEST(VfsTimesSizesAttrs) {
+    char dir[] = "/tmp/tvm_times_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char f[PATH_MAX], l[PATH_MAX], buf[64];
+    struct stat st;
+    snprintf(f, sizeof(f), "%s/f", dir);
+    int fd = open(f, O_WRONLY | O_CREAT, 0644);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(6, write(fd, "hello\n", 6));
+    ASSERT_EQ(0, close(fd));
+    snprintf(l, sizeof(l), "%s/l", dir);
+    ASSERT_EQ(0, symlink("f", l));
+    tvm_mount_bind(dir, "/mnt_times_test");
+
+    struct timespec ts[2] = { { 1000000000, 0 }, { 1000000001, 0 } };
+    ASSERT_EQ(0, utimensat(AT_FDCWD, "/mnt_times_test/f", ts, 0));
+    ASSERT_EQ(0, stat(f, &st));
+    ASSERT_EQ(1000000000, st.st_atime);
+    ASSERT_EQ(1000000001, st.st_mtime);
+    struct timeval tv[2] = { { 1100000000, 0 }, { 1100000001, 0 } };
+    ASSERT_EQ(0, utimes("/mnt_times_test/f", tv));
+    ASSERT_EQ(0, stat(f, &st));
+    ASSERT_EQ(1100000001, st.st_mtime);
+    // through a link, and the link itself
+    tv[0].tv_sec = 1200000000; tv[1].tv_sec = 1200000001;
+    ASSERT_EQ(0, utimes("/mnt_times_test/l", tv));
+    ASSERT_EQ(0, stat(f, &st));
+    ASSERT_EQ(1200000001, st.st_mtime);
+    tv[0].tv_sec = 1300000000; tv[1].tv_sec = 1300000001;
+    ASSERT_EQ(0, lutimes("/mnt_times_test/l", tv));
+    ASSERT_EQ(0, lstat(l, &st));
+    ASSERT_EQ(1300000001, st.st_mtime);
+    ASSERT_EQ(0, stat(f, &st));
+    ASSERT_EQ(1200000001, st.st_mtime);
+    struct utimbuf ub = { 1400000000, 1400000001 };
+    ASSERT_EQ(0, utime("/mnt_times_test/f", &ub));
+    ASSERT_EQ(0, stat(f, &st));
+    ASSERT_EQ(1400000001, st.st_mtime);
+    // relative to a descriptor of the bind, and on a descriptor
+    int dfd = open("/mnt_times_test", O_RDONLY | O_DIRECTORY);
+    ASSERT_NEQ(dfd, -1);
+    ts[0].tv_sec = 1500000000; ts[1].tv_sec = 1500000001;
+    ASSERT_EQ(0, utimensat(dfd, "f", ts, 0));
+    ASSERT_EQ(0, close(dfd));
+    ASSERT_EQ(0, stat(f, &st));
+    ASSERT_EQ(1500000001, st.st_mtime);
+    fd = open("/mnt_times_test/f", O_RDWR);
+    ASSERT_NEQ(fd, -1);
+    ts[0].tv_sec = 1600000000; ts[1].tv_sec = 1600000001;
+    ASSERT_EQ(0, futimens(fd, ts));
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(1600000001, st.st_mtime);
+    tv[0].tv_sec = 1700000000; tv[1].tv_sec = 1700000001;
+    ASSERT_EQ(0, futimes(fd, tv));
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(1700000001, st.st_mtime);
+    ASSERT_EQ(0, close(fd));
+
+    ASSERT_EQ(0, truncate("/mnt_times_test/f", 3));
+    ASSERT_EQ(0, stat(f, &st));
+    ASSERT_EQ(3, st.st_size);
+    ASSERT_EQ(-1, truncate("/mnt_times_test", 0));
+    ASSERT_EQ(errno, EISDIR);
+
+    // a cpio entry
+    ASSERT_EQ(-1, utimensat(AT_FDCWD, "/tvm/etc/profile", NULL, 0));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, utimes("/tvm/etc/profile", NULL));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, utimes("/bin/sh", NULL));      // the file behind the bind: /tvm's
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, truncate("/tvm/etc/profile", 0));
+    ASSERT_EQ(errno, EROFS);
+    ASSERT_EQ(-1, truncate("/tvm/etc", 0));
+    ASSERT_EQ(errno, EISDIR);
+    ASSERT_EQ(-1, truncate("/tvm/none", 0));
+    ASSERT_EQ(errno, ENOENT);
+    ASSERT_EQ(-1, XATTR_GET("/tvm/etc/profile", "user.tvm", buf, sizeof(buf)));
+    ASSERT_EQ(errno, ENOTSUP);
+
+    // a host file's attributes: set on a descriptor, read by path through
+    // the bind; the link's own are not the file's
+    fd = open(f, O_RDONLY);
+    ASSERT_NEQ(fd, -1);
+    if (0 == XATTR_FSET(fd, "user.tvm", "v", 1)) {
+        ASSERT_EQ(1, XATTR_GET("/mnt_times_test/f", "user.tvm", buf, sizeof(buf)));
+        ASSERT_EQ('v', buf[0]);
+        ASSERT_EQ(1, XATTR_GET("/mnt_times_test/l", "user.tvm", buf, sizeof(buf)));
+        ASSERT_EQ(-1, XATTR_LGET("/mnt_times_test/l", "user.tvm", buf, sizeof(buf)));
+    }
+    else
+        ASSERT_EQ(errno, ENOTSUP);  // a host filesystem without them
+    ASSERT_EQ(0, close(fd));
+
+    struct statvfs sv;
+    ASSERT_EQ(0, statvfs("/tvm/bin", &sv));
+    ASSERT_EQ(4096, sv.f_bsize);
+    ASSERT_EQ(0, sv.f_blocks);
+    ASSERT_EQ(ST_RDONLY, sv.f_flag & ST_RDONLY);
+    ASSERT_EQ(0, statvfs("/bin/sh", &sv));         // the file behind the bind: /tvm's
+    ASSERT_EQ(0, sv.f_blocks);
+    ASSERT_EQ(0, statvfs("/mnt_times_test", &sv)); // the host's
+    ASSERT_NEQ(0, sv.f_blocks);
+    ASSERT_EQ(0, statvfs("/", &sv));
+    ASSERT_NEQ(0, sv.f_blocks);
+    ASSERT_EQ(-1, statvfs("/tvm/none", &sv));
+    ASSERT_EQ(errno, ENOENT);
+    fd = open("/mnt_times_test/f", O_RDONLY);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, fstatvfs(fd, &sv));
+    ASSERT_NEQ(0, sv.f_blocks);
+    ASSERT_EQ(0, close(fd));
+
+    ASSERT_EQ(0, unlink(l));
+    ASSERT_EQ(0, unlink(f));
+    ASSERT_EQ(0, rmdir(dir));
 }
 
 static int cow_int;
