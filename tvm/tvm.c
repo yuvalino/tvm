@@ -1671,7 +1671,10 @@ static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath
 
 // The VFS's path operations (see "VFS"): every absolute path resolves
 // through the tree to a node -- a mount's entry, a device, or a transient
-// node of the host path behind it -- whose kind answers.
+// node of the host path behind it -- whose kind answers. The hooks call
+// them with a path they normalized first (normalize_path against the
+// task's cwd, dirfd_normalize_path against a descriptor's recorded name):
+// a relative one would mean the host's cwd, not the task's.
 static int vfs_open_path(struct file *file, const char *abspath, int flags, mode_t mode, uid_t uid, gid_t gid);
 static int vfs_stat_path(const char *abspath, struct stat *st, int flag);
 static int vfs_access_path(const char *abspath, int mode, int flags);
@@ -1810,37 +1813,6 @@ static int stat_access(const struct stat *st, int mode)
         return 0;
     errno = EACCES;
     return -1;
-}
-
-// The path operations by name. Every caller hands them an absolute path:
-// the hooks normalize theirs first (normalize_path against the task's cwd,
-// dirfd_normalize_path against the descriptor's recorded name, both
-// absolute or NULL), and tvm_start resolves the initrc's. A relative one
-// used to be passed to the host as it was, against the host's cwd rather
-// than the task's: a branch nothing reached once the hooks normalized,
-// and the wrong directory if anything had (ChownRelative).
-int file_access(const char *pathname, int mode, int flags) {
-    return vfs_access_path(pathname, mode, flags);
-}
-
-int file_stat(const char *pathname, struct stat *statbuf, int flag)
-{
-    return vfs_stat_path(pathname, statbuf, flag);
-}
-
-int file_chmod(const char *pathname, mode_t mode, int flag)
-{
-    return vfs_chmod_path(pathname, mode, flag);
-}
-
-int file_chown(const char *pathname, uid_t owner, gid_t group, int flag)
-{
-    return vfs_chown_path(pathname, owner, group, flag);
-}
-
-ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
-{
-    return vfs_readlink_path(pathname, buf, bufsiz);
 }
 
 /////////////
@@ -12818,7 +12790,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     // The initrc must exist, on the host or inside a config mount (hence after
     // the mounts). Resolved the way the interposed open() will resolve it
-    // later: against cfg->cwd, or the host cwd. file_access() walks the VFS
+    // later: against cfg->cwd, or the host cwd. vfs_access_path() walks the VFS
     // first and falls back to the host, and needs no task.
     if (cfg->initrc) {
         char base[PATH_MAX], abs[PATH_MAX];
@@ -12828,7 +12800,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
                 return -1;
             dir = base;
         }
-        if (!normalize_path(dir, cfg->initrc, abs) || 0 != file_access(abs, R_OK, 0)) {
+        if (!normalize_path(dir, cfg->initrc, abs) || 0 != vfs_access_path(abs, R_OK, 0)) {
             INFO("tvm_start: initrc %s: %s", cfg->initrc, strerror(errno));
             return -1;
         }
@@ -15529,7 +15501,7 @@ FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
         return 0;
     }
 
-    int ret = file_stat(pathname, statbuf, 0);
+    int ret = vfs_stat_path(pathname, statbuf, 0);
 #if TARGET_OS_IOS
     // iOS sandbox may not report execute permission on signed dylibs
     // accessed from the app bundle. Add execute bits so the shell's
@@ -15554,7 +15526,7 @@ FUNCTION_DEFINE2(int, lstat, const char *, pathname, struct stat *, statbuf) {
         return 0;
     }
 
-    int ret = file_stat(pathname, statbuf, AT_SYMLINK_NOFOLLOW);
+    int ret = vfs_stat_path(pathname, statbuf, AT_SYMLINK_NOFOLLOW);
     tvm_sig_leave();
     return ret;
 }
@@ -15623,7 +15595,7 @@ FUNCTION_DEFINE4(int, fstatat, int, dirfd, const char *, pathname, struct stat *
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_stat(pathname, statbuf, flag);
+    int ret = vfs_stat_path(pathname, statbuf, flag);
     tvm_sig_leave();
     return ret;
 }
@@ -15648,7 +15620,7 @@ FUNCTION_DEFINE2(int, access, const char *, pathname, int, mode) {
             mode = F_OK;
     }
     
-    int ret = file_access(pathname, mode, 0);
+    int ret = vfs_access_path(pathname, mode, 0);
     tvm_sig_leave();
     return ret;
 }
@@ -15673,7 +15645,7 @@ FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, 
             mode = F_OK;
     }
 
-    int ret = file_access(pathname, mode, flags);
+    int ret = vfs_access_path(pathname, mode, flags);
     tvm_sig_leave();
     return ret;
 }
@@ -15707,7 +15679,7 @@ FUNCTION_DEFINE2(int, chmod, const char *, pathname, mode_t, mode) {
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_chmod(pathname, mode, 0);
+    int ret = vfs_chmod_path(pathname, mode, 0);
     tvm_sig_leave();
     return ret;
 }
@@ -15719,7 +15691,7 @@ FUNCTION_DEFINE2(int, lchmod, const char *, pathname, mode_t, mode) {
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_chmod(pathname, mode, AT_SYMLINK_NOFOLLOW);
+    int ret = vfs_chmod_path(pathname, mode, AT_SYMLINK_NOFOLLOW);
     tvm_sig_leave();
     return ret;
 }
@@ -15755,7 +15727,7 @@ FUNCTION_DEFINE4(int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_chmod(pathname, mode, flag);
+    int ret = vfs_chmod_path(pathname, mode, flag);
     tvm_sig_leave();
     return ret;
 }
@@ -15770,7 +15742,7 @@ FUNCTION_DEFINE3(int, chown, const char *, pathname, uid_t, owner, gid_t, group)
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_chown(pathname, owner, group, 0);
+    int ret = vfs_chown_path(pathname, owner, group, 0);
     tvm_sig_leave();
     return ret;
 }
@@ -15782,7 +15754,7 @@ FUNCTION_DEFINE3(int, lchown, const char *, pathname, uid_t, owner, gid_t, group
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_chown(pathname, owner, group, AT_SYMLINK_NOFOLLOW);
+    int ret = vfs_chown_path(pathname, owner, group, AT_SYMLINK_NOFOLLOW);
     tvm_sig_leave();
     return ret;
 }
@@ -15818,7 +15790,7 @@ FUNCTION_DEFINE5(int, fchownat, int, dirfd, const char *, pathname, uid_t, owner
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_chown(pathname, owner, group, flag);
+    int ret = vfs_chown_path(pathname, owner, group, flag);
     tvm_sig_leave();
     return ret;
 }
@@ -15873,7 +15845,7 @@ FUNCTION_DEFINE3(ssize_t, readlink, const char *, pathname, char *, buf, size_t,
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    ssize_t ret = file_readlink(pathname, buf, bufsiz);
+    ssize_t ret = vfs_readlink_path(pathname, buf, bufsiz);
     tvm_sig_leave();
     return ret;
 }
@@ -15885,7 +15857,7 @@ FUNCTION_DEFINE4(ssize_t, readlinkat, int, dirfd, const char *, pathname, char *
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    ssize_t ret = file_readlink(pathname, buf, bufsiz);
+    ssize_t ret = vfs_readlink_path(pathname, buf, bufsiz);
     tvm_sig_leave();
     return ret;
 }
@@ -20946,7 +20918,7 @@ FUNCTION_DEFINE4(int, fstatat64, int, dirfd, const char *, pathname, struct stat
     pathname = pathname_abs;
 
     tvm_sig_enter();
-    int ret = file_stat(pathname, (struct stat *)statbuf, flags);
+    int ret = vfs_stat_path(pathname, (struct stat *)statbuf, flags);
     tvm_sig_leave();
     return ret;
 }
