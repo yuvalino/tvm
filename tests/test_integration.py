@@ -2280,6 +2280,19 @@ def test_realpath_namespace(sshi: spawn):
     out, rc = _sh(sshi, "realpath /tvm/bin/sh /bin/sh /tvm/etc/../bin; cd /bin && pwd -P; cd /tvm/bin && pwd -P")
     assert rc == 0 and _lines(out)[-5:] == ["/tvm/bin/bash", "/bin/sh", "/tvm/bin", "/bin", "/tvm/bin"], out
 
+def test_trailing_slash_symlink(sshi: spawn):
+    """A path ending in "/" names a directory: through a symlink to one,
+    find and ls -R see the directory (the final link is followed, lstat
+    included -- `find /usr/share/zoneinfo/`, a host link on macOS, used to
+    list the link alone, 1 entry against 625), without the "/" the link
+    itself, and a file named that way is "Not a directory"."""
+    out, rc = _sh(sshi, "d=$(mktemp -d) && mkdir -p $d/t/a/b && touch $d/t/a/f $d/t/g && ln -s t $d/l && cd $d && "
+                        "find l/ | wc -l && find t | wc -l && find l | wc -l && "
+                        "[ \"$(find l/ -mindepth 1 | sed 's,^l/,,' | sort)\" = \"$(find t -mindepth 1 | sed 's,^t/,,' | sort)\" ] && echo same_tree && "
+                        "[ $(ls -R l/ | wc -l) = $(ls -R t | wc -l) ] && echo same_ls; "
+                        "ls -d t/g/ 2>&1 | grep -c 'Not a directory'; cd /; rm -rf $d")
+    assert rc == 0 and _lines(out)[-6:] == ["5", "5", "1", "same_tree", "same_ls", "1"], out
+
 def test_tty_device_dir(sshi: spawn):
     """The session's tty is an entry of the ptys' directory, a node of the
     tree: the directory exists to ls, [ -d ] and stat (it used to be

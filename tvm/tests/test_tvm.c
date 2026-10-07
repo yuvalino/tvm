@@ -2152,6 +2152,143 @@ TEST(VfsBindCpioLink) {
     }
 }
 
+// A path ending in "/" (or "/.") names a directory: a final symlink is
+// followed, lstat and O_NOFOLLOW included, and anything but a directory
+// is ENOTDIR -- the host's answers for a host path (mkdir of "file/" is
+// the host's EEXIST or ENOTDIR), the resolver's for a cpio entry and a
+// bind. The "/" used to be folded away, so lstat("/usr/share/zoneinfo/")
+// (a host link on macOS) was the link and `find` of it listed one entry.
+TEST(VfsTrailingSlash) {
+    char dir[] = "/tmp/tvm_slash_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char d[PATH_MAX], p[PATH_MAX], q[PATH_MAX], buf[64];
+    struct stat st;
+    snprintf(d, sizeof(d), "%s/d", dir);
+    ASSERT_EQ(0, mkdir(d, 0755));
+    snprintf(p, sizeof(p), "%s/d/f", dir);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    snprintf(p, sizeof(p), "%s/file", dir);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    snprintf(p, sizeof(p), "%s/ld", dir);
+    ASSERT_EQ(0, symlink("d", p));
+    snprintf(p, sizeof(p), "%s/lf", dir);
+    ASSERT_EQ(0, symlink("file", p));
+
+    // a host link to a directory: the directory, however it is asked
+    snprintf(p, sizeof(p), "%s/ld", dir);
+    ASSERT_EQ(0, lstat(p, &st));
+    ASSERT_EQ(1, S_ISLNK(st.st_mode));
+    snprintf(p, sizeof(p), "%s/ld/", dir);
+    ASSERT_EQ(0, lstat(p, &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, fstatat(AT_FDCWD, p, &st, AT_SYMLINK_NOFOLLOW));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(-1, readlink(p, buf, sizeof(buf)));
+    ASSERT_EQ(errno, EINVAL);
+    int fd = open(p, O_RDONLY | O_NOFOLLOW);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(0, fstat(fd, &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, close(fd));
+    ASSERT_EQ(1, dir_has(p, "f", NULL));
+    ASSERT_EQ(0, access(p, F_OK));
+    ASSERT_EQ(0, chmod(p, 0755));
+    snprintf(p, sizeof(p), "%s/ld/.", dir);
+    ASSERT_EQ(0, lstat(p, &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+
+    // a file, or a link to one, named as a directory
+    const char *files[] = { "file", "lf" };
+    for (int i = 0; i < 2; i++) {
+        snprintf(p, sizeof(p), "%s/%s/", dir, files[i]);
+        ASSERT_EQ(-1, lstat(p, &st));
+        ASSERT_EQ(errno, ENOTDIR);
+        ASSERT_EQ(-1, stat(p, &st));
+        ASSERT_EQ(errno, ENOTDIR);
+        ASSERT_EQ(-1, open(p, O_RDONLY));
+        ASSERT_EQ(errno, ENOTDIR);
+        ASSERT_EQ(NULL, opendir(p));
+        ASSERT_EQ(errno, ENOTDIR);
+        ASSERT_EQ(-1, chmod(p, 0644));
+        ASSERT_EQ(errno, ENOTDIR);
+        ASSERT_EQ(-1, unlink(p));
+        ASSERT_EQ(errno, ENOTDIR);
+        snprintf(q, sizeof(q), "%s/moved", dir);
+        ASSERT_EQ(-1, rename(p, q));
+        ASSERT_EQ(errno, ENOTDIR);
+    }
+
+    // the mutators hand the host the "/" with the path
+    snprintf(p, sizeof(p), "%s/new/", dir);
+    ASSERT_EQ(0, mkdir(p, 0755));
+    snprintf(q, sizeof(q), "%s/new", dir);
+    ASSERT_EQ(0, lstat(q, &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, rmdir(p));
+    ASSERT_EQ(-1, lstat(q, &st));
+    ASSERT_EQ(errno, ENOENT);
+
+    // the cwd is recorded without it
+    snprintf(p, sizeof(p), "%s/ld/", dir);
+    ASSERT_EQ(0, chdir(p));
+    ASSERT_NEQ(getcwd(p, sizeof(p)), NULL);
+    ASSERT_NEQ(realpath(d, q), NULL);
+    ASSERT_EQ(0, strcmp(p, q));
+    ASSERT_EQ(0, chdir("/"));
+
+    // a cpio link to a directory, and a cpio file
+    static const struct cpio_ent ents[] = {
+        { "out", S_IFREG | 0644, "root\n" },
+        { "d",   S_IFDIR | 0755, NULL },
+        { "d/f", S_IFREG | 0644, "d\n" },
+        { "lnk", S_IFLNK | 0777, "d" },
+        { "lf",  S_IFLNK | 0777, "out" },
+        { NULL, 0, NULL },
+    };
+    vfs_test_mount("sl", ents, "/mnt_sl_test");
+    ASSERT_EQ(0, lstat("/mnt_sl_test/lnk", &st));
+    ASSERT_EQ(1, S_ISLNK(st.st_mode));
+    ASSERT_EQ(0, lstat("/mnt_sl_test/lnk/", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(0, lstat("/mnt_sl_test/", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(1, dir_has("/mnt_sl_test/lnk/", "f", NULL));
+    assert_file_is("/mnt_sl_test/lnk/f", "d\n");
+    ASSERT_EQ(-1, lstat("/mnt_sl_test/out/", &st));
+    ASSERT_EQ(errno, ENOTDIR);
+    ASSERT_EQ(-1, lstat("/mnt_sl_test/lf/", &st));
+    ASSERT_EQ(errno, ENOTDIR);
+    ASSERT_EQ(-1, open("/mnt_sl_test/out/", O_RDONLY));
+    ASSERT_EQ(errno, ENOTDIR);
+    ASSERT_EQ(-1, unlink("/mnt_sl_test/out/"));
+    ASSERT_EQ(errno, ENOTDIR);
+    ASSERT_EQ(-1, mkdir("/mnt_sl_test/x/", 0755));
+    ASSERT_EQ(errno, EROFS);
+
+    // a bind: of a file (/bin/sh is the initrc's), of a directory
+    ASSERT_EQ(-1, stat("/bin/sh/", &st));
+    ASSERT_EQ(errno, ENOTDIR);
+    ASSERT_EQ(NULL, opendir("/bin/sh/"));
+    ASSERT_EQ(errno, ENOTDIR);
+    tvm_mount_bind(d, "/mnt_sl_bind");
+    ASSERT_EQ(0, lstat("/mnt_sl_bind/", &st));
+    ASSERT_EQ(1, S_ISDIR(st.st_mode));
+    ASSERT_EQ(1, dir_has("/mnt_sl_bind/", "f", NULL));
+    ASSERT_EQ(-1, stat("/mnt_sl_bind/f/", &st));
+    ASSERT_EQ(errno, ENOTDIR);
+
+    snprintf(p, sizeof(p), "%s/d/f", dir);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/file", dir);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/ld", dir);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/lf", dir);
+    ASSERT_EQ(0, unlink(p));
+    ASSERT_EQ(0, rmdir(d));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
 // A directory the VFS serves has no host DIR behind its stream: fdopendir
 // of a cpio file is ENOTDIR by the node (the host said it for the
 // /dev/null behind it), and a stream open across fork reads on in the
