@@ -3275,11 +3275,21 @@ static void terminate_current_locked(int result)
 
 /**
  * normalize `file_name` path, with an optional dirname for relative values.
+ *
+ * A path whose last component is empty, "." or ".." ("dir/", "dir/.")
+ * keeps a trailing "/": POSIX resolves it as a directory, a final
+ * symlink followed and anything else ENOTDIR, which the resolver
+ * (vfs_resolve) applies and a host path carries to the host. It used to
+ * be folded away with the rest, so lstat("/usr/share/zoneinfo/") was the
+ * host link itself and `find /usr/share/zoneinfo/` listed one entry. The
+ * root is "/" alone. A caller that records or compares the path rather
+ * than resolves it takes the "/" off (path_strip_slash).
  */
 char *normalize_path(const char *dirname, const char *file_name, char *out_path)
 {
     char tmp[PATH_MAX];
     int c = 0;
+    int dir = 0;    /* the last component names a directory */
 
     if (!dirname)
         task_lock(current);
@@ -3304,20 +3314,25 @@ char *normalize_path(const char *dirname, const char *file_name, char *out_path)
     char *p = tmp;
     while (*p) {
         while (*p == '/') p++;
-        if (!*p)
+        if (!*p) {
+            dir = 1;
             break;
+        }
 
         char *start = p;
         while (*p && *p != '/') p++;
-        if (*p)
+        int slash = *p == '/';  /* the component is followed by "/" */
+        if (slash)
             *p++ = '\0';
 
         if (strcmp(start, ".") == 0) {
-            continue;
+            dir = 1;
         } else if (strcmp(start, "..") == 0) {
+            dir = 1;
             if (top > 0)
                 top--;
         } else {
+            dir = slash && !*p;
             stack[top++] = start;
         }
     }
@@ -3344,18 +3359,45 @@ char *normalize_path(const char *dirname, const char *file_name, char *out_path)
         out += len;
         left -= len;
 
-        if (i != top - 1) {
+        if (i != top - 1 || dir) {
+            if (left < 2) {
+                errno = ENAMETOOLONG;
+                return NULL;
+            }
             *out++ = '/';
             left--;
         }
     }
 
-    if (out == out_path + 1)  /* root */
-        *out = '\0';
-    else
-        *out = '\0';
-
+    *out = '\0';
     return out_path;
+}
+
+/* The trailing "/" of a normalized path taken off, for a name that is
+   recorded (a cwd, a mount point) or compared rather than resolved; 1
+   when there was one */
+static int path_strip_slash(char *path)
+{
+    size_t len = strlen(path);
+    if (len < 2 || path[len - 1] != '/')
+        return 0;
+    path[len - 1] = 0;
+    return 1;
+}
+
+/* The "/" put back on a path (PATH_MAX) that must name a directory */
+static int path_add_slash(char *path)
+{
+    size_t len = strlen(path);
+    if (len && path[len - 1] == '/')
+        return 0;
+    if (len + 2 > PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    path[len] = '/';
+    path[len + 1] = 0;
+    return 0;
 }
 
 // The path of an open file as the task knows it: the name file_open()
@@ -6669,8 +6711,12 @@ static void vfs_attach_locked(struct vfs_node *parent, struct vfs_node *child)
    with the archive, attached under vfs_lock. */
 static int vfs_load_cpio(struct vfs_node *vn, const void *buf, size_t len);
 
-static int vfs_mount_cpio(const char *abspath, const void *buf, size_t size)
+static int vfs_mount_cpio(const char *path, const void *buf, size_t size)
 {
+    char abspath[PATH_MAX];
+    snprintf(abspath, sizeof(abspath), "%s", path);
+    path_strip_slash(abspath);  /* a name in the tree: "/tvm/" mounts at /tvm */
+
     VFS_LOCK();
     struct vfs_node *parent;
     char leaf[NAME_MAX + 1];
@@ -6715,8 +6761,13 @@ static int vfs_bind(const char *source, const char *mountpoint)
 {
     char s[PATH_MAX], m[PATH_MAX];
     if (source[0] != '/' || mountpoint[0] != '/' ||
-        !normalize_path("/", source, s) || !normalize_path("/", mountpoint, m) ||
-        0 == strcmp(m, "/") || 0 == strcmp(m, s)) {
+        !normalize_path("/", source, s) || !normalize_path("/", mountpoint, m)) {
+        errno = EINVAL;
+        return -1;
+    }
+    path_strip_slash(s);    /* names in the tree, not resolved: "/bin/sh/" is /bin/sh */
+    path_strip_slash(m);
+    if (0 == strcmp(m, "/") || 0 == strcmp(m, s)) {
         errno = EINVAL;
         return -1;
     }
@@ -6812,6 +6863,12 @@ static int vfs_mount_dev(const char *abspath, mode_t mode, const struct vfs_node
  * (nothing at /outside) while stat("/mnt/up") is a/../outside, the
  * host's (VfsRealpath pins both). The result is a node, locked with a
  * reference: the tree's, or a VN_HOST node of the host path.
+ *
+ * A path ending in "/" (normalize_path keeps it) must name a directory:
+ * a cpio symlink as the final component is followed, VR_NOFOLLOW or
+ * not, and a node that is no directory is ENOTDIR; a host result keeps
+ * the "/" on its path, for the host to apply the same to its own links
+ * and files, and a bind's target is walked with it (vfs_bind_target).
  */
 #define VR_NOFOLLOW 0x1     /* a cpio symlink as the final component is the result itself */
 #define VR_PARENT   0x2     /* resolve the directory part; the final component's name in leaf */
@@ -6821,10 +6878,12 @@ static int vfs_mount_dev(const char *abspath, mode_t mode, const struct vfs_node
    (vfs_node_stat and the others), which consumes it. */
 struct vfs_res {
     struct vfs_node *vn;
-    char path[PATH_MAX];        /* the node's canonical guest path; a host node's: the host path to operate on */
+    char path[PATH_MAX];        /* the node's canonical guest path; a host node's: the host path to operate on;
+                                   with the trailing "/" of a path that must name a directory for a host or bind node */
     char leaf[NAME_MAX + 1];    /* VR_PARENT: the final component */
     int mount_id;               /* the mount the result lives in, 0 for the host namespace */
     int is_mountpoint;          /* the final component is a mount point: a bind, a cpio root, an overlay directory, a device */
+    int trailing;               /* the path ended in "/" (normalize_path): it must name a directory */
 };
 
 /* The components strtok_r has not handed out yet, `next` first */
@@ -6923,7 +6982,7 @@ static int vfs_walk_push(struct vfs_walk *w, const char *tok)
 }
 
 static int vfs_resolve(const char *abspath, unsigned flags, struct vfs_res *out);
-static int vfs_bind_target(struct vfs_node *vn, struct vfs_res *out);
+static int vfs_bind_target(struct vfs_node *vn, int trailing, struct vfs_res *out);
 
 /* A node is a mount point unless it is an entry of one: a cpio entry
    under a cpio directory, a device directory's entry, a host node. The
@@ -6968,12 +7027,16 @@ static int vfs_resolve_walk(const char *abspath, unsigned flags, struct vfs_res 
         return -1;
     }
 
+    char tmp[PATH_MAX], rest[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", abspath);
+    int trailing = path_strip_slash(tmp);
+
     if (flags & VR_PARENT) {
         /* the directory part, links followed, and a bind it ends at too
            (the entry goes in what the bind names); the leaf by name, for
            the caller to look at itself (it may not exist, or be a mount
            point) */
-        const char *slash = strrchr(abspath, '/');
+        const char *slash = strrchr(tmp, '/');
         if (!slash[1]) {
             errno = EINVAL;     /* "/" has no leaf */
             return -1;
@@ -6983,28 +7046,28 @@ static int vfs_resolve_walk(const char *abspath, unsigned flags, struct vfs_res 
             return -1;
         }
         char dir[PATH_MAX];
-        size_t dlen = slash == abspath ? 1 : (size_t)(slash - abspath);
-        memcpy(dir, abspath, dlen);
+        size_t dlen = slash == tmp ? 1 : (size_t)(slash - tmp);
+        memcpy(dir, tmp, dlen);
         dir[dlen] = 0;
         if (0 != vfs_resolve(dir, flags & ~(VR_PARENT | VR_NOFOLLOW), out))
             return -1;
-        if (out->vn->vn_kind == VN_BIND && 0 != vfs_bind_target(out->vn, out))
+        if (out->vn->vn_kind == VN_BIND && 0 != vfs_bind_target(out->vn, 0, out))
             return -1;
         strcpy(out->leaf, slash + 1);
         out->is_mountpoint = 0;
+        out->trailing = trailing;
         return 0;
     }
 
-    char tmp[PATH_MAX], rest[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s", abspath);
-
     if (!vfs_root) {
         /* before vfs_init: nothing is mounted, every path is the host's */
-        snprintf(out->path, sizeof(out->path), "%s", abspath);
+        snprintf(out->path, sizeof(out->path), "%s", tmp);
         goto host;
     }
 
 restart:;
+    /* a link's or a bind's target may end in "/" itself */
+    trailing |= path_strip_slash(tmp);
     struct vfs_node *cur = vfs_root;
     vn_lock(cur, 1);
     vfs_walk_restart(w, tmp);
@@ -7103,7 +7166,7 @@ restart:;
             goto restart;
         }
 
-        if (child->vn_kind == VN_CPIO && S_ISLNK(child->vn_st.st_mode) && (next || !(flags & VR_NOFOLLOW))) {
+        if (child->vn_kind == VN_CPIO && S_ISLNK(child->vn_st.st_mode) && (next || trailing || !(flags & VR_NOFOLLOW))) {
             if (!child->vn_data || child->vn_size >= PATH_MAX) {
                 vn_unlock(child, 1);
                 vn_unlock(cur, 1);
@@ -7164,18 +7227,32 @@ restart:;
         tok = next;
     }
 
+    /* a bind's target answers for it, walked with the "/" (vfs_bind_target) */
+    if (trailing && cur->vn_kind != VN_BIND && !S_ISDIR(cur->vn_st.st_mode)) {
+        vn_unlock(cur, 1);
+        errno = ENOTDIR;
+        return -1;
+    }
     out->vn = cur;
     vfs_node_path_locked(cur, out->path, sizeof(out->path));
     out->mount_id = cur->vn_mount_id;
     out->is_mountpoint = vfs_node_is_mountpoint(cur);
+    out->trailing = trailing;
+    if (trailing && cur->vn_kind == VN_BIND && path_add_slash(out->path)) {
+        vn_unlock(cur, 1);
+        return -1;
+    }
     return 0;
 
 host:
     /* the host's: a transient node of the path in out->path, of the bind
-       it is under */
+       it is under; with the "/" for the host to apply */
+    if (trailing && path_add_slash(out->path))
+        return -1;
     if (!(out->vn = vfs_host_node(out->path, w->host_mount_id)))
         return -1;
     out->mount_id = w->host_mount_id;
+    out->trailing = trailing;
     return 0;
 }
 
@@ -7199,13 +7276,15 @@ static int vfs_resolve(const char *abspath, unsigned flags, struct vfs_res *out)
    renaming or linking out of it is EXDEV). The lookup takes the nodes on
    the target's path, which may lead back to the bind, so the bind is let
    go of first. */
-static int vfs_bind_target(struct vfs_node *vn, struct vfs_res *out)
+static int vfs_bind_target(struct vfs_node *vn, int trailing, struct vfs_res *out)
 {
     struct vfs_walk w = { .nmap = 0, .mount = NULL, .nlinks = 0 };
     char target[PATH_MAX];
     int r;
     for (;;) {
-        snprintf(target, sizeof(target), "%s", vn->vn_target);
+        /* with the "/" of a path that must name a directory: the target's
+           walk applies it (a file bind named "/bin/sh/" is ENOTDIR) */
+        snprintf(target, sizeof(target), "%s%s", vn->vn_target, trailing ? "/" : "");
         w.host_mount_id = vn->vn_mount_id;
         vn_unlock(vn, 1);
         if (++w.nlinks > MAXSYMLINKS) {
@@ -7235,7 +7314,7 @@ static int vfs_backing_path(const char *abspath, char *out)
     struct vfs_res res;
     if (0 != vfs_resolve(abspath, 0, &res))
         return -1;
-    if (res.vn->vn_kind == VN_BIND && 0 != vfs_bind_target(res.vn, &res))
+    if (res.vn->vn_kind == VN_BIND && 0 != vfs_bind_target(res.vn, res.trailing, &res))
         return -1;
     vn_unlock(res.vn, 1);
     strcpy(out, res.path);
@@ -7932,17 +8011,19 @@ static const struct vfs_nodeops vfs_overlay_ops = {
  * bind.
  */
 /* the operation's node, referenced and unlocked, handed to vfs_bind_target
-   with the lock and reference it consumes */
-static int bind_forward(struct vfs_node *vn, struct vfs_res *out)
+   with the lock and reference it consumes; `path` is the bind's, with the
+   "/" of a path that must name a directory (the resolver's) */
+static int bind_forward(struct vfs_node *vn, const char *path, struct vfs_res *out)
 {
+    size_t len = strlen(path);
     vn_lock(vn, 1);
-    return vfs_bind_target(vn, out);
+    return vfs_bind_target(vn, len > 1 && path[len - 1] == '/', out);
 }
 
 static int bind_stat(struct vfs_node *vn, const char *path, struct stat *st, int flags)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_stat(res.vn, res.path, st, flags & ~AT_SYMLINK_NOFOLLOW);
 }
@@ -7950,7 +8031,7 @@ static int bind_stat(struct vfs_node *vn, const char *path, struct stat *st, int
 static int bind_access(struct vfs_node *vn, const char *path, int mode, int flags)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_access(res.vn, res.path, mode, flags & ~AT_SYMLINK_NOFOLLOW);
 }
@@ -7958,7 +8039,7 @@ static int bind_access(struct vfs_node *vn, const char *path, int mode, int flag
 static int bind_chmod(struct vfs_node *vn, const char *path, mode_t mode, int flags)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_chmod(res.vn, res.path, mode, flags & ~AT_SYMLINK_NOFOLLOW);
 }
@@ -7966,7 +8047,7 @@ static int bind_chmod(struct vfs_node *vn, const char *path, mode_t mode, int fl
 static int bind_chown(struct vfs_node *vn, const char *path, uid_t owner, gid_t group, int flags)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_chown(res.vn, res.path, owner, group, flags & ~AT_SYMLINK_NOFOLLOW);
 }
@@ -7974,7 +8055,7 @@ static int bind_chown(struct vfs_node *vn, const char *path, uid_t owner, gid_t 
 static int bind_statfs(struct vfs_node *vn, const char *path, struct statfs *buf)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_statfs(res.vn, res.path, buf);
 }
@@ -7983,7 +8064,7 @@ static int bind_statfs(struct vfs_node *vn, const char *path, struct statfs *buf
 static int bind_utimens(struct vfs_node *vn, const char *path, const struct timespec *times, int flags)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_utimens(res.vn, res.path, times, flags & ~AT_SYMLINK_NOFOLLOW);
 }
@@ -7991,7 +8072,7 @@ static int bind_utimens(struct vfs_node *vn, const char *path, const struct time
 static ssize_t bind_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, int nofollow)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_getxattr(res.vn, res.path, name, value, size, 0);
 }
@@ -7999,7 +8080,7 @@ static ssize_t bind_getxattr(struct vfs_node *vn, const char *path, const char *
 static int bind_statvfs(struct vfs_node *vn, const char *path, struct statvfs *buf)
 {
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res))
+    if (0 != bind_forward(vn, path, &res))
         return -1;
     return vfs_node_statvfs(res.vn, res.path, buf);
 }
@@ -8037,7 +8118,7 @@ static int bind_open(struct vfs_node *vn, const char *path, int flags, mode_t mo
         return vfs_open_fail(out);
 
     struct vfs_res res;
-    if (0 != bind_forward(vn, &res)) {
+    if (0 != bind_forward(vn, path, &res)) {
         if ((flags & O_CREAT) && errno == ENOENT)
             errno = vfs_create_enoent(path, EROFS);     /* a dangling bind: the resolver's ENOENT */
         return vfs_open_fail(out);
@@ -8195,6 +8276,10 @@ static int vfs_mutate_path(const char *abspath, struct vfs_mut *m)
     m->parent_errno = vfs_node_mutate(parent.vn, parent.path);
     snprintf(m->path, sizeof(m->path), "%s", parent.path);
     if (vfs_path_join(m->path, parent.leaf))
+        return -1;
+    /* the "/" of a path that must name a directory goes to the host with
+       the operation (rmdir("d/") removes d, unlink("f/") is ENOTDIR) */
+    if (parent.trailing && path_add_slash(m->path))
         return -1;
 
     struct vfs_res leaf;
@@ -19944,10 +20029,11 @@ FUNCTION_DEFINE1(int, chdir, const char *, path) {
 
     tvm_sig_enter();
     task_lock(current);
-    strcpy(current->tsk_cwd, path);
+    path_strip_slash(abs_path);     /* the recorded cwd is what getcwd reports and relative paths join */
+    strcpy(current->tsk_cwd, abs_path);
     task_unlock(current);
     tvm_sig_leave();
-    
+
     return 0;
 }
 
