@@ -1742,7 +1742,10 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
 static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath, const char *devpath, int flags, mode_t mode, uid_t uid, gid_t gid)
 {
     if (devpath[0] != '/') {
-        // relative to a descriptor with no recorded path: the host's
+        // relative to a descriptor with no recorded path (file_open: one
+        // adopted from the host, which no name was recorded for): the
+        // host's, by (dirfd, relative) -- the one relative path the path
+        // operations ever see, as the others' callers normalize theirs
         int rfd = CALL_FUNC(openat, dirfd, hostpath, flags, mode);
         if (rfd == -1)
             return -1;
@@ -1808,37 +1811,34 @@ static int stat_access(const struct stat *st, int mode)
     return -1;
 }
 
+// The path operations by name. Every caller hands them an absolute path:
+// the hooks normalize theirs first (normalize_path against the task's cwd,
+// dirfd_normalize_path against the descriptor's recorded name, both
+// absolute or NULL), and tvm_start resolves the initrc's. A relative one
+// used to be passed to the host as it was, against the host's cwd rather
+// than the task's: a branch nothing reached once the hooks normalized,
+// and the wrong directory if anything had (ChownRelative).
 int file_access(const char *pathname, int mode, int flags) {
-    if (pathname[0] != '/')
-        return CALL_FUNC(faccessat, AT_FDCWD, pathname, mode, flags);
     return vfs_access_path(pathname, mode, flags);
 }
 
 int file_stat(const char *pathname, struct stat *statbuf, int flag)
 {
-    if (pathname[0] != '/')
-        return CALL_FUNC(fstatat, AT_FDCWD, pathname, statbuf, flag);
     return vfs_stat_path(pathname, statbuf, flag);
 }
 
 int file_chmod(const char *pathname, mode_t mode, int flag)
 {
-    if (pathname[0] != '/')
-        return CALL_FUNC(fchmodat, AT_FDCWD, pathname, mode, flag);
     return vfs_chmod_path(pathname, mode, flag);
 }
 
 int file_chown(const char *pathname, uid_t owner, gid_t group, int flag)
 {
-    if (pathname[0] != '/')
-        return CALL_FUNC(fchownat, AT_FDCWD, pathname, owner, group, flag);
     return vfs_chown_path(pathname, owner, group, flag);
 }
 
 ssize_t file_readlink(const char *pathname, char *buf, size_t bufsiz)
 {
-    if (pathname[0] != '/')
-        return CALL_FUNC(readlink, pathname, buf, bufsiz);
     return vfs_readlink_path(pathname, buf, bufsiz);
 }
 
@@ -4076,7 +4076,10 @@ int task_filestreamrealloc_locked(struct task *t, struct file_stream *fs) {
 
     fs->fs_gencnt = file->f_gencnt;
     if (fs->fs_type == FS_DIR) {
-        if (!(fs->fs_dp = CALL_FUNC(fdopendir, file->f_rfd))) {
+        /* a directory the VFS serves has no host DIR (fdopendir): the
+           child reads the listing through the file it shares */
+        int vfs = file->f_ops && file->f_ops->f_readdir;
+        if (!vfs && !(fs->fs_dp = CALL_FUNC(fdopendir, file->f_rfd))) {
             file_unlock(file, 1);
             return -1;
         }
@@ -4151,8 +4154,10 @@ static struct file *file_for_task_stream_locked(struct task *t, struct file_stre
     if (file->f_gencnt != fs->fs_gencnt) {
         if (fs->fs_type == FS_FILE)
             fp_setfileno(fs->fs_fp, file->f_rfd);
-        else if (fs->fs_type == FS_DIR)
-            dp_setfileno(fs->fs_dp, file->f_rfd);
+        else if (fs->fs_type == FS_DIR) {
+            if (fs->fs_dp)      /* none for a directory the VFS serves (fdopendir) */
+                dp_setfileno(fs->fs_dp, file->f_rfd);
+        }
         else {
             // unknown type?
             file_unlock(file, 1);
@@ -6719,8 +6724,10 @@ static int vfs_mount_dev(const char *abspath, mode_t mode, const struct vfs_devo
  * (normalize_path), walked from the root: at each directory node the next
  * component is looked for among its own children; a cpio symlink met on
  * the way, or last unless VR_NOFOLLOW, is spliced in -- its target, then
- * the rest of the path, folded lexically from the directory it is in --
- * and the walk restarts from the root, so a link may name any guest path
+ * the rest of the path, folded lexically from the directory it is in, by
+ * the guest path walked to it (struct vfs_walk: through a bind, the mount
+ * point's, as the kernel resolves a link under a bind mount) -- and the
+ * walk restarts from the root, so a link may name any guest path
  * (/tvm/bin/sh, a host file, another mount). A bind node is spliced the
  * same way, with its target: always, as mount(2) resolves the source's
  * links when mounting (lstat of a file bind is the file), unless the next
@@ -6732,10 +6739,14 @@ static int vfs_mount_dev(const char *abspath, mode_t mode, const struct vfs_devo
  * directory's lock dropped: a transient node of the entry, or ENOENT),
  * and for an overlay the host path of the same name with the rest of the
  * path behind it, which the host resolves in its own namespace from there
- * (host links included: a relative one climbing out of a bound directory
+ * -- host links included: a relative one climbing out of a bound directory
  * goes where the host's does, not to the mount point's parent as on Linux
- * -- a TODO). The result is a node, locked with a reference, or a host
- * path.
+ * (a TODO: no per-component lstat is done on the host side). tvm_realpath
+ * does splice a host link from the guest path, so realpath and the path
+ * calls disagree on such a link: with host a/up -> ../outside and a bound
+ * at /mnt, realpath("/mnt/up") is ENOENT (nothing at /outside) while
+ * stat("/mnt/up") is a/../outside, the host's (VfsRealpath pins both).
+ * The result is a node, locked with a reference, or a host path.
  */
 #define VR_NOFOLLOW 0x1     /* a cpio symlink as the final component is the result itself */
 #define VR_PARENT   0x2     /* resolve the directory part; the final component's name in leaf */
@@ -6748,7 +6759,6 @@ struct vfs_res {
     char leaf[NAME_MAX + 1];    /* VR_PARENT: the final component */
     int mount_id;               /* the mount the result lives in, 0 for the host namespace */
     int is_mountpoint;          /* the final component is a mount point: a bind, a cpio root, an overlay directory */
-    int crossed_vfs;            /* 0: the walk fell through overlays only, and path is the input */
 };
 
 /* The components strtok_r has not handed out yet, `next` first */
@@ -6763,12 +6773,17 @@ static void vfs_rest(const char *next, const char *saveptr, char *rest)
         snprintf(rest, PATH_MAX, "%s", next);
 }
 
+/* `name` behind `path`, with a "/" between unless path is "/" (or
+   nothing). The test for "/" was the length alone, so a relative link
+   target of one character (lnk -> d) had the rest of the path glued to
+   it: /mnt/lnk/sub was looked for as dsub under /mnt. */
 static int vfs_path_join(char *path, const char *name)
 {
     if (!name[0])
         return 0;
     size_t len = strlen(path);
-    int n = snprintf(path + len, PATH_MAX - len, "%s%s", len > 1 ? "/" : "", name);
+    const char *sep = (len == 0 || (len == 1 && path[0] == '/')) ? "" : "/";
+    int n = snprintf(path + len, PATH_MAX - len, "%s%s", sep, name);
     if (n < 0 || (size_t)n >= PATH_MAX - len) {
         errno = ENAMETOOLONG;
         return -1;
@@ -6776,7 +6791,72 @@ static int vfs_path_join(char *path, const char *name)
     return 0;
 }
 
-static int vfs_resolve(const char *abspath, unsigned flags, struct vfs_res *out)
+/*
+ * The guest path walked to the directory being looked in (gpath): what a
+ * relative cpio link met there is from. The walk restarts from the root
+ * on a splice, with the target in place of what was spliced, so the path
+ * walked is not the one in hand: after a bind's splice the target's own
+ * components are walked first (their guest path is theirs, a link among
+ * them being the target's own), and once the last of them is consumed --
+ * `ntail` components left, the rest of the caller's path behind the mount
+ * point -- the guest path is the mount point's, where the caller's path
+ * had it. A bind met while walking a target pushes one more of these,
+ * applied first (more of the path is left at its point), and a bind whose
+ * target ends at another bind keeps the outer mount point, the one walked.
+ * The mount points are on the heap: one per splice, so a loop of binds
+ * would pile up MAXSYMLINKS of PATH_MAX on the stack.
+ */
+struct vfs_walk {
+    char gpath[PATH_MAX];       /* the guest path of the directory being looked in */
+    int left;                   /* components of the path in hand not consumed yet */
+    int nmap;
+    int ntail[MAXSYMLINKS + 1]; /* [i]: with this many left, gpath is mount[i] */
+    char (*mount)[PATH_MAX];    /* kalloc'ed at the first push, freed by vfs_resolve */
+};
+
+/* The walk starts over with `path` (absolute, normalized) in hand */
+static void vfs_walk_restart(struct vfs_walk *w, const char *path)
+{
+    strcpy(w->gpath, "/");
+    w->left = 0;
+    for (const char *p = path; *p; p++)
+        w->left += *p == '/' && p[1] && p[1] != '/';
+}
+
+/* The component `tok` is consumed: the guest path is its directory's */
+static int vfs_walk_step(struct vfs_walk *w, const char *tok)
+{
+    w->left--;
+    if (w->nmap && w->ntail[w->nmap - 1] == w->left) {
+        strcpy(w->gpath, w->mount[--w->nmap]);
+        return 0;
+    }
+    return vfs_path_join(w->gpath, tok);
+}
+
+/* The bind `tok` is spliced (`left` counts it still): its mount point is
+   the guest path of what its target's walk ends at */
+static int vfs_walk_push(struct vfs_walk *w, const char *tok)
+{
+    int ntail = w->left - 1;
+    if (w->nmap && w->ntail[w->nmap - 1] == ntail)
+        return 0;   /* a bind of a bind: the outer mount point is the one walked */
+    char (*mount)[PATH_MAX] = krealloc(w->mount, (w->nmap + 1) * sizeof(*mount));
+    if (!mount) {
+        errno = ENOMEM;
+        return -1;
+    }
+    w->mount = mount;
+    snprintf(w->mount[w->nmap], PATH_MAX, "%s", w->gpath);
+    if (vfs_path_join(w->mount[w->nmap], tok))
+        return -1;
+    w->ntail[w->nmap++] = ntail;
+    return 0;
+}
+
+static int vfs_resolve(const char *abspath, unsigned flags, struct vfs_res *out);
+
+static int vfs_resolve_walk(const char *abspath, unsigned flags, struct vfs_res *out, struct vfs_walk *w)
 {
     memset(out, 0, sizeof(*out));
     if (abspath[0] != '/') {
@@ -6823,6 +6903,7 @@ static int vfs_resolve(const char *abspath, unsigned flags, struct vfs_res *out)
 restart:;
     struct vfs_node *cur = vfs_root;
     vn_lock(cur, 1);
+    vfs_walk_restart(w, tmp);
     char *saveptr;
     char *tok = strtok_r(tmp, "/", &saveptr);
 
@@ -6850,7 +6931,10 @@ restart:;
                 errno = ENOTDIR;
                 return -1;
             }
-            out->crossed_vfs = 1;
+            if (vfs_walk_step(w, tok)) {
+                vn_unlock(child, 1);
+                return -1;
+            }
             cur = child;
             tok = next;
             continue;
@@ -6883,6 +6967,11 @@ restart:;
                 struct vfs_node *nested = vfs_find_child_locked(child, next);
                 if (nested) {
                     vn_unlock(nested, 1);
+                    if (vfs_walk_step(w, tok)) {
+                        vn_unlock(child, 1);
+                        vn_unlock(cur, 1);
+                        return -1;
+                    }
                     vn_unlock(cur, 1);
                     cur = child;
                     tok = next;
@@ -6908,12 +6997,15 @@ restart:;
             vn_unlock(child, 1);
             vn_unlock(cur, 1);
 
+            /* the mount point is the guest path of what the target's walk
+               ends at (vfs_walk_push, before tok goes with tmp) */
+            if (vfs_walk_push(w, tok))
+                return -1;
             vfs_rest(next, saveptr, rest);
             if (vfs_path_join(target, rest))
                 return -1;
             if (!normalize_path("/", target, tmp))
                 return -1;
-            out->crossed_vfs = 1;
             if (!next) {
                 /* the source is what the mount point is, links and all */
                 final_bind = 1;
@@ -6936,25 +7028,32 @@ restart:;
                 return -1;
             }
 
-            char target[PATH_MAX], base[PATH_MAX];
+            char target[PATH_MAX];
             memcpy(target, child->vn_data, child->vn_size);
             target[child->vn_size] = 0;
-            /* a relative target is from the directory the link is in */
-            vfs_node_path_locked(cur, base, sizeof(base));
             vn_unlock(child, 1);
             vn_unlock(cur, 1);
 
             /* The target with the rest of the path behind it, folded the way
                the caller's path was (".." steps over the link's directory,
-               as the host's namei does). Restart from the root, in place
-               rather than by recursion, so a chain of links cannot pile up
-               PATH_MAX buffers on the stack. */
+               as the host's namei does): a relative target is from the
+               directory the link is in, by the guest path walked to it
+               (w->gpath) -- through a bind, the mount point's, as the
+               kernel resolves a link under a bind mount, not the source's
+               the node is canonically at. It used to be the canonical
+               path, so with /mnt/d bound at /bd and d/up -> ../out, `cat
+               /bd/up` read /mnt/out while realpath (tvm_realpath, which
+               splices from the guest prefix) said /out: open, stat and
+               realpath now agree on /out. The mappings of the binds
+               walked through stay: the rest of the path is still behind
+               the target. Restart from the root, in place rather than by
+               recursion, so a chain of links cannot pile up PATH_MAX
+               buffers on the stack. */
             vfs_rest(next, saveptr, rest);
             if (vfs_path_join(target, rest))
                 return -1;
-            if (!normalize_path(base, target, tmp))
+            if (!normalize_path(w->gpath, target, tmp))
                 return -1;
-            out->crossed_vfs = 1;
             host_mount_id = 0;  /* a link is followed in the namespace it names */
             goto restart;
         }
@@ -6966,8 +7065,11 @@ restart:;
             return -1;
         }
 
-        if (child->vn_kind != VN_OVERLAY)
-            out->crossed_vfs = 1;
+        if (vfs_walk_step(w, tok)) {
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
+            return -1;
+        }
         vn_unlock(cur, 1);
         cur = child;
         tok = next;
@@ -6982,6 +7084,17 @@ restart:;
     out->is_mountpoint = final_bind ||
         (!cur->vn_transient && (cur->vn_kind != VN_CPIO || !cur->vn_parent || cur->vn_parent->vn_kind != VN_CPIO));
     return 0;
+}
+
+static int vfs_resolve(const char *abspath, unsigned flags, struct vfs_res *out)
+{
+    struct vfs_walk w = { .nmap = 0, .mount = NULL };
+    int r = vfs_resolve_walk(abspath, flags, out, &w);
+    int last_errno = errno;
+    if (w.mount)
+        kfree(w.mount);
+    errno = last_errno;
+    return r;
 }
 
 /* The physical name of `abspath`: the canonical guest path of the node it
@@ -7004,13 +7117,17 @@ static int vfs_physical_path(const char *abspath, char *out)
  * guest path: ENOENT for anything under a mount (/tvm), and the host's
  * answer for a bind (/bin/sh, only because macOS has one). Every prefix
  * of the normalized path is resolved with its last component taken as
- * is: a cpio symlink is spliced and the walk restarts; a bind is kept by
- * its mount point, which hides the source (Linux: /t/mnt/sub, never
- * /t/src/sub); a host object is lstat'ed and, when a link, read and
+ * is: a cpio symlink is spliced and the walk restarts, from the guest
+ * prefix as vfs_resolve splices it (through a bind, the mount point's
+ * path), so open, stat and realpath agree on where it leads; a bind is
+ * kept by its mount point, which hides the source (Linux: /t/mnt/sub,
+ * never /t/src/sub); a host object is lstat'ed and, when a link, read and
  * spliced from the guest prefix -- so here a relative host link under a
  * bind that climbs out does go through the mount point's parent, as on
- * Linux (vfs_resolve itself does not; a TODO) -- else kept. A component
- * that is nothing is ENOENT, as realpath reports.
+ * Linux, while vfs_resolve leaves host links to the host, which takes
+ * them from the source's directory (its TODO): realpath and the path
+ * calls disagree on such a link, the one known deviation -- else kept. A
+ * component that is nothing is ENOENT, as realpath reports.
  */
 static int tvm_realpath(const char *abspath, char *out)
 {
@@ -7114,6 +7231,7 @@ static int vfs_statfs_node(struct vfs_node *vn, struct statfs *buf)
 struct vfs_dirent {
     ino_t vd_ino;
     unsigned char vd_type;
+    unsigned char vd_stat;      /* the inode (and a DT_UNKNOWN type) are a stat's of its path, still to take (vfs_dir_stat_entries) */
     char vd_name[NAME_MAX + 1];
 };
 
@@ -7121,6 +7239,7 @@ struct vfs_dir {
     struct vfs_dirent *vd_ents;
     int vd_n;
     int vd_cap;
+    int vd_cover;               /* [2, vd_cover): the layers above the one being added, which cover an entry of their name */
 };
 
 struct vfs_file {
@@ -8021,6 +8140,7 @@ static int vfs_dir_add(struct vfs_dir *d, const char *name, ino_t ino, unsigned 
     struct vfs_dirent *e = &d->vd_ents[d->vd_n++];
     e->vd_ino = ino;
     e->vd_type = type;
+    e->vd_stat = 0;
     snprintf(e->vd_name, sizeof(e->vd_name), "%s", name);
     return 0;
 }
@@ -8053,16 +8173,84 @@ static unsigned char vfs_dirent_type(const struct vfs_node *vn)
    until the next, and telldir/seekdir positions are indexes into it. The
    entries used to be the own children by index, without "." and "..",
    d_type 0 and no host entries, so `ls /` had no tvm. */
-/* An underlay entry: added unless an entry of that name is listed already
-   (own entries win, and a mount covers the host entry of its name) */
+/* The listing is layers, each one directory's entries -- the own
+   children, a device directory's, the host's -- and an entry is covered
+   by one of its name in a layer above it (own entries win, and a mount
+   covers the host entry of its name). A layer's own names are distinct,
+   so an entry is checked against the layers above alone: it used to be
+   checked against every entry listed so far, its own layer's included,
+   which made the host layer quadratic (/usr/bin's 926 entries: 4.2 ms a
+   listing against 0.37 natively). A layer begins here. */
+static void vfs_dir_layer(struct vfs_dir *d)
+{
+    d->vd_cover = d->vd_n;
+}
+
+/* An underlay entry: added unless a layer above has one of that name */
 static int vfs_dir_add_covered(struct vfs_dir *d, const char *name, ino_t ino, unsigned char type)
 {
     if (0 == strcmp(name, ".") || 0 == strcmp(name, ".."))
         return 0;
-    for (int i = 2; i < d->vd_n; i++)
+    for (int i = 2; i < d->vd_cover; i++)
         if (0 == strcmp(d->vd_ents[i].vd_name, name))
             return 0;
     return vfs_dir_add(d, name, ino, type);
+}
+
+/* An own child of a directory as an entry (`covered`: unless a layer
+   above has one of its name). Name, inode and kind are fixed at creation,
+   the type bits of st_mode too (chmod keeps them). Its d_ino is what a
+   stat of its path reports, which is the node's own for a cpio entry
+   alone: an overlay's is its host directory's when there is one, a bind's
+   its target's, a device's its driver's (vfs_stat_node), so those are
+   marked for vfs_dir_stat_entries, once the directory's lock is dropped.
+   They used to be listed with the node's, so readdir("/")'s usr had an
+   inode of the VM's while stat("/usr") had the host's. */
+static int vfs_dir_add_child(struct vfs_dir *d, struct vfs_node *child, int covered)
+{
+    int n = d->vd_n;
+    ino_t ino = child->vn_st.st_ino;
+    unsigned char type = vfs_dirent_type(child);
+    int r = covered ? vfs_dir_add_covered(d, child->vn_name, ino, type) : vfs_dir_add(d, child->vn_name, ino, type);
+    if (r == 0 && d->vd_n > n && child->vn_kind != VN_CPIO)
+        d->vd_ents[n].vd_stat = 1;
+    return r;
+}
+
+/* The inode of each marked entry, by a stat of its path under `path`
+   (the directory's; "." is the directory, ".." its parent, "/" its own),
+   with no node lock held: a stat walks the tree from the root. A bind's
+   type too, which its node has none for (DT_UNKNOWN). An entry whose path
+   stats as nothing (a dangling bind) keeps the node's. */
+static void vfs_dir_stat_entries(struct vfs_dir *d, const char *path)
+{
+    for (int i = 0; i < d->vd_n; i++) {
+        struct vfs_dirent *e = &d->vd_ents[i];
+        if (!e->vd_stat)
+            continue;
+        e->vd_stat = 0;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s", path);
+        if (i == 1) {
+            /* the parent: "/a/b" -> "/a", "/a" -> "/", "/" -> "/" */
+            char *slash = strrchr(p, '/');
+            if (slash == p)
+                p[1] = 0;
+            else
+                *slash = 0;
+        }
+        else if (i > 1 && 0 != vfs_path_join(p, e->vd_name))
+            continue;
+        struct stat st;
+        if (0 != vfs_stat_path(p, &st, 0))
+            continue;
+        e->vd_ino = st.st_ino;
+        if (e->vd_type == DT_UNKNOWN)
+            e->vd_type = S_ISDIR(st.st_mode) ? DT_DIR : S_ISREG(st.st_mode) ? DT_REG :
+                         S_ISLNK(st.st_mode) ? DT_LNK : S_ISFIFO(st.st_mode) ? DT_FIFO :
+                         S_ISCHR(st.st_mode) ? DT_CHR : S_ISBLK(st.st_mode) ? DT_BLK :
+                         S_ISSOCK(st.st_mode) ? DT_SOCK : DT_UNKNOWN;
+    }
 }
 
 static int vfs_dir_add_host(struct vfs_dir *d, const char *path)
@@ -8071,6 +8259,7 @@ static int vfs_dir_add_host(struct vfs_dir *d, const char *path)
     DIR *hd = CALL_FUNC(opendir, path);
     if (!hd)
         return 0;   /* missing or unreadable (iOS has no /bin): nothing */
+    vfs_dir_layer(d);
     struct dirent *e;
     while (!r && (e = CALL_FUNC(readdir, hd)))
         r = vfs_dir_add_covered(d, e->d_name, e->d_ino, e->d_type);
@@ -8084,6 +8273,7 @@ static int vfs_dir_add_dev(struct vfs_dir *d, struct vfs_node *vn)
 {
     const struct vfs_devops *ops = vn->vn_devops;
     vn_unlock(vn, 0);
+    vfs_dir_layer(d);
     int r = ops->d_list ? ops->d_list(vn, d) : 0;
     vn_lock(vn, 0);
     vn_unlock(vn, 1);
@@ -8111,11 +8301,12 @@ static int vfs_dir_add_underlay(struct vfs_dir *d, const char *abspath, int dept
         return 0;
     }
     int r = 0;
+    vfs_dir_layer(d);
     struct vfs_node *child;
     list_for_each_entry(child, &vn->vn_children, vn_list) {
         if (r)
             break;
-        r = vfs_dir_add_covered(d, child->vn_name, child->vn_st.st_ino, vfs_dirent_type(child));
+        r = vfs_dir_add_child(d, child, 1);
     }
     int kind = vn->vn_kind;
     char next[PATH_MAX];
@@ -8124,10 +8315,12 @@ static int vfs_dir_add_underlay(struct vfs_dir *d, const char *abspath, int dept
     else
         snprintf(next, sizeof(next), "%s", res.path);
     if (kind == VN_DEV && !r)
-        return vfs_dir_add_dev(d, vn);
-    vn_unlock(vn, 1);
+        r = vfs_dir_add_dev(d, vn);
+    else
+        vn_unlock(vn, 1);
     if (r)
         return r;
+    vfs_dir_stat_entries(d, res.path);
     if (kind == VN_OVERLAY)
         return vfs_dir_add_host(d, next);
     if (kind == VN_BIND)
@@ -8156,44 +8349,32 @@ static struct vfs_dir *vfs_dir_snapshot(struct vfs_node *vn)
     int kind = vn->vn_kind;
     if (kind == VN_BIND)
         snprintf(target, sizeof(target), "%s", vn->vn_target);
-    /* the parent's inode, read without its lock: it never changes */
-    ino_t parent_ino = vn->vn_parent ? vn->vn_parent->vn_st.st_ino : vn->vn_st.st_ino;
+    /* the parent's inode and kind, read without its lock: neither changes */
+    struct vfs_node *parent = vn->vn_parent ? vn->vn_parent : vn;
 
+    /* "." and ".." are what stat reports for the directory and its parent
+       (vfs_dir_stat_entries), which is the node's own for a cpio entry
+       alone: "." of /bin, an overlay, is the host's /bin, ".." of /tvm the
+       host's "/". They were listed with the nodes' inodes. */
     int r = vfs_dir_add(d, ".", vn->vn_st.st_ino, DT_DIR) ||
-            vfs_dir_add(d, "..", parent_ino, DT_DIR);
-    int nbind = 0;
+            vfs_dir_add(d, "..", parent->vn_st.st_ino, DT_DIR);
+    if (!r) {
+        d->vd_ents[0].vd_stat = kind != VN_CPIO;
+        d->vd_ents[1].vd_stat = parent->vn_kind != VN_CPIO;
+    }
     struct vfs_node *child;
     list_for_each_entry(child, &vn->vn_children, vn_list) {
         if (r)
             break;
-        /* name, inode and kind are fixed at creation; the type bits of
-           st_mode too, chmod keeping them */
-        r = vfs_dir_add(d, child->vn_name, child->vn_st.st_ino, vfs_dirent_type(child));
-        nbind += child->vn_kind == VN_BIND;
+        r = vfs_dir_add_child(d, child, 0);
     }
-    int nown = d->vd_n;
     if (kind == VN_DEV && !r)
         r = vfs_dir_add_dev(d, vn);
     else
         vn_unlock(vn, 1);
 
-    /* a bind entry is what it names: its type by a stat of its path
-       (DT_UNKNOWN when it names nothing) */
-    for (int i = 2; i < nown && nbind && !r; i++) {
-        struct vfs_dirent *e = &d->vd_ents[i];
-        if (e->vd_type != DT_UNKNOWN)
-            continue;
-        char p[PATH_MAX];
-        snprintf(p, sizeof(p), "%s", path);
-        struct stat st;
-        if (0 == vfs_path_join(p, e->vd_name) && 0 == vfs_stat_path(p, &st, 0)) {
-            e->vd_type = S_ISDIR(st.st_mode) ? DT_DIR : S_ISREG(st.st_mode) ? DT_REG :
-                         S_ISLNK(st.st_mode) ? DT_LNK : S_ISFIFO(st.st_mode) ? DT_FIFO :
-                         S_ISCHR(st.st_mode) ? DT_CHR : S_ISBLK(st.st_mode) ? DT_BLK :
-                         S_ISSOCK(st.st_mode) ? DT_SOCK : DT_UNKNOWN;
-            e->vd_ino = st.st_ino;
-        }
-    }
+    if (!r)
+        vfs_dir_stat_entries(d, path);
 
     if (!r && kind == VN_OVERLAY)
         r = vfs_dir_add_host(d, path);
@@ -12530,12 +12711,34 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
 
     uint64_t gencnt = file->f_gencnt;
 
-    DIR *dp = CALL_FUNC(fdopendir, file->f_rfd);
-    if (!dp) {
+    // A directory the VFS serves (f_readdir: a mount's, an overlay's, a
+    // bind's) is read from its own listing (vfsop_readdir), and positioned
+    // through its f_lseek, never through a host DIR: the one fdopendir
+    // used to open on its descriptor -- the host's "/", or the overlay's
+    // host directory -- was never read, a getdirentries buffer and a stat
+    // per opendir for nothing, and a second DIR to close. None is opened
+    // for it (fs_dp stays NULL; dirfd() answers with fs_nfd regardless),
+    // and what the host's fdopendir said for a descriptor that is no
+    // directory (ENOTDIR for a cpio file's /dev/null) the node's stat
+    // says. Any other descriptor is read through the host's DIR, as
+    // before.
+    DIR *dp = NULL;
+    int ok;
+    if (file->f_ops && file->f_ops->f_readdir) {
+        struct stat st;
+        ok = 0 == file->f_ops->f_fstat(file, &st) && S_ISDIR(st.st_mode);
+        if (!ok)
+            errno = ENOTDIR;
+    }
+    else
+        ok = NULL != (dp = CALL_FUNC(fdopendir, file->f_rfd));
+    if (!ok) {
+        int last_errno = errno;
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
         file_unlock(file, 1);
         tvm_sig_leave();
+        errno = last_errno;
         return NULL;
     }
 
