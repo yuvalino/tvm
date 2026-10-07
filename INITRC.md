@@ -39,69 +39,26 @@ Variable names consist of alphanumeric characters and underscores.
 
 ### mount
 
-Mount a CPIO archive, or bind a path over another, in the TVM virtual
-filesystem, with mount(8)'s spelling:
+Mount a CPIO archive, or bind one path over another (as `mount --bind` on Linux).
 
 ```
 mount [-t cpio] <hostpath>:<guestpath>
 mount --bind|-B|-o bind <source>:<mountpoint>
 ```
 
-- `hostpath` — path to a CPIO (newc) file on the host filesystem (relative to cwd)
-- `guestpath`, `mountpoint` — absolute path in TVM's virtual filesystem; it
-  is created if missing, parents included, and need not exist on the host
-- `source` — absolute guest path the mount point shows: a file or a directory,
-  in a cpio mount, on the host, or under another bind; it need not exist yet
-  (a dangling bind is `ENOENT` until it does)
+- `hostpath` — CPIO (newc) file on the host, relative to cwd; mounted read-only
+- `guestpath`, `mountpoint` — absolute path; created if missing
+- `source` — absolute path (file or directory) the mount point shows
 
-The VFS is one tree under the host's root: a mount is attached where it was
-mounted, a later mount at the same path replaces it, and a path that meets no
-mount is the host's. Directory listings merge: a mounted directory lists its
-own entries and the mounts under it, then the entries the host (or the bind's
-source) has of the same path, an own entry covering a host one of the same
-name. A cpio mount is read-only (`EROFS`).
+Mounts are merged with the host filesystem: paths no mount covers are the host's, and listings show both. A later mount at the same path replaces the earlier one.
 
-A bind mount is the object its source names, links resolved, as `mount
---bind` on Linux: `lstat` of a file bind is the file, `readlink` of a mount
-point fails, `realpath` reports the mount point. The mount point itself, and
-the directories the VM made to hold mount points, cannot be removed or
-renamed (`EBUSY`); a rename or hard link across a mount boundary is `EXDEV`
-(`mv` copies instead). Everything under a directory bind of a host directory
-goes to that directory. A mount under a bind (`mount --bind X:/mnt` then
-`mount --bind Y:/mnt/sub`) shadows the source's entry of that name. A
-relative host symlink inside a bound directory that climbs above the mount
-point resolves where the host's would, not through the mount point's parent
-(a known deviation).
-
-The VM's devices are nodes of the same tree, mounted before the initrc runs:
-`/dev/tty` (the calling process's controlling tty; a process with none gets
-the host's `/dev/tty`), `/dev/ptmx` (a new pty on every open) and `/tvm/pts`,
-the directory of the ptys (`/tvm/pts/N`, what `tty` and `ptsname` say).
-`/dev` is the host's directory with these in it. A mount over `/tvm` keeps
-`/tvm/pts` (the CLI's `init.rc` mounts the rootfs there). The ptys'
-directory holds nothing but the driver's entries: creating, removing or
-renaming in it is refused (`EPERM`, `EACCES` for `open(O_CREAT)`), as devpts
-on Linux does.
-
-Example: scripts and programs name their interpreter by host path
-(`#!/bin/sh`, `#!/usr/bin/env bash`, `system(3)`), and the host's are not
-loadable in TVM, so both rc files mount the VM's own over them:
+Example:
 ```
 mount initrd.cpio:/tvm
-mount $HOME/extra.cpio:/opt
 mount --bind /tvm/bin/sh:/bin/sh
-mount --bind /tvm/bin/env:/usr/bin/env
 ```
 
-The guest-side builtin takes the same options with two operands:
-`tvm mount [-t cpio] FILE TARGET`, `tvm mount --bind SOURCE TARGET`.
-
-On iOS (checked on an iPhone 12, iOS 18.1.1) the app's sandbox can stat
-the host's `/bin`, `/usr/bin` and `/dev` but not list them: `stat /bin`
-answers a host directory, `ls /bin` lists only the bind mounts (`bash`,
-`sh`), `ls /usr/bin` only `env`, and `ls /dev` only the VM's `tty` and
-`ptmx`, while `/dev/null` is still the host's. The merged listing simply
-adds nothing for an unreadable host directory.
+The `tvm mount` builtin takes the same options: `tvm mount [-t cpio] FILE TARGET`, `tvm mount --bind SOURCE TARGET`.
 
 ### setenv
 
