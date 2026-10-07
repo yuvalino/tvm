@@ -1963,6 +1963,228 @@ TEST(VfsRealpath) {
     ASSERT_EQ(0, rmdir(dir));
 }
 
+// readdir's d_ino is what stat reports for the entry, "." and ".."
+// included: the host's inode for an overlay directory with a host one
+// ("/", /bin, /usr), a bind's target's, a device's driver's. The VM's own
+// entries used to carry their nodes' inodes while stat gave the host's, so
+// readdir("/")'s usr and stat("/usr") disagreed, as did "." of /bin and
+// ".." of /tvm. A host entry is the host's own (whose d_ino and st_ino
+// differ by themselves on macOS firmlinks), so under a host directory the
+// VM's entries alone are compared (`names`); every entry where the VM
+// makes them all (NULL).
+static void assert_dirent_inos(const char *dir, const char *const *names)
+{
+    DIR *d = opendir(dir);
+    ASSERT_NEQ(d, NULL);
+    struct dirent *e;
+    int seen = 0;
+    while ((e = readdir(d))) {
+        int dot = 0 == strcmp(e->d_name, ".") || 0 == strcmp(e->d_name, "..");
+        int listed = dot || !names;
+        for (int i = 0; names && names[i]; i++)
+            listed |= 0 == strcmp(e->d_name, names[i]);
+        if (!listed)
+            continue;
+        seen++;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        struct stat st;
+        ASSERT_EQ(0, dot ? stat(p, &st) : lstat(p, &st));
+        if ((unsigned long long)st.st_ino != (unsigned long long)e->d_ino)
+            FAIL("    %s: d_ino %llu, st_ino %llu", p, (unsigned long long)e->d_ino, (unsigned long long)st.st_ino);
+    }
+    ASSERT_EQ(0, closedir(d));
+    int want = 2;
+    for (int i = 0; names && names[i]; i++)
+        want++;
+    if (names)
+        ASSERT_EQ(want, seen);
+}
+
+TEST(VfsDirentIno) {
+    static const char *const root[] = { "tvm", "bin", "usr", "dev", NULL };
+    static const char *const bin[] = { "sh", "bash", NULL };
+    static const char *const usr[] = { "bin", NULL };
+    static const char *const usrbin[] = { "env", NULL };
+    static const char *const dev[] = { "tty", "ptmx", NULL };
+    assert_dirent_inos("/", root);
+    assert_dirent_inos("/bin", bin);
+    assert_dirent_inos("/usr", usr);
+    assert_dirent_inos("/usr/bin", usrbin);
+    assert_dirent_inos("/dev", dev);
+    assert_dirent_inos("/tvm", NULL);
+    assert_dirent_inos("/tvm/bin", NULL);
+    assert_dirent_inos("/tvm/pts", NULL);
+
+    // "." of "/" is the host's root, not the VM's node
+    DIR *d = opendir("/");
+    ASSERT_NEQ(d, NULL);
+    struct dirent *e;
+    while ((e = readdir(d)) && strcmp(e->d_name, "."))
+        ;
+    ASSERT_NEQ(e, NULL);
+    ASSERT_EQ(1, (unsigned long long)e->d_ino < VFS_INODE_BASE);
+    ASSERT_EQ(0, closedir(d));
+
+    // a bound host directory with a bind under it: the entries are the
+    // sources', "." the source's, ".." the mount point's parent's
+    char dir[] = "/tmp/tvm_ino_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char a[PATH_MAX], b[PATH_MAX], p[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(b, sizeof(b), "%s/b", dir);
+    ASSERT_EQ(0, mkdir(a, 0755));
+    ASSERT_EQ(0, mkdir(b, 0755));
+    snprintf(p, sizeof(p), "%s/own", a);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    snprintf(p, sizeof(p), "%s/inner", b);
+    ASSERT_EQ(0, close(open(p, O_WRONLY | O_CREAT, 0644)));
+    tvm_mount_bind(a, "/mnt_ino_test");
+    tvm_mount_bind(b, "/mnt_ino_test/nested");
+    assert_dirent_inos("/mnt_ino_test", NULL);
+    assert_dirent_inos("/mnt_ino_test/nested", NULL);
+    struct stat st, hst;
+    ASSERT_EQ(0, stat(b, &hst));
+    d = opendir("/mnt_ino_test");
+    ASSERT_NEQ(d, NULL);
+    while ((e = readdir(d)) && strcmp(e->d_name, "nested"))
+        ;
+    ASSERT_NEQ(e, NULL);
+    ASSERT_EQ(hst.st_ino, e->d_ino);
+    ASSERT_EQ(DT_DIR, e->d_type);
+    ASSERT_EQ(0, fstat(dirfd(d), &st));
+    ASSERT_EQ(0, stat(a, &hst));
+    ASSERT_EQ(hst.st_ino, st.st_ino);
+    ASSERT_EQ(0, closedir(d));
+
+    snprintf(p, sizeof(p), "%s/inner", b);
+    ASSERT_EQ(0, unlink(p));
+    snprintf(p, sizeof(p), "%s/own", a);
+    ASSERT_EQ(0, unlink(p));
+    ASSERT_EQ(0, rmdir(a));
+    ASSERT_EQ(0, rmdir(b));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+static void assert_file_is(const char *path, const char *content)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd == -1)
+        FAIL("    open(%s): %s", path, strerror(errno));
+    char buf[64] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    if (n != (ssize_t)strlen(content) || 0 != strcmp(buf, content))
+        FAIL("    %s reads \"%s\", not \"%s\"", path, buf, content);
+    ASSERT_EQ(0, close(fd));
+}
+
+// A relative cpio link under a bind is from the guest path walked to it,
+// the mount point's, as the kernel resolves a link under a bind mount: so
+// open, stat and realpath agree on where it leads. open and stat used to
+// splice it from the link's canonical directory, the bind's source, so
+// `cat /bd/up` (up -> ../out) read the source's neighbour while realpath,
+// which splices from the guest prefix, said the mount point's. Reached
+// without the bind, the link is still its own directory's neighbour.
+TEST(VfsBindCpioLink) {
+    static const struct cpio_ent ents[] = {
+        { "out",      S_IFREG | 0644, "root\n" },
+        { "d",        S_IFDIR | 0755, NULL },
+        { "d/out",    S_IFREG | 0644, "d\n" },
+        { "d/sub",    S_IFDIR | 0755, NULL },
+        { "d/sub/up", S_IFLNK | 0777, "../out" },
+        { "lnk",      S_IFLNK | 0777, "d" },
+        { NULL, 0, NULL },
+    };
+    vfs_test_mount("bl", ents, "/mnt_bl_test");
+    tvm_mount_bind("/mnt_bl_test/d/sub", "/mnt_bl_test/bd");
+    tvm_mount_bind("/mnt_bl_test/lnk/sub", "/mnt_bl_test/bd2");   // the source through a link of its own
+    tvm_mount_bind("/mnt_bl_test/d/sub", "/bd_bl_test");
+
+    char r[PATH_MAX];
+    struct stat st, want;
+    ASSERT_EQ(0, stat("/mnt_bl_test/out", &want));
+
+    // the link by its own path: its directory's neighbour
+    assert_file_is("/mnt_bl_test/d/sub/up", "d\n");
+    ASSERT_NEQ(realpath("/mnt_bl_test/d/sub/up", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_bl_test/d/out"));
+
+    // through a bind: the mount point's neighbour, where realpath leads
+    assert_file_is("/mnt_bl_test/bd/up", "root\n");
+    ASSERT_EQ(0, stat("/mnt_bl_test/bd/up", &st));
+    ASSERT_EQ(want.st_ino, st.st_ino);
+    ASSERT_NEQ(realpath("/mnt_bl_test/bd/up", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_bl_test/out"));
+    // the link that the bind's source goes through is the source's own
+    // directory's (a link met walking the target), the one under it the
+    // mount point's
+    assert_file_is("/mnt_bl_test/bd2/up", "root\n");
+    ASSERT_NEQ(realpath("/mnt_bl_test/bd2/up", r), NULL);
+    ASSERT_EQ(0, strcmp(r, "/mnt_bl_test/out"));
+    ssize_t n = readlink("/mnt_bl_test/bd/up", r, sizeof(r) - 1);
+    ASSERT_EQ(n, 6);
+    r[n] = 0;
+    ASSERT_EQ(0, strcmp(r, "../out"));
+
+    // bound at the root: /out, which is whatever the host has there
+    // (nothing, as a rule) for open, stat and realpath alike
+    int host_out = 0 == access("/out", F_OK);
+    char *rp = realpath("/bd_bl_test/up", r);
+    int rp_errno = errno;
+    int fd = open("/bd_bl_test/up", O_RDONLY);
+    int open_errno = errno;
+    int sr = stat("/bd_bl_test/up", &st);
+    int stat_errno = errno;
+    if (!host_out) {
+        ASSERT_EQ(rp, NULL);
+        ASSERT_EQ(rp_errno, ENOENT);
+        ASSERT_EQ(fd, -1);
+        ASSERT_EQ(open_errno, ENOENT);
+        ASSERT_EQ(sr, -1);
+        ASSERT_EQ(stat_errno, ENOENT);
+    }
+    else {
+        ASSERT_NEQ(rp, NULL);
+        ASSERT_EQ(0, strcmp(r, "/out"));
+        ASSERT_EQ(0, sr);
+        if (fd != -1)
+            ASSERT_EQ(0, close(fd));
+    }
+}
+
+// A directory the VFS serves has no host DIR behind its stream: fdopendir
+// of a cpio file is ENOTDIR by the node (the host said it for the
+// /dev/null behind it), and a stream open across fork reads on in the
+// child, which has no host DIR to reopen.
+TEST(DirVfsFork) {
+    int fd = open("/tvm/bin/toybox", O_RDONLY);
+    ASSERT_NEQ(fd, -1);
+    errno = 0;
+    ASSERT_EQ(NULL, fdopendir(fd));
+    ASSERT_EQ(errno, ENOTDIR);
+    ASSERT_EQ(0, close(fd));
+
+    DIR *d = opendir("/tvm");
+    ASSERT_NEQ(d, NULL);
+    int total = dir_count(d);
+    ASSERT_EQ(1, total > 2);
+    rewinddir(d);
+    ASSERT_NEQ(readdir(d), NULL);
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int n = dir_count(d);
+        _exit(n == total - 1 ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+    rewinddir(d);
+    ASSERT_EQ(total, dir_count(d));
+    ASSERT_EQ(0, closedir(d));
+}
+
 TEST(VfsStatfs) {
     struct statfs sf;
     ASSERT_EQ(0, statfs("/tvm/bin", &sf));
