@@ -2293,6 +2293,18 @@ def test_trailing_slash_symlink(sshi: spawn):
                         "ls -d t/g/ 2>&1 | grep -c 'Not a directory'; cd /; rm -rf $d")
     assert rc == 0 and _lines(out)[-6:] == ["5", "5", "1", "same_tree", "same_ls", "1"], out
 
+def test_touch_truncate_through_bind(sshi: spawn):
+    """touch (utimensat) and truncate reach the host through a runtime bind
+    of a host directory: on macOS and iOS utimensat was not interposed and
+    went to the host with the guest path (touch of an existing file:
+    ENOENT); a cpio file is read-only to touch, and df (statvfs) of the
+    bind is the host filesystem's."""
+    out, rc = _sh(sshi, "d=$(mktemp -d) && echo hello > $d/f && tvm mount --bind $d /mnt_touch_test && "
+                        "touch /mnt_touch_test/f && touch -d @1000000000 /mnt_touch_test/f && stat -c %Y $d/f && "
+                        "truncate -s 2 /mnt_touch_test/f && stat -c %s $d/f && touch /mnt_touch_test/new && [ -f $d/new ] && echo created && "
+                        "[ $(df /mnt_touch_test | wc -l) = 2 ] && echo df_host; touch /tvm/etc/profile 2>&1 | grep -c 'Read-only file system'; rm -rf $d")
+    assert rc == 0 and _lines(out)[-5:] == ["1000000000", "2", "created", "df_host", "1"], out
+
 def test_tty_device_dir(sshi: spawn):
     """The session's tty is an entry of the ptys' directory, a node of the
     tree: the directory exists to ls, [ -d ] and stat (it used to be

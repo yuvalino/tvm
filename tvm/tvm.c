@@ -74,9 +74,15 @@
 #include <malloc.h>   // memalign, pvalloc
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <stdio_ext.h>  // __fpurge
+#endif
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
-#include <stdio_ext.h>  // __fpurge
+#include <utime.h>
+
+#if !defined(XATTR_NOFOLLOW)
+// Darwin's getxattr option, the VFS's spelling of lgetxattr on Linux
+#define XATTR_NOFOLLOW 0x0001
 #endif
 
 #if defined(__linux__)
@@ -472,6 +478,20 @@ DECL_FUNC(mkfifo);
 DECL_FUNC(mkfifoat);
 DECL_FUNC(mkstemp);
 DECL_FUNC(mkdtemp);
+DECL_FUNC(utimensat);
+DECL_FUNC(utimes);
+DECL_FUNC(lutimes);
+DECL_FUNC(utime);
+DECL_FUNC(futimens);
+DECL_FUNC(futimes);
+DECL_FUNC(truncate);
+DECL_FUNC(getxattr);
+DECL_FUNC(fgetxattr);
+DECL_FUNC(fsetxattr);
+DECL_FUNC(flistxattr);
+DECL_FUNC(fremovexattr);
+DECL_FUNC(statvfs);
+DECL_FUNC(fstatvfs);
 
 DECL_FUNC(socket);
 DECL_FUNC(accept);
@@ -658,18 +678,9 @@ DECL_FUNC(inotify_add_watch);
 DECL_FUNC(inotify_rm_watch);
 DECL_FUNC(sync_file_range);
 DECL_FUNC(fpathconf);
-DECL_FUNC(futimens);
-DECL_FUNC(utimensat);
 DECL_FUNC(futimesat);
-DECL_FUNC(fgetxattr);
-DECL_FUNC(fsetxattr);
-DECL_FUNC(flistxattr);
-DECL_FUNC(fremovexattr);
-DECL_FUNC(getxattr);
 DECL_FUNC(lgetxattr);
-DECL_FUNC(statvfs);
 DECL_FUNC(statvfs64);
-DECL_FUNC(fstatvfs);
 DECL_FUNC(fstatvfs64);
 DECL_FUNC(eaccess);
 DECL_FUNC(euidaccess);
@@ -6271,11 +6282,13 @@ struct vfs_nodeops {
     /* the host descriptor behind an open directory of this kind, which
        fstatfs and the like reach (NULL: "/"), with open(2)'s flags */
     int (*o_dirfd)(struct vfs_node *vn, const char *path, int flags);
-#if defined(__linux__)
+    /* utimensat's times and flags (AT_SYMLINK_NOFOLLOW is the host's to apply) */
     int (*o_utimens)(struct vfs_node *vn, const char *path, const struct timespec *times, int flags);
-    ssize_t (*o_getxattr)(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, int nofollow);
+    /* Darwin's getxattr arguments: position (0 but for a resource fork)
+       and options, XATTR_NOFOLLOW among them (lgetxattr on Linux) */
+    ssize_t (*o_getxattr)(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, uint32_t position, int options);
     int (*o_statvfs)(struct vfs_node *vn, const char *path, struct statvfs *buf);
-#endif
+    int (*o_truncate)(struct vfs_node *vn, const char *path, off_t length);
     int (*o_statfs)(struct vfs_node *vn, const char *path, struct statfs *buf);
     /* the underlay's entries of the directory, behind its own children
        in `d` (a layer of their own: vfs_dir_add_covered, an own child
@@ -7599,14 +7612,13 @@ static int vfs_own_statfs(struct vfs_node *vn, const char *path, struct statfs *
     return vfs_statfs_synthetic(mntpath, buf);
 }
 
-#if defined(__linux__)
 static int vfs_own_utimens(struct vfs_node *vn, const char *path, const struct timespec *times, int flags)
 {
     errno = EROFS;
     return -1;
 }
 
-static ssize_t vfs_own_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, int nofollow)
+static ssize_t vfs_own_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, uint32_t position, int options)
 {
     errno = ENOTSUP;
     return -1;
@@ -7620,7 +7632,16 @@ static int vfs_own_statvfs(struct vfs_node *vn, const char *path, struct statvfs
     buf->f_flag = ST_RDONLY;
     return 0;
 }
-#endif
+
+/* a directory first, as the host answers truncate of one */
+static int vfs_own_truncate(struct vfs_node *vn, const char *path, off_t length)
+{
+    vn_lock(vn, 0);
+    int isdir = S_ISDIR(vn->vn_st.st_mode);
+    vn_unlock(vn, 0);
+    errno = isdir ? EISDIR : EROFS;
+    return -1;
+}
 
 static int vfs_own_open(struct vfs_node *vn, const char *path, int flags, mode_t mode, struct file *out);
 
@@ -7668,17 +7689,16 @@ static int vfs_node_statfs(struct vfs_node *vn, const char *path, struct statfs 
     return vn_op_leave(vn, (ops->o_statfs ? ops->o_statfs : vfs_own_statfs)(vn, path, buf));
 }
 
-#if defined(__linux__)
 static int vfs_node_utimens(struct vfs_node *vn, const char *path, const struct timespec *times, int flags)
 {
     const struct vfs_nodeops *ops = vn_op_enter(vn);
     return vn_op_leave(vn, (ops->o_utimens ? ops->o_utimens : vfs_own_utimens)(vn, path, times, flags));
 }
 
-static ssize_t vfs_node_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, int nofollow)
+static ssize_t vfs_node_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, uint32_t position, int options)
 {
     const struct vfs_nodeops *ops = vn_op_enter(vn);
-    return vn_op_leave(vn, (ops->o_getxattr ? ops->o_getxattr : vfs_own_getxattr)(vn, path, name, value, size, nofollow));
+    return vn_op_leave(vn, (ops->o_getxattr ? ops->o_getxattr : vfs_own_getxattr)(vn, path, name, value, size, position, options));
 }
 
 static int vfs_node_statvfs(struct vfs_node *vn, const char *path, struct statvfs *buf)
@@ -7686,7 +7706,12 @@ static int vfs_node_statvfs(struct vfs_node *vn, const char *path, struct statvf
     const struct vfs_nodeops *ops = vn_op_enter(vn);
     return vn_op_leave(vn, (ops->o_statvfs ? ops->o_statvfs : vfs_own_statvfs)(vn, path, buf));
 }
-#endif
+
+static int vfs_node_truncate(struct vfs_node *vn, const char *path, off_t length)
+{
+    const struct vfs_nodeops *ops = vn_op_enter(vn);
+    return vn_op_leave(vn, (ops->o_truncate ? ops->o_truncate : vfs_own_truncate)(vn, path, length));
+}
 
 /* The verdict on entries made in or removed from the directory `vn`
    (consumed): 0, or the errno refusing them (o_mutate) */
@@ -7892,22 +7917,29 @@ static int host_statfs(struct vfs_node *vn, const char *path, struct statfs *buf
     return CALL_FUNC(statfs, path, buf);
 }
 
-#if defined(__linux__)
 static int host_utimens(struct vfs_node *vn, const char *path, const struct timespec *times, int flags)
 {
     return CALL_FUNC(utimensat, AT_FDCWD, path, times, flags);
 }
 
-static ssize_t host_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, int nofollow)
+static ssize_t host_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, uint32_t position, int options)
 {
-    return nofollow ? CALL_FUNC(lgetxattr, path, name, value, size) : CALL_FUNC(getxattr, path, name, value, size);
+#if defined(__APPLE__)
+    return CALL_FUNC(getxattr, path, name, value, size, position, options);
+#else
+    return (options & XATTR_NOFOLLOW) ? CALL_FUNC(lgetxattr, path, name, value, size) : CALL_FUNC(getxattr, path, name, value, size);
+#endif
 }
 
 static int host_statvfs(struct vfs_node *vn, const char *path, struct statvfs *buf)
 {
     return CALL_FUNC(statvfs, path, buf);
 }
-#endif
+
+static int host_truncate(struct vfs_node *vn, const char *path, off_t length)
+{
+    return CALL_FUNC(truncate, path, length);
+}
 
 static int host_list(struct vfs_node *vn, const char *path, struct vfs_dir *d)
 {
@@ -7927,11 +7959,10 @@ static const struct vfs_nodeops vfs_host_ops = {
     .o_readlink = host_readlink,
     .o_open = host_open,
     .o_dirfd = host_dirfd,
-#if defined(__linux__)
     .o_utimens = host_utimens,
     .o_getxattr = host_getxattr,
     .o_statvfs = host_statvfs,
-#endif
+    .o_truncate = host_truncate,
     .o_statfs = host_statfs,
     .o_list = host_list,
     .o_mutate = host_mutate,
@@ -7978,6 +8009,16 @@ static int overlay_statfs(struct vfs_node *vn, const char *path, struct statfs *
     return vfs_statfs_synthetic(path, buf);
 }
 
+/* as statfs: the host's for the host directory of its path ("/"), else
+   the synthetic read-only one (/bin on iOS) */
+static int overlay_statvfs(struct vfs_node *vn, const char *path, struct statvfs *buf)
+{
+    struct stat st;
+    if (0 == CALL_FUNC(fstatat, AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode))
+        return CALL_FUNC(statvfs, path, buf);
+    return vfs_own_statvfs(vn, path, buf);
+}
+
 static int overlay_list(struct vfs_node *vn, const char *path, struct vfs_dir *d)
 {
     return vfs_dir_add_host(d, path);
@@ -7994,6 +8035,7 @@ static const struct vfs_nodeops vfs_overlay_ops = {
     .o_chmod = overlay_chmod,
     .o_chown = overlay_chown,
     .o_dirfd = host_dirfd,
+    .o_statvfs = overlay_statvfs,
     .o_statfs = overlay_statfs,
     .o_list = overlay_list,
     .o_mutate = overlay_mutate,
@@ -8060,7 +8102,6 @@ static int bind_statfs(struct vfs_node *vn, const char *path, struct statfs *buf
     return vfs_node_statfs(res.vn, res.path, buf);
 }
 
-#if defined(__linux__)
 static int bind_utimens(struct vfs_node *vn, const char *path, const struct timespec *times, int flags)
 {
     struct vfs_res res;
@@ -8069,12 +8110,12 @@ static int bind_utimens(struct vfs_node *vn, const char *path, const struct time
     return vfs_node_utimens(res.vn, res.path, times, flags & ~AT_SYMLINK_NOFOLLOW);
 }
 
-static ssize_t bind_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, int nofollow)
+static ssize_t bind_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, uint32_t position, int options)
 {
     struct vfs_res res;
     if (0 != bind_forward(vn, path, &res))
         return -1;
-    return vfs_node_getxattr(res.vn, res.path, name, value, size, 0);
+    return vfs_node_getxattr(res.vn, res.path, name, value, size, position, options & ~XATTR_NOFOLLOW);
 }
 
 static int bind_statvfs(struct vfs_node *vn, const char *path, struct statvfs *buf)
@@ -8084,7 +8125,14 @@ static int bind_statvfs(struct vfs_node *vn, const char *path, struct statvfs *b
         return -1;
     return vfs_node_statvfs(res.vn, res.path, buf);
 }
-#endif
+
+static int bind_truncate(struct vfs_node *vn, const char *path, off_t length)
+{
+    struct vfs_res res;
+    if (0 != bind_forward(vn, path, &res))
+        return -1;
+    return vfs_node_truncate(res.vn, res.path, length);
+}
 
 static int bind_list(struct vfs_node *vn, const char *path, struct vfs_dir *d)
 {
@@ -8149,11 +8197,10 @@ static const struct vfs_nodeops vfs_bind_ops = {
     .o_chmod = bind_chmod,
     .o_chown = bind_chown,
     .o_open = bind_open,
-#if defined(__linux__)
     .o_utimens = bind_utimens,
     .o_getxattr = bind_getxattr,
     .o_statvfs = bind_statvfs,
-#endif
+    .o_truncate = bind_truncate,
     .o_statfs = bind_statfs,
     .o_list = bind_list,
 };
@@ -16191,6 +16238,165 @@ FUNCTION_DEFINE1(char *, mkdtemp, char *, template) {
     return template;
 }
 
+// Times, sizes, attributes and filesystem statistics by path, through the
+// VFS: a node of the VM's own has no times or size to set (EROFS; a
+// directory is EISDIR to truncate) and no attributes (ENOTSUP), its
+// filesystem the synthetic read-only one statfs reports; a bind's are its
+// target's; a host path's are the host's calls on it. On macOS and iOS
+// these reached the host with the guest path (they were interposed on
+// Linux alone; utimes, lutimes, utime, futimes and truncate nowhere), so
+// `touch f` through a bind of a host directory was ENOENT (toybox's
+// utimensat) and touch of a cpio file ENOENT rather than EROFS, and a
+// descriptor's futimens, f*xattr and fstatvfs reached the host with the
+// task's number, which is some other host descriptor's. The names are
+// what the guests import (nm -u of the initrd's programs): utimensat and
+// futimens (toybox, nano), utimes (curl, sqlite3, dropbear, sftp-server,
+// nano), utime (git, vim), futimes (nano), truncate (sftp-server),
+// getxattr and f*xattr (toybox; Darwin's take a position and options,
+// XATTR_NOFOLLOW among them), statvfs (toybox, git) -- none under a
+// $-versioned spelling, which the linker matches by base name anyway.
+static int tvm_utimensat(int dirfd, const char *pathname, const struct timespec *times, int flags)
+{
+    char pathname_abs[PATH_MAX];
+    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
+        return -1;
+    tvm_sig_enter();
+    struct vfs_res res;
+    int ret = vfs_resolve(pathname_abs, (flags & AT_SYMLINK_NOFOLLOW) ? VR_NOFOLLOW : 0, &res);
+    if (0 == ret)
+        ret = vfs_node_utimens(res.vn, res.path, times, flags);
+    tvm_sig_leave();
+    return ret;
+}
+
+// utimes' timevals as utimensat's timespecs; NULL stays NULL (now)
+static const struct timespec *timeval_to_timespec(const struct timeval *tv, struct timespec ts[2])
+{
+    if (!tv)
+        return NULL;
+    for (int i = 0; i < 2; i++) {
+        ts[i].tv_sec = tv[i].tv_sec;
+        ts[i].tv_nsec = tv[i].tv_usec * 1000;
+    }
+    return ts;
+}
+
+FUNCTION_DEFINE4(int, utimensat, int, dirfd, const char *, pathname, const struct timespec *, times, int, flags) {
+    if (!pathname)  // Linux: the descriptor itself, as futimens
+        return CURRENT_RFD(dirfd, CALL_FUNC(utimensat, __rfd, NULL, times, flags));
+    return tvm_utimensat(dirfd, pathname, times, flags);
+}
+
+FUNCTION_DEFINE2(int, utimes, const char *, pathname, const struct timeval *, times) {
+    struct timespec ts[2];
+    return tvm_utimensat(AT_FDCWD, pathname, timeval_to_timespec(times, ts), 0);
+}
+
+FUNCTION_DEFINE2(int, lutimes, const char *, pathname, const struct timeval *, times) {
+    struct timespec ts[2];
+    return tvm_utimensat(AT_FDCWD, pathname, timeval_to_timespec(times, ts), AT_SYMLINK_NOFOLLOW);
+}
+
+FUNCTION_DEFINE2(int, utime, const char *, pathname, const struct utimbuf *, times) {
+    struct timespec ts[2] = { { .tv_sec = times ? times->actime : 0 }, { .tv_sec = times ? times->modtime : 0 } };
+    return tvm_utimensat(AT_FDCWD, pathname, times ? ts : NULL, 0);
+}
+
+FUNCTION_DEFINE2(int, futimens, int, fd, const struct timespec *, times) {
+    return CURRENT_RFD(fd, CALL_FUNC(futimens, __rfd, times));
+}
+
+FUNCTION_DEFINE2(int, futimes, int, fd, const struct timeval *, times) {
+    return CURRENT_RFD(fd, CALL_FUNC(futimes, __rfd, times));
+}
+
+FUNCTION_DEFINE2(int, truncate, const char *, pathname, off_t, length) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    tvm_sig_enter();
+    struct vfs_res res;
+    int ret = vfs_resolve(pathname_abs, 0, &res);
+    if (0 == ret)
+        ret = vfs_node_truncate(res.vn, res.path, length);
+    tvm_sig_leave();
+    return ret;
+}
+
+static ssize_t tvm_getxattr(const char *pathname, const char *name, void *value, size_t size, uint32_t position, int options)
+{
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    tvm_sig_enter();
+    struct vfs_res res;
+    ssize_t ret = vfs_resolve(pathname_abs, (options & XATTR_NOFOLLOW) ? VR_NOFOLLOW : 0, &res);
+    if (0 == ret)
+        ret = vfs_node_getxattr(res.vn, res.path, name, value, size, position, options);
+    tvm_sig_leave();
+    return ret;
+}
+
+#if defined(__APPLE__)
+FUNCTION_DEFINE6(ssize_t, getxattr, const char *, pathname, const char *, name, void *, value, size_t, size, u_int32_t, position, int, options) {
+    return tvm_getxattr(pathname, name, value, size, position, options);
+}
+
+FUNCTION_DEFINE6(ssize_t, fgetxattr, int, fd, const char *, name, void *, value, size_t, size, u_int32_t, position, int, options) {
+    return CURRENT_RFD(fd, CALL_FUNC(fgetxattr, __rfd, name, value, size, position, options));
+}
+
+FUNCTION_DEFINE6(int, fsetxattr, int, fd, const char *, name, const void *, value, size_t, size, u_int32_t, position, int, options) {
+    return CURRENT_RFD(fd, CALL_FUNC(fsetxattr, __rfd, name, value, size, position, options));
+}
+
+FUNCTION_DEFINE4(ssize_t, flistxattr, int, fd, char *, list, size_t, size, int, options) {
+    return CURRENT_RFD(fd, CALL_FUNC(flistxattr, __rfd, list, size, options));
+}
+
+FUNCTION_DEFINE3(int, fremovexattr, int, fd, const char *, name, int, options) {
+    return CURRENT_RFD(fd, CALL_FUNC(fremovexattr, __rfd, name, options));
+}
+#else
+FUNCTION_DEFINE4(ssize_t, getxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
+    return tvm_getxattr(pathname, name, value, size, 0, 0);
+}
+
+FUNCTION_DEFINE4(ssize_t, fgetxattr, int, fd, const char *, name, void *, value, size_t, size) {
+    return CURRENT_RFD(fd, CALL_FUNC(fgetxattr, __rfd, name, value, size));
+}
+
+FUNCTION_DEFINE5(int, fsetxattr, int, fd, const char *, name, const void *, value, size_t, size, int, flags) {
+    return CURRENT_RFD(fd, CALL_FUNC(fsetxattr, __rfd, name, value, size, flags));
+}
+
+FUNCTION_DEFINE3(ssize_t, flistxattr, int, fd, char *, list, size_t, size) {
+    return CURRENT_RFD(fd, CALL_FUNC(flistxattr, __rfd, list, size));
+}
+
+FUNCTION_DEFINE2(int, fremovexattr, int, fd, const char *, name) {
+    return CURRENT_RFD(fd, CALL_FUNC(fremovexattr, __rfd, name));
+}
+#endif
+
+// As statfs: the host's answer for the host path, a synthetic one for a node.
+FUNCTION_DEFINE2(int, statvfs, const char *, pathname, struct statvfs *, buf) {
+    char pathname_abs[PATH_MAX];
+    if (!normalize_path(NULL, pathname, pathname_abs))
+        return -1;
+    tvm_sig_enter();
+    struct vfs_res res;
+    int ret = vfs_resolve(pathname_abs, 0, &res);
+    if (0 == ret)
+        ret = vfs_node_statvfs(res.vn, res.path, buf);
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE2(int, fstatvfs, int, fd, struct statvfs *, buf) {
+    return CURRENT_RFD(fd, CALL_FUNC(fstatvfs, __rfd, buf));
+}
+
 // A new host descriptor, entered into the task's table (cf. eventfd).
 static int tvm_task_adopt_fd(int r)
 {
@@ -20661,7 +20867,7 @@ FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len)
  *   guest import only found them by symbol through dlsym, which works where
  *   TVM is the executable; register both spellings by name.
  * - Descriptors created outside the task table (accept4, memfd_create,
- *   inotify_init) and calls on task descriptors (xattrs, futimens, ...).
+ *   inotify_init) and calls on task descriptors (fpathconf, ...).
  */
 static void tvm_chk_fail(void)
 {
@@ -20829,108 +21035,20 @@ FUNCTION_DEFINE2(long, fpathconf, int, fd, int, name) {
     return CURRENT_RFD(fd, CALL_FUNC(fpathconf, __rfd, name));
 }
 
-FUNCTION_DEFINE2(int, futimens, int, fd, const struct timespec *, times) {
-    return CURRENT_RFD(fd, CALL_FUNC(futimens, __rfd, times));
-}
-
-// The path through the VFS: a node of the VM's own has no times to set
-// (EROFS) and no attributes (ENOTSUP), a host path the host's.
-FUNCTION_DEFINE4(int, utimensat, int, dirfd, const char *, pathname, const struct timespec *, times, int, flags) {
-    if (!pathname)  // Linux: the descriptor itself, as futimens
-        return CURRENT_RFD(dirfd, CALL_FUNC(utimensat, __rfd, NULL, times, flags));
-    char pathname_abs[PATH_MAX];
-    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
-        return -1;
-    tvm_sig_enter();
-    struct vfs_res res;
-    int ret = vfs_resolve(pathname_abs, (flags & AT_SYMLINK_NOFOLLOW) ? VR_NOFOLLOW : 0, &res);
-    if (0 == ret)
-        ret = vfs_node_utimens(res.vn, res.path, times, flags);
-    tvm_sig_leave();
-    return ret;
-}
-
 // utimensat's, the timevals as timespecs (what glibc's futimesat is)
 FUNCTION_DEFINE3(int, futimesat, int, dirfd, const char *, pathname, const struct timeval *, times) {
     if (!pathname)
         return CURRENT_RFD(dirfd, CALL_FUNC(futimesat, __rfd, NULL, times));
-    char pathname_abs[PATH_MAX];
-    if (!dirfd_normalize_path(dirfd, pathname, pathname_abs))
-        return -1;
     struct timespec ts[2];
-    if (times) {
-        for (int i = 0; i < 2; i++) {
-            ts[i].tv_sec = times[i].tv_sec;
-            ts[i].tv_nsec = times[i].tv_usec * 1000;
-        }
-    }
-    tvm_sig_enter();
-    struct vfs_res res;
-    int ret = vfs_resolve(pathname_abs, 0, &res);
-    if (0 == ret)
-        ret = vfs_node_utimens(res.vn, res.path, times ? ts : NULL, 0);
-    tvm_sig_leave();
-    return ret;
-}
-
-FUNCTION_DEFINE4(ssize_t, fgetxattr, int, fd, const char *, name, void *, value, size_t, size) {
-    return CURRENT_RFD(fd, CALL_FUNC(fgetxattr, __rfd, name, value, size));
-}
-
-FUNCTION_DEFINE5(int, fsetxattr, int, fd, const char *, name, const void *, value, size_t, size, int, flags) {
-    return CURRENT_RFD(fd, CALL_FUNC(fsetxattr, __rfd, name, value, size, flags));
-}
-
-FUNCTION_DEFINE3(ssize_t, flistxattr, int, fd, char *, list, size_t, size) {
-    return CURRENT_RFD(fd, CALL_FUNC(flistxattr, __rfd, list, size));
-}
-
-FUNCTION_DEFINE2(int, fremovexattr, int, fd, const char *, name) {
-    return CURRENT_RFD(fd, CALL_FUNC(fremovexattr, __rfd, name));
-}
-
-static ssize_t tvm_getxattr(const char *pathname, const char *name, void *value, size_t size, int nofollow)
-{
-    char pathname_abs[PATH_MAX];
-    if (!normalize_path(NULL, pathname, pathname_abs))
-        return -1;
-    tvm_sig_enter();
-    struct vfs_res res;
-    ssize_t ret = vfs_resolve(pathname_abs, nofollow ? VR_NOFOLLOW : 0, &res);
-    if (0 == ret)
-        ret = vfs_node_getxattr(res.vn, res.path, name, value, size, nofollow);
-    tvm_sig_leave();
-    return ret;
-}
-
-FUNCTION_DEFINE4(ssize_t, getxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
-    return tvm_getxattr(pathname, name, value, size, 0);
+    return tvm_utimensat(dirfd, pathname, timeval_to_timespec(times, ts), 0);
 }
 
 FUNCTION_DEFINE4(ssize_t, lgetxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
-    return tvm_getxattr(pathname, name, value, size, 1);
-}
-
-// As statfs: the host's answer for the host path, a synthetic one for a node.
-FUNCTION_DEFINE2(int, statvfs, const char *, pathname, struct statvfs *, buf) {
-    char pathname_abs[PATH_MAX];
-    if (!normalize_path(NULL, pathname, pathname_abs))
-        return -1;
-    tvm_sig_enter();
-    struct vfs_res res;
-    int ret = vfs_resolve(pathname_abs, 0, &res);
-    if (0 == ret)
-        ret = vfs_node_statvfs(res.vn, res.path, buf);
-    tvm_sig_leave();
-    return ret;
+    return tvm_getxattr(pathname, name, value, size, 0, XATTR_NOFOLLOW);
 }
 
 FUNCTION_DEFINE2(int, statvfs64, const char *, pathname, struct statvfs64 *, buf) {
     return statvfs(pathname, (struct statvfs *)buf);
-}
-
-FUNCTION_DEFINE2(int, fstatvfs, int, fd, struct statvfs *, buf) {
-    return CURRENT_RFD(fd, CALL_FUNC(fstatvfs, __rfd, buf));
 }
 
 FUNCTION_DEFINE2(int, fstatvfs64, int, fd, struct statvfs64 *, buf) {
