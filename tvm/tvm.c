@@ -1667,8 +1667,6 @@ void file_unlock(struct file *file, int refcount) {
 
 char *normalize_path(const char *dirname, const char *file_name, char *out_path);
 
-static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath, const char *devpath, int flags, mode_t mode, uid_t uid, gid_t gid);
-
 // The VFS's path operations (see "VFS"): every absolute path resolves
 // through the tree to a node -- a mount's entry, a device, or a transient
 // node of the host path behind it -- whose kind answers. The hooks call
@@ -1731,34 +1729,26 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
         }
     }
 
-    if (0 != file_open_dispatch(file, dirfd, pathname, devpath, flags, mode, uid, gid)) {
+    if (devpath[0] != '/') {
+        // relative to a descriptor with no recorded path (one adopted from
+        // the host): the host's, by (dirfd, relative) -- the one relative
+        // path an open ever sees, as every other caller normalizes theirs
+        int rfd = CALL_FUNC(openat, dirfd, pathname, flags, mode);
+        if (rfd == -1) {
+            filedealloc_locked(file);
+            return NULL;
+        }
+        file->f_rfd = rfd_adopt(rfd);
+        return file;
+    }
+
+    // the VFS opens its own node (a mount's entry, a device) or the host
+    // path behind it
+    if (0 != vfs_open_path(file, devpath, flags, mode, uid, gid)) {
         filedealloc_locked(file);
         return NULL;
     }
     return file;
-}
-
-/**
- * Open into `file` (locked, still unopened): the VFS opens its own node
- * (a mount's entry, a device) or the host path behind it. -1 with errno,
- * `file` left for the caller to dispose of.
- */
-static int file_open_dispatch(struct file *file, int dirfd, const char *hostpath, const char *devpath, int flags, mode_t mode, uid_t uid, gid_t gid)
-{
-    if (devpath[0] != '/') {
-        // relative to a descriptor with no recorded path (file_open: one
-        // adopted from the host, which no name was recorded for): the
-        // host's, by (dirfd, relative) -- the one relative path the path
-        // operations ever see, as the others' callers normalize theirs
-        int rfd = CALL_FUNC(openat, dirfd, hostpath, flags, mode);
-        if (rfd == -1)
-            return -1;
-
-        file->f_rfd = rfd_adopt(rfd);
-        return 0;
-    }
-
-    return vfs_open_path(file, devpath, flags, mode, uid, gid);
 }
 
 /**
