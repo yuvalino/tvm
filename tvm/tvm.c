@@ -1695,6 +1695,14 @@ static ssize_t vfs_readlink_path(const char *abspath, char *buf, size_t bufsiz);
 
 /**
  * returns locked with refcnt
+ *
+ * The file is filled in unlocked: until it is returned nobody can reach
+ * it (it is in no task's table, handed to nothing; the opens that fill
+ * it -- the host's, the VFS's, a tty's -- take their own locks and keep
+ * no pointer to it), so it is locked once at the end, for the caller.
+ * It used to be locked first and every open had to return it locked,
+ * so each let it go of around the tty's locks (which come before a
+ * file's) and took it back on every failure path.
  */
 struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int flags, mode_t mode, uid_t uid, gid_t gid)
 {
@@ -1703,7 +1711,6 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
         return NULL;
 
     file->f_refcnt++;
-    file_lock(file, 0);
 
     // The pathname the file is known by, recorded in f_pathname for the
     // *at() calls that TVM answers by path (dirfd_normalize_path). An open
@@ -1727,19 +1734,15 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
     // relative): nothing else can resolve it.
     char pathname_abs[PATH_MAX];
     if (pathname[0] != '/' && dirfd != AT_FDCWD && dirpath) {
-        if (!normalize_path(dirpath, pathname, pathname_abs)) {
-            filedealloc_locked(file);
-            return NULL;
-        }
+        if (!normalize_path(dirpath, pathname, pathname_abs))
+            goto fail;
     }
     const char *devpath = (pathname[0] != '/' && dirfd != AT_FDCWD && dirpath) ? pathname_abs : pathname;
 
     if (devpath[0] == '/') {
         file->f_pathname = kstrdup(devpath);
-        if (!file->f_pathname) {
-            filedealloc_locked(file);
-            return NULL;
-        }
+        if (!file->f_pathname)
+            goto fail;
     }
 
     if (devpath[0] != '/') {
@@ -1747,21 +1750,22 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
         // the host): the host's, by (dirfd, relative) -- the one relative
         // path an open ever sees, as every other caller normalizes theirs
         int rfd = CALL_FUNC(openat, dirfd, pathname, flags, mode);
-        if (rfd == -1) {
-            filedealloc_locked(file);
-            return NULL;
-        }
+        if (rfd == -1)
+            goto fail;
         file->f_rfd = rfd_adopt(rfd);
-        return file;
     }
-
     // the VFS opens its own node (a mount's entry, a device) or the host
     // path behind it
-    if (0 != vfs_open_path(file, devpath, flags, mode, uid, gid)) {
-        filedealloc_locked(file);
-        return NULL;
-    }
+    else if (0 != vfs_open_path(file, devpath, flags, mode, uid, gid))
+        goto fail;
+
+    file_lock(file, 0);
     return file;
+
+fail:
+    file_lock(file, 0);     /* filedealloc_locked wants it locked; errno is the open's */
+    filedealloc_locked(file);
+    return NULL;
 }
 
 /**
@@ -5120,10 +5124,11 @@ static struct fops *ttyops();
 
 /**
  * Open the slave side of `tt` (locked and referenced; the reference is
- * consumed) into `out`, which is unlocked here and locked on return,
- * with open(2)'s `flags`: without O_NOCTTY a session leader with no
- * controlling tty takes it as its own. What open(TTY_DIR/N) and
- * open(TTY_FILE) do, through their nodes (see "Devices in the tree").
+ * consumed) into `out` (unlocked, reachable by nobody yet: file_open's,
+ * being filled), with open(2)'s `flags`: without O_NOCTTY a session
+ * leader with no controlling tty takes it as its own. What
+ * open(TTY_DIR/N) and open(TTY_FILE) do, through their nodes (see
+ * "Devices in the tree").
  */
 static int tty_open_file(struct tty *tt, int flags, struct file *out)
 {
@@ -5144,7 +5149,6 @@ static int tty_open_file(struct tty *tt, int flags, struct file *out)
             if (tt->t_sid != current->tsk_sid && tt->t_sid != -1) {
                 task_unlock(current);
                 tty_unlock(tt, 1);
-                file_lock(out, 0);
                 errno = EIO;
                 return -1;
             }
@@ -5164,7 +5168,6 @@ static int tty_open_file(struct tty *tt, int flags, struct file *out)
         if (0 == (flags & O_NOCTTY))
             task_unlock(current);
         tty_unlock(tt, 1);
-        file_lock(out, 0);
         return -1;
     }
 
@@ -5177,8 +5180,6 @@ static int tty_open_file(struct tty *tt, int flags, struct file *out)
     }
 
     // by this point, task is unlocked
-
-    file_lock(out, 0);
 
     out->f_rfd = rfd_adopt(r_sfd);
     out->f_type = DEV_TTY;
@@ -6112,8 +6113,9 @@ static struct tty *tty_for_file_locked(struct file *file, int *out_ttymode) {
 }
 
 /**
- * A new pty, its master side opened into `file` (locked, unopened): what
- * open(PTMX_FILE) does, through its node, and openpty.
+ * A new pty, its master side opened into `file` (unopened, unlocked:
+ * reachable by nobody yet, being filled): what open(PTMX_FILE) does,
+ * through its node, and openpty.
  */
 static int ptm_open_file(struct file *file)
 {
@@ -6141,7 +6143,8 @@ static int ptm_open_file(struct file *file)
 }
 
 /**
- * returns locked and refcnt
+ * returns locked and refcnt (the file is filled in unlocked, as
+ * file_open fills its own: nobody can reach it yet)
  */
 static struct file *ptm_open()
 {
@@ -6149,12 +6152,14 @@ static struct file *ptm_open()
     if (!file)
         return NULL;
 
-    file_lock(file, 1);
+    file->f_refcnt++;
     if (0 != ptm_open_file(file)) {
+        file_lock(file, 0);     /* filedealloc_locked wants it locked */
         filedealloc_locked(file);
         return NULL;
     }
 
+    file_lock(file, 0);
     return file;
 }
 
@@ -6276,10 +6281,11 @@ struct vfs_nodeops {
     int (*o_chown)(struct vfs_node *vn, const char *path, uid_t owner, gid_t group, int flags);
     /* EINVAL for what is no link (what realpath asks, component by component) */
     ssize_t (*o_readlink)(struct vfs_node *vn, const char *path, char *buf, size_t bufsiz);
-    /* open into `out`, unlocked here and locked on return (the tty takes
-       its locks ahead of the file's), with open(2)'s flags and mode; what
-       it opens is its own kind of file (a tty's DEV_TTY, the host's
-       descriptor, a vfs_file on the node) */
+    /* open into `out` -- a file nobody can reach yet (file_open's, being
+       filled: in no task's table, locked by nobody), left untouched on
+       failure (-1, errno) -- with open(2)'s flags and mode; what it opens
+       is its own kind of file (a tty's DEV_TTY, the host's descriptor, a
+       vfs_file on the node) */
     int (*o_open)(struct vfs_node *vn, const char *path, int flags, mode_t mode, struct file *out);
     /* the host descriptor behind an open directory of this kind, which
        fstatfs and the like reach (NULL: "/"), with open(2)'s flags */
@@ -7818,21 +7824,11 @@ static int vfs_node_dirfd(struct vfs_node *vn, const char *path, int flags)
     return ops->o_dirfd ? ops->o_dirfd(vn, path, flags) : CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
 }
 
-/* open of `vn` into `out`, unlocked here and locked on return */
+/* open of `vn` into `out` (o_open's contract: a file nobody can reach yet) */
 static int vfs_node_open(struct vfs_node *vn, const char *path, int flags, mode_t mode, struct file *out)
 {
     const struct vfs_nodeops *ops = vn->vn_ops;
     return (ops->o_open ? ops->o_open : vfs_own_open)(vn, path, flags, mode, out);
-}
-
-/* An open that failed: `out` locked, as the open's contract has it on
-   return, errno kept */
-static int vfs_open_fail(struct file *out)
-{
-    int last_errno = errno;
-    file_lock(out, 0);
-    errno = last_errno;
-    return -1;
 }
 
 /* The checks a read-only mount makes on an open of `vn` (referenced, no
@@ -7873,7 +7869,7 @@ static int vfs_open_checks(struct vfs_node *vn, int flags, int *isdir)
     return 0;
 }
 
-/* `out` (unlocked here, locked on return) is an open of the node `vn`
+/* `out` (o_open's: reachable by nobody) is an open of the node `vn`
    (referenced, no lock held) with the host descriptor `rfd` behind it
    (adopted): a vfs_file on the node, served by vfsops */
 static int vfs_file_open(struct vfs_node *vn, int flags, int rfd, struct file *out)
@@ -7882,7 +7878,7 @@ static int vfs_file_open(struct vfs_node *vn, int flags, int rfd, struct file *o
     if (!vf) {
         CALL_FUNC(close, rfd);
         errno = ENOMEM;
-        return vfs_open_fail(out);
+        return -1;
     }
     vf->vf_oflags = flags;
     vf->vf_vn = vn;
@@ -7890,7 +7886,6 @@ static int vfs_file_open(struct vfs_node *vn, int flags, int rfd, struct file *o
     vf->vf_refcnt++;
     vf_unlock(vf, 1);
 
-    file_lock(out, 0);
     out->f_rfd = rfd_adopt(rfd);
     out->f_type = DEV_VFS;
     out->f_data = (void *)vf;
@@ -7907,14 +7902,14 @@ static int vfs_own_open(struct vfs_node *vn, const char *path, int flags, mode_t
 {
     int isdir;
     if (0 != vfs_open_checks(vn, flags, &isdir))
-        return vfs_open_fail(out);
+        return -1;
     int rfd;
     if (isdir)
         rfd = vfs_node_dirfd(vn, path, flags);
     else
         rfd = CALL_FUNC(open, "/dev/null", flags & O_ACCMODE);
     if (rfd == -1)
-        return vfs_open_fail(out);
+        return -1;
     return vfs_file_open(vn, flags, rfd, out);
 }
 
@@ -7976,8 +7971,7 @@ static int host_open(struct vfs_node *vn, const char *path, int flags, mode_t mo
 {
     int rfd = CALL_FUNC(openat, AT_FDCWD, path, flags, mode);
     if (rfd == -1)
-        return vfs_open_fail(out);
-    file_lock(out, 0);
+        return -1;
     out->f_rfd = rfd_adopt(rfd);
     return 0;
 }
@@ -8256,13 +8250,13 @@ static int bind_open(struct vfs_node *vn, const char *path, int flags, mode_t mo
     int rdonly = (flags & O_ACCMODE) == O_RDONLY && !(flags & (O_CREAT | O_TRUNC));
     int isdir;
     if ((flags & O_DIRECTORY) && 0 != vfs_open_checks(vn, flags, &isdir))
-        return vfs_open_fail(out);
+        return -1;
 
     struct vfs_res res;
     if (0 != bind_forward(vn, path, &res)) {
         if ((flags & O_CREAT) && errno == ENOENT)
             errno = vfs_create_enoent(path, EROFS);     /* a dangling bind: the resolver's ENOENT */
-        return vfs_open_fail(out);
+        return -1;
     }
     if (rdonly || (flags & O_DIRECTORY)) {
         struct stat st;
@@ -8271,22 +8265,17 @@ static int bind_open(struct vfs_node *vn, const char *path, int flags, mode_t mo
             int rfd = vfs_node_dirfd(res.vn, res.path, flags);
             vn_release(res.vn);
             if (rfd == -1)
-                return vfs_open_fail(out);
+                return -1;
             return vfs_file_open(vn, flags, rfd, out);
         }
         if (flags & O_DIRECTORY) {
             vn_release(res.vn);
             errno = ENOTDIR;
-            return vfs_open_fail(out);
+            return -1;
         }
     }
     int r = vfs_node_open(res.vn, res.path, flags & ~O_NOFOLLOW, mode, out);
-    /* the file is let go of while the target is released: the last
-       reference to a transient node takes the driver's locks (o_release:
-       the tty's), which come before the file's */
-    file_unlock(out, 0);
     vn_release(res.vn);
-    file_lock(out, 0);
     return r;
 }
 
@@ -8382,25 +8371,17 @@ static ssize_t vfs_readlink_path(const char *abspath, char *buf, size_t bufsiz)
    in a device directory EACCES (the resolver's ENOENT comes from those
    alone: an overlay falls through to the host, which creates there, and
    says ENOENT itself for a directory that is not there). `out` is
-   locked; released while the tree is walked, as the lock order is file,
-   then vfs_file, then node. */
+   file_open's, being filled: unlocked, reachable by nobody. */
 static int vfs_open_path(struct file *out, const char *abspath, int flags, mode_t mode, uid_t uid, gid_t gid)
 {
-    file_unlock(out, 0);
-
     struct vfs_res res;
     if (0 != vfs_resolve(abspath, (flags & O_NOFOLLOW) ? VR_NOFOLLOW : 0, &res)) {
         if ((flags & O_CREAT) && errno == ENOENT)
             errno = vfs_create_enoent(abspath, EROFS);
-        return vfs_open_fail(out);
+        return -1;
     }
     int r = vfs_node_open(res.vn, res.path, flags, mode, out);
-    /* the file is let go of while the node is released: the last
-       reference to a transient node takes the driver's locks (o_release:
-       the tty's), which come before the file's */
-    file_unlock(out, 0);
     vn_release(res.vn);
-    file_lock(out, 0);
     if (r == -1 && (flags & O_CREAT) && errno == ENOENT)
         errno = vfs_create_enoent(abspath, ENOENT);
     return r;
@@ -9203,7 +9184,7 @@ static int cttydev_open(struct vfs_node *vn, const char *path, int flags, mode_t
 {
     if (flags & O_DIRECTORY) {
         errno = ENOTDIR;
-        return vfs_open_fail(out);
+        return -1;
     }
     struct tty *tt = tty_ctty();
     if (!tt)
@@ -9252,9 +9233,8 @@ static int ptmxdev_open(struct vfs_node *vn, const char *path, int flags, mode_t
 {
     if (flags & O_DIRECTORY) {
         errno = ENOTDIR;
-        return vfs_open_fail(out);
+        return -1;
     }
-    file_lock(out, 0);
     return ptm_open_file(out);
 }
 
@@ -9266,7 +9246,7 @@ static int ptsdev_open(struct vfs_node *vn, const char *path, int flags, mode_t 
 {
     if (flags & O_DIRECTORY) {
         errno = ENOTDIR;
-        return vfs_open_fail(out);
+        return -1;
     }
     struct tty *tt = vn->vn_devdata;
     tty_lock(tt, 1);
