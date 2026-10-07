@@ -5467,7 +5467,8 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
         return -1;
     }
 
-    struct tty *tt = tty_for_file_locked(file, NULL);
+    int ttymode;
+    struct tty *tt = tty_for_file_locked(file, &ttymode);
     if (!tt)
         return -1;
 
@@ -5476,6 +5477,23 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
 
     tty_unlock(tt, 0);
     file_unlock(file, 0);
+
+    // The master (sshd's end) reads whatever the slave has written, up to
+    // count, as a kernel's pty master does: VMIN/VTIME are the slave's
+    // read settings. Going through the loop below, with the slave's VMIN of
+    // 1, returned one byte per read, so dropbear sent every byte of output
+    // as an SSH packet of its own: ~65 KB/s through a tty against ~1 MB/s
+    // without one, and vim redrew visibly slowly on the iPhone. A blocking
+    // read of the socket returns as soon as anything is there.
+    if (ttymode == TTM_MASTER) {
+        ssize_t n = count ? CALL_FUNC(read, file->f_rfd, buf, count) : 0;
+        int last_errno = errno;
+        tty_lock(tt, 0);
+        tty_unlock(tt, 1);
+        file_lock(file, 0);
+        errno = last_errno;
+        return n;
+    }
 
     size_t total_read = 0;
     uint8_t *out = buf;
@@ -5638,52 +5656,70 @@ static u_char const char_type[] = {
 #undef  TB
 #undef  VT
 
-static int tty_putc_locked(struct tty *tt, int fd, int c)
+// The slave's output on its way to the master, after OPOST: collected and
+// written a buffer at a time (it was a write(2) per byte, two with ONLCR).
+struct tty_obuf {
+    struct tty *tt;
+    int fd;             // O_NONBLOCK
+    size_t n;
+    uint8_t b[1024];
+};
+
+// Write out what is collected. The descriptor is non-blocking so the tty
+// lock is not held while a full master side blocks: on EAGAIN the rest
+// goes out blocking with the lock dropped, as tty_putc_locked did.
+static int tty_obuf_flush(struct tty_obuf *o)
 {
-    // assumes fd is O_NONBLOCK
+    size_t off = 0;
+    while (off < o->n) {
+        ssize_t w = CALL_FUNC(write, o->fd, o->b + off, o->n - off);
+        if (w > 0) {
+            off += w;
+            continue;
+        }
+        if (w == 0)
+            panic("what?");
+        if (errno != EWOULDBLOCK && errno != EAGAIN)
+            return -1;
 
-
-    ssize_t ret = CALL_FUNC(write, fd, &c, 1);
-    if (ret == 1)
-        return 0;
-    if (ret == 0)
-        panic("what?");
-    if (errno != EWOULDBLOCK && errno != EAGAIN)
-        return -1;
-    
-    // would block, try with blocking
-    if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, 0))
-        return -1;
-    
-    tty_unlock(tt, 0);
-    ret = CALL_FUNC(write, fd, &c, 1);
-    tty_lock(tt, 0);
-
-    if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, O_NONBLOCK))
-        return -1;
-
-    if (ret == 0)
-        panic("what?");
-    if (ret == 1)
-        return 0;
-    return -1;
+        if (-1 == CALL_FUNC(fcntl, o->fd, F_SETFL, 0))
+            return -1;
+        tty_unlock(o->tt, 0);
+        w = CALL_FUNC(write, o->fd, o->b + off, o->n - off);
+        tty_lock(o->tt, 0);
+        if (-1 == CALL_FUNC(fcntl, o->fd, F_SETFL, O_NONBLOCK))
+            return -1;
+        if (w <= 0)
+            return -1;
+        off += w;
+    }
+    o->n = 0;
+    return 0;
 }
 
-static int tty_output_locked(struct tty *tt, int fd, int c)
+static int tty_putc_locked(struct tty_obuf *o, int c)
+{
+    if (o->n == sizeof(o->b) && tty_obuf_flush(o))
+        return -1;
+    o->b[o->n++] = (uint8_t)c;
+    return 0;
+}
+
+static int tty_output_locked(struct tty *tt, struct tty_obuf *o, int c)
 {
     int col;
 
     if (!ISSET(tt->t_oflag, OPOST)) {
         if (ISSET(tt->t_lflag, FLUSHO))
             return 0;
-        return tty_putc_locked(tt, fd, c);
+        return tty_putc_locked(o, c);
     }
 
     // expand tabs or smth
 
     // if ONLCR is set, translate newline into "\r\n"
     if (c == '\n' && ISSET(tt->t_oflag, ONLCR)) {
-        if (tty_putc_locked(tt, fd, '\r'))
+        if (tty_putc_locked(o, '\r'))
             return -1;
     }
     // if OCRNL is set, translate "\r" into "\n"
@@ -5693,7 +5729,7 @@ static int tty_output_locked(struct tty *tt, int fd, int c)
     else if (c == '\r' && ISSET(tt->t_oflag, ONOCR) && tt->t_col == 0)
         return 0;
 
-    if (!ISSET(tt->t_lflag, FLUSHO) && tty_putc_locked(tt, fd, c))
+    if (!ISSET(tt->t_lflag, FLUSHO) && tty_putc_locked(o, c))
         return -1;
     
     col = tt->t_col;
@@ -5732,13 +5768,19 @@ static ssize_t tty_output_buffer_locked(struct tty *tt, struct file *file, const
         return -1;
 
     file_unlock(file, 0);
-    size_t i;
-    for (i = 0; i < count; i++)
-        if (0 != tty_output_locked(tt, file->f_rfd, (int)buf[i]))
+    struct tty_obuf o = { .tt = tt, .fd = file->f_rfd };
+    size_t i, done = 0;
+    for (i = 0; i < count; i++) {
+        if (0 != tty_output_locked(tt, &o, (int)buf[i]))
             break;
+        if (o.n == 0)
+            done = i + 1;   // everything up to here is out
+    }
+    if (0 == tty_obuf_flush(&o))
+        done = i;
     file_lock(file, 0);
-    
-    ret = i;
+
+    ret = done;
 
     CALL_FUNC(fcntl, file->f_rfd, F_SETFL, fflags);
 
@@ -5762,10 +5804,11 @@ static void tty_echo_locked(struct tty *tt, int c)
         return;
     }
 
+    struct tty_obuf o = { .tt = tt, .fd = slave };
 	if (ISSET(tt->t_lflag, ECHOCTL) &&
 	    ((ISSET(c, TTY_CHARMASK) <= 037 && c != '\t' && c != '\n') ||
 	    ISSET(c, TTY_CHARMASK) == 0177)) {
-		(void)tty_output_locked(tt, slave, '^');
+		(void)tty_output_locked(tt, &o, '^');
 		CLR(c, ~TTY_CHARMASK);
 		if (c == 0177) {
 			c = '?';
@@ -5774,7 +5817,8 @@ static void tty_echo_locked(struct tty *tt, int c)
 		}
 	}
 
-	tty_output_locked(tt, slave, c);
+	tty_output_locked(tt, &o, c);
+    (void)tty_obuf_flush(&o);
     CALL_FUNC(close, slave);
 }
 
@@ -5808,7 +5852,11 @@ static int tty_input_locked(struct tty *tt, int fd, int c)
         
     }
 
-    return tty_putc_locked(tt, fd, c);
+    // keystrokes, one at a time: an ISIG character above acts between them
+    struct tty_obuf o = { .tt = tt, .fd = fd };
+    if (tty_putc_locked(&o, c))
+        return -1;
+    return tty_obuf_flush(&o);
 }
 
 static ssize_t tty_input_buffer_locked(struct tty *tt, struct file *file, const uint8_t *buf, size_t count)
