@@ -2,7 +2,8 @@
 
 #include <stddef.h>
 
-enum { TVM_MOUNT_CPIO = 0, TVM_MOUNT_BIND = 1 };
+#define TVM_MOUNT_CPIO 0   // a cpio archive (data, size): the default
+#define TVM_MOUNT_BIND 1   // a bind mount of `source` over `path`
 
 struct tvm_mount {
     const char *path;   // absolute, normalized guest mount point, e.g. "/tvm"
