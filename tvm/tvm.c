@@ -6261,8 +6261,8 @@ struct vfs_dir;
  * node lock held and a reference on the node, released once it returns:
  * a host call, or a driver's locks (the tty's, under which no node is
  * ever taken), is never made under a node lock. An operation that reads
- * or changes the node's fields takes its lock for that alone (vn_lock(vn)
- * .. vn_unlock(vn)); vn_ops, vn_kind, vn_devdata and vn_target are fixed
+ * or changes the node's fields takes its lock for that alone (vn_lock(vn, 0)
+ * .. vn_unlock(vn, 0)); vn_ops, vn_kind, vn_devdata and vn_target are fixed
  * at the node's creation and read without it. `path` is the node's
  * canonical guest path, as the resolver hands it out with the node (a
  * host node's: the host path). A NULL operation is the answer of a node
@@ -6407,7 +6407,8 @@ static struct vfs_node * vnalloc(const char *name, mode_t mode, uid_t uid, gid_t
  * A node's references and its lock are two things. A reference keeps the
  * node (vn_acquire, vn_release: atomic, taken and dropped with or without
  * any lock held); the lock (vn_lock, vn_unlock) guards its fields for the
- * moment they are read or changed. Whoever locks a node holds a reference
+ * moment they are read or changed, and takes or drops references with it
+ * when the two go together. Whoever locks a node holds a reference
  * on it, its own or one of something that holds one (a parent's child
  * list, an open vfs_file), so the last reference is never dropped on a
  * locked node: vn_release frees it with nobody able to reach it, and
@@ -6459,12 +6460,21 @@ static void vn_release(struct vfs_node *vn) {
     }
 }
 
-static void vn_lock(struct vfs_node *vn) {
+/* The lock, and a reference taken with it or dropped after it, as
+   file_lock/file_unlock and tty_lock/tty_unlock do: vn_lock(vn, 1) locks
+   and keeps the node, vn_unlock(vn, 1) is done with its fields and with
+   the node. A reference alone, with no lock to take, is vn_acquire and
+   vn_release. */
+static void vn_lock(struct vfs_node *vn, int refcount) {
     pthread_mutex_lock(&vn->vn_lock);
+    if (refcount)
+        __atomic_add_fetch(&vn->vn_refcnt, refcount, __ATOMIC_RELAXED);
 }
 
-static void vn_unlock(struct vfs_node *vn) {
+static void vn_unlock(struct vfs_node *vn, int refcount) {
     pthread_mutex_unlock(&vn->vn_lock);
+    while (refcount-- > 0)
+        vn_release(vn);
 }
 
 /* `child` (locked) goes in the list of `parent` (locked): the list's
@@ -6489,8 +6499,7 @@ static struct vfs_node *vfs_find_child_locked(struct vfs_node *dir, const char *
 
     list_for_each_entry(vn, &dir->vn_children, vn_list) {
         if (0 == strcmp(vn->vn_name, name)) {
-            vn_acquire(vn);
-            vn_lock(vn);
+            vn_lock(vn, 1);
             return vn;
         }
     }
@@ -6577,12 +6586,10 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
         if (strcmp(tok, "..") == 0) {
             if (cur != root) {
                 struct vfs_node *parent = cur->vn_parent;
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(cur, 1);
                 cur = parent;
                 if (cur != root) {
-                    vn_acquire(cur);
-                    vn_lock(cur);
+                    vn_lock(cur, 1);
                 }
             }
             tok = next_tok;
@@ -6597,8 +6604,7 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
                 child = vnalloc(tok, mode, uid, gid);
                 if (!child) {
                     if (cur != root) {
-                        vn_unlock(cur);
-                        vn_release(cur);
+                        vn_unlock(cur, 1);
                     }
                     return NULL;
                 }
@@ -6607,14 +6613,12 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
                 child->vn_mount_id = cur->vn_mount_id;
                 vfs_add_child_locked(cur, child);
                 if (cur != root) {
-                    vn_unlock(cur);
-                    vn_release(cur);
+                    vn_unlock(cur, 1);
                 }
                 return child;
             } else {
                 if (cur != root) {
-                    vn_unlock(cur);
-                    vn_release(cur);
+                    vn_unlock(cur, 1);
                 }
                 errno = ENOENT;
                 return NULL;
@@ -6622,19 +6626,16 @@ static struct vfs_node *vfs_lookup_locked(struct vfs_node *root, const char *rel
         }
 
         if (next_tok && !S_ISDIR(child->vn_st.st_mode)) {
-            vn_unlock(child);
-            vn_release(child);
+            vn_unlock(child, 1);
             if (cur != root) {
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(cur, 1);
             }
             errno = ENOTDIR;
             return NULL;
         }
 
         if (cur != root) {
-            vn_unlock(cur);
-            vn_release(cur);
+            vn_unlock(cur, 1);
         }
         cur = child;
         tok = next_tok;
@@ -6650,7 +6651,7 @@ static void vfs_init(void)
         panic("vfs_init");
     vfs_root->vn_kind = VN_OVERLAY;
     vfs_root->vn_ops = &vfs_overlay_ops;
-    vn_unlock(vfs_root);
+    vn_unlock(vfs_root, 0);
 }
 
 /* Mount points are created: `mount X /a/b/c` makes /a and /a/b overlay
@@ -6680,15 +6681,13 @@ static int vfs_mkpath_locked(const char *abspath, struct vfs_node **parent, char
     }
 
     struct vfs_node *cur = vfs_root;
-    vn_acquire(cur);
-    vn_lock(cur);
+    vn_lock(cur, 1);
 
     for (;;) {
         char *next = strtok_r(NULL, "/", &saveptr);
         if (!next) {
             if (strlen(tok) > NAME_MAX) {
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(cur, 1);
                 errno = ENAMETOOLONG;
                 return -1;
             }
@@ -6700,15 +6699,13 @@ static int vfs_mkpath_locked(const char *abspath, struct vfs_node **parent, char
         struct vfs_node *child = vfs_find_child_locked(cur, tok);
         if (!child) {
             if (!VFS_CREATE_MOUNTPOINTS) {
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(cur, 1);
                 errno = ENOENT;
                 return -1;
             }
             child = vnalloc(tok, S_IFDIR | 0755, 0, 0);
             if (!child) {
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(cur, 1);
                 return -1;
             }
             child->vn_kind = VN_OVERLAY;
@@ -6717,16 +6714,13 @@ static int vfs_mkpath_locked(const char *abspath, struct vfs_node **parent, char
             vfs_add_child_locked(cur, child);
         }
         else if (!S_ISDIR(child->vn_st.st_mode)) {
-            vn_unlock(child);
-            vn_release(child);
-            vn_unlock(cur);
-            vn_release(cur);
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
             errno = ENOTDIR;
             return -1;
         }
 
-        vn_unlock(cur);
-        vn_release(cur);
+        vn_unlock(cur, 1);
         cur = child;
         tok = next;
     }
@@ -6756,19 +6750,17 @@ static void vfs_attach_locked(struct vfs_node *parent, struct vfs_node *child)
                 pos = pos->next;
                 if (dev->vn_kind != VN_DEV)
                     continue;
-                vn_lock(dev);
+                vn_lock(dev, 0);
                 list_del(&dev->vn_list);
                 dev->vn_parent = child;
                 vn_acquire(child);  /* the device's reference on its new directory */
                 list_add(&dev->vn_list, &child->vn_children);
-                vn_unlock(dev);
+                vn_unlock(dev, 0);
             }
         }
         list_del(&old->vn_list);
         INIT_LIST_HEAD(&old->vn_list);
-        vn_unlock(old);
-        vn_release(old);    /* the lookup's reference */
-        vn_release(old);    /* the list's */
+        vn_unlock(old, 2);  /* the lookup's reference and the list's */
     }
     vfs_add_child_locked(parent, child);
 }
@@ -6794,8 +6786,7 @@ static int vfs_mount_cpio(const char *path, const void *buf, size_t size)
 
     struct vfs_node *root = vnalloc(leaf, S_IFDIR | 0766, getuid(), getgid());
     if (!root) {
-        vn_unlock(parent);
-        vn_release(parent);
+        vn_unlock(parent, 1);
         VFS_UNLOCK();
         return -1;
     }
@@ -6804,20 +6795,16 @@ static int vfs_mount_cpio(const char *path, const void *buf, size_t size)
     root->vn_mount_id = ++vfs_next_mount_id;
 
     if (0 != vfs_load_cpio(root, buf, size)) {
-        vn_unlock(root);
-        vn_release(root);
-        vn_unlock(parent);
-        vn_release(parent);
+        vn_unlock(root, 1);
+        vn_unlock(parent, 1);
         VFS_UNLOCK();
         errno = EINVAL;
         return -1;
     }
 
     vfs_attach_locked(parent, root);
-    vn_unlock(root);
-    vn_release(root);
-    vn_unlock(parent);
-    vn_release(parent);
+    vn_unlock(root, 1);
+    vn_unlock(parent, 1);
     VFS_UNLOCK();
     return 0;
 }
@@ -6855,11 +6842,9 @@ static int vfs_bind(const char *source, const char *mountpoint)
     struct vfs_node *vn = vnalloc(leaf, S_IFDIR | 0755, 0, 0);
     if (!vn || !(vn->vn_target = kstrdup(s))) {
         if (vn) {
-            vn_unlock(vn);
-            vn_release(vn);
+            vn_unlock(vn, 1);
         }
-        vn_unlock(parent);
-        vn_release(parent);
+        vn_unlock(parent, 1);
         VFS_UNLOCK();
         errno = ENOMEM;
         return -1;
@@ -6869,10 +6854,8 @@ static int vfs_bind(const char *source, const char *mountpoint)
     vn->vn_mount_id = ++vfs_next_mount_id;
 
     vfs_attach_locked(parent, vn);
-    vn_unlock(vn);
-    vn_release(vn);
-    vn_unlock(parent);
-    vn_release(parent);
+    vn_unlock(vn, 1);
+    vn_unlock(parent, 1);
     VFS_UNLOCK();
     return 0;
 }
@@ -6894,8 +6877,7 @@ static int vfs_mount_dev(const char *abspath, mode_t mode, const struct vfs_node
 
     struct vfs_node *vn = vnalloc(leaf, mode, 0, 0);
     if (!vn) {
-        vn_unlock(parent);
-        vn_release(parent);
+        vn_unlock(parent, 1);
         VFS_UNLOCK();
         return -1;
     }
@@ -6905,10 +6887,8 @@ static int vfs_mount_dev(const char *abspath, mode_t mode, const struct vfs_node
     vn->vn_mount_id = ++vfs_next_mount_id;
 
     vfs_attach_locked(parent, vn);
-    vn_unlock(vn);
-    vn_release(vn);
-    vn_unlock(parent);
-    vn_release(parent);
+    vn_unlock(vn, 1);
+    vn_unlock(parent, 1);
     VFS_UNLOCK();
     return 0;
 }
@@ -7154,8 +7134,7 @@ restart:;
     /* a link's or a bind's target may end in "/" itself */
     trailing |= path_strip_slash(tmp);
     struct vfs_node *cur = vfs_root;
-    vn_acquire(cur);
-    vn_lock(cur);
+    vn_lock(cur, 1);
     vfs_walk_restart(w, tmp);
     char *saveptr;
     char *tok = strtok_r(tmp, "/", &saveptr);
@@ -7169,21 +7148,19 @@ restart:;
                no node lock held (it takes its own locks), the reference on
                the directory kept meanwhile */
             struct vfs_node *dir = cur;
-            vn_unlock(dir);
+            vn_unlock(dir, 0);
             child = dir->vn_ops->o_lookup(dir, tok);
             vn_release(dir);
             if (!child)
                 return -1;
-            vn_lock(child);
+            vn_lock(child, 0);
             if (next && !S_ISDIR(child->vn_st.st_mode)) {
-                vn_unlock(child);
-                vn_release(child);
+                vn_unlock(child, 1);
                 errno = ENOTDIR;
                 return -1;
             }
             if (vfs_walk_step(w, tok)) {
-                vn_unlock(child);
-                vn_release(child);
+                vn_unlock(child, 1);
                 return -1;
             }
             cur = child;
@@ -7193,8 +7170,7 @@ restart:;
 
         if (!child) {
             if (cur->vn_kind != VN_OVERLAY) {
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(cur, 1);
                 /* Set errno explicitly: the callers return -1 straight from
                    this verdict, and a stale value leaked (ls reported ENOTTY,
                    cat EBADEXEC, cd EINTR). */
@@ -7204,8 +7180,7 @@ restart:;
             /* an overlay's underlay is the host directory of its own path:
                the host's object of the name, the rest of the path behind it */
             vfs_node_path_locked(cur, out->path, sizeof(out->path));
-            vn_unlock(cur);
-            vn_release(cur);
+            vn_unlock(cur, 1);
             vfs_rest(next, saveptr, rest);
             if (vfs_path_join(out->path, tok) || vfs_path_join(out->path, rest))
                 return -1;
@@ -7216,37 +7191,29 @@ restart:;
             /* a mount of its own under it: descend to it as a directory */
             struct vfs_node *nested = vfs_find_child_locked(child, next);
             if (nested) {
-                vn_unlock(nested);
-                vn_release(nested);
+                vn_unlock(nested, 1);
                 if (vfs_walk_step(w, tok)) {
-                    vn_unlock(child);
-                    vn_release(child);
-                    vn_unlock(cur);
-                    vn_release(cur);
+                    vn_unlock(child, 1);
+                    vn_unlock(cur, 1);
                     return -1;
                 }
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(cur, 1);
                 cur = child;
                 tok = next;
                 continue;
             }
 
             if (++w->nlinks > MAXSYMLINKS) {
-                vn_unlock(child);
-                vn_release(child);
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(child, 1);
+                vn_unlock(cur, 1);
                 errno = ELOOP;
                 return -1;
             }
             char target[PATH_MAX];
             snprintf(target, sizeof(target), "%s", child->vn_target);
             w->host_mount_id = child->vn_mount_id;
-            vn_unlock(child);
-            vn_release(child);
-            vn_unlock(cur);
-            vn_release(cur);
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
 
             /* the mount point is the guest path of what the target's walk
                ends at (vfs_walk_push, before tok goes with tmp) */
@@ -7262,18 +7229,14 @@ restart:;
 
         if (child->vn_kind == VN_CPIO && S_ISLNK(child->vn_st.st_mode) && (next || trailing || !(flags & VR_NOFOLLOW))) {
             if (!child->vn_data || child->vn_size >= PATH_MAX) {
-                vn_unlock(child);
-                vn_release(child);
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(child, 1);
+                vn_unlock(cur, 1);
                 errno = EINVAL;
                 return -1;
             }
             if (++w->nlinks > MAXSYMLINKS) {
-                vn_unlock(child);
-                vn_release(child);
-                vn_unlock(cur);
-                vn_release(cur);
+                vn_unlock(child, 1);
+                vn_unlock(cur, 1);
                 errno = ELOOP;
                 return -1;
             }
@@ -7281,10 +7244,8 @@ restart:;
             char target[PATH_MAX];
             memcpy(target, child->vn_data, child->vn_size);
             target[child->vn_size] = 0;
-            vn_unlock(child);
-            vn_release(child);
-            vn_unlock(cur);
-            vn_release(cur);
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
 
             /* The target with the rest of the path behind it, folded the way
                the caller's path was (".." steps over the link's directory,
@@ -7311,36 +7272,30 @@ restart:;
         }
 
         if (next && !S_ISDIR(child->vn_st.st_mode)) {
-            vn_unlock(child);
-            vn_release(child);
-            vn_unlock(cur);
-            vn_release(cur);
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
             errno = ENOTDIR;
             return -1;
         }
 
         if (vfs_walk_step(w, tok)) {
-            vn_unlock(child);
-            vn_release(child);
-            vn_unlock(cur);
-            vn_release(cur);
+            vn_unlock(child, 1);
+            vn_unlock(cur, 1);
             return -1;
         }
-        vn_unlock(cur);
-        vn_release(cur);
+        vn_unlock(cur, 1);
         cur = child;
         tok = next;
     }
 
     /* a bind's target answers for it, walked with the "/" (vfs_bind_target) */
     if (trailing && cur->vn_kind != VN_BIND && !S_ISDIR(cur->vn_st.st_mode)) {
-        vn_unlock(cur);
-        vn_release(cur);
+        vn_unlock(cur, 1);
         errno = ENOTDIR;
         return -1;
     }
     vfs_node_path_locked(cur, out->path, sizeof(out->path));
-    vn_unlock(cur);     /* the reference is the result's */
+    vn_unlock(cur, 0);     /* the reference is the result's */
     out->vn = cur;
     out->mount_id = cur->vn_mount_id;
     out->is_mountpoint = vfs_node_is_mountpoint(cur);
@@ -7591,7 +7546,7 @@ static struct vfs_node *vn_for_vf_locked(struct vfs_file *vf) {
     struct vfs_node *vn = vf->vf_vn;
     vn_acquire(vn);
     vf_unlock(vf, 0);
-    vn_lock(vn);
+    vn_lock(vn, 0);
     vf_lock(vf, 0);
     return vn;
 }
@@ -7636,25 +7591,25 @@ static int vfs_dir_add_underlay(struct vfs_dir *d, const char *abspath);
 /* The answers of a node of the VM's own (a NULL operation): in memory */
 static int vfs_own_stat(struct vfs_node *vn, const char *path, struct stat *st, int flags)
 {
-    vn_lock(vn);
+    vn_lock(vn, 0);
     int ret = vn_stat_locked(vn, st);
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     return ret;
 }
 
 static int vfs_own_chmod(struct vfs_node *vn, const char *path, mode_t mode, int flags)
 {
-    vn_lock(vn);
+    vn_lock(vn, 0);
     int ret = vn_chmod_locked(vn, mode);
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     return ret;
 }
 
 static int vfs_own_chown(struct vfs_node *vn, const char *path, uid_t owner, gid_t group, int flags)
 {
-    vn_lock(vn);
+    vn_lock(vn, 0);
     int ret = vn_chown_locked(vn, owner, group);
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     return ret;
 }
 
@@ -7704,9 +7659,9 @@ static int vfs_own_statfs(struct vfs_node *vn, const char *path, struct statfs *
 {
     struct vfs_node *mount = vfs_node_mount(vn);
     char mntpath[PATH_MAX];
-    vn_lock(mount);
+    vn_lock(mount, 0);
     vfs_node_path_locked(mount, mntpath, sizeof(mntpath));
-    vn_unlock(mount);
+    vn_unlock(mount, 0);
     return vfs_statfs_synthetic(mntpath, buf);
 }
 
@@ -7734,9 +7689,9 @@ static int vfs_own_statvfs(struct vfs_node *vn, const char *path, struct statvfs
 /* a directory first, as the host answers truncate of one */
 static int vfs_own_truncate(struct vfs_node *vn, const char *path, off_t length)
 {
-    vn_lock(vn);
+    vn_lock(vn, 0);
     int isdir = S_ISDIR(vn->vn_st.st_mode);
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     errno = isdir ? EISDIR : EROFS;
     return -1;
 }
@@ -7835,9 +7790,9 @@ static int vfs_node_open(struct vfs_node *vn, const char *path, int flags, mode_
    lock held), by its mode; *isdir says it is a directory. */
 static int vfs_open_checks(struct vfs_node *vn, int flags, int *isdir)
 {
-    vn_lock(vn);
+    vn_lock(vn, 0);
     mode_t mode = vn->vn_st.st_mode;
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     *isdir = S_ISDIR(mode);
 
     // The VFS holds cpio mounts and is read-only: vfsop_write is unimplemented
@@ -7919,9 +7874,9 @@ static int vfs_own_open(struct vfs_node *vn, const char *path, int flags, mode_t
  */
 static ssize_t cpio_readlink(struct vfs_node *vn, const char *path, char *buf, size_t bufsiz)
 {
-    vn_lock(vn);
+    vn_lock(vn, 0);
     if (!S_ISLNK(vn->vn_st.st_mode)) {
-        vn_unlock(vn);
+        vn_unlock(vn, 0);
         errno = EINVAL;
         return -1;
     }
@@ -7929,7 +7884,7 @@ static ssize_t cpio_readlink(struct vfs_node *vn, const char *path, char *buf, s
     if (len > bufsiz)
         len = bufsiz;
     memcpy(buf, vn->vn_data, len);
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     return (ssize_t)len;
 }
 
@@ -8573,17 +8528,14 @@ static void vfsop_close(struct file *file) {
     vf->vf_refcnt--;
     if (vf->vf_refcnt > 1) {
         vf_unlock(vf, 1);
-        vn_unlock(vn);
-        vn_release(vn);
+        vn_unlock(vn, 1);
         return;
     }
 
     VERIFY(vf->vf_refcnt == 1);
 
     vf->vf_vn = NULL;
-    vn_unlock(vn);
-    vn_release(vn);     /* vn_for_vf_locked's reference */
-    vn_release(vn);     /* the vfs_file's (vfs_file_open) */
+    vn_unlock(vn, 2);   /* vn_for_vf_locked's reference and the vfs_file's (vfs_file_open) */
 
     file->f_data = NULL;
     vf_unlock(vf, 1); // will dealloc
@@ -8608,7 +8560,7 @@ static int vfsop_fstat(struct file *file, struct stat *st)
 
     char path[PATH_MAX];
     vfs_node_path_locked(vn, path, sizeof(path));
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     file_unlock(file, 0);
     int ret = vfs_node_stat(vn, path, st, 0);
     vn_release(vn);
@@ -8623,8 +8575,7 @@ static int vfsop_fchmod(struct file *file, mode_t mode)
         return -1;
 
     int ret = vn_chmod_locked(vn, mode);
-    vn_unlock(vn);
-    vn_release(vn);
+    vn_unlock(vn, 1);
     return ret;
 }
 
@@ -8635,8 +8586,7 @@ static int vfsop_fchown(struct file *file, uid_t owner, gid_t group)
         return -1;
 
     int ret = vn_chown_locked(vn, owner, group);
-    vn_unlock(vn);
-    vn_release(vn);
+    vn_unlock(vn, 1);
     return ret;
 }
 
@@ -8662,8 +8612,7 @@ static ssize_t vfsop_read(struct file *file, void *buf, size_t count, int offset
 
     if (S_ISDIR(vn->vn_st.st_mode) || (vf->vf_oflags & O_DIRECTORY)) {
         vf_unlock(vf, 1);
-        vn_unlock(vn);
-        vn_release(vn);
+        vn_unlock(vn, 1);
         errno = EISDIR;
         return -1;
     }
@@ -8671,8 +8620,7 @@ static ssize_t vfsop_read(struct file *file, void *buf, size_t count, int offset
     if (O_RDONLY != (vf->vf_oflags & (O_ACCMODE)) &&
         O_RDWR   != (vf->vf_oflags & (O_ACCMODE))) {
         vf_unlock(vf, 1);
-        vn_unlock(vn);
-        vn_release(vn);
+        vn_unlock(vn, 1);
         errno = EBADF;
         return -1;
     }
@@ -8684,8 +8632,7 @@ static ssize_t vfsop_read(struct file *file, void *buf, size_t count, int offset
     // read after size return no data
     if (op_offset > vn->vn_size) {
         vf_unlock(vf, 1);
-        vn_unlock(vn);
-        vn_release(vn);
+        vn_unlock(vn, 1);
         return 0;
     }
 
@@ -8701,8 +8648,7 @@ static ssize_t vfsop_read(struct file *file, void *buf, size_t count, int offset
         vf->vf_cursor += op_size;
 
     vf_unlock(vf, 1);
-    vn_unlock(vn);
-    vn_release(vn);
+    vn_unlock(vn, 1);
 
     return op_size;
 }
@@ -8731,14 +8677,12 @@ static off_t vfsop_lseek(struct file *file, off_t offset, int whence)
     case SEEK_END: new_pos = (off_t)vn->vn_size + offset; break;
     default:
         vf_unlock(vf, 1);
-        vn_unlock(vn);
-        vn_release(vn);
+        vn_unlock(vn, 1);
         errno = EINVAL;
         return -1;
     }
 
-    vn_unlock(vn);
-    vn_release(vn);
+    vn_unlock(vn, 1);
 
     if (new_pos < 0) {
         vf_unlock(vf, 1);
@@ -8900,14 +8844,14 @@ static int vfs_node_list(struct vfs_node *vn, const char *path, struct vfs_dir *
 {
     int r = 0;
     vfs_dir_layer(d);
-    vn_lock(vn);
+    vn_lock(vn, 0);
     struct vfs_node *child;
     list_for_each_entry(child, &vn->vn_children, vn_list) {
         if (r)
             break;
         r = vfs_dir_add_child(d, child, 1);
     }
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     if (!r)
         vfs_dir_stat_entries(d, path);
     if (!r && vn->vn_ops->o_list) {
@@ -8946,11 +8890,11 @@ static struct vfs_dir *vfs_dir_snapshot(struct vfs_node *vn)
     /* the node's mode, inode and path under its lock; the parent's inode
        and kind without the parent's: neither changes */
     char path[PATH_MAX];
-    vn_lock(vn);
+    vn_lock(vn, 0);
     mode_t mode = vn->vn_st.st_mode;
     ino_t ino = vn->vn_st.st_ino;
     vfs_node_path_locked(vn, path, sizeof(path));
-    vn_unlock(vn);
+    vn_unlock(vn, 0);
     struct vfs_node *parent = vn->vn_parent ? vn->vn_parent : vn;
 
     if (!S_ISDIR(mode)) {
@@ -9001,7 +8945,7 @@ static int vfsop_readdir(struct file *file, struct dirent *out)
         /* the listing is taken with no lock held, neither the file's, vf's
            nor the node's (it asks the host, and stats paths through the
            tree): the reference keeps the node */
-        vn_unlock(vn);
+        vn_unlock(vn, 0);
         vf_unlock(vf, 0);
         struct vfs_dir *d = vfs_dir_snapshot(vn);
         vn_release(vn);
@@ -9044,16 +8988,14 @@ void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file
         return MAP_FAILED;
 
     if (!S_ISREG(vn->vn_st.st_mode)) {
-        vn_unlock(vn);
-        vn_release(vn);
+        vn_unlock(vn, 1);
         errno = ENOTSUP;
         return MAP_FAILED;
     }
 
     void *ret = CALL_FUNC(mmap, hint, size, PROT_READ | PROT_WRITE, flags | MAP_ANONYMOUS, -1, 0);
     if (ret == MAP_FAILED) {
-        vn_unlock(vn);
-        vn_release(vn);
+        vn_unlock(vn, 1);
         return MAP_FAILED;
     }
 
@@ -9073,8 +9015,7 @@ void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file
         VERIFY(0 == CALL_FUNC(mprotect, ret, size, prot));
     }
 
-    vn_unlock(vn);
-    vn_release(vn);
+    vn_unlock(vn, 1);
 
     return ret;
 }
@@ -9127,8 +9068,7 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
                 void *buf = kalloc(cpio->c_filesize + 1);
                 if (!buf) {
                     // TODO clear all children
-                    vn_unlock(child);
-                    vn_release(child);
+                    vn_unlock(child, 1);
                     return -1;
                 }
                 memcpy(buf, cpio->data, cpio->c_filesize);
@@ -9140,8 +9080,7 @@ static int vfs_load_cpio_cb(struct vfs_node *vn, const cpio_t *cpio) {
         }
 
         if (child != vn) {
-            vn_unlock(child);
-            vn_release(child);
+            vn_unlock(child, 1);
         }
     }
 
@@ -9335,7 +9274,7 @@ static struct vfs_node *ptsdev_lookup(struct vfs_node *dir, const char *name)
     vn->vn_transient = 1;
     vn->vn_parent = dir;
     vn->vn_mount_id = dir->vn_mount_id;     /* fixed at the directory's creation */
-    vn_unlock(vn);      /* vnalloc's reference is the lookup's: the resolver's to release */
+    vn_unlock(vn, 0);      /* vnalloc's reference is the lookup's: the resolver's to release */
     return vn;
 }
 
