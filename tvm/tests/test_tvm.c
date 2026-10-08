@@ -22,6 +22,7 @@
 #include <utime.h>
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
+#include <setjmp.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -1882,6 +1883,188 @@ TEST(ExecBoundShell) {
     ASSERT_EQ(p, waitpid(p, &s, 0));
     ASSERT_EQ(1, WIFEXITED(s));
     ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// Runs `/bin/sh -c cmd` in a child, its stdout into out; returns its status.
+static int sh_output(const char *cmd, char *out, size_t size) {
+    int pp[2];
+    if (0 != pipe(pp))
+        return -1;
+    pid_t p = fork();
+    if (p < 0)
+        return -1;
+    if (!p) {
+        dup2(pp[1], 1);
+        close(pp[0]);
+        close(pp[1]);
+        execl("/bin/sh", "sh", "-c", cmd, NULL);
+        _exit(127);
+    }
+    close(pp[1]);
+    size_t n = 0;
+    ssize_t r;
+    while (n < size - 1 && (r = read(pp[0], out + n, size - 1 - n)) > 0)
+        n += r;
+    out[n] = 0;
+    close(pp[0]);
+    int s;
+    if (p != waitpid(p, &s, 0))
+        return -1;
+    return s;
+}
+
+// A text file without #! is ENOEXEC from execve, as from a kernel; execvp
+// runs it with the shell, and so does bash, in-process, also in a fork child
+// (a longjmp to its parent's setjmp: see SetjmpForkLongjmp).
+TEST(ExecTextNoShebang) {
+    char dir[] = "/tmp/tvm_text_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/script", dir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NEQ(f, NULL);
+    fputs("echo text_ok\n", f);
+    fclose(f);
+    ASSERT_EQ(0, chmod(path, 0755));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        execl(path, "script", NULL);
+        _exit(errno == ENOEXEC ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+
+    char out[64], cmd[PATH_MAX + 32];
+    p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int fd = open("/dev/null", O_WRONLY);
+        dup2(fd, 1);
+        execlp(path, "script", NULL);
+        _exit(127);
+    }
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+
+    // bash forks for the first command, then execve says ENOEXEC
+    snprintf(cmd, sizeof(cmd), "%s; echo after", path);
+    s = sh_output(cmd, out, sizeof(out));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+    ASSERT_EQ(0, strcmp(out, "text_ok\nafter\n"));
+
+    ASSERT_EQ(0, unlink(path));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+// #!/usr/bin/env runs env (the initrc binds the VM's over /usr/bin/env),
+// which finds the interpreter in PATH; trailing blanks of the line are not
+// part of its argument, as on Linux.
+TEST(ExecEnvShebang) {
+    char dir[] = "/tmp/tvm_envsb_XXXXXX";
+    ASSERT_NEQ(mkdtemp(dir), NULL);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/script", dir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NEQ(f, NULL);
+    fputs("#!/usr/bin/env sh \t\necho env_ok $#\n", f);
+    fclose(f);
+    ASSERT_EQ(0, chmod(path, 0755));
+
+    char out[64], cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof(cmd), "%s a b", path);
+    int s = sh_output(cmd, out, sizeof(out));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+    ASSERT_EQ(0, strcmp(out, "env_ok 2\n"));
+
+    ASSERT_EQ(0, unlink(path));
+    ASSERT_EQ(0, rmdir(dir));
+}
+
+// A fork child longjmps to a setjmp its parent made before the fork, on the
+// stack the fork copied (bash's subshell_top_level)
+static jmp_buf fork_jmp;
+
+static __attribute__((noinline)) void fork_jmp_child(int val) {
+    longjmp(fork_jmp, val);
+}
+
+TEST(SetjmpForkLongjmp) {
+    volatile int marker = 40;
+    int r = setjmp(fork_jmp);
+    if (r)
+        _exit(marker + r);
+    marker++;
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p)
+        fork_jmp_child(1);
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(42, WEXITSTATUS(s));
+}
+
+// sigsetjmp(env, 1) has siglongjmp restore the signal mask; (env, 0) not
+TEST(SigsetjmpMask) {
+    sigset_t usr1, cur;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    ASSERT_EQ(0, sigprocmask(SIG_BLOCK, &usr1, NULL));
+
+    sigjmp_buf env;
+    if (0 == sigsetjmp(env, 1)) {
+        ASSERT_EQ(0, sigprocmask(SIG_UNBLOCK, &usr1, NULL));
+        siglongjmp(env, 1);
+    }
+    ASSERT_EQ(0, sigprocmask(SIG_BLOCK, NULL, &cur));
+    ASSERT_EQ(1, sigismember(&cur, SIGUSR1));
+
+    if (0 == sigsetjmp(env, 0)) {
+        ASSERT_EQ(0, sigprocmask(SIG_UNBLOCK, &usr1, NULL));
+        siglongjmp(env, 1);
+    }
+    ASSERT_EQ(0, sigprocmask(SIG_BLOCK, NULL, &cur));
+    ASSERT_EQ(0, sigismember(&cur, SIGUSR1));
+}
+
+// siglongjmp out of a signal handler, delivered at once and deferred (by
+// the mask): the signal comes again after each jump
+static sigjmp_buf handler_jmp;
+
+static void handler_jump(int sig) {
+    (void)sig;
+    siglongjmp(handler_jmp, 1);
+}
+
+TEST(SiglongjmpFromHandler) {
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    ASSERT_NEQ(SIG_ERR, signal(SIGUSR1, handler_jump));
+
+    volatile int jumps = 0;
+    sigsetjmp(handler_jmp, 1);
+    if (jumps < 4) {
+        jumps++;
+        if (jumps % 2) {
+            raise(SIGUSR1);
+        } else {
+            sigprocmask(SIG_BLOCK, &usr1, NULL);
+            raise(SIGUSR1);
+            sigprocmask(SIG_UNBLOCK, &usr1, NULL);
+        }
+        for (int i = 0; i < 2000; i++)
+            usleep(1000);
+        FAIL("    SIGUSR1 did not jump (jump %d)", jumps);
+    }
+    ASSERT_NEQ(SIG_ERR, signal(SIGUSR1, SIG_DFL));
 }
 
 // realpath and getcwd answer in the guest namespace: a mount point hides

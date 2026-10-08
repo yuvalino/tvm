@@ -1157,179 +1157,156 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
 /////////////
 
 /**
- * if you port to a new OS/architecture, good luck with this.
- * 
+ * TVM's setjmp/longjmp: fork's own (tvm_jmp_save, tvm_longjmp_regs) and the
+ * guests' native ones (tvm_sigsetjmp etc., see "setjmp/longjmp of native
+ * code"). Unlike the host libc's they keep the saved stack pointer, frame
+ * pointer and return address as plain values (glibc mangles them with
+ * PTR_MANGLE, Darwin XORs them with a per-process cookie), so fork can read
+ * and move a jmp_buf's stack, and translate one it copied like any other
+ * pointer.
+ *
  * In order to properly have a `fork()` function that actually creates a thread behind the scenes,
  * we need to copy stack frames from the parent's stack to the child's stack, so all the local
  * variables will work on the child when `fork()` returns. To actually set the stack pointer
- * we use `setjmp` and `longjmp`.
- * 
- * The tricky parts are:
- * - Stack data copied from parent must be scanned for pointers pointing to the parent stack and fixed up to child stack.
- * - Saved SP/LR/FP/PC registers are obfuscated with a thread-specific token and must be unobfuscated (mangle/demangle).
- * - On arm64, pointer-authentication encrypts LR (return addresses).
- * 
- * TODO:
- * - MacOS is compiled for arm64 meaning only APPLE library code has PAC for its LRs, but on iOS its arm64e which is for every program.
+ * we use setjmp and longjmp (tvm_jmp_save, tvm_longjmp_regs), and stack data copied from the
+ * parent is scanned for pointers to the parent's stack and fixed up to the child's.
+ *
+ * The registers, JMP_REGS words from an 8-byte boundary (fork translates
+ * 8-byte words):
+ *   arm64:  x19-x28, x29, x30, sp, d8-d15, sp at JMP_SP 12
+ *   x86_64: rbx, rbp, r12-r15, rsp, rip, rsp at JMP_SP 6
+ * tvm_jmp_save saves them and returns 0; tvm_longjmp_regs loads them back
+ * and returns val (1 for 0) from that tvm_jmp_save. A guest's setjmp
+ * (tvm_sigsetjmp) aligns its jmp_buf first and goes on to tvm_setjmp_tail
+ * after the registers, which keeps a jmp_tail at NATIVE_JMP_TAIL.
  */
-
-#if defined(__linux__)
-#if defined(__x86_64__)
-
-#define JB_RBX	0
-#define JB_RBP	1
-#define JB_R12	2
-#define JB_R13	3
-#define JB_R14	4
-#define JB_R15	5
-#define JB_RSP	6
-#define JB_PC	7
-#define JB_SIZE (8*8)
-
-#define PTR_MANGLE(var)	asm ("xor %%fs:0x30, %0\n"		      \
-				     "rol $2*8+1, %0"		      \
-				     : "=r" (var)			      \
-				     : "0" (var))
-#define PTR_DEMANGLE(var) asm ("ror $2*8+1, %0\n"	      \
-				     "xor %%fs:0x30, %0"			      \
-				     : "=r" (var) \
-				     : "r" (var))
-
-static void jmpbuf_mangle(jmp_buf *jmpbuf)
-{
-    void **jb = (void **) (jmpbuf);
-    PTR_MANGLE(jb[JB_RBP]);
-    PTR_MANGLE(jb[JB_RSP]);
-    PTR_MANGLE(jb[JB_PC]);
-}
-
-static void jmpbuf_demangle(jmp_buf *jmpbuf)
-{
-    void **jb = (void **) (jmpbuf);
-    PTR_DEMANGLE(jb[JB_RBP]);
-    PTR_DEMANGLE(jb[JB_RSP]);
-    PTR_DEMANGLE(jb[JB_PC]);
-}
-
-static void *jmpbuf_getstack(jmp_buf *jmpbuf)
-{
-    void **jb = (void **) (jmpbuf);
-    return jb[JB_RSP];
-}
-
-#undef PTR_MANGLE
-#undef PTR_DEMANGLE
-
-#endif
-#elif defined(__APPLE__)
 #if defined(__aarch64__)
-
-#define JMP_FP 10
-#define JMP_LR 11
-#define JMP_SP 12
-
-#define PTR_MANGLE(var) do { \
-        uint64_t __TOKEN; \
-        asm ("mrs %0, TPIDRRO_EL0\n" : "=r" (__TOKEN)); \
-        *((uint64_t *) &var) ^= ((uint64_t *) (__TOKEN & ~0x7ULL))[7]; \
-    } while (0)
-
-#define PTR_DEMANGLE(var) do { \
-        uint64_t __TOKEN; \
-        asm ("mrs %0, TPIDRRO_EL0\n" : "=r" (__TOKEN)); \
-        *((uint64_t *) &var) ^= ((uint64_t *) (__TOKEN & ~0x7ULL))[7]; \
-    } while (0)
-
-static uint64_t
-xpaci(uint64_t pointer) {
-	//asm("xpaci %[value]\n" : [value] "+r"(pointer));
-	return pointer;
-}
-
-static uint64_t
-pacibsp(uint64_t pointer, uint64_t context) {
-	asm(
-        "mov x2, sp\n"
-        "mov x3, lr\n"
-        "mov sp, %[context]\n"
-        "mov lr, %[pointer]\n"
-        //"pacibsp\n"
-        "mov %[pointer], lr\n"
-        "mov sp, x2\n"
-        "mov lr, x3\n"
-        :
-        [pointer] "+r"(pointer), [context] "+r"(context)
-    );
-	return pointer;
-}
-
-static uint64_t
-xpacd(uint64_t pointer) {
-	//asm("xpacd %[value]\n" : [value] "+r"(pointer));
-	return pointer;
-}
-
-static void jmpbuf_mangle(jmp_buf *jmpbuf)
-{
-    uint64_t *jb = (uint64_t *) (jmpbuf);
-
-    jb[JMP_LR] = pacibsp(jb[JMP_LR], jb[JMP_SP]);
-
-    PTR_MANGLE(jb[JMP_FP]);
-    PTR_MANGLE(jb[JMP_LR]);
-    PTR_MANGLE(jb[JMP_SP]);
-}
-
-static void jmpbuf_demangle(jmp_buf *jmpbuf)
-{
-    uint64_t *jb = (uint64_t *) (jmpbuf);
-    PTR_DEMANGLE(jb[JMP_FP]);
-    PTR_DEMANGLE(jb[JMP_LR]);
-    PTR_DEMANGLE(jb[JMP_SP]);
-
-    jb[JMP_LR] = xpaci(jb[JMP_LR]);
-}
-
-static void *jmpbuf_getstack(jmp_buf *jmpbuf)
-{
-    void **jb = (void **) (jmpbuf);
-    return jb[JMP_SP];
-}
-
-#undef PTR_MANGLE
-#undef PTR_DEMANGLE
-
+#define JMP_REGS 21
+#define JMP_SP   12
+#elif defined(__x86_64__)
+#define JMP_REGS 8
+#define JMP_SP   6
 #endif
-#endif
+#define NATIVE_JMP_TAIL (JMP_REGS * 8)
 
-static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
+typedef uint64_t tvm_jmp_buf[JMP_REGS];
+
+__attribute__((returns_twice)) int tvm_jmp_save(tvm_jmp_buf buf);
+__attribute__((noreturn)) void tvm_longjmp_regs(uint64_t *buf, int val);
+int tvm_setjmp(void *env);
+int tvm__setjmp(void *env);
+int tvm_sigsetjmp(void *env, int savemask);
+
+#if defined(__APPLE__) && defined(__aarch64__)
+#define JMP_SAVE_REGS \
+    "    stp x19, x20, [x0, #0]\n" \
+    "    stp x21, x22, [x0, #16]\n" \
+    "    stp x23, x24, [x0, #32]\n" \
+    "    stp x25, x26, [x0, #48]\n" \
+    "    stp x27, x28, [x0, #64]\n" \
+    "    stp x29, x30, [x0, #80]\n" \
+    "    mov x2, sp\n" \
+    "    str x2, [x0, #96]\n" \
+    "    stp d8, d9, [x0, #104]\n" \
+    "    stp d10, d11, [x0, #120]\n" \
+    "    stp d12, d13, [x0, #136]\n" \
+    "    stp d14, d15, [x0, #152]\n"
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".private_extern _tvm_jmp_save\n"
+    "_tvm_jmp_save:\n"
+    JMP_SAVE_REGS
+    "    mov w0, #0\n"
+    "    ret\n"
+    ".private_extern _tvm_setjmp\n"
+    "_tvm_setjmp:\n"
+    "    mov w1, #1\n"
+    "    b _tvm_sigsetjmp\n"
+    ".private_extern _tvm__setjmp\n"
+    "_tvm__setjmp:\n"
+    "    mov w1, #0\n"
+    ".private_extern _tvm_sigsetjmp\n"
+    "_tvm_sigsetjmp:\n"
+    "    add x0, x0, #7\n"
+    "    and x0, x0, #~7\n"
+    JMP_SAVE_REGS
+    "    b _tvm_setjmp_tail\n"
+    ".private_extern _tvm_longjmp_regs\n"
+    "_tvm_longjmp_regs:\n"
+    "    ldp x19, x20, [x0, #0]\n"
+    "    ldp x21, x22, [x0, #16]\n"
+    "    ldp x23, x24, [x0, #32]\n"
+    "    ldp x25, x26, [x0, #48]\n"
+    "    ldp x27, x28, [x0, #64]\n"
+    "    ldp x29, x30, [x0, #80]\n"
+    "    ldr x2, [x0, #96]\n"
+    "    mov sp, x2\n"
+    "    ldp d8, d9, [x0, #104]\n"
+    "    ldp d10, d11, [x0, #120]\n"
+    "    ldp d12, d13, [x0, #136]\n"
+    "    ldp d14, d15, [x0, #152]\n"
+    "    cmp w1, #0\n"
+    "    csinc w0, w1, wzr, ne\n"
+    "    ret\n"
+);
+#elif defined(__linux__) && defined(__x86_64__)
+#define JMP_SAVE_REGS \
+    "    mov %rbx, 0(%rdi)\n" \
+    "    mov %rbp, 8(%rdi)\n" \
+    "    mov %r12, 16(%rdi)\n" \
+    "    mov %r13, 24(%rdi)\n" \
+    "    mov %r14, 32(%rdi)\n" \
+    "    mov %r15, 40(%rdi)\n" \
+    "    lea 8(%rsp), %rdx\n" \
+    "    mov %rdx, 48(%rdi)\n" \
+    "    mov (%rsp), %rdx\n" \
+    "    mov %rdx, 56(%rdi)\n"
+#define JMP_FUNC(name) ".globl " #name "\n.hidden " #name "\n.type " #name ", @function\n" #name ":\n"
+__asm__(
+    ".text\n"
+    JMP_FUNC(tvm_jmp_save)
+    JMP_SAVE_REGS
+    "    xor %eax, %eax\n"
+    "    ret\n"
+    JMP_FUNC(tvm_setjmp)
+    "    mov $1, %esi\n"
+    "    jmp tvm_sigsetjmp\n"
+    JMP_FUNC(tvm__setjmp)
+    "    xor %esi, %esi\n"
+    JMP_FUNC(tvm_sigsetjmp)
+    "    add $7, %rdi\n"
+    "    and $-8, %rdi\n"
+    JMP_SAVE_REGS
+    "    jmp tvm_setjmp_tail\n"
+    JMP_FUNC(tvm_longjmp_regs)
+    "    mov %esi, %eax\n"
+    "    test %eax, %eax\n"
+    "    jnz 1f\n"
+    "    inc %eax\n"
+    "1:  mov 0(%rdi), %rbx\n"
+    "    mov 8(%rdi), %rbp\n"
+    "    mov 16(%rdi), %r12\n"
+    "    mov 24(%rdi), %r13\n"
+    "    mov 32(%rdi), %r14\n"
+    "    mov 40(%rdi), %r15\n"
+    "    mov 48(%rdi), %rsp\n"
+    "    jmp *56(%rdi)\n"
+);
+#undef JMP_FUNC
+#else
+#error tvm_jmp_save/tvm_longjmp_regs: unsupported platform
+#endif
+#undef JMP_SAVE_REGS
+
+// move every saved register that points into old_stack by the same offset into new_stack
+static void jmpbuf_setstack(tvm_jmp_buf jb, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
 {
-    uintptr_t *jb = (uintptr_t*) (jmpbuf);
     uintptr_t diff = old_stack - new_stack;
- 
-    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
-    {
+    for (int i = 0; i < JMP_REGS; i++) {
         if (jb[i] >= old_stack && jb[i] < (old_stack + stack_size))
             jb[i] -= diff;
     }
-}
-
-static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
-{
-    uintptr_t x;
-
-    uintptr_t jmpbuf_old_sp = (uintptr_t) jmpbuf_getstack(jmpbuf);
-
-    if (!(jmpbuf_old_sp >= old_stack && jmpbuf_old_sp < (old_stack + stack_size)))
-        panic("jmpbuf's sp not in old_stack");
-
-    memcpy(
-        (void *) new_stack,
-        (void *) old_stack,
-        stack_size - 0x1000
-    );
-
-    jmpbuf_setstack(jmpbuf, new_stack, old_stack, stack_size);
 }
 
 /////////////
@@ -10643,14 +10620,74 @@ sig_t emulator_signal(int signum, sig_t handler)
     return handler;
 }
 
-int emulator_setjmp(jmp_buf env) {
-    uc_err err;
+/*
+ * A jmp_buf, as TVM's setjmps fill it, starts at its first 8-byte boundary
+ * (JMP_ALIGN): fork translates the pointers in what it copies 8-byte word by
+ * 8-byte word, and Darwin's jmp_buf is an int array, 4-byte aligned. After
+ * the registers, at JMP_TAIL_* bytes, comes a jmp_tail: whether the signal
+ * mask was saved and the mask, and for a native jump the VM state a longjmp
+ * out of a callback or a signal handler leaves behind (see tvm_siglongjmp).
+ * All within every jmp_buf this runs with: Darwin arm64's is 192 bytes,
+ * x86_64's 148, glibc's 200 and more.
+ */
+struct jmp_tail {
+    struct tvm_call *jt_call;
+    uint32_t jt_mask;           // bit `sig` for each blocked sig < MAX_SIGNALS
+    uint16_t jt_savemask;
+    uint16_t jt_sig_draining;
+};
+
+#define JMP_ALIGN(env)     ((uint64_t *)(((uintptr_t)(env) + 7) & ~(uintptr_t)7))
+#define JMP_TAIL(buf, off) ((struct jmp_tail *)((char *)(buf) + (off)))
+
+static void jmp_tail_save(struct jmp_tail *t, int savemask)
+{
+    memset(t, 0, sizeof(*t));
+    t->jt_sig_draining = tvm_sig_draining;
+    t->jt_savemask = savemask != 0;
+    if (!savemask)
+        return;
+    sigset_t set;
+    sigprocmask(SIG_BLOCK, NULL, &set);
+    for (int sig = 1; sig < MAX_SIGNALS; sig++)
+        if (sigismember(&set, sig) == 1)
+            t->jt_mask |= 1u << sig;
+}
+
+/*
+ * A jump out of a signal handler skips signal_handler's return, and with it
+ * the host's restoring of its thread mask (the host blocks the signal for the
+ * handler) and tvm_sig_drain's clearing of tvm_sig_draining. A guest thread
+ * runs with no host signal blocked (signals are masked in thr_sigmask), so
+ * unblocking all of them restores it. Then the mask, if the setjmp saved it.
+ */
+static void jmp_tail_restore(const struct jmp_tail *t)
+{
+    tvm_sig_draining = t->jt_sig_draining;
+    sigset_t all;
+    sigfillset(&all);
+    CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &all, NULL);
+    if (!t->jt_savemask)
+        return;
+    sigset_t set;
+    sigemptyset(&set);
+    for (int sig = 1; sig < MAX_SIGNALS; sig++)
+        if (t->jt_mask & (1u << sig))
+            sigaddset(&set, sig);
+    sigprocmask(SIG_SETMASK, &set, NULL);
+}
+
+#define EMU_JMP_TAIL_X86_64 (8 * 8)
+#define EMU_JMP_TAIL_ARM64  (14 * 8)
+
+// setjmp/_setjmp/sigsetjmp of emulated code: savemask as each saves the mask
+static int emulator_sigsetjmp(jmp_buf env, int savemask) {
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
 
     if (!ess)
         panic("emulator_setjmp called without emulator saved state");
 
-    uint64_t *envarr = (uint64_t *)env;
+    uint64_t *envarr = JMP_ALIGN(env);
 
     if (ess->ess_arch == ULARCH_X86_64/* && ess->ess_abi == ULABI_LINUX*/) {
         envarr[0] = ess->ess_context.x86_64.rbx;
@@ -10682,17 +10719,21 @@ int emulator_setjmp(jmp_buf env) {
     else
         panic("emulator_setjmp(arch=%d) unknown arch", ess->ess_arch);
 
+    jmp_tail_save(JMP_TAIL(envarr, ess->ess_arch == ULARCH_X86_64 ? EMU_JMP_TAIL_X86_64 : EMU_JMP_TAIL_ARM64), savemask);
     return 0;
 }
 
-int emulator_longjmp(jmp_buf env, int val) {
-    uc_err err;
+static int emulator_setjmp(jmp_buf env) { return emulator_sigsetjmp(env, 1); }
+static int emulator__setjmp(jmp_buf env) { return emulator_sigsetjmp(env, 0); }
+
+// longjmp/_longjmp/siglongjmp of emulated code: restores the mask if it was saved
+static int emulator_longjmp(jmp_buf env, int val) {
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
 
     if (!ess)
         panic("emulator_longjmp called without emulator saved state");
 
-    uint64_t *envarr = (uint64_t *)env;
+    uint64_t *envarr = JMP_ALIGN(env);
 
     if (!val) val = 1;
 
@@ -10726,8 +10767,44 @@ int emulator_longjmp(jmp_buf env, int val) {
     else
         panic("emulator_longjmp(arch=%d) unknown arch", ess->ess_arch);
 
+    jmp_tail_restore(JMP_TAIL(envarr, ess->ess_arch == ULARCH_X86_64 ? EMU_JMP_TAIL_X86_64 : EMU_JMP_TAIL_ARM64));
     return val;
 }
+
+/*
+ * setjmp/longjmp of native code (the registers: see "Jmpbuf"). The host
+ * libc's mangle the saved stack pointer, frame pointer and return address, so
+ * a fork could not translate a jmp_buf: a child's longjmp to a setjmp of its
+ * parent's -- bash running a #!-less script in a fork child, shell_execve ->
+ * sh_longjmp(subshell_top_level) -- landed on the parent's live stack. These
+ * keep plain values, which the fork translates like any other pointer.
+ * tvm_sigsetjmp returns through tvm_setjmp_tail, which fills the jmp_tail.
+ */
+__attribute__((visibility("hidden"), used))
+int tvm_setjmp_tail(uint64_t *buf, int savemask)
+{
+    struct jmp_tail *t = JMP_TAIL(buf, NATIVE_JMP_TAIL);
+    jmp_tail_save(t, savemask);
+    t->jt_call = tvm_tls()->tls_call;
+    return 0;
+}
+
+/*
+ * longjmp, _longjmp, siglongjmp (and glibc's __longjmp_chk): back to the
+ * setjmp's VM state (jmp_tail_restore; and the call chain, whose pop a jump
+ * out of a callback of an interposed function skips), then its registers.
+ * The mask a setjmp saved is restored here even for _longjmp, as glibc does;
+ * Darwin's _longjmp does not, but its pair, _setjmp, saves none.
+ */
+static __attribute__((noreturn)) void tvm_siglongjmp(void *env, int val)
+{
+    uint64_t *buf = JMP_ALIGN(env);
+    struct jmp_tail *t = JMP_TAIL(buf, NATIVE_JMP_TAIL);
+    tvm_tls()->tls_call = t->jt_call;
+    jmp_tail_restore(t);
+    tvm_longjmp_regs(buf, val);
+}
+
 
 static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
 
@@ -12700,19 +12777,16 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(base, "sigaction"))    return &emulator_sigaction;
     if (0 == strcmp(base, "signal"))       return &emulator_signal;
 
-    // only intercept setjmp/longjmp for emulated binaries — in NOEMU mode
-    // emulator_setjmp calls real _setjmp which saves the host stack frame,
-    // but longjmp back into that frame corrupts the stack canary (the frame
-    // was reused by guest code in between), triggering __stack_chk_fail/SIGABRT
-    if (emu) {
-        if (0 == strcmp(base, "_setjmp"))      return &emulator_setjmp;
-        if (0 == strcmp(base, "setjmp"))       return &emulator_setjmp;
-        if (0 == strcmp(base, "__sigsetjmp"))  return &emulator_setjmp;
-        if (0 == strcmp(base, "sigsetjmp"))    return &emulator_setjmp;
-        if (0 == strcmp(base, "longjmp"))      return &emulator_longjmp;
-        if (0 == strcmp(base, "_longjmp"))     return &emulator_longjmp;
-        if (0 == strcmp(base, "siglongjmp"))   return &emulator_longjmp;
-    }
+    // setjmp/longjmp: the emulator's for emulated code, which work on its
+    // saved registers; native code's for native (tvm_sigsetjmp)
+    if (0 == strcmp(base, "setjmp"))         return emu ? (void *)&emulator_setjmp : (void *)&tvm_setjmp;
+    if (0 == strcmp(base, "_setjmp"))        return emu ? (void *)&emulator__setjmp : (void *)&tvm__setjmp;
+    if (0 == strcmp(base, "sigsetjmp")
+        || 0 == strcmp(base, "__sigsetjmp")) return emu ? (void *)&emulator_sigsetjmp : (void *)&tvm_sigsetjmp;
+    if (0 == strcmp(base, "longjmp")
+        || 0 == strcmp(base, "_longjmp")
+        || 0 == strcmp(base, "siglongjmp")
+        || 0 == strcmp(base, "__longjmp_chk")) return emu ? (void *)&emulator_longjmp : (void *)&tvm_siglongjmp;
 
     if (0 == strcmp(base, "__chkstk_darwin")) return &chkstk_nop;
 
@@ -12819,7 +12893,6 @@ static int is_noemu_binary(const char *pathname)
 
 
 static void usershell_cache_init(void);
-static int tvm_path_search(const char *file, char *out);
 
 #if defined(__linux__)
 /*
@@ -16710,7 +16783,7 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
  * 
  * Idea is to `setjmp` on parent, on child stack copy some frames from the parent and `longjmp` to the new stack.
  * Main problem is fixing up all the stack pointers on the frames pointer to the old stack to be on the new stack,
- * read `Jmpbuf implementation` section for that.
+ * read the `Jmpbuf` section for that.
  */
 
 #define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
@@ -16729,9 +16802,9 @@ struct fork_arg {
 
     pthread_mutex_t mtx;
     pthread_cond_t cond;
-    jmp_buf jmpbuf_parent;
-    jmp_buf jmpbuf_tmp;
-    jmp_buf jmpbuf_fail;
+    tvm_jmp_buf jmpbuf_parent;
+    tvm_jmp_buf jmpbuf_tmp;
+    tvm_jmp_buf jmpbuf_fail;
     
     size_t duplicate_errors;
     int first_duplicate_error;
@@ -16849,12 +16922,12 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
     // the error number is set to thread's errno
-    if ((setjmp(arg->jmpbuf_fail))) {
+    if ((tvm_jmp_save(arg->jmpbuf_fail))) {
         return (void *)(long)errno;
     }
 
     // move to temporary stack
-    if (0 == setjmp(arg->jmpbuf_tmp))
+    if (0 == tvm_jmp_save(arg->jmpbuf_tmp))
     {
         /**
          * this code moves to a temporary stack, since we're gonna modify our own stack.
@@ -16883,8 +16956,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
          *   | prev lr |
          *   |         |
          */
-        jmpbuf_demangle(&arg->jmpbuf_tmp);
-        uintptr_t curr_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_tmp);
+        uintptr_t curr_sp = arg->jmpbuf_tmp[JMP_SP];
         // `fp` is just before the value of `fp` itself, so keep room for `fp` on the stack
         uintptr_t next_fp = (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE - 2 * sizeof(uintptr_t);
         uintptr_t next_sp = next_fp - (curr_fp - curr_sp);
@@ -16899,10 +16971,9 @@ static void *tvm_proc_entry(struct fork_arg *arg)
         // INFO("  next-arg = %p *%p", (uintptr_t)&arg - ((uintptr_t)curr_sp - (uintptr_t)next_sp), *(uintptr_t *)((uintptr_t)&arg - ((uintptr_t)curr_sp - (uintptr_t)next_sp)));
 
         // include prologue (fp + lr) when adjusting jmpbuf context regs
-        jmpbuf_setstack(&arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
+        jmpbuf_setstack(arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
 
-        jmpbuf_mangle(&arg->jmpbuf_tmp);
-        longjmp(arg->jmpbuf_tmp, 1);
+        tvm_longjmp_regs(arg->jmpbuf_tmp, 1);
     }
 
     // running on a temporary stack until the next longjmp
@@ -16929,7 +17000,7 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
      *                     '_______'      -> -> '_______'  <- fp  <--'  size
      */
 
-    uintptr_t parent_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_parent);
+    uintptr_t parent_sp = arg->jmpbuf_parent[JMP_SP];
     uintptr_t parent_fp = (uintptr_t)arg->parent_thr->thr_fork_fp;
 
     // its important to "link" the new frames copied from parent to the current stack for `pthread_exit()` to work
@@ -17037,21 +17108,15 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
 
     arg->thr->thr_fork_fp = (void *)child_fp;
 
-    // include prologue (fp + lr) when adjusting jmpbuf context regs
-    //jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
-
     // fix the jmpbuf
-    void **jb = (void **) (&arg->jmpbuf_parent);
-    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
-        jb[i] = cow_fixup_translate(&arg->fixup, jb[i]);
-
-    jmpbuf_mangle(&arg->jmpbuf_parent);
+    for (int i = 0; i < JMP_REGS; i++)
+        arg->jmpbuf_parent[i] = (uint64_t)cow_fixup_translate(&arg->fixup, (void *)arg->jmpbuf_parent[i]);
 
     // Resume emulation at the parent's emulator_call_ex depth: the longjmp lands
     // back in the copied emulated frame, whose eventual out: will decrement.
     tvm_emu_call_depth = arg->emu_call_depth;
 
-    longjmp(arg->jmpbuf_parent, 1);
+    tvm_longjmp_regs(arg->jmpbuf_parent, 1);
 
 fail:
     panic("tvm_proc_entry failed (fail flow not yet implemented)");
@@ -17064,7 +17129,7 @@ fail:
 
     // TODO for some reason this crashes badly
 
-    longjmp(arg->jmpbuf_fail, 1);
+    tvm_longjmp_regs(arg->jmpbuf_fail, 1);
 }
 
 // for now we need strict control of how many frames we need to restore on new stack
@@ -17145,7 +17210,7 @@ pid_t fork(void) {
         goto out;
     }
 
-    if (0 != setjmp(arg->jmpbuf_parent)) {
+    if (0 != tvm_jmp_save(arg->jmpbuf_parent)) {
 
         // child
 
@@ -17164,8 +17229,6 @@ pid_t fork(void) {
     }
 
     // parent
-
-    jmpbuf_demangle(&arg->jmpbuf_parent);
 
     // Block OS signals before creating the child thread so it inherits a
     // blocked signal mask.  The child unblocks after setting current/current_thread
@@ -18856,45 +18919,13 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         }
     }
 
-    // An empty file (or a read error) is ENOEXEC, as from a kernel; bash
-    // treats an empty sample as success without running anything. Files of
-    // 1-3 bytes are still checked for text below: they used to get ENOEXEC
-    // here, so `printf 'ls\n' > x; ./x` took bash's in-process longjmp path
-    // that the text fallback exists to avoid.
-    if (n <= 0) {
-        INFO("  failed(ENOEXEC)");
-        errno = ENOEXEC;
-        return -1;
-    }
-
-    // A text file without a #! line: a kernel says ENOEXEC and lets the
-    // calling shell run it as a script itself. bash does that in-process
-    // (shell_execve -> sh_longjmp(subshell_top_level)), which cannot work in
-    // a TVM fork child: the fork copied the parent's stack frames to a new
-    // stack but subshell_top_level was setjmp'd on the parent's stack (shell.c
-    // main), so the longjmp lands on the parent's live stack and the child
-    // dies with a corrupted heap (rmem "invalid pointer" abort). Run such
-    // files through the shell here instead, the way tvm_execvpe() already
-    // does for execvp(). "Text" is what bash's check_binary_file() would
-    // also treat as a script: no NUL byte in the sample; anything else (and
-    // any non-Mach-O binary) still gets ENOEXEC, which bash reports as
-    // "cannot execute binary file" without longjmp'ing.
+    // An empty file (or a read error), or one too short to be a loadable
+    // image and not a script, is ENOEXEC, as from a kernel. So is a text
+    // file without a #! line (below, when it does not load): the calling
+    // shell then runs it as a script itself, bash in-process (shell_execve
+    // -> sh_longjmp(subshell_top_level)), and execvp() through the shell
+    // (tvm_execvpe).
     int has_shebang = n >= 2 && hdr[0] == '#' && hdr[1] == '!';
-    if (!has_shebang && memchr(hdr, 0, n) == NULL
-        && !(n >= 4 && memcmp(hdr, "\xcf\xfa\xed\xfe", 4) == 0) /* MH_MAGIC_64 */
-        && !(n >= 4 && memcmp(hdr, "\x7f" "ELF", 4) == 0)) {
-        const char *sh = getenv("TVM_SHELL");
-        if (!sh || !*sh) sh = "/bin/sh";
-        INFO("execve: text file without #!, running it with %s", sh);
-        n = snprintf(hdr, sizeof(hdr), "#!%s", sh);
-        if (n >= (ssize_t)sizeof(hdr)) {
-            errno = ENOEXEC;
-            return -1;
-        }
-        has_shebang = 1;
-    }
-
-    // too short to be a loadable image, and not a script
     if (!has_shebang && n < 4) {
         INFO("  failed(ENOEXEC)");
         errno = ENOEXEC;
@@ -18905,6 +18936,9 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         hdr[n] = '\0';
         char *eol = strchr(hdr + 2, '\n');
         if (eol) *eol = '\0';
+        // trailing blanks are no part of the interpreter's argument (Linux)
+        for (char *e = hdr + strlen(hdr); e > hdr + 2 && (e[-1] == ' ' || e[-1] == '\t'); e--)
+            e[-1] = '\0';
 
         char *interp = hdr + 2;
         while (*interp == ' ' || *interp == '\t') interp++;
@@ -18924,32 +18958,6 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
             return -1;
         }
 
-        // "#!/usr/bin/env prog [arg]": resolve prog through PATH the way
-        // env(1) would. The host's /usr/bin/env is not loadable here (fat
-        // binary on macOS, shared cache on iOS), and this is how most
-        // portable scripts name their interpreter.
-        char envprog[PATH_MAX];
-        const char *ibase = strrchr(interp, '/');
-        ibase = ibase ? ibase + 1 : interp;
-        if (interp_arg && 0 == strcmp(ibase, "env")) {
-            char *prog = interp_arg;
-            char *rest = prog;
-            while (*rest && *rest != ' ' && *rest != '\t') rest++;
-            if (*rest) {
-                *rest++ = '\0';
-                while (*rest == ' ' || *rest == '\t') rest++;
-            }
-            interp_arg = *rest ? rest : NULL;
-            if (strchr(prog, '/')) {
-                interp = prog;
-            } else if (0 == tvm_path_search(prog, envprog)) {
-                interp = envprog;
-            } else {
-                INFO("execve shebang: env: %s not found in PATH", prog);
-                return -1;
-            }
-        }
-
         INFO("execve shebang: interp=\"%s\" arg=\"%s\" script=\"%s\"",
              interp, interp_arg ? interp_arg : "(none)", pathname);
 
@@ -18966,15 +18974,10 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         // The interpreter must be something TVM can load: an image that
         // defines main (RTLD_NEEDMAIN below). The host's /bin/bash,
         // /bin/sh, /usr/bin/env are not -- fat binaries on macOS,
-        // shared-cache stubs on iOS, stripped executables on Linux -- so a
-        // plain "#!/bin/bash" script would fail with ENOEXEC, which bash
-        // then handles by running the file in-process via longjmp,
-        // corrupting a TVM fork child (see the #!-less case above). The
-        // rc files mount the VM's own over those paths (mount --bind,
-        // INITRC.md); the retry of an interpreter that did not load as the
-        // same name through PATH is gone with that, and one that does not
-        // load is a missing interpreter (ENOENT, "bad interpreter"), as
-        // Linux reports it.
+        // shared-cache stubs on iOS, stripped executables on Linux -- and
+        // the rc files mount the VM's own over those paths (mount --bind,
+        // INITRC.md). One that does not load is a missing interpreter
+        // (ENOENT, "bad interpreter"), as Linux reports it.
         is_script = 1;
         pathname = pathname_abs;
 
