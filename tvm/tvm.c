@@ -1158,33 +1158,26 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
 /////////////
 
 /**
- * setjmp/longjmp with plain registers, for native guests (setjmp, longjmp,
- * ...) and fork's own jumps (tvm__setjmp, tvm__longjmp). The host
- * libc's mangle the saved stack pointer, frame pointer and return address
- * (glibc's PTR_MANGLE, Darwin's per-process cookie); these keep them as they
- * are, so fork can read and move a jmp_buf's stack, and translate one it
- * copied like any other pointer.
- *
+ * if you port to a new OS/architecture, good luck with this.
+ * 
  * In order to properly have a `fork()` function that actually creates a thread behind the scenes,
  * we need to copy stack frames from the parent's stack to the child's stack, so all the local
  * variables will work on the child when `fork()` returns. To actually set the stack pointer
- * we use setjmp and longjmp (tvm__setjmp, tvm__longjmp), and stack data copied from the
- * parent is scanned for pointers to the parent's stack and fixed up to the child's.
- *
- * They take a jmp_buf, and keep in it, from its first 8-byte boundary
- * (JMP_ALIGN: fork translates 8-byte words, and Darwin's jmp_buf is an int
- * array, 4-byte aligned), the registers, JMP_REGS words:
- *   arm64:  x19-x28, x29, x30, sp, d8-d15 (sp at JMP_SP)
- *   x86_64: rbx, rbp, r12-r15, rsp, rip
- * then the signal mask (struct jmp_sigmask), if the setjmp saved it.
- * fork reads and moves the registers with jmpbuf_getstack, jmpbuf_setstack
- * and jmpbuf_fixup.
+ * we use `setjmp` and `longjmp`.
+ * 
+ * The tricky parts are:
+ * - Stack data copied from parent must be scanned for pointers pointing to the parent stack and fixed up to child stack.
+ * - The saved SP/FP/LR must be plain values, which the host libc's setjmp mangles; so fork, like the
+ *   native guests, uses TVM's own (tvm__setjmp/tvm__longjmp below). They keep the registers from the
+ *   jmp_buf's first 8-byte boundary (fork translates 8-byte words; Darwin's jmp_buf is 4-byte aligned),
+ *   then the signal mask (struct jmp_sigmask); fork's jmp_bufs are 8-byte aligned.
  */
+
 #if defined(__aarch64__)
-#define JMP_REGS 21
+#define JMP_REGS 21     // x19-x28, x29, x30, sp, d8-d15
 #define JMP_SP   12
 #elif defined(__x86_64__)
-#define JMP_REGS 8
+#define JMP_REGS 8      // rbx, rbp, r12-r15, rsp, rip
 #define JMP_SP   6
 #endif
 
@@ -1335,32 +1328,40 @@ static __attribute__((noreturn)) void tvm_longjmp(jmp_buf env, int val)
     tvm__longjmp(env, val);
 }
 
-// the saved stack pointer
-static uintptr_t jmpbuf_getstack(jmp_buf env)
+static void *jmpbuf_getstack(jmp_buf *jmpbuf)
 {
-    return JMP_ALIGN(env)[JMP_SP];
+    void **jb = (void **) (jmpbuf);
+    return jb[JMP_SP];
 }
 
-// move every saved register that points into old_stack by the same offset into new_stack
-static void jmpbuf_setstack(jmp_buf env, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
+static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
 {
-    uint64_t *jb = JMP_ALIGN(env);
+    uintptr_t *jb = (uintptr_t*) (jmpbuf);
     uintptr_t diff = old_stack - new_stack;
-    for (int i = 0; i < JMP_REGS; i++) {
+ 
+    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
+    {
         if (jb[i] >= old_stack && jb[i] < (old_stack + stack_size))
             jb[i] -= diff;
     }
 }
 
-struct cow_fixup_context;
-static void *cow_fixup_translate(struct cow_fixup_context *dctx, void *p);
-
-// translate every saved register through a fork's fixup, as a word it copied
-static void jmpbuf_fixup(jmp_buf env, struct cow_fixup_context *fixup)
+static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
 {
-    uint64_t *jb = JMP_ALIGN(env);
-    for (int i = 0; i < JMP_REGS; i++)
-        jb[i] = (uint64_t)cow_fixup_translate(fixup, (void *)jb[i]);
+    uintptr_t x;
+
+    uintptr_t jmpbuf_old_sp = (uintptr_t) jmpbuf_getstack(jmpbuf);
+
+    if (!(jmpbuf_old_sp >= old_stack && jmpbuf_old_sp < (old_stack + stack_size)))
+        panic("jmpbuf's sp not in old_stack");
+
+    memcpy(
+        (void *) new_stack,
+        (void *) old_stack,
+        stack_size - 0x1000
+    );
+
+    jmpbuf_setstack(jmpbuf, new_stack, old_stack, stack_size);
 }
 
 /////////////
@@ -16792,9 +16793,9 @@ struct fork_arg {
 
     pthread_mutex_t mtx;
     pthread_cond_t cond;
-    jmp_buf jmpbuf_parent;
-    jmp_buf jmpbuf_tmp;
-    jmp_buf jmpbuf_fail;
+    jmp_buf jmpbuf_parent __attribute__((aligned(8)));
+    jmp_buf jmpbuf_tmp __attribute__((aligned(8)));
+    jmp_buf jmpbuf_fail __attribute__((aligned(8)));
     
     size_t duplicate_errors;
     int first_duplicate_error;
@@ -16946,7 +16947,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
          *   | prev lr |
          *   |         |
          */
-        uintptr_t curr_sp = jmpbuf_getstack(arg->jmpbuf_tmp);
+        uintptr_t curr_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_tmp);
         // `fp` is just before the value of `fp` itself, so keep room for `fp` on the stack
         uintptr_t next_fp = (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE - 2 * sizeof(uintptr_t);
         uintptr_t next_sp = next_fp - (curr_fp - curr_sp);
@@ -16961,7 +16962,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
         // INFO("  next-arg = %p *%p", (uintptr_t)&arg - ((uintptr_t)curr_sp - (uintptr_t)next_sp), *(uintptr_t *)((uintptr_t)&arg - ((uintptr_t)curr_sp - (uintptr_t)next_sp)));
 
         // include prologue (fp + lr) when adjusting jmpbuf context regs
-        jmpbuf_setstack(arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
+        jmpbuf_setstack(&arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
 
         tvm__longjmp(arg->jmpbuf_tmp, 1);
     }
@@ -16990,7 +16991,7 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
      *                     '_______'      -> -> '_______'  <- fp  <--'  size
      */
 
-    uintptr_t parent_sp = jmpbuf_getstack(arg->jmpbuf_parent);
+    uintptr_t parent_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf_parent);
     uintptr_t parent_fp = (uintptr_t)arg->parent_thr->thr_fork_fp;
 
     // its important to "link" the new frames copied from parent to the current stack for `pthread_exit()` to work
@@ -17098,8 +17099,13 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
 
     arg->thr->thr_fork_fp = (void *)child_fp;
 
+    // include prologue (fp + lr) when adjusting jmpbuf context regs
+    //jmpbuf_setstack(&arg->jmpbuf_parent, child_sp, parent_sp, parent_fp - parent_sp + 2 * sizeof(uintptr_t));
+
     // fix the jmpbuf
-    jmpbuf_fixup(arg->jmpbuf_parent, &arg->fixup);
+    void **jb = (void **) (&arg->jmpbuf_parent);
+    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
+        jb[i] = cow_fixup_translate(&arg->fixup, jb[i]);
 
     // Resume emulation at the parent's emulator_call_ex depth: the longjmp lands
     // back in the copied emulated frame, whose eventual out: will decrement.
