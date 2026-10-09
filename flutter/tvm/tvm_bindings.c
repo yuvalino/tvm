@@ -117,10 +117,7 @@ static char **build_envp(const char *const *overrides)
 }
 
 // Worker thread: reads the initrd and hands everything to tvm_start, which
-// boots the VM and execs dropbear on this thread and never returns.
-//
-// tvm_start only returns -1 before any task exists, so a plain return from
-// this thread is safe on every failure path below.
+// boots the VM and execs dropbear on a thread of its own, and returns.
 static void *worker_entry(void *arg)
 {
     (void)arg;
@@ -171,9 +168,9 @@ static void *worker_entry(void *arg)
     char *argv[] = {"sshd", "-R", "-e", "-F", "-E", "-p", port_str, NULL};
 
     app_log("tvm_app_start: booting, exec dropbear\n");
-    fn_tvm_start("dropbear", argv, worker_envp, &cfg);
+    if (0 != fn_tvm_start("dropbear", argv, worker_envp, &cfg))
+        app_log("tvm_app_start: tvm_start failed: %s\n", strerror(errno));
 
-    app_log("tvm_app_start: tvm_start failed: %s\n", strerror(errno));
     free(initrd_data);
     return NULL;
 }

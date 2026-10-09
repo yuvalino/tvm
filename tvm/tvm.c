@@ -516,6 +516,9 @@ DECL_FUNC(ioctl);
 
 DECL_FUNC(pthread_create);
 DECL_FUNC(pthread_exit);
+DECL_FUNC(pthread_join);
+DECL_FUNC(pthread_detach);
+DECL_FUNC(pthread_kill);
 
 DECL_FUNC(exit);
 DECL_FUNC(_exit);
@@ -791,6 +794,15 @@ void call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t
 static inline void tvm_sig_enter(void);
 static inline void tvm_sig_leave(void);
 static void tvm_sig_drain(void);
+
+struct task;
+struct tvm_stack;
+static void *tvm_mmap_guarded(size_t size, int prot, int flags);
+static struct tvm_stack *stack_alloc(struct task *tsk, size_t size, int reuse);
+static void stack_release(struct tvm_stack *st);
+static void stack_detach(struct tvm_stack *st);
+static void stack_exit(struct tvm_stack *st);
+static void stack_task_gone(struct task *tsk);
 
 typedef void *(*start_routine_fn)(void *);
 
@@ -1644,7 +1656,7 @@ static void epipe_signal(void)
         // signal landing inside call_sighandler's ulinker_dladdr took its
         // mutex again (deadlock).
         if (!current_signal_ignored(SIGPIPE))
-            pthread_kill(pthread_self(), SIGPIPE);
+            CALL_FUNC(pthread_kill, pthread_self(), SIGPIPE);
         errno = last_errno;
     }
 #endif
@@ -1660,7 +1672,7 @@ static void epipe_signal_locked(struct task *t)
     if (errno == EPIPE) {
         int last_errno = errno;
         if (!task_signal_ignored_locked(t, SIGPIPE))
-            pthread_kill(pthread_self(), SIGPIPE);
+            CALL_FUNC(pthread_kill, pthread_self(), SIGPIPE);
         errno = last_errno;
     }
 #else
@@ -1979,6 +1991,7 @@ struct thread {
     siginfo_t thr_pending_siginfo[MAX_SIGNALS];
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
+    struct tvm_stack *thr_stack;  // the stack TVM allocated the thread, if (see stack_alloc)
 };
 
 static struct rmem_arena *global_arena = NULL;
@@ -2617,6 +2630,8 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
     t->tsk_itimer_real = -1;
     pthread_mutex_unlock(&vtimers_lock);
 
+    stack_task_gone(t);
+
     task_filestreamdealloc_list(t, &t->tsk_filestreams);
 
     for (int i = 0; i < 3; i++)
@@ -2992,7 +3007,7 @@ static int task_kill_locked(struct task *t, int signum) {
         if (!fallback)
             fallback = thr;
         if (!__atomic_load_n(&thr->thr_sig_blocked, __ATOMIC_ACQUIRE)) {
-            r = pthread_kill(thr->thr_pthread, signum);
+            r = CALL_FUNC(pthread_kill, thr->thr_pthread, signum);
             goto delivered;
         }
     }
@@ -3003,7 +3018,7 @@ static int task_kill_locked(struct task *t, int signum) {
     // gets drained on the next tvm_sig_leave().
     if (!fallback)
         panic("fallback thread NULL");
-    r = pthread_kill(fallback->thr_pthread, signum);
+    r = CALL_FUNC(pthread_kill, fallback->thr_pthread, signum);
 
 delivered:
     // pthread_cond_wait is not EINTR-interruptible, so a thread sleeping in
@@ -3073,6 +3088,8 @@ static void detach_current_thread_and_exit(void *retval)
     sigset_t all_sigs;
     sigfillset(&all_sigs);
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, NULL);
+
+    stack_exit(current_thread->thr_stack);
 
     // current_thread left set → tvm_thread_destructor calls threaddealloc
     current = NULL;
@@ -3176,6 +3193,7 @@ static void terminate_current_locked(int result)
 
     // Decide now; `current` may be cleared before the exit below.
     int is_init = (current == main_task);
+    struct tvm_stack *stack = current_thread->thr_stack;
 
     // Destroy this task's timers so the vtimer manager spawns no new callbacks.
     // Any already-running SIGEV_THREAD callbacks are regular task threads and
@@ -3200,7 +3218,7 @@ static void terminate_current_locked(int result)
         struct thread *sib;
         list_for_each_entry(sib, &current->tsk_threads, thr_list) {
             if (sib != current_thread)
-                pthread_kill(sib->thr_pthread, SIGCONT);
+                CALL_FUNC(pthread_kill, sib->thr_pthread, SIGCONT);
         }
         pthread_cond_broadcast(&current->tsk_wait_cond);
         task_unlock(current);
@@ -3245,7 +3263,10 @@ static void terminate_current_locked(int result)
     if (auto_reap) {
         taskfreelastref(current, 0, 0);
         list_del(&current->tsk_list);
-        pthread_detach(pthread_self());
+        if (stack)
+            stack_detach(stack);
+        else
+            CALL_FUNC(pthread_detach, pthread_self());
     }
     else {
         if (!parent)
@@ -3320,6 +3341,7 @@ static void terminate_current_locked(int result)
         CALL_FUNC(_exit, WEXITSTATUS(result));
     }
 
+    stack_exit(stack);
     CALL_FUNC(pthread_exit, 0);
     __builtin_unreachable();
 }
@@ -3625,7 +3647,7 @@ static inline struct timespec ts_add(const struct timespec *a, const struct time
 
 static int task_create_thread_locked(struct task *tsk, start_routine_fn start_fn, void *arg,
                               pthread_t *out_thread, const pthread_attr_t *attr,
-                              const sigset_t *sigmask);
+                              const sigset_t *sigmask, struct tvm_stack *stack);
 
 static void pthread_cond_timedwait_mono_np(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *mono_deadline)
 {
@@ -3740,7 +3762,7 @@ static void *vtimer_thread(void *arg)
                     pthread_attr_init(&attr);
                     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-                    VERIFY(0 == task_create_thread_locked(target, thread_func, a, &thr, &attr, NULL));
+                    VERIFY(0 == task_create_thread_locked(target, thread_func, a, &thr, &attr, NULL, NULL));
 
                     pthread_attr_destroy(&attr);
 
@@ -10073,7 +10095,7 @@ struct emulator_saved_state *emulator_saved_state_create(int arch, int abi)
     ess->ess_arch = arch;
     ess->ess_abi  = abi;
 
-    void *stack = CALL_FUNC(mmap, NULL, EMULATOR_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    void *stack = tvm_mmap_guarded(EMULATOR_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE);
 #ifdef TRACE_MMAP
     INFO("mmap %p-%p (emu stack)", stack, (uintptr_t)stack + EMULATOR_STACK_SIZE);
 #endif
@@ -12649,6 +12671,153 @@ static void tvm_reserve_boundary_pages(void)
     }
 }
 
+/*
+ * The stacks of the task threads TVM creates (fork's children, the guests'
+ * threads, the init task's): a thread's stack is a region fork copies (its
+ * frames between sp and thr_fork_fp), so it is placed off the guard windows
+ * as tvm_mmap_guarded() places the others. libpthread frees only the stacks
+ * it allocated, and a thread cannot unmap the one it runs on, so a stack
+ * goes once its thread is joined: by the joiner (waitpid, fork, the guest's
+ * pthread_join), or, for a thread nobody joins (detached, or left unjoined
+ * by its task), by stack_drain() when a thread starts or exits or a task is
+ * reaped. A thread starting takes such a stack of its size, if one is there.
+ */
+#define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
+
+struct tvm_stack {
+    struct list_head st_list;
+    pthread_t st_pthread;   // set by the thread itself, first thing
+    struct task *st_task;
+    void *st_base;          // the page below is a PROT_NONE overflow guard
+    size_t st_size;
+    int st_detached;        // nobody joins the thread: stack_drain() does
+    int st_exited;          // the thread is done with TVM
+};
+
+static LIST_HEAD(stacks);
+static pthread_mutex_t stacks_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void stack_free(struct tvm_stack *st)
+{
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    CALL_FUNC(munmap, (char *)st->st_base - pg, st->st_size + pg);
+    kfree(st);
+}
+
+// Join the threads nobody joins that are done, and free their stacks, but
+// for one of `size`, handed to *reuse if `reuse`. No TVM lock may be held:
+// the threads joined finish in their TLS destructor.
+static void stack_drain(size_t size, struct tvm_stack **reuse)
+{
+    LIST_HEAD(done);
+    struct tvm_stack *st, *next;
+    pthread_mutex_lock(&stacks_lock);
+    for (st = list_first_entry(&stacks, struct tvm_stack, st_list);
+         !list_entry_is_head(st, &stacks, st_list); st = next) {
+        next = list_next_entry(st, st_list);
+        if (st->st_detached && st->st_exited) {
+            list_del(&st->st_list);
+            list_add(&st->st_list, &done);
+        }
+    }
+    pthread_mutex_unlock(&stacks_lock);
+
+    for (st = list_first_entry(&done, struct tvm_stack, st_list);
+         !list_entry_is_head(st, &done, st_list); st = next) {
+        next = list_next_entry(st, st_list);
+        CALL_FUNC(pthread_join, st->st_pthread, NULL);
+        if (reuse && !*reuse && st->st_size == size)
+            *reuse = st;
+        else
+            stack_free(st);
+    }
+}
+
+// A stack for a thread of `tsk`: a drained one of its size if `reuse` (no TVM
+// lock held, see stack_drain), else a new one.
+static struct tvm_stack *stack_alloc(struct task *tsk, size_t size, int reuse)
+{
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    size = (size + pg - 1) & ~(pg - 1);
+
+    struct tvm_stack *st = NULL;
+    if (reuse)
+        stack_drain(size, &st);
+    if (!st) {
+        if (!(st = kalloc(sizeof(*st))))
+            return NULL;
+        char *map = tvm_mmap_guarded(size + pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        if (map == MAP_FAILED) {
+            kfree(st);
+            return NULL;
+        }
+        CALL_FUNC(mprotect, map, pg, PROT_NONE);
+        st->st_base = map + pg;
+        st->st_size = size;
+    }
+    memset(&st->st_pthread, 0, sizeof(st->st_pthread));
+    st->st_task = tsk;
+    st->st_detached = 0;
+    st->st_exited = 0;
+
+    pthread_mutex_lock(&stacks_lock);
+    list_add(&st->st_list, &stacks);
+    pthread_mutex_unlock(&stacks_lock);
+    return st;
+}
+
+// The thread is joined (or was never created): free its stack
+static void stack_release(struct tvm_stack *st)
+{
+    pthread_mutex_lock(&stacks_lock);
+    list_del(&st->st_list);
+    pthread_mutex_unlock(&stacks_lock);
+    stack_free(st);
+}
+
+// Nobody will join the thread
+static void stack_detach(struct tvm_stack *st)
+{
+    pthread_mutex_lock(&stacks_lock);
+    st->st_detached = 1;
+    pthread_mutex_unlock(&stacks_lock);
+}
+
+// The calling thread is done with TVM (its last step before pthread_exit, no
+// TVM lock held): drain the threads done before it, and mark its own
+static void stack_exit(struct tvm_stack *st)
+{
+    stack_drain(0, NULL);
+    if (st) {
+        pthread_mutex_lock(&stacks_lock);
+        st->st_exited = 1;
+        pthread_mutex_unlock(&stacks_lock);
+    }
+}
+
+// `tsk` is gone: its threads done and never joined will not be
+static void stack_task_gone(struct task *tsk)
+{
+    struct tvm_stack *st;
+    pthread_mutex_lock(&stacks_lock);
+    list_for_each_entry(st, &stacks, st_list)
+        if (st->st_task == tsk && st->st_exited)
+            st->st_detached = 1;
+    pthread_mutex_unlock(&stacks_lock);
+}
+
+// The stack TVM allocated the thread, if
+static struct tvm_stack *stack_find(pthread_t thread)
+{
+    struct tvm_stack *st, *ret = NULL;
+    pthread_mutex_lock(&stacks_lock);
+    list_for_each_entry(st, &stacks, st_list)
+        if (pthread_equal(st->st_pthread, thread))
+            ret = st;
+    pthread_mutex_unlock(&stacks_lock);
+    return ret;
+}
+
 void *rmem_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offset) {
     void *map;
     if (!hint && fd == -1 && !(flags & MAP_FIXED))
@@ -12903,6 +13072,179 @@ static int tvm_want_gdb_jit(void)
 }
 #endif
 
+// What the init task's thread starts with (tvm_start)
+struct tvm_init_arg {
+    char *file;
+    char **argv;
+    char **envp;
+    char *cwd;
+    char *initrc;
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+    int ready;
+};
+
+// The init task's thread: the task, then the initrc and the exec. Never returns.
+static void *tvm_init_entry(struct tvm_init_arg *ia)
+{
+    struct tvm_tls *t = kalloc(sizeof(struct tvm_tls));
+    if (!t)
+        panic("tvm_init_entry: tvm_tls alloc");
+    memset(t, 0, sizeof(struct tvm_tls));
+    pthread_setspecific(tls_key, t);
+
+
+    // we dont bother lockin current
+
+    current = taskalloc_common();
+    if (!current)
+        panic("couldn't create main task");
+
+    main_task = current;
+    current->tsk_pid = __gettid();
+    current->tsk_sid = current->tsk_pgid = current->tsk_pid;
+    current->tsk_umask = 022;
+    CALL_FUNC(umask, 0); // real umask=0; per-task tsk_umask applied in interposed open/mkdir
+
+    current->tsk_data = rmem_arena_alloc(current->tsk_ar, sizeof(*current->tsk_data));
+    if (!current->tsk_data)
+        panic("tsk_data");
+    memset(current->tsk_data, 0, sizeof(*current->tsk_data));
+
+    // __environ on linux, environ on apple
+    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0)
+                                 ?: ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "environ", 0)
+                                 ?: &current->tsk_data->__environ;
+    current->tsk_relocs.optind = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optind", 0) ?: &current->tsk_data->optind;
+    current->tsk_relocs.opterr = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "opterr", 0) ?: &current->tsk_data->opterr;
+    current->tsk_relocs.optopt = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optopt", 0) ?: &current->tsk_data->optopt;
+    current->tsk_relocs.optarg = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optarg", 0) ?: &current->tsk_data->optarg;
+
+    *current->tsk_relocs.optind = 1;
+    *current->tsk_relocs.opterr = 1;
+    current->tsk_data->optreset = 0;
+
+    // dup 0,1,2 fds
+    for (int i = 0; i < 3; i++) {
+        int rfd = CALL_FUNC(dup, i);
+        if (-1 == rfd)
+            panic("tvm_start::dup %d", i);
+
+        struct file *f = filealloc_from_rfd(rfd);
+        if (!f)
+            panic("tvm_start::filealloc_from_rfd %d", rfd);
+
+        f->f_refcnt++;
+
+        int nfd = task_assign_file_locked(current, f, i);
+        if (nfd != i)
+            panic("tvm_start::task_assign_file %d %d", i, nfd);
+    }
+
+    // allocate stdin, stdout, stderr filestreams
+    for (int i = 0; i < 3; i++) {
+        struct file_stream *fs = task_filestreamalloc_locked(current);
+        VERIFY(fs);
+
+        struct file *file = file_for_task_locked(current, i);
+        VERIFY(file);
+
+        fs->fs_type = FS_FILE;
+        fs->fs_nfd = i;
+        fs->fs_gencnt = file->f_gencnt;
+
+        memset(fs->fs_mode, 0, sizeof(fs->fs_mode));
+        strncpy(fs->fs_mode, (i?"w":"r"), sizeof(fs->fs_mode)-1);
+
+        VERIFY((fs->fs_fp = CALL_FUNC(fdopen, file->f_rfd, fs->fs_mode)));
+        file_unlock(file, 1);
+        current->tsk_io_filestreams[i] = fs;
+
+        VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
+    }
+
+    // The guest environment. Everything TVM reads about itself from here on
+    // (TVM_NOEMU, TVM_SHELL, PLATFORM, ...) comes from this copy.
+    *current->tsk_relocs.__environ = copyenv(current->tsk_ar, ia->envp);
+    if (!*current->tsk_relocs.__environ)
+        panic("tvm_start::copyenv");
+
+    current_thread = threadalloc(current);
+    if (!current_thread)
+        panic("tvm_start::threadalloc");
+
+    current_thread->thr_pthread = pthread_self();
+    current_thread->thr_task = current;
+    current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
+
+    list_add_tail(&current_thread->thr_list, &current->tsk_threads);
+    current->tsk_threads_cnt++;
+
+    current->tsk_cwd[0] = 0;
+    if (!CALL_FUNC(getcwd, current->tsk_cwd, sizeof(current->tsk_cwd)))
+        panic("tvm_start::getcwd");
+
+    // execve() replaces this with the program's basename
+    strncpy(current->tsk_comm, "tvm", sizeof(current->tsk_comm));
+    task_rusage_start(current);
+
+    vtimer_init(); // must be before signal handler installation
+
+    struct sigaction act = {
+        .sa_sigaction = signal_handler,
+        .sa_flags = SA_SIGINFO,
+    };
+
+    for (int i = 0; i < MAX_SIGNALS; i++) {
+        if (0 == CALL_FUNC(sigaction, i, NULL, current->tsk_sighandlers + i)) {
+            if (i == SIGKILL || i == SIGSTOP)
+                continue;
+            if (0 != CALL_FUNC(sigaction, i, &act, NULL))
+                panic("sigaction(%d): %s", i, strerror(errno));
+        }
+    }
+
+    tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    setenv("PLATFORM", "macos-arm64", 0);
+#elif defined(__linux__) && defined(__x86_64__)
+    setenv("PLATFORM", "linux-x64", 0);
+#elif defined(__linux__) && defined(__aarch64__)
+    setenv("PLATFORM", "linux-arm64", 0);
+#endif
+
+    // The init task is set up: tvm_start returns (OS signals were blocked
+    // for the thread's creation, see there)
+    pthread_mutex_lock(&ia->mtx);
+    ia->ready = 1;
+    pthread_cond_broadcast(&ia->cond);
+    pthread_mutex_unlock(&ia->mtx);
+
+    sigset_t empty_sigs;
+    sigemptyset(&empty_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
+
+    // Guest-side setup. These are direct calls from libtvm text, so the
+    // interposed functions see a TVM return address and enter the VM.
+
+    if (ia->cwd && 0 != chdir(ia->cwd))
+        panic("tvm_start::chdir(%s): %s", ia->cwd, strerror(errno));
+
+    if (ia->initrc)
+        tvm_exec_initrc(ia->initrc);
+
+    tvm_parse_noemu();
+
+    // after the initrc, so a `setenv TVM_SHELL=...` there is honored
+    usershell_cache_init();
+
+    // Exec. Never returns on success (ends in the in-VM exit()).
+
+    execvp(ia->file, ia->argv);
+    panic("tvm_start::execvp(%s): %s", ia->file, strerror(errno));
+}
+
 static int tvm_started = 0;
 
 /**
@@ -13045,148 +13387,51 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
         }
     }
 
-    // FROM HERE ON WE ENTER TVM ON CURRENT THREAD. No more returning.
+    // The init task runs on a thread of its own, on a TVM stack (stack_alloc),
+    // with copies of what it needs: the calling thread is the caller's again.
 
-    // we dont bother lockin current
+    struct tvm_init_arg *ia = kalloc(sizeof(*ia));
+    if (!ia)
+        panic("tvm_start: init arg");
+    memset(ia, 0, sizeof(*ia));
+    ia->file = kstrdup(file);
+    ia->argv = copyenv(global_arena, (char **)argv);
+    ia->envp = copyenv(global_arena, envp ? (char **)envp : environ);
+    ia->cwd = cfg->cwd ? kstrdup(cfg->cwd) : NULL;
+    ia->initrc = cfg->initrc ? kstrdup(cfg->initrc) : NULL;
+    if (!ia->file || !ia->argv || !ia->envp || (cfg->cwd && !ia->cwd) || (cfg->initrc && !ia->initrc))
+        panic("tvm_start: init arg copies");
+    pthread_mutex_init(&ia->mtx, NULL);
+    pthread_cond_init(&ia->cond, NULL);
 
-    current = taskalloc_common();
-    if (!current)
-        panic("couldn't create main task");
+    struct tvm_stack *stack = stack_alloc(NULL, DEFAULT_STACK_SIZE, 0);
+    if (!stack)
+        panic("tvm_start: init stack");
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstack(&attr, stack->st_base, stack->st_size);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    main_task = current;
-    current->tsk_pid = __gettid();
-    current->tsk_sid = current->tsk_pgid = current->tsk_pid;
-    current->tsk_umask = 022;
-    CALL_FUNC(umask, 0); // real umask=0; per-task tsk_umask applied in interposed open/mkdir
+    // OS signals blocked until the thread has its task (it unblocks them)
+    sigset_t all_sigs, old_sigs;
+    sigfillset(&all_sigs);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
+    pthread_t pth;
+    int r = CALL_FUNC(pthread_create, &pth, &attr, (start_routine_fn)tvm_init_entry, ia);
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
+    pthread_attr_destroy(&attr);
+    if (r)
+        panic("tvm_start: pthread_create: %s", strerror(r));
 
-    current->tsk_data = rmem_arena_alloc(current->tsk_ar, sizeof(*current->tsk_data));
-    if (!current->tsk_data)
-        panic("tsk_data");
-    memset(current->tsk_data, 0, sizeof(*current->tsk_data));
+    pthread_mutex_lock(&ia->mtx);
+    while (!ia->ready)
+        pthread_cond_wait(&ia->cond, &ia->mtx);
+    pthread_mutex_unlock(&ia->mtx);
 
-    // __environ on linux, environ on apple
-    current->tsk_relocs.__environ = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "__environ", 0)
-                                 ?: ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "environ", 0)
-                                 ?: &current->tsk_data->__environ;
-    current->tsk_relocs.optind = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optind", 0) ?: &current->tsk_data->optind;
-    current->tsk_relocs.opterr = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "opterr", 0) ?: &current->tsk_data->opterr;
-    current->tsk_relocs.optopt = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optopt", 0) ?: &current->tsk_data->optopt;
-    current->tsk_relocs.optarg = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, "optarg", 0) ?: &current->tsk_data->optarg;
-
-    *current->tsk_relocs.optind = 1;
-    *current->tsk_relocs.opterr = 1;
-    current->tsk_data->optreset = 0;
-
-    // dup 0,1,2 fds
-    for (int i = 0; i < 3; i++) {
-        int rfd = CALL_FUNC(dup, i);
-        if (-1 == rfd)
-            panic("tvm_start::dup %d", i);
-
-        struct file *f = filealloc_from_rfd(rfd);
-        if (!f)
-            panic("tvm_start::filealloc_from_rfd %d", rfd);
-
-        f->f_refcnt++;
-
-        int nfd = task_assign_file_locked(current, f, i);
-        if (nfd != i)
-            panic("tvm_start::task_assign_file %d %d", i, nfd);
-    }
-
-    // allocate stdin, stdout, stderr filestreams
-    for (int i = 0; i < 3; i++) {
-        struct file_stream *fs = task_filestreamalloc_locked(current);
-        VERIFY(fs);
-
-        struct file *file = file_for_task_locked(current, i);
-        VERIFY(file);
-
-        fs->fs_type = FS_FILE;
-        fs->fs_nfd = i;
-        fs->fs_gencnt = file->f_gencnt;
-
-        memset(fs->fs_mode, 0, sizeof(fs->fs_mode));
-        strncpy(fs->fs_mode, (i?"w":"r"), sizeof(fs->fs_mode)-1);
-
-        VERIFY((fs->fs_fp = CALL_FUNC(fdopen, file->f_rfd, fs->fs_mode)));
-        file_unlock(file, 1);
-        current->tsk_io_filestreams[i] = fs;
-
-        VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
-    }
-
-    // The guest environment. Everything TVM reads about itself from here on
-    // (TVM_NOEMU, TVM_SHELL, PLATFORM, ...) comes from this copy.
-    *current->tsk_relocs.__environ = copyenv(current->tsk_ar, envp ? (char **)envp : environ);
-    if (!*current->tsk_relocs.__environ)
-        panic("tvm_start::copyenv");
-
-    current_thread = threadalloc(current);
-    if (!current_thread)
-        panic("tvm_start::threadalloc");
-
-    current_thread->thr_pthread = pthread_self();
-    current_thread->thr_task = current;
-
-    // wouldn't be able to fork if caller returned
-    current_thread->thr_fork_fp = *(void **)__builtin_frame_address(0);
-
-    list_add_tail(&current_thread->thr_list, &current->tsk_threads);
-    current->tsk_threads_cnt++;
-
-    current->tsk_cwd[0] = 0;
-    if (!CALL_FUNC(getcwd, current->tsk_cwd, sizeof(current->tsk_cwd)))
-        panic("tvm_start::getcwd");
-
-    // execve() replaces this with the program's basename
-    strncpy(current->tsk_comm, "tvm", sizeof(current->tsk_comm));
-    task_rusage_start(current);
-
-    vtimer_init(); // must be before signal handler installation
-
-    struct sigaction act = {
-        .sa_sigaction = signal_handler,
-        .sa_flags = SA_SIGINFO,
-    };
-
-    for (int i = 0; i < MAX_SIGNALS; i++) {
-        if (0 == CALL_FUNC(sigaction, i, NULL, current->tsk_sighandlers + i)) {
-            if (i == SIGKILL || i == SIGSTOP)
-                continue;
-            if (0 != CALL_FUNC(sigaction, i, &act, NULL))
-                panic("sigaction(%d): %s", i, strerror(errno));
-        }
-    }
-
-    tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
-
-#if defined(__APPLE__) && defined(__aarch64__)
-    setenv("PLATFORM", "macos-arm64", 0);
-#elif defined(__linux__) && defined(__x86_64__)
-    setenv("PLATFORM", "linux-x64", 0);
-#elif defined(__linux__) && defined(__aarch64__)
-    setenv("PLATFORM", "linux-arm64", 0);
-#endif
-
-    // Guest-side setup. These are direct calls from libtvm text, so the
-    // interposed functions see a TVM return address and enter the VM.
-
-    if (cfg->cwd && 0 != chdir(cfg->cwd))
-        panic("tvm_start::chdir(%s): %s", cfg->cwd, strerror(errno));
-
-    if (cfg->initrc)
-        tvm_exec_initrc(cfg->initrc);
-
-    tvm_parse_noemu();
-
-    // after the initrc, so a `setenv TVM_SHELL=...` there is honored
-    usershell_cache_init();
-
-    // Exec. Never returns on success (ends in the in-VM exit()).
-
-    execvp(file, argv);
-    panic("tvm_start::execvp(%s): %s", file, strerror(errno));
+    // no TVM state on this thread any more: its calls go to the host
+    pthread_setspecific(tls_key, NULL);
+    kfree(t);
+    return 0;
 }
 
 char ***_tvm_environ()
@@ -16780,8 +17025,6 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
  */
 
 #define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
-#define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
-
 #define TEMP_STACK_SIZE DEFAULT_STACK_SIZE
 
 struct fork_arg {
@@ -16898,6 +17141,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     current_thread = arg->thr;
     current->tsk_pid = __gettid();
     current_thread->thr_pthread = pthread_self();
+    current_thread->thr_stack->st_pthread = pthread_self();
     task_rusage_start(current);
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
     current->tsk_threads_cnt++;
@@ -17140,6 +17384,7 @@ pid_t fork(void) {
     struct task *tsk = NULL;
     struct thread *thr = NULL;
     struct fork_arg *arg = NULL;
+    struct tvm_stack *stack = NULL;
     pthread_attr_t attr;
     pid_t ret = -1;
     int r;
@@ -17152,7 +17397,14 @@ pid_t fork(void) {
         return -1;
     }
 
-    if ((r = pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE))) {
+    // before taskalloc() locks current (stack_alloc may join threads)
+    stack = stack_alloc(NULL, DEFAULT_STACK_SIZE, 1);
+    if (!stack) {
+        errno = ENOMEM;
+        goto out;
+    }
+
+    if ((r = pthread_attr_setstack(&attr, stack->st_base, stack->st_size))) {
         errno = r;
         goto out;
     }
@@ -17162,12 +17414,14 @@ pid_t fork(void) {
         errno = ENOMEM;
         goto out;
     }
+    stack->st_task = tsk;
 
     thr = threadalloc(tsk);
     if (!thr) {
         errno = ENOMEM;
         goto out;
     }
+    thr->thr_stack = stack;
 
     if ((r = copy_pthread_attr(&attr, &thr->thr_pthread_attr))) {
         errno = r;
@@ -17267,7 +17521,7 @@ pid_t fork(void) {
     if (ret == -1) {
         // we are not allowed to fail here
         void *thread_r;
-        if ((r = pthread_join(pth, &thread_r)))
+        if ((r = CALL_FUNC(pthread_join, pth, &thread_r)))
             panic("fork::pthread_join failed (errno %d)", r);
 
         errno = (int)(long)(thread_r);
@@ -17300,6 +17554,10 @@ out:
     }
 
     if (ret == -1) {
+
+        // no child thread, or a joined one
+        if (stack)
+            stack_release(stack);
 
         if (thr) {
             threaddealloc(thr);
@@ -17354,6 +17612,8 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
 
     current_thread->thr_pthread = pthread_self();
     current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
+    if (current_thread->thr_stack)
+        current_thread->thr_stack->st_pthread = pthread_self();
 
     // Inherit the creating thread's virtual signal mask.
     current_thread->thr_sigmask = arg->sigmask;
@@ -17377,21 +17637,52 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
     pthread_exit(start_fn(start_arg));
 }
 
+// The size of the stack TVM gives a thread created with `attr` (NULL: the
+// defaults); 0 if `attr` brings the thread's own. Both libcs keep the top of
+// a stack set with pthread_attr_setstack and report its bottom, the top less
+// the size they keep: with no stack set, NULL (no size set either) or minus
+// the size.
+static size_t attr_stack_size(const pthread_attr_t *attr)
+{
+    pthread_attr_t def;
+    if (!attr) {
+        pthread_attr_init(&def);
+        attr = &def;
+    }
+    void *addr = NULL;
+    size_t size = 0;
+    pthread_attr_getstack(attr, &addr, &size);
+    int own = addr && (uintptr_t)addr + size != 0;
+    pthread_attr_getstacksize(attr, &size);
+    if (attr == &def)
+        pthread_attr_destroy(&def);
+    return own ? 0 : size;
+}
+
 // Create a thread within a locked task.  The new thread gets the full TVM lifecycle
 // (thread list, signal mask, refcount, emulator context, pthread_exit teardown).
 //
 // If parent_attr is non-NULL it is copied to the thread's pthread_attr.
 // If parent_sigmask is non-NULL the thread inherits it; otherwise starts empty.
+// The thread runs on `stack` (from stack_alloc, taken over, failure or not),
+// or one allocated here, unless `attr` brings its own.
 static int task_create_thread_locked(struct task *tsk, start_routine_fn start_fn, void *arg,
                               pthread_t *out_thread, const pthread_attr_t *attr,
-                              const sigset_t *sigmask)
+                              const sigset_t *sigmask, struct tvm_stack *stack)
 {
     int ret = ENOMEM;
     tsk->tsk_refcount++;
 
+    size_t stack_size = attr_stack_size(attr);
+    if (!stack && stack_size && !(stack = stack_alloc(tsk, stack_size, 0))) {
+        ret = EAGAIN;
+        goto fail_refcount;
+    }
+
     struct thread *thr = threadalloc(tsk);
     if (!thr)
         goto fail_refcount;
+    thr->thr_stack = stack;
 
     if (attr) {
         ret = copy_pthread_attr(attr, &thr->thr_pthread_attr);
@@ -17429,13 +17720,30 @@ static int task_create_thread_locked(struct task *tsk, start_routine_fn start_fn
 
     pthread_mutex_lock(&a->mtx);
 
+    // On TVM's stack the host thread is joinable whatever `attr` asks: a
+    // detached one is joined by stack_drain()
+    pthread_attr_t hattr;
+    if (stack) {
+        int detach = PTHREAD_CREATE_JOINABLE;
+        pthread_attr_init(&hattr);
+        if (attr) {
+            copy_pthread_attr(attr, &hattr);
+            pthread_attr_getdetachstate(attr, &detach);
+        }
+        stack->st_detached = detach == PTHREAD_CREATE_DETACHED;
+        pthread_attr_setdetachstate(&hattr, PTHREAD_CREATE_JOINABLE);
+        pthread_attr_setstack(&hattr, stack->st_base, stack->st_size);
+    }
+
     sigset_t all, old;
     sigfillset(&all);
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &old);
 
-    ret = CALL_FUNC(pthread_create, out_thread, attr, (start_routine_fn)tvm_thread_entry, a);
+    ret = CALL_FUNC(pthread_create, out_thread, stack ? &hattr : attr, (start_routine_fn)tvm_thread_entry, a);
 
     CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old, NULL);
+    if (stack)
+        pthread_attr_destroy(&hattr);
 
     if (ret) {
         pthread_mutex_unlock(&a->mtx);
@@ -17463,17 +17771,74 @@ fail_arg:
 fail_thr:
     threaddealloc(thr);
 fail_refcount:
+    if (stack)
+        stack_release(stack);
     tsk->tsk_refcount--;
     return ret;
 }
 
 FUNCTION_DEFINE4(int, pthread_create, pthread_t *, thread, const pthread_attr_t *, attr, start_routine_fn, start_routine, void *, arg) {
     tvm_sig_enter();
+    // before task_lock: stack_alloc may join threads (see stack_drain)
+    size_t stack_size = attr_stack_size(attr);
+    struct tvm_stack *stack = stack_size ? stack_alloc(current, stack_size, 1) : NULL;
+    if (stack_size && !stack) {
+        tvm_sig_leave();
+        return EAGAIN;
+    }
     task_lock(current);
-    int ret = task_create_thread_locked(current, start_routine, arg, thread, attr, &current_thread->thr_sigmask);
+    int ret = task_create_thread_locked(current, start_routine, arg, thread, attr, &current_thread->thr_sigmask, stack);
     task_unlock(current);
     tvm_sig_leave();
     return ret;
+}
+
+// A thread on TVM's stack (stack_alloc) is joinable on the host whatever
+// the guest asks, and its stack goes when it is joined: by the guest's
+// pthread_join, or by stack_drain() once the guest has detached it.
+FUNCTION_DEFINE2(int, pthread_join, pthread_t, thread, void **, retval) {
+    // before the join: once joined, `thread` may name a new thread
+    struct tvm_stack *st = stack_find(thread);
+    if (st && st->st_detached)
+        return EINVAL;
+    int ret = CALL_FUNC(pthread_join, thread, retval);
+    if (!ret && st)
+        stack_release(st);
+    return ret;
+}
+
+// A thread that is gone is ESRCH, never looked at: glibc keeps a thread's
+// descriptor (what its pthread_t points to) at the top of its stack, which
+// is unmapped once the thread is joined. One still in the task's list, or
+// done but not joined (its stack registered), is the host's to signal.
+FUNCTION_DEFINE2(int, pthread_kill, pthread_t, thread, int, sig) {
+    int ret = ESRCH;
+    tvm_sig_enter();
+    task_lock(current);
+    pthread_mutex_lock(&stacks_lock);
+    int live = 0;
+    struct thread *thr;
+    list_for_each_entry(thr, &current->tsk_threads, thr_list)
+        live |= pthread_equal(thr->thr_pthread, thread);
+    struct tvm_stack *st;
+    list_for_each_entry(st, &stacks, st_list)
+        live |= pthread_equal(st->st_pthread, thread);
+    if (live)
+        ret = CALL_FUNC(pthread_kill, thread, sig);
+    pthread_mutex_unlock(&stacks_lock);
+    task_unlock(current);
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE1(int, pthread_detach, pthread_t, thread) {
+    struct tvm_stack *st = stack_find(thread);
+    if (!st)
+        return CALL_FUNC(pthread_detach, thread);
+    if (st->st_detached)
+        return EINVAL;
+    stack_detach(st);
+    return 0;
 }
 
 FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
@@ -18037,7 +18402,9 @@ static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
     if (list_empty(&zombiet->tsk_threads))
         panic("waitpid tsk_pthreads empty");
     struct thread *thr = list_entry(zombiet->tsk_threads.next, struct thread, thr_list);
-    pthread_join(thr->thr_pthread, NULL);
+    CALL_FUNC(pthread_join, thr->thr_pthread, NULL);
+    if (thr->thr_stack)
+        stack_release(thr->thr_stack);
 
     pid_t childpid = zombiet->tsk_pid;
     if (wstatus)
@@ -18052,6 +18419,8 @@ static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
     // wake fellow waiters: one may be blocked waiting for this specific child
     // (it skipped the TS_REAPED zombie) and must re-scan to discover ECHILD
     pthread_cond_broadcast(&current->tsk_wait_cond);
+
+    stack_drain(0, NULL);
 
     tvm_sig_leave();
 
@@ -18217,7 +18586,7 @@ FUNCTION_DEFINE1(int, raise, int, sig) {
         return 0;
     }
 
-    int r = pthread_kill(pthread_self(), sig);
+    int r = CALL_FUNC(pthread_kill, pthread_self(), sig);
     if (r != 0) {
         errno = r;
         r = -1;
