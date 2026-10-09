@@ -2067,6 +2067,71 @@ TEST(SiglongjmpFromHandler) {
     ASSERT_NEQ(SIG_ERR, signal(SIGUSR1, SIG_DFL));
 }
 
+// The same, for a signal that arrives while the task runs its own code
+// (no interposed call to defer it to): sent by a child while this spins.
+// Native only (TVM_NOEMU=1): emulated, the handler runs in a nested
+// emulator_call at the emulator's safe point, which a longjmp out of does
+// not unwind (it hangs or aborts in TCG, as it did before).
+TEST(SiglongjmpFromHandlerAsync) {
+    const char *noemu = getenv("TVM_NOEMU");
+    if (!noemu || strcmp(noemu, "1"))
+        return;
+    ASSERT_NEQ(SIG_ERR, signal(SIGUSR1, handler_jump));
+
+    volatile int jumps = 0;
+    sigsetjmp(handler_jmp, 1);
+    if (jumps < 3) {
+        jumps++;
+        pid_t parent = getpid();
+        pid_t p = fork();
+        ASSERT_NEQ(p, -1);
+        if (!p) {
+            usleep(20000);
+            kill(parent, SIGUSR1);
+            _exit(0);
+        }
+        for (volatile unsigned long i = 0; i < 20000000000UL; i++)
+            ;
+        FAIL("    SIGUSR1 did not jump (jump %d)", jumps);
+    }
+    for (int i = 0; i < 3; i++)
+        wait(NULL);
+    ASSERT_NEQ(SIG_ERR, signal(SIGUSR1, SIG_DFL));
+}
+
+// A handler runs with its signal (unless SA_NODEFER) and sa_mask blocked,
+// and the mask is back to what it was after it returns
+static volatile int handler_blocked;
+
+static void handler_mask(int sig) {
+    (void)sig;
+    sigset_t cur;
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    handler_blocked = sigismember(&cur, SIGUSR1) * 2 + sigismember(&cur, SIGUSR2);
+}
+
+TEST(SignalHandlerMask) {
+    struct sigaction sa = { .sa_handler = handler_mask };
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGUSR2);
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+    handler_blocked = -1;
+    ASSERT_EQ(0, raise(SIGUSR1));
+    ASSERT_EQ(3, handler_blocked);
+
+    sa.sa_flags = SA_NODEFER;
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, NULL));
+    handler_blocked = -1;
+    ASSERT_EQ(0, raise(SIGUSR1));
+    ASSERT_EQ(1, handler_blocked);
+
+    sigset_t cur;
+    ASSERT_EQ(0, sigprocmask(SIG_BLOCK, NULL, &cur));
+    ASSERT_EQ(0, sigismember(&cur, SIGUSR1));
+    ASSERT_EQ(0, sigismember(&cur, SIGUSR2));
+    ASSERT_NEQ(SIG_ERR, signal(SIGUSR1, SIG_DFL));
+}
+
 // realpath and getcwd answer in the guest namespace: a mount point hides
 // its source, a cpio link is followed, a host link too.
 TEST(VfsRealpath) {

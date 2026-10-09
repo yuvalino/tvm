@@ -790,6 +790,7 @@ void call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t
 
 static inline void tvm_sig_enter(void);
 static inline void tvm_sig_leave(void);
+static void tvm_sig_drain(void);
 
 typedef void *(*start_routine_fn)(void *);
 
@@ -1157,13 +1158,12 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
 /////////////
 
 /**
- * TVM's setjmp/longjmp: fork's own (tvm_jmp_save, tvm_longjmp_regs) and the
- * guests' native ones (tvm_sigsetjmp etc., see "setjmp/longjmp of native
- * code"). Unlike the host libc's they keep the saved stack pointer, frame
- * pointer and return address as plain values (glibc mangles them with
- * PTR_MANGLE, Darwin XORs them with a per-process cookie), so fork can read
- * and move a jmp_buf's stack, and translate one it copied like any other
- * pointer.
+ * setjmp/longjmp with plain registers: fork's own (tvm_jmp_save,
+ * tvm_longjmp_regs) and native guests' (setjmp, longjmp, ...). The host
+ * libc's mangle the saved stack pointer, frame pointer and return address
+ * (glibc's PTR_MANGLE, Darwin's per-process cookie); these keep them as they
+ * are, so fork can read and move a jmp_buf's stack, and translate one it
+ * copied like any other pointer.
  *
  * In order to properly have a `fork()` function that actually creates a thread behind the scenes,
  * we need to copy stack frames from the parent's stack to the child's stack, so all the local
@@ -1171,14 +1171,15 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
  * we use setjmp and longjmp (tvm_jmp_save, tvm_longjmp_regs), and stack data copied from the
  * parent is scanned for pointers to the parent's stack and fixed up to the child's.
  *
- * The registers, JMP_REGS words from an 8-byte boundary (fork translates
- * 8-byte words):
- *   arm64:  x19-x28, x29, x30, sp, d8-d15, sp at JMP_SP 12
- *   x86_64: rbx, rbp, r12-r15, rsp, rip, rsp at JMP_SP 6
+ * The registers, JMP_REGS words:
+ *   arm64:  x19-x28, x29, x30, sp, d8-d15 (sp at JMP_SP)
+ *   x86_64: rbx, rbp, r12-r15, rsp, rip
  * tvm_jmp_save saves them and returns 0; tvm_longjmp_regs loads them back
- * and returns val (1 for 0) from that tvm_jmp_save. A guest's setjmp
- * (tvm_sigsetjmp) aligns its jmp_buf first and goes on to tvm_setjmp_tail
- * after the registers, which keeps a jmp_tail at NATIVE_JMP_TAIL.
+ * and returns val (1 for 0) from that tvm_jmp_save. A guest's jmp_buf holds
+ * them from its first 8-byte boundary (JMP_ALIGN: fork translates 8-byte
+ * words, and Darwin's jmp_buf is an int array, 4-byte aligned), then the
+ * signal mask (struct jmp_sigmask), all within every jmp_buf: Darwin arm64's
+ * is 192 bytes, glibc x86_64's 200.
  */
 #if defined(__aarch64__)
 #define JMP_REGS 21
@@ -1187,17 +1188,54 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
 #define JMP_REGS 8
 #define JMP_SP   6
 #endif
-#define NATIVE_JMP_TAIL (JMP_REGS * 8)
 
 typedef uint64_t tvm_jmp_buf[JMP_REGS];
 
+#define JMP_ALIGN(env) ((uint64_t *)(((uintptr_t)(env) + 7) & ~(uintptr_t)7))
+
+struct jmp_sigmask {
+    int savemask;
+    sigset_t mask;
+};
+
+// after a guest jmp_buf's nregs registers; returns setjmp's 0
+__attribute__((visibility("hidden"), used))
+int jmp_save_mask(uint64_t *buf, int savemask, int nregs)
+{
+    struct jmp_sigmask *m = (struct jmp_sigmask *)(buf + nregs);
+    m->savemask = savemask;
+    if (savemask)
+        sigprocmask(SIG_BLOCK, NULL, &m->mask);
+    return 0;
+}
+
+static void jmp_restore_mask(uint64_t *buf, int nregs)
+{
+    struct jmp_sigmask *m = (struct jmp_sigmask *)(buf + nregs);
+    if (m->savemask)
+        sigprocmask(SIG_SETMASK, &m->mask, NULL);
+}
+
 __attribute__((returns_twice)) int tvm_jmp_save(tvm_jmp_buf buf);
 __attribute__((noreturn)) void tvm_longjmp_regs(uint64_t *buf, int val);
+// setjmp saves the mask, _setjmp not, sigsetjmp if savemask
 int tvm_setjmp(void *env);
 int tvm__setjmp(void *env);
 int tvm_sigsetjmp(void *env, int savemask);
 
-#if defined(__APPLE__) && defined(__aarch64__)
+// One block per architecture; the object format only spells the names:
+// Mach-O's C symbols have a leading underscore, ELF's are typed
+#if defined(__APPLE__)
+#define JMP_SYM(name)  "_" #name
+#define JMP_FUNC(name) ".private_extern _" #name "\n_" #name ":\n"
+#else
+#define JMP_SYM(name)  #name
+#define JMP_FUNC(name) ".globl " #name "\n.hidden " #name "\n.type " #name ", %function\n" #name ":\n"
+#endif
+#define JMP_STR_(x)    #x
+#define JMP_STR(x)     JMP_STR_(x)
+
+#if defined(__aarch64__)
 #define JMP_SAVE_REGS \
     "    stp x19, x20, [x0, #0]\n" \
     "    stp x21, x22, [x0, #16]\n" \
@@ -1214,26 +1252,22 @@ int tvm_sigsetjmp(void *env, int savemask);
 __asm__(
     ".text\n"
     ".p2align 2\n"
-    ".private_extern _tvm_jmp_save\n"
-    "_tvm_jmp_save:\n"
+    JMP_FUNC(tvm_jmp_save)
     JMP_SAVE_REGS
     "    mov w0, #0\n"
     "    ret\n"
-    ".private_extern _tvm_setjmp\n"
-    "_tvm_setjmp:\n"
+    JMP_FUNC(tvm_setjmp)
     "    mov w1, #1\n"
-    "    b _tvm_sigsetjmp\n"
-    ".private_extern _tvm__setjmp\n"
-    "_tvm__setjmp:\n"
+    "    b " JMP_SYM(tvm_sigsetjmp) "\n"
+    JMP_FUNC(tvm__setjmp)
     "    mov w1, #0\n"
-    ".private_extern _tvm_sigsetjmp\n"
-    "_tvm_sigsetjmp:\n"
+    JMP_FUNC(tvm_sigsetjmp)
     "    add x0, x0, #7\n"
     "    and x0, x0, #~7\n"
     JMP_SAVE_REGS
-    "    b _tvm_setjmp_tail\n"
-    ".private_extern _tvm_longjmp_regs\n"
-    "_tvm_longjmp_regs:\n"
+    "    mov w2, #" JMP_STR(JMP_REGS) "\n"
+    "    b " JMP_SYM(jmp_save_mask) "\n"
+    JMP_FUNC(tvm_longjmp_regs)
     "    ldp x19, x20, [x0, #0]\n"
     "    ldp x21, x22, [x0, #16]\n"
     "    ldp x23, x24, [x0, #32]\n"
@@ -1250,7 +1284,7 @@ __asm__(
     "    csinc w0, w1, wzr, ne\n"
     "    ret\n"
 );
-#elif defined(__linux__) && defined(__x86_64__)
+#elif defined(__x86_64__)
 #define JMP_SAVE_REGS \
     "    mov %rbx, 0(%rdi)\n" \
     "    mov %rbp, 8(%rdi)\n" \
@@ -1262,7 +1296,6 @@ __asm__(
     "    mov %rdx, 48(%rdi)\n" \
     "    mov (%rsp), %rdx\n" \
     "    mov %rdx, 56(%rdi)\n"
-#define JMP_FUNC(name) ".globl " #name "\n.hidden " #name "\n.type " #name ", @function\n" #name ":\n"
 __asm__(
     ".text\n"
     JMP_FUNC(tvm_jmp_save)
@@ -1271,14 +1304,15 @@ __asm__(
     "    ret\n"
     JMP_FUNC(tvm_setjmp)
     "    mov $1, %esi\n"
-    "    jmp tvm_sigsetjmp\n"
+    "    jmp " JMP_SYM(tvm_sigsetjmp) "\n"
     JMP_FUNC(tvm__setjmp)
     "    xor %esi, %esi\n"
     JMP_FUNC(tvm_sigsetjmp)
     "    add $7, %rdi\n"
     "    and $-8, %rdi\n"
     JMP_SAVE_REGS
-    "    jmp tvm_setjmp_tail\n"
+    "    mov $" JMP_STR(JMP_REGS) ", %edx\n"
+    "    jmp " JMP_SYM(jmp_save_mask) "\n"
     JMP_FUNC(tvm_longjmp_regs)
     "    mov %esi, %eax\n"
     "    test %eax, %eax\n"
@@ -1293,11 +1327,22 @@ __asm__(
     "    mov 48(%rdi), %rsp\n"
     "    jmp *56(%rdi)\n"
 );
-#undef JMP_FUNC
 #else
-#error tvm_jmp_save/tvm_longjmp_regs: unsupported platform
+#error tvm_jmp_save/tvm_longjmp_regs: unsupported architecture
 #endif
 #undef JMP_SAVE_REGS
+#undef JMP_FUNC
+#undef JMP_SYM
+#undef JMP_STR
+#undef JMP_STR_
+
+// longjmp, _longjmp, siglongjmp: restore the mask if the setjmp saved it
+static __attribute__((noreturn)) void tvm_longjmp(void *env, int val)
+{
+    uint64_t *buf = JMP_ALIGN(env);
+    jmp_restore_mask(buf, JMP_REGS);
+    tvm_longjmp_regs(buf, val);
+}
 
 // move every saved register that points into old_stack by the same offset into new_stack
 static void jmpbuf_setstack(tvm_jmp_buf jb, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
@@ -4492,17 +4537,49 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
 
     tvm_sig_interrupted = signum;
 
-    if ((act->sa_flags & SA_SIGINFO) == 0) {
-        task_unlock(current);
-        tvm_sig_depth--;
-        call_sighandler((uint64_t)act->sa_handler, signum, 0, 0);
-        return;
-    }
-
+    struct sigaction a = *act;
     task_unlock(current);
     tvm_sig_depth--;
-    call_sighandler((uint64_t)act->sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
-    return;
+
+    // The handler runs with sa_mask and the signal itself (unless
+    // SA_NODEFER) blocked, as POSIX has it; that mask, not the host's,
+    // keeps the signal out meanwhile, so the host's blocking of it for its
+    // own handler (when dispatched from signal_handler) is let go of here,
+    // where no TVM lock is held. A handler that longjmps out leaves no host
+    // signal blocked, and the mask is what its setjmp saved (siglongjmp) or
+    // the handler's, as on Linux.
+    struct thread *thr = current_thread;
+    sigset_t old_mask = thr->thr_sigmask;
+    for (int sig = 1; sig < MAX_SIGNALS; sig++)
+        if (sigismember(&a.sa_mask, sig) == 1)
+            sigaddset(&thr->thr_sigmask, sig);
+    if (!(a.sa_flags & SA_NODEFER))
+        sigaddset(&thr->thr_sigmask, signum);
+    sigset_t one;
+    sigemptyset(&one);
+    sigaddset(&one, signum);
+    CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &one, NULL);
+
+    if (a.sa_flags & SA_SIGINFO)
+        call_sighandler((uint64_t)a.sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
+    else
+        call_sighandler((uint64_t)a.sa_handler, signum, 0, 0);
+
+    thr->thr_sigmask = old_mask;
+    tvm_sig_drain(); // what the handler's mask held back
+}
+
+// The lowest pending signal the thread does not block, cleared from *pending; 0 if none
+static int sig_take(uint32_t *pending)
+{
+    uint32_t p = __atomic_load_n(pending, __ATOMIC_ACQUIRE);
+    for (int sig = 1; sig < MAX_SIGNALS; sig++) {
+        uint32_t bit = 1u << sig;
+        if ((p & bit) && !sigismember(&current_thread->thr_sigmask, sig)
+            && (__atomic_fetch_and(pending, ~bit, __ATOMIC_ACQ_REL) & bit))
+            return sig;
+    }
+    return 0;
 }
 
 /**
@@ -4522,48 +4599,16 @@ static void tvm_sig_drain(void)
         return;
     tvm_sig_draining = 1;
 
-
-    uint32_t pending;
-
-    // Drain thread-directed pending signals
+    // One signal at a time, taken out of its pending set only as it is
+    // dispatched: a handler that longjmps out of here leaves the rest
+    // pending, for the next drain (call_sighandler clears tvm_sig_draining
+    // for the handler).
+    int sig;
     struct thread *thr = current_thread;
-    if (thr) {
-        while ((pending = __atomic_exchange_n(&thr->thr_pending_sigs, 0, __ATOMIC_ACQ_REL)) != 0) {
-            uint32_t reblock = 0;
-            for (int sig = 1; sig < MAX_SIGNALS; sig++) {
-                if (!(pending & (1u << sig)))
-                    continue;
-                if (sigismember(&current_thread->thr_sigmask, sig)) {
-                    reblock |= (1u << sig);
-                    continue;
-                }
-                signal_dispatch(sig, &thr->thr_pending_siginfo[sig], &thr->thr_pending_ucontext[sig]);
-            }
-            if (reblock)
-                __atomic_fetch_or(&thr->thr_pending_sigs, reblock, __ATOMIC_RELEASE);
-            if (reblock && !(pending & ~reblock))
-                break; // only blocked signals remain
-        }
-    }
-
-    // Drain process-directed pending signals
-    struct task *t = current;
-    while ((pending = __atomic_exchange_n(&t->tsk_pending_sigs, 0, __ATOMIC_ACQ_REL)) != 0) {
-        uint32_t reblock = 0;
-        for (int sig = 1; sig < MAX_SIGNALS; sig++) {
-            if (!(pending & (1u << sig)))
-                continue;
-            if (sigismember(&current_thread->thr_sigmask, sig)) {
-                reblock |= (1u << sig);
-                continue;
-            }
-            signal_dispatch(sig, &t->tsk_pending_siginfo[sig], &t->tsk_pending_ucontext[sig]);
-        }
-        if (reblock)
-            __atomic_fetch_or(&t->tsk_pending_sigs, reblock, __ATOMIC_RELEASE);
-        if (reblock && !(pending & ~reblock))
-            break; // only blocked signals remain
-    }
+    while (thr && (sig = sig_take(&thr->thr_pending_sigs)))
+        signal_dispatch(sig, &thr->thr_pending_siginfo[sig], &thr->thr_pending_ucontext[sig]);
+    while ((sig = sig_take(&current->tsk_pending_sigs)))
+        signal_dispatch(sig, &current->tsk_pending_siginfo[sig], &current->tsk_pending_ucontext[sig]);
 
     tvm_sig_draining = 0;
 }
@@ -10620,66 +10665,6 @@ sig_t emulator_signal(int signum, sig_t handler)
     return handler;
 }
 
-/*
- * A jmp_buf, as TVM's setjmps fill it, starts at its first 8-byte boundary
- * (JMP_ALIGN): fork translates the pointers in what it copies 8-byte word by
- * 8-byte word, and Darwin's jmp_buf is an int array, 4-byte aligned. After
- * the registers, at JMP_TAIL_* bytes, comes a jmp_tail: whether the signal
- * mask was saved and the mask, and for a native jump the VM state a longjmp
- * out of a callback or a signal handler leaves behind (see tvm_siglongjmp).
- * All within every jmp_buf this runs with: Darwin arm64's is 192 bytes,
- * x86_64's 148, glibc's 200 and more.
- */
-struct jmp_tail {
-    struct tvm_call *jt_call;
-    uint32_t jt_mask;           // bit `sig` for each blocked sig < MAX_SIGNALS
-    uint16_t jt_savemask;
-    uint16_t jt_sig_draining;
-};
-
-#define JMP_ALIGN(env)     ((uint64_t *)(((uintptr_t)(env) + 7) & ~(uintptr_t)7))
-#define JMP_TAIL(buf, off) ((struct jmp_tail *)((char *)(buf) + (off)))
-
-static void jmp_tail_save(struct jmp_tail *t, int savemask)
-{
-    memset(t, 0, sizeof(*t));
-    t->jt_sig_draining = tvm_sig_draining;
-    t->jt_savemask = savemask != 0;
-    if (!savemask)
-        return;
-    sigset_t set;
-    sigprocmask(SIG_BLOCK, NULL, &set);
-    for (int sig = 1; sig < MAX_SIGNALS; sig++)
-        if (sigismember(&set, sig) == 1)
-            t->jt_mask |= 1u << sig;
-}
-
-/*
- * A jump out of a signal handler skips signal_handler's return, and with it
- * the host's restoring of its thread mask (the host blocks the signal for the
- * handler) and tvm_sig_drain's clearing of tvm_sig_draining. A guest thread
- * runs with no host signal blocked (signals are masked in thr_sigmask), so
- * unblocking all of them restores it. Then the mask, if the setjmp saved it.
- */
-static void jmp_tail_restore(const struct jmp_tail *t)
-{
-    tvm_sig_draining = t->jt_sig_draining;
-    sigset_t all;
-    sigfillset(&all);
-    CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &all, NULL);
-    if (!t->jt_savemask)
-        return;
-    sigset_t set;
-    sigemptyset(&set);
-    for (int sig = 1; sig < MAX_SIGNALS; sig++)
-        if (t->jt_mask & (1u << sig))
-            sigaddset(&set, sig);
-    sigprocmask(SIG_SETMASK, &set, NULL);
-}
-
-#define EMU_JMP_TAIL_X86_64 (8 * 8)
-#define EMU_JMP_TAIL_ARM64  (14 * 8)
-
 // setjmp/_setjmp/sigsetjmp of emulated code: savemask as each saves the mask
 static int emulator_sigsetjmp(jmp_buf env, int savemask) {
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
@@ -10719,8 +10704,7 @@ static int emulator_sigsetjmp(jmp_buf env, int savemask) {
     else
         panic("emulator_setjmp(arch=%d) unknown arch", ess->ess_arch);
 
-    jmp_tail_save(JMP_TAIL(envarr, ess->ess_arch == ULARCH_X86_64 ? EMU_JMP_TAIL_X86_64 : EMU_JMP_TAIL_ARM64), savemask);
-    return 0;
+    return jmp_save_mask(envarr, savemask, ess->ess_arch == ULARCH_X86_64 ? 8 : 14);
 }
 
 static int emulator_setjmp(jmp_buf env) { return emulator_sigsetjmp(env, 1); }
@@ -10767,44 +10751,9 @@ static int emulator_longjmp(jmp_buf env, int val) {
     else
         panic("emulator_longjmp(arch=%d) unknown arch", ess->ess_arch);
 
-    jmp_tail_restore(JMP_TAIL(envarr, ess->ess_arch == ULARCH_X86_64 ? EMU_JMP_TAIL_X86_64 : EMU_JMP_TAIL_ARM64));
+    jmp_restore_mask(envarr, ess->ess_arch == ULARCH_X86_64 ? 8 : 14);
     return val;
 }
-
-/*
- * setjmp/longjmp of native code (the registers: see "Jmpbuf"). The host
- * libc's mangle the saved stack pointer, frame pointer and return address, so
- * a fork could not translate a jmp_buf: a child's longjmp to a setjmp of its
- * parent's -- bash running a #!-less script in a fork child, shell_execve ->
- * sh_longjmp(subshell_top_level) -- landed on the parent's live stack. These
- * keep plain values, which the fork translates like any other pointer.
- * tvm_sigsetjmp returns through tvm_setjmp_tail, which fills the jmp_tail.
- */
-__attribute__((visibility("hidden"), used))
-int tvm_setjmp_tail(uint64_t *buf, int savemask)
-{
-    struct jmp_tail *t = JMP_TAIL(buf, NATIVE_JMP_TAIL);
-    jmp_tail_save(t, savemask);
-    t->jt_call = tvm_tls()->tls_call;
-    return 0;
-}
-
-/*
- * longjmp, _longjmp, siglongjmp (and glibc's __longjmp_chk): back to the
- * setjmp's VM state (jmp_tail_restore; and the call chain, whose pop a jump
- * out of a callback of an interposed function skips), then its registers.
- * The mask a setjmp saved is restored here even for _longjmp, as glibc does;
- * Darwin's _longjmp does not, but its pair, _setjmp, saves none.
- */
-static __attribute__((noreturn)) void tvm_siglongjmp(void *env, int val)
-{
-    uint64_t *buf = JMP_ALIGN(env);
-    struct jmp_tail *t = JMP_TAIL(buf, NATIVE_JMP_TAIL);
-    tvm_tls()->tls_call = t->jt_call;
-    jmp_tail_restore(t);
-    tvm_longjmp_regs(buf, val);
-}
-
 
 static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
 
@@ -11014,19 +10963,32 @@ int emulator_call(uint64_t *out_ret, uint64_t pc, uint64_t arg0, uint64_t arg1, 
     return emulator_call_ex(NULL, &params, out_ret);
 }
 
+/*
+ * A guest signal handler is top-level guest code: it runs with no call chain
+ * (tls_call) and outside the drain, both put back when it returns. One that
+ * longjmps out (siglongjmp to the main loop) leaves neither behind: a chain
+ * entry of the wrapper it was called under (raise's, say), dead with that
+ * frame, which the next interposed call would walk; or tvm_sig_draining
+ * set, which would keep every later drain from delivering anything.
+ */
 void call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+    struct tvm_tls *tls = tvm_tls();
+    struct tvm_call *chain = tls->tls_call;
+    int draining = tls->tls_tvm_sig_draining;
+    tls->tls_call = NULL;
+    tls->tls_tvm_sig_draining = 0;
 
-    // handler is not in emulator
     if (!EMUFUNC_MARKED(handler_pc)) {
         ((void (*)(uint64_t, uint64_t, uint64_t))handler_pc)(arg0, arg1, arg2);
-        return;
+    } else {
+        // handler is in emulator, call emulator from signal handler so help me god
+        INFO("sighandler in emulator start");
+        emulator_call(NULL, EMUFUNC_UNMARK(handler_pc), arg0, arg1, arg2, 0, 0, 0);
+        INFO("sighandler in emulator end");
     }
 
-    // handler is in emulator, call emulator from signal handler so help me god
-    handler_pc = EMUFUNC_UNMARK(handler_pc);
-    INFO("sighandler in emulator start");
-    emulator_call(NULL, handler_pc, arg0, arg1, arg2, 0, 0, 0);
-    INFO("sighandler in emulator end");
+    tls->tls_call = chain;
+    tls->tls_tvm_sig_draining = draining;
 }
 
 struct emulator_pthread_create_arg {
@@ -12777,16 +12739,18 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(base, "sigaction"))    return &emulator_sigaction;
     if (0 == strcmp(base, "signal"))       return &emulator_signal;
 
-    // setjmp/longjmp: the emulator's for emulated code, which work on its
-    // saved registers; native code's for native (tvm_sigsetjmp)
-    if (0 == strcmp(base, "setjmp"))         return emu ? (void *)&emulator_setjmp : (void *)&tvm_setjmp;
-    if (0 == strcmp(base, "_setjmp"))        return emu ? (void *)&emulator__setjmp : (void *)&tvm__setjmp;
-    if (0 == strcmp(base, "sigsetjmp")
-        || 0 == strcmp(base, "__sigsetjmp")) return emu ? (void *)&emulator_sigsetjmp : (void *)&tvm_sigsetjmp;
-    if (0 == strcmp(base, "longjmp")
-        || 0 == strcmp(base, "_longjmp")
-        || 0 == strcmp(base, "siglongjmp")
-        || 0 == strcmp(base, "__longjmp_chk")) return emu ? (void *)&emulator_longjmp : (void *)&tvm_siglongjmp;
+    // emulated code's setjmp/longjmp work on the emulator's saved registers;
+    // native code's are TVM's own (FUNCTION_METADATA, see "Jmpbuf")
+    if (emu) {
+        if (0 == strcmp(base, "setjmp"))        return &emulator_setjmp;
+        if (0 == strcmp(base, "_setjmp"))       return &emulator__setjmp;
+        if (0 == strcmp(base, "sigsetjmp"))     return &emulator_sigsetjmp;
+        if (0 == strcmp(base, "__sigsetjmp"))   return &emulator_sigsetjmp;
+        if (0 == strcmp(base, "longjmp"))       return &emulator_longjmp;
+        if (0 == strcmp(base, "_longjmp"))      return &emulator_longjmp;
+        if (0 == strcmp(base, "siglongjmp"))    return &emulator_longjmp;
+        if (0 == strcmp(base, "__longjmp_chk")) return &emulator_longjmp;
+    }
 
     if (0 == strcmp(base, "__chkstk_darwin")) return &chkstk_nop;
 
@@ -13287,6 +13251,16 @@ static void __panic(const char *msg, const char *file, int line)
 /////////////
 // MARK: Hooks
 /////////////
+
+// native guests' setjmp/longjmp (see "Jmpbuf")
+FUNCTION_METADATA(setjmp, &tvm_setjmp);
+FUNCTION_METADATA(_setjmp, &tvm__setjmp);
+FUNCTION_METADATA(sigsetjmp, &tvm_sigsetjmp);
+FUNCTION_METADATA(__sigsetjmp, &tvm_sigsetjmp);
+FUNCTION_METADATA(longjmp, &tvm_longjmp);
+FUNCTION_METADATA(_longjmp, &tvm_longjmp);
+FUNCTION_METADATA(siglongjmp, &tvm_longjmp);
+FUNCTION_METADATA(__longjmp_chk, &tvm_longjmp);
 
 
 
