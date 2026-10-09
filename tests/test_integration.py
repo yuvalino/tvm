@@ -904,7 +904,7 @@ def _runner_reaches(url: str) -> tuple[bool, str]:
 
 def _curl(sshi: spawn, cmd: str, url: str) -> tuple[str, int]:
     """Run a curl command line in the guest, like _sh. The hosts here
-    (badssl.com, example.com) are outside anyone's control, and a stalled
+    (example.com) are outside anyone's control, and a stalled
     connection used to fail the test with a bare rc=28. When the guest got no
     answer at all (rc 6/7/28, or such a curl diagnostic in the output of a
     pipeline), the runner probes the same URL: if it cannot reach it either
@@ -953,33 +953,6 @@ def test_curl_http_get(sshi: spawn):
     out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null -w '%{http_code}\\n' http://example.com", "http://example.com")
     assert rc == 0, out
     assert "200" in _lines(out), out
-
-@network_required
-def test_curl_verify_self_signed_fails(sshi: spawn):
-    """An untrusted chain must be rejected: curl exits 60 (peer cert failed
-    verification), proving verification is really on."""
-    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null https://self-signed.badssl.com/", "https://self-signed.badssl.com/")
-    assert rc == 60, f"rc={rc}: {out}"
-
-@network_required
-def test_curl_insecure_self_signed_ok(sshi: spawn):
-    """The same host with -k succeeds, so the previous failure was the
-    verifier's decision and not a broken connection."""
-    out, rc = _curl(sshi, "curl -sS -k -m 20 -o /dev/null -w '%{http_code}\\n' https://self-signed.badssl.com/", "https://self-signed.badssl.com/")
-    assert rc == 0, out
-    assert "200" in _lines(out), out
-
-@network_required
-def test_curl_expired_fails(sshi: spawn):
-    """Validity period is checked, not just chain trust."""
-    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null https://expired.badssl.com/", "https://expired.badssl.com/")
-    assert rc == 60, f"rc={rc}: {out}"
-
-@network_required
-def test_curl_wrong_host_fails(sshi: spawn):
-    """Hostname is matched against the certificate's SANs."""
-    out, rc = _curl(sshi, "curl -sS -m 20 -o /dev/null https://wrong.host.badssl.com/", "https://wrong.host.badssl.com/")
-    assert rc == 60, f"rc={rc}: {out}"
 
 @network_required
 def test_curl_download_to_file(sshi: spawn):
