@@ -2132,6 +2132,109 @@ TEST(SignalHandlerMask) {
     ASSERT_NEQ(SIG_ERR, signal(SIGUSR1, SIG_DFL));
 }
 
+// Stacks fork copies -- the init task's, a thread's, a fork child's -- lie
+// off the 4 GB guard windows [N<<32, N<<32 + 16 MB), as tvm_mmap_guarded
+// places what else fork copies
+static int off_guard_windows(const void *p) {
+    return ((uintptr_t)p & 0xffffffffULL) >= (16u << 20);
+}
+
+static void *stack_probe(void *arg) {
+    int local;
+    *(uintptr_t *)arg = (uintptr_t)&local;
+    return arg;
+}
+
+TEST(StacksOffGuardWindows) {
+    int local;
+    ASSERT_EQ(1, off_guard_windows(&local));
+
+    uintptr_t a = 0;
+    pthread_t t;
+    ASSERT_EQ(0, pthread_create(&t, NULL, stack_probe, &a));
+    ASSERT_EQ(0, pthread_join(t, NULL));
+    ASSERT_EQ(1, off_guard_windows((void *)a));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        int child_local;
+        _exit(off_guard_windows(&child_local) ? 0 : 1);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+}
+
+// pthread_join and pthread_detach keep their meaning on TVM's stacks: the
+// joined thread's value; a detached thread cannot be joined or detached again
+static volatile int join_gate;
+
+static void *wait_gate(void *arg) {
+    while (!join_gate)
+        usleep(1000);
+    return arg;
+}
+
+TEST(PthreadJoinDetach) {
+    uintptr_t x;
+    void *r = NULL;
+    pthread_t t;
+    ASSERT_EQ(0, pthread_create(&t, NULL, stack_probe, &x));
+    ASSERT_EQ(0, pthread_join(t, &r));
+    ASSERT_EQ((uintptr_t)&x, (uintptr_t)r);
+
+    join_gate = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    ASSERT_EQ(0, pthread_create(&t, &attr, wait_gate, NULL));
+    pthread_attr_destroy(&attr);
+    ASSERT_EQ(EINVAL, pthread_join(t, NULL));
+
+    pthread_t u;
+    ASSERT_EQ(0, pthread_create(&u, NULL, wait_gate, NULL));
+    ASSERT_EQ(0, pthread_detach(u));
+    ASSERT_EQ(EINVAL, pthread_detach(u));
+    ASSERT_EQ(EINVAL, pthread_join(u, NULL));
+    join_gate = 1;
+}
+
+// A thread's stack is unmapped once the thread is joined, or, detached, once
+// it is done and another thread starts (here with a stack of another size,
+// so it does not take the old one). msync() fails with ENOMEM on a page not
+// mapped (Darwin's mincore() does not).
+static int page_mapped(uintptr_t a) {
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    return 0 == msync((void *)(a & ~(pg - 1)), pg, MS_ASYNC);
+}
+
+TEST(StackFreedAfterJoin) {
+    uintptr_t a = 0;
+    pthread_t t;
+    ASSERT_EQ(0, pthread_create(&t, NULL, stack_probe, &a));
+    ASSERT_EQ(0, pthread_join(t, NULL));
+    ASSERT_EQ(0, page_mapped(a));
+
+    a = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    ASSERT_EQ(0, pthread_create(&t, &attr, stack_probe, &a));
+    pthread_attr_destroy(&attr);
+    while (!a)
+        usleep(1000);
+    usleep(100000); // its exit
+
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1 << 20);
+    ASSERT_EQ(0, pthread_create(&t, &attr, stack_probe, &(uintptr_t){0}));
+    pthread_attr_destroy(&attr);
+    ASSERT_EQ(0, pthread_join(t, NULL));
+    ASSERT_EQ(0, page_mapped(a));
+}
+
 // realpath and getcwd answer in the guest namespace: a mount point hides
 // its source, a cpio link is followed, a host link too.
 TEST(VfsRealpath) {

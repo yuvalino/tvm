@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <pthread.h>
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -160,8 +161,19 @@ int main(int argc, char **argv)
         .nmounts = nmounts,
     };
 
-    // Never returns on success; the program's exit() ends the process.
-    tvm_start(argv[i], &argv[i], NULL, &cfg);
-    perror("tvm_start");
-    return 1;
+    if (0 != tvm_start(argv[i], &argv[i], NULL, &cfg)) {
+        perror("tvm_start");
+        return 1;
+    }
+
+    // The program runs on the init task's thread, and its exit() ends the
+    // process. This thread is no task's: blocked, the host's signals go to
+    // the tasks' threads (a task-less one drops them). It waits rather than
+    // exit: Linux's /proc/<pid> entries (mounts, ...) fail once the main
+    // thread is gone.
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
+    for (;;)
+        pause();
 }

@@ -22,7 +22,8 @@ struct tvm_config {
 };
 
 /**
- * Boot the VM on the calling thread and exec `file` inside it.
+ * Boot the VM and exec `file` inside it, as the init task, on a thread of
+ * its own.
  *
  * `file` is PATH-searched like execvp(), against the guest environment.
  * `envp` is the guest environment; NULL inherits the host environ. Runtime
@@ -32,11 +33,11 @@ struct tvm_config {
  * nothing. A relative `initrc` resolves against `cwd` (or the host cwd) and
  * may live inside one of the config mounts.
  *
- * Never returns on success: the calling thread becomes the init task's thread
- * and ends in the in-VM exit(). Returns -1 with errno set only for failures
- * detected before any task exists (bad argument, bad mount, bad cwd, missing
- * initrc), in which case the calling thread may return normally. One call
- * per process.
+ * Returns 0 once the init task is set up (the initrc and the exec follow on
+ * its thread), or -1 with errno set for failures detected before any task
+ * exists (bad argument, bad mount, bad cwd, missing initrc). The arguments
+ * are copied: the caller may free them on return. The init task's exit()
+ * ends the process. One call per process.
  *
  * Mount order: config mounts first, then the initrc; an initrc `mount` of the
  * same path shadows the config mount. A TVM_MOUNT_BIND lays `source` over

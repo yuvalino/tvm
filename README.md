@@ -72,8 +72,8 @@ land there, not in your real home directory.
 
 ## Embedding
 
-`libtvm` exposes one entry point, declared in `tvm/tvm.h`. It boots the VM on
-the calling thread and execs the program inside it:
+`libtvm` exposes one entry point, declared in `tvm/tvm.h`. It boots the VM and
+execs the program inside it, on a thread of its own, and returns:
 
 ```c
 #include "tvm.h"
@@ -87,8 +87,9 @@ struct tvm_config cfg = {
     .nmounts = 1,
 };
 char *argv[] = { "sh", "-l", NULL };
-tvm_start("sh", argv, envp, &cfg);  // envp NULL = inherit; cfg NULL = all defaults
-perror("tvm_start");                // only reached on a pre-boot failure
+if (tvm_start("sh", argv, envp, &cfg))  // envp NULL = inherit; cfg NULL = all defaults
+    perror("tvm_start");                // a pre-boot failure
+// else sh runs as the init task, on a thread of its own; its exit ends the process
 ```
 
 ## Flutter app (iOS / macOS)
