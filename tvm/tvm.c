@@ -800,7 +800,7 @@ struct tvm_stack;
 static void *tvm_mmap_guarded(size_t size, int prot, int flags);
 static struct tvm_stack *stack_alloc(struct task *tsk, size_t size, int reuse);
 static void stack_release(struct tvm_stack *st);
-static void stack_detach(struct tvm_stack *st);
+static void stack_detach(struct tvm_stack *st, int detached);
 static void stack_exit(struct tvm_stack *st);
 static void stack_task_gone(struct task *tsk);
 
@@ -3264,7 +3264,7 @@ static void terminate_current_locked(int result)
         taskfreelastref(current, 0, 0);
         list_del(&current->tsk_list);
         if (stack)
-            stack_detach(stack);
+            stack_detach(stack, 1);
         else
             CALL_FUNC(pthread_detach, pthread_self());
     }
@@ -3274,6 +3274,10 @@ static void terminate_current_locked(int result)
 
 
         taskfreelastref(current, 0, 0);
+
+        // the parent's waitpid joins this thread, whatever the guest asked
+        if (stack)
+            stack_detach(stack, 0);
 
         current->tsk_state |= TS_ZOMBIE;
         current->tsk_result = result;
@@ -12775,11 +12779,11 @@ static void stack_release(struct tvm_stack *st)
     stack_free(st);
 }
 
-// Nobody will join the thread
-static void stack_detach(struct tvm_stack *st)
+// Whether nobody will join the thread (stack_drain then does)
+static void stack_detach(struct tvm_stack *st, int detached)
 {
     pthread_mutex_lock(&stacks_lock);
-    st->st_detached = 1;
+    st->st_detached = detached;
     pthread_mutex_unlock(&stacks_lock);
 }
 
@@ -12795,13 +12799,15 @@ static void stack_exit(struct tvm_stack *st)
     }
 }
 
-// `tsk` is gone: its threads done and never joined will not be
+// `tsk` is gone: none of its threads will be joined but the caller (its last,
+// which terminate_current_locked hands on). They have all left the task, if
+// not yet marked done (stack_exit).
 static void stack_task_gone(struct task *tsk)
 {
     struct tvm_stack *st;
     pthread_mutex_lock(&stacks_lock);
     list_for_each_entry(st, &stacks, st_list)
-        if (st->st_task == tsk && st->st_exited)
+        if (st->st_task == tsk && st != current_thread->thr_stack)
             st->st_detached = 1;
     pthread_mutex_unlock(&stacks_lock);
 }
@@ -13079,6 +13085,7 @@ struct tvm_init_arg {
     char **envp;
     char *cwd;
     char *initrc;
+    struct tvm_stack *stack;
     pthread_mutex_t mtx;
     pthread_cond_t cond;
     int ready;
@@ -13176,6 +13183,9 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
     current_thread->thr_pthread = pthread_self();
     current_thread->thr_task = current;
     current_thread->thr_fork_fp = (void *)__builtin_frame_address(0);
+    current_thread->thr_stack = ia->stack;
+    ia->stack->st_task = current;
+    ia->stack->st_pthread = pthread_self();
 
     list_add_tail(&current_thread->thr_list, &current->tsk_threads);
     current->tsk_threads_cnt++;
@@ -13404,17 +13414,21 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     pthread_mutex_init(&ia->mtx, NULL);
     pthread_cond_init(&ia->cond, NULL);
 
-    struct tvm_stack *stack = stack_alloc(NULL, DEFAULT_STACK_SIZE, 0);
-    if (!stack)
+    if (!(ia->stack = stack_alloc(NULL, DEFAULT_STACK_SIZE, 0)))
         panic("tvm_start: init stack");
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstack(&attr, stack->st_base, stack->st_size);
+    pthread_attr_setstack(&attr, ia->stack->st_base, ia->stack->st_size);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    // OS signals blocked until the thread has its task (it unblocks them)
+    // OS signals blocked until the thread has its task (it unblocks them),
+    // but the synchronous faults, as fork's (see there)
     sigset_t all_sigs, old_sigs;
     sigfillset(&all_sigs);
+    sigdelset(&all_sigs, SIGSEGV);
+    sigdelset(&all_sigs, SIGBUS);
+    sigdelset(&all_sigs, SIGILL);
+    sigdelset(&all_sigs, SIGFPE);
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
     pthread_t pth;
     int r = CALL_FUNC(pthread_create, &pth, &attr, (start_routine_fn)tvm_init_entry, ia);
@@ -17837,7 +17851,7 @@ FUNCTION_DEFINE1(int, pthread_detach, pthread_t, thread) {
         return CALL_FUNC(pthread_detach, thread);
     if (st->st_detached)
         return EINVAL;
-    stack_detach(st);
+    stack_detach(st, 1);
     return 0;
 }
 
