@@ -1238,6 +1238,7 @@ __asm__(
     "    b " JMP_SYM(tvm_sigsetjmp) "\n"
     JMP_FUNC(tvm__setjmp)
     "    mov w1, #0\n"
+    "    b " JMP_SYM(tvm_sigsetjmp) "\n"
     JMP_FUNC(tvm_sigsetjmp)
     "    add x0, x0, #7\n"
     "    and x0, x0, #~7\n"
@@ -1282,6 +1283,7 @@ __asm__(
     "    jmp " JMP_SYM(tvm_sigsetjmp) "\n"
     JMP_FUNC(tvm__setjmp)
     "    xor %esi, %esi\n"
+    "    jmp " JMP_SYM(tvm_sigsetjmp) "\n"
     JMP_FUNC(tvm_sigsetjmp)
     "    add $7, %rdi\n"
     "    and $-8, %rdi\n"
