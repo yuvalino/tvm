@@ -1158,8 +1158,8 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
 /////////////
 
 /**
- * setjmp/longjmp with plain registers: fork's own (tvm_jmp_save,
- * tvm_longjmp_regs) and native guests' (setjmp, longjmp, ...). The host
+ * setjmp/longjmp with plain registers, for native guests (setjmp, longjmp,
+ * ...) and fork's own jumps (tvm__setjmp, tvm__longjmp). The host
  * libc's mangle the saved stack pointer, frame pointer and return address
  * (glibc's PTR_MANGLE, Darwin's per-process cookie); these keep them as they
  * are, so fork can read and move a jmp_buf's stack, and translate one it
@@ -1168,18 +1168,17 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
  * In order to properly have a `fork()` function that actually creates a thread behind the scenes,
  * we need to copy stack frames from the parent's stack to the child's stack, so all the local
  * variables will work on the child when `fork()` returns. To actually set the stack pointer
- * we use setjmp and longjmp (tvm_jmp_save, tvm_longjmp_regs), and stack data copied from the
+ * we use setjmp and longjmp (tvm__setjmp, tvm__longjmp), and stack data copied from the
  * parent is scanned for pointers to the parent's stack and fixed up to the child's.
  *
- * The registers, JMP_REGS words:
+ * They take a jmp_buf, and keep in it, from its first 8-byte boundary
+ * (JMP_ALIGN: fork translates 8-byte words, and Darwin's jmp_buf is an int
+ * array, 4-byte aligned), the registers, JMP_REGS words:
  *   arm64:  x19-x28, x29, x30, sp, d8-d15 (sp at JMP_SP)
  *   x86_64: rbx, rbp, r12-r15, rsp, rip
- * tvm_jmp_save saves them and returns 0; tvm_longjmp_regs loads them back
- * and returns val (1 for 0) from that tvm_jmp_save. A guest's jmp_buf holds
- * them from its first 8-byte boundary (JMP_ALIGN: fork translates 8-byte
- * words, and Darwin's jmp_buf is an int array, 4-byte aligned), then the
- * signal mask (struct jmp_sigmask), all within every jmp_buf: Darwin arm64's
- * is 192 bytes, glibc x86_64's 200.
+ * then the signal mask (struct jmp_sigmask), if the setjmp saved it.
+ * fork reads and moves the registers with jmpbuf_getstack, jmpbuf_setstack
+ * and jmpbuf_fixup.
  */
 #if defined(__aarch64__)
 #define JMP_REGS 21
@@ -1189,14 +1188,15 @@ static int cpio_parse(const void *buf, size_t len, cpio_cb cb, void *arg) {
 #define JMP_SP   6
 #endif
 
-typedef uint64_t tvm_jmp_buf[JMP_REGS];
-
 #define JMP_ALIGN(env) ((uint64_t *)(((uintptr_t)(env) + 7) & ~(uintptr_t)7))
 
 struct jmp_sigmask {
     int savemask;
     sigset_t mask;
 };
+
+_Static_assert((8 - _Alignof(jmp_buf) % 8) % 8 + JMP_REGS * 8 + sizeof(struct jmp_sigmask) <= sizeof(jmp_buf),
+               "jmp_buf too small for the registers and the signal mask");
 
 // after a guest jmp_buf's nregs registers; returns setjmp's 0
 __attribute__((visibility("hidden"), used))
@@ -1216,12 +1216,13 @@ static void jmp_restore_mask(uint64_t *buf, int nregs)
         sigprocmask(SIG_SETMASK, &m->mask, NULL);
 }
 
-__attribute__((returns_twice)) int tvm_jmp_save(tvm_jmp_buf buf);
-__attribute__((noreturn)) void tvm_longjmp_regs(uint64_t *buf, int val);
 // setjmp saves the mask, _setjmp not, sigsetjmp if savemask
-int tvm_setjmp(void *env);
-int tvm__setjmp(void *env);
-int tvm_sigsetjmp(void *env, int savemask);
+__attribute__((returns_twice)) int tvm_setjmp(jmp_buf env);
+__attribute__((returns_twice)) int tvm__setjmp(jmp_buf env);
+__attribute__((returns_twice)) int tvm_sigsetjmp(jmp_buf env, int savemask);
+// _longjmp: the registers back from env, returning val (1 for 0) from its
+// setjmp; the mask is left as it is
+__attribute__((noreturn)) void tvm__longjmp(jmp_buf env, int val);
 
 // One block per architecture; the object format only spells the names:
 // Mach-O's C symbols have a leading underscore, ELF's are typed
@@ -1236,26 +1237,9 @@ int tvm_sigsetjmp(void *env, int savemask);
 #define JMP_STR(x)     JMP_STR_(x)
 
 #if defined(__aarch64__)
-#define JMP_SAVE_REGS \
-    "    stp x19, x20, [x0, #0]\n" \
-    "    stp x21, x22, [x0, #16]\n" \
-    "    stp x23, x24, [x0, #32]\n" \
-    "    stp x25, x26, [x0, #48]\n" \
-    "    stp x27, x28, [x0, #64]\n" \
-    "    stp x29, x30, [x0, #80]\n" \
-    "    mov x2, sp\n" \
-    "    str x2, [x0, #96]\n" \
-    "    stp d8, d9, [x0, #104]\n" \
-    "    stp d10, d11, [x0, #120]\n" \
-    "    stp d12, d13, [x0, #136]\n" \
-    "    stp d14, d15, [x0, #152]\n"
 __asm__(
     ".text\n"
     ".p2align 2\n"
-    JMP_FUNC(tvm_jmp_save)
-    JMP_SAVE_REGS
-    "    mov w0, #0\n"
-    "    ret\n"
     JMP_FUNC(tvm_setjmp)
     "    mov w1, #1\n"
     "    b " JMP_SYM(tvm_sigsetjmp) "\n"
@@ -1264,10 +1248,23 @@ __asm__(
     JMP_FUNC(tvm_sigsetjmp)
     "    add x0, x0, #7\n"
     "    and x0, x0, #~7\n"
-    JMP_SAVE_REGS
+    "    stp x19, x20, [x0, #0]\n"
+    "    stp x21, x22, [x0, #16]\n"
+    "    stp x23, x24, [x0, #32]\n"
+    "    stp x25, x26, [x0, #48]\n"
+    "    stp x27, x28, [x0, #64]\n"
+    "    stp x29, x30, [x0, #80]\n"
+    "    mov x2, sp\n"
+    "    str x2, [x0, #96]\n"
+    "    stp d8, d9, [x0, #104]\n"
+    "    stp d10, d11, [x0, #120]\n"
+    "    stp d12, d13, [x0, #136]\n"
+    "    stp d14, d15, [x0, #152]\n"
     "    mov w2, #" JMP_STR(JMP_REGS) "\n"
     "    b " JMP_SYM(jmp_save_mask) "\n"
-    JMP_FUNC(tvm_longjmp_regs)
+    JMP_FUNC(tvm__longjmp)
+    "    add x0, x0, #7\n"
+    "    and x0, x0, #~7\n"
     "    ldp x19, x20, [x0, #0]\n"
     "    ldp x21, x22, [x0, #16]\n"
     "    ldp x23, x24, [x0, #32]\n"
@@ -1285,23 +1282,8 @@ __asm__(
     "    ret\n"
 );
 #elif defined(__x86_64__)
-#define JMP_SAVE_REGS \
-    "    mov %rbx, 0(%rdi)\n" \
-    "    mov %rbp, 8(%rdi)\n" \
-    "    mov %r12, 16(%rdi)\n" \
-    "    mov %r13, 24(%rdi)\n" \
-    "    mov %r14, 32(%rdi)\n" \
-    "    mov %r15, 40(%rdi)\n" \
-    "    lea 8(%rsp), %rdx\n" \
-    "    mov %rdx, 48(%rdi)\n" \
-    "    mov (%rsp), %rdx\n" \
-    "    mov %rdx, 56(%rdi)\n"
 __asm__(
     ".text\n"
-    JMP_FUNC(tvm_jmp_save)
-    JMP_SAVE_REGS
-    "    xor %eax, %eax\n"
-    "    ret\n"
     JMP_FUNC(tvm_setjmp)
     "    mov $1, %esi\n"
     "    jmp " JMP_SYM(tvm_sigsetjmp) "\n"
@@ -1310,10 +1292,21 @@ __asm__(
     JMP_FUNC(tvm_sigsetjmp)
     "    add $7, %rdi\n"
     "    and $-8, %rdi\n"
-    JMP_SAVE_REGS
+    "    mov %rbx, 0(%rdi)\n"
+    "    mov %rbp, 8(%rdi)\n"
+    "    mov %r12, 16(%rdi)\n"
+    "    mov %r13, 24(%rdi)\n"
+    "    mov %r14, 32(%rdi)\n"
+    "    mov %r15, 40(%rdi)\n"
+    "    lea 8(%rsp), %rdx\n"
+    "    mov %rdx, 48(%rdi)\n"
+    "    mov (%rsp), %rdx\n"
+    "    mov %rdx, 56(%rdi)\n"
     "    mov $" JMP_STR(JMP_REGS) ", %edx\n"
     "    jmp " JMP_SYM(jmp_save_mask) "\n"
-    JMP_FUNC(tvm_longjmp_regs)
+    JMP_FUNC(tvm__longjmp)
+    "    add $7, %rdi\n"
+    "    and $-8, %rdi\n"
     "    mov %esi, %eax\n"
     "    test %eax, %eax\n"
     "    jnz 1f\n"
@@ -1328,30 +1321,46 @@ __asm__(
     "    jmp *56(%rdi)\n"
 );
 #else
-#error tvm_jmp_save/tvm_longjmp_regs: unsupported architecture
+#error setjmp/longjmp: unsupported architecture
 #endif
-#undef JMP_SAVE_REGS
 #undef JMP_FUNC
 #undef JMP_SYM
 #undef JMP_STR
 #undef JMP_STR_
 
-// longjmp, _longjmp, siglongjmp: restore the mask if the setjmp saved it
-static __attribute__((noreturn)) void tvm_longjmp(void *env, int val)
+// longjmp, siglongjmp: the mask, if the setjmp saved it, then _longjmp
+static __attribute__((noreturn)) void tvm_longjmp(jmp_buf env, int val)
 {
-    uint64_t *buf = JMP_ALIGN(env);
-    jmp_restore_mask(buf, JMP_REGS);
-    tvm_longjmp_regs(buf, val);
+    jmp_restore_mask(JMP_ALIGN(env), JMP_REGS);
+    tvm__longjmp(env, val);
+}
+
+// the saved stack pointer
+static uintptr_t jmpbuf_getstack(jmp_buf env)
+{
+    return JMP_ALIGN(env)[JMP_SP];
 }
 
 // move every saved register that points into old_stack by the same offset into new_stack
-static void jmpbuf_setstack(tvm_jmp_buf jb, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
+static void jmpbuf_setstack(jmp_buf env, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
 {
+    uint64_t *jb = JMP_ALIGN(env);
     uintptr_t diff = old_stack - new_stack;
     for (int i = 0; i < JMP_REGS; i++) {
         if (jb[i] >= old_stack && jb[i] < (old_stack + stack_size))
             jb[i] -= diff;
     }
+}
+
+struct cow_fixup_context;
+static void *cow_fixup_translate(struct cow_fixup_context *dctx, void *p);
+
+// translate every saved register through a fork's fixup, as a word it copied
+static void jmpbuf_fixup(jmp_buf env, struct cow_fixup_context *fixup)
+{
+    uint64_t *jb = JMP_ALIGN(env);
+    for (int i = 0; i < JMP_REGS; i++)
+        jb[i] = (uint64_t)cow_fixup_translate(fixup, (void *)jb[i]);
 }
 
 /////////////
@@ -10710,8 +10719,8 @@ static int emulator_sigsetjmp(jmp_buf env, int savemask) {
 static int emulator_setjmp(jmp_buf env) { return emulator_sigsetjmp(env, 1); }
 static int emulator__setjmp(jmp_buf env) { return emulator_sigsetjmp(env, 0); }
 
-// longjmp/_longjmp/siglongjmp of emulated code: restores the mask if it was saved
-static int emulator_longjmp(jmp_buf env, int val) {
+// _longjmp of emulated code: the registers, the mask left as it is
+static int emulator__longjmp(jmp_buf env, int val) {
     struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
 
     if (!ess)
@@ -10751,8 +10760,15 @@ static int emulator_longjmp(jmp_buf env, int val) {
     else
         panic("emulator_longjmp(arch=%d) unknown arch", ess->ess_arch);
 
-    jmp_restore_mask(envarr, ess->ess_arch == ULARCH_X86_64 ? 8 : 14);
     return val;
+}
+
+// longjmp/siglongjmp of emulated code: the mask, if the setjmp saved it, then _longjmp
+static int emulator_longjmp(jmp_buf env, int val) {
+    struct emulator_saved_state *ess = current_thread->thr_emulator->ec_ss;
+    if (ess)
+        jmp_restore_mask(JMP_ALIGN(env), ess->ess_arch == ULARCH_X86_64 ? 8 : 14);
+    return emulator__longjmp(env, val);
 }
 
 static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
@@ -12747,7 +12763,7 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
         if (0 == strcmp(base, "sigsetjmp"))     return &emulator_sigsetjmp;
         if (0 == strcmp(base, "__sigsetjmp"))   return &emulator_sigsetjmp;
         if (0 == strcmp(base, "longjmp"))       return &emulator_longjmp;
-        if (0 == strcmp(base, "_longjmp"))      return &emulator_longjmp;
+        if (0 == strcmp(base, "_longjmp"))      return &emulator__longjmp;
         if (0 == strcmp(base, "siglongjmp"))    return &emulator_longjmp;
         if (0 == strcmp(base, "__longjmp_chk")) return &emulator_longjmp;
     }
@@ -13258,7 +13274,7 @@ FUNCTION_METADATA(_setjmp, &tvm__setjmp);
 FUNCTION_METADATA(sigsetjmp, &tvm_sigsetjmp);
 FUNCTION_METADATA(__sigsetjmp, &tvm_sigsetjmp);
 FUNCTION_METADATA(longjmp, &tvm_longjmp);
-FUNCTION_METADATA(_longjmp, &tvm_longjmp);
+FUNCTION_METADATA(_longjmp, &tvm__longjmp);
 FUNCTION_METADATA(siglongjmp, &tvm_longjmp);
 FUNCTION_METADATA(__longjmp_chk, &tvm_longjmp);
 
@@ -16776,9 +16792,9 @@ struct fork_arg {
 
     pthread_mutex_t mtx;
     pthread_cond_t cond;
-    tvm_jmp_buf jmpbuf_parent;
-    tvm_jmp_buf jmpbuf_tmp;
-    tvm_jmp_buf jmpbuf_fail;
+    jmp_buf jmpbuf_parent;
+    jmp_buf jmpbuf_tmp;
+    jmp_buf jmpbuf_fail;
     
     size_t duplicate_errors;
     int first_duplicate_error;
@@ -16896,12 +16912,12 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
     // the error number is set to thread's errno
-    if ((tvm_jmp_save(arg->jmpbuf_fail))) {
+    if ((tvm__setjmp(arg->jmpbuf_fail))) {
         return (void *)(long)errno;
     }
 
     // move to temporary stack
-    if (0 == tvm_jmp_save(arg->jmpbuf_tmp))
+    if (0 == tvm__setjmp(arg->jmpbuf_tmp))
     {
         /**
          * this code moves to a temporary stack, since we're gonna modify our own stack.
@@ -16930,7 +16946,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
          *   | prev lr |
          *   |         |
          */
-        uintptr_t curr_sp = arg->jmpbuf_tmp[JMP_SP];
+        uintptr_t curr_sp = jmpbuf_getstack(arg->jmpbuf_tmp);
         // `fp` is just before the value of `fp` itself, so keep room for `fp` on the stack
         uintptr_t next_fp = (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE - 2 * sizeof(uintptr_t);
         uintptr_t next_sp = next_fp - (curr_fp - curr_sp);
@@ -16947,7 +16963,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
         // include prologue (fp + lr) when adjusting jmpbuf context regs
         jmpbuf_setstack(arg->jmpbuf_tmp, next_sp, curr_sp, curr_fp - curr_sp + 2 * sizeof(uintptr_t));
 
-        tvm_longjmp_regs(arg->jmpbuf_tmp, 1);
+        tvm__longjmp(arg->jmpbuf_tmp, 1);
     }
 
     // running on a temporary stack until the next longjmp
@@ -16974,7 +16990,7 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
      *                     '_______'      -> -> '_______'  <- fp  <--'  size
      */
 
-    uintptr_t parent_sp = arg->jmpbuf_parent[JMP_SP];
+    uintptr_t parent_sp = jmpbuf_getstack(arg->jmpbuf_parent);
     uintptr_t parent_fp = (uintptr_t)arg->parent_thr->thr_fork_fp;
 
     // its important to "link" the new frames copied from parent to the current stack for `pthread_exit()` to work
@@ -17083,14 +17099,13 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     arg->thr->thr_fork_fp = (void *)child_fp;
 
     // fix the jmpbuf
-    for (int i = 0; i < JMP_REGS; i++)
-        arg->jmpbuf_parent[i] = (uint64_t)cow_fixup_translate(&arg->fixup, (void *)arg->jmpbuf_parent[i]);
+    jmpbuf_fixup(arg->jmpbuf_parent, &arg->fixup);
 
     // Resume emulation at the parent's emulator_call_ex depth: the longjmp lands
     // back in the copied emulated frame, whose eventual out: will decrement.
     tvm_emu_call_depth = arg->emu_call_depth;
 
-    tvm_longjmp_regs(arg->jmpbuf_parent, 1);
+    tvm__longjmp(arg->jmpbuf_parent, 1);
 
 fail:
     panic("tvm_proc_entry failed (fail flow not yet implemented)");
@@ -17103,7 +17118,7 @@ fail:
 
     // TODO for some reason this crashes badly
 
-    tvm_longjmp_regs(arg->jmpbuf_fail, 1);
+    tvm__longjmp(arg->jmpbuf_fail, 1);
 }
 
 // for now we need strict control of how many frames we need to restore on new stack
@@ -17184,7 +17199,7 @@ pid_t fork(void) {
         goto out;
     }
 
-    if (0 != tvm_jmp_save(arg->jmpbuf_parent)) {
+    if (0 != tvm__setjmp(arg->jmpbuf_parent)) {
 
         // child
 
