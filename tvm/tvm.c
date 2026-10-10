@@ -2355,12 +2355,18 @@ struct rlock_waiter {
 };
 static LIST_HEAD(rlock_waiters);
 
-// A lock was released: wake every waiter to look again. With rlocks_lock held.
+// A lock was released: wake every waiter to look again, and take it off the
+// list meanwhile -- it waits on nobody until it looks, and left there it
+// made rlock_would_deadlock_locked() see a cycle a release had already
+// broken. With rlocks_lock held.
 static void rlock_wake_locked(void)
 {
-    struct rlock_waiter *w;
-    list_for_each_entry(w, &rlock_waiters, rw_list)
+    while (!list_empty(&rlock_waiters)) {
+        struct rlock_waiter *w = list_first_entry(&rlock_waiters, struct rlock_waiter, rw_list);
+        list_del(&w->rw_list);
+        INIT_LIST_HEAD(&w->rw_list);
         (void)CALL_FUNC(write, w->rw_wake[1], "", 1);
+    }
 }
 
 // Would `self` blocking on a lock held by `owner` close a cycle? Follows
@@ -15845,7 +15851,8 @@ FUNCTION_DEFINE6(int, pselect, int, nfds, fd_set *, readfds, fd_set *, writefds,
 
 // Whether the calling thread has a pending signal it does not block: one
 // deferred while signals are (tvm_sig_enter), which a wait must not outlast.
-// signal_handler records them per thread (thr_pending_sigs), kill() per task.
+// signal_handler records them per thread (thr_pending_sigs); the task's
+// (tsk_pending_sigs) are looked at too.
 static int signal_deliverable(void)
 {
     uint32_t pend = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE) |
@@ -15858,20 +15865,18 @@ static int signal_deliverable(void)
 
 // An F_SETLKW's sleep: until `fd` is readable (a release, rlock_wake_locked),
 // `timeout` (NULL: none) passes, or a signal comes, which ends it with EINTR
-// as the kernel's would. The host's signals are blocked from the check for a
-// pending one to pselect(), which unblocks them atomically: one arriving in
-// between interrupts the pselect instead of going unnoticed until a release.
+// (fcntl() restarts it after an SA_RESTART handler, as the kernel does).
+// The host's signals are blocked from the check for a pending one to the
+// wait, which unblocks them atomically (tvm_poll_host_masked): one arriving
+// in between interrupts it instead of going unnoticed until a release.
 static int rlock_sleep(int fd, const struct timespec *timeout)
 {
     sigset_t all, old;
     sigfillset(&all);
     CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &old);
     if (!signal_deliverable()) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        if (fd >= 0)
-            FD_SET(fd, &fds);
-        (void)CALL_FUNC(pselect, fd + 1, fd >= 0 ? &fds : NULL, NULL, NULL, timeout, &old);
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        (void)tvm_poll_host_masked(&pfd, 1, timeout, &old);
     }
     CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old, NULL);
     if (!signal_deliverable())
@@ -15971,6 +15976,7 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                     struct rlock_waiter waiter = { .rw_waiter = current, .rw_owner = c->rl_owner };
                     if (0 != CALL_FUNC(pipe, waiter.rw_wake)) {
                         pthread_mutex_unlock(&rlocks_lock);
+                        errno = ENOLCK;
                         ret = -1;
                         break;
                     }
@@ -15979,7 +15985,7 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                     pthread_mutex_unlock(&rlocks_lock);
                     int r = rlock_sleep(waiter.rw_wake[0], NULL);
                     pthread_mutex_lock(&rlocks_lock);
-                    list_del(&waiter.rw_list);
+                    list_del(&waiter.rw_list); // a no-op if a release took it off
                     pthread_mutex_unlock(&rlocks_lock);
                     CALL_FUNC(close, waiter.rw_wake[0]);
                     CALL_FUNC(close, waiter.rw_wake[1]);
@@ -16006,8 +16012,18 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(fcntl, fd, cmd, arg);
 
-    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW)
-        return fcntl_rlock(fd, cmd, (struct flock *)arg);
+    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
+        // An F_SETLKW a signal ended restarts, as read() does: unless a guest
+        // handler ran and was installed without SA_RESTART (fcntl_rlock's
+        // tvm_sig_leave runs it).
+        int ret;
+        tvm_sig_interrupted = 0;
+        do
+            ret = fcntl_rlock(fd, cmd, (struct flock *)arg);
+        while (ret == -1 && errno == EINTR && cmd == F_SETLKW && (!tvm_sig_interrupted ||
+               (current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART)));
+        return ret;
+    }
 
 #ifdef F_SETNOSIGPIPE
     // the program's own no-SIGPIPE setting, kept in TVM (see setsockopt)
