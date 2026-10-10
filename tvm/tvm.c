@@ -770,6 +770,7 @@ struct fops;
 struct task;
 struct file;
 struct file_stream;
+static void stream_flocks_release_locked(struct task *t);
 
 void task_filestreamdealloc_list(struct task *t, struct list_head *head);
 
@@ -1980,9 +1981,6 @@ struct task {
     unsigned tsk_rlocks; // POSIX record locks held (entries in rlocks owned by this task, see fcntl_rlock)
 };
 
-#define THR_FLOCKS 8
-struct thread_flock { FILE *fl_fp; int fl_n; };
-
 struct thread {
     struct list_head thr_list;
     struct task *thr_task;  // back pointer to owning task
@@ -1997,7 +1995,6 @@ struct thread {
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
     struct tvm_stack *thr_stack;  // the stack TVM allocated the thread, if (see stack_alloc)
-    struct thread_flock thr_flocks[THR_FLOCKS];  // libc FILEs the guest holds by flockfile() on this thread, and how often (thread_flock_count)
 };
 
 static struct rmem_arena *global_arena = NULL;
@@ -3083,41 +3080,6 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
     return childt;
 }
 
-// Count a flockfile() (`d` 1) or funlockfile() (-1) of `fp` by the guest on
-// this thread. A thread holding more streams at once than thr_flocks has
-// room for is not counted for the rest.
-static void thread_flock_count(FILE *fp, int d)
-{
-    struct thread_flock *fl = current_thread->thr_flocks, *unused = NULL;
-    for (int i = 0; i < THR_FLOCKS; i++) {
-        if (fl[i].fl_fp == fp) {
-            if (!(fl[i].fl_n += d))
-                fl[i].fl_fp = NULL;
-            return;
-        }
-        if (!unused && !fl[i].fl_fp)
-            unused = &fl[i];
-    }
-    if (d > 0 && unused)
-        *unused = (struct thread_flock){ fp, d };
-}
-
-// Let go of what the guest holds of `fp` (NULL: of every stream) by
-// flockfile() on this thread: the thread is leaving, or closing the stream.
-// Left held, a lock outlived its thread, and fflush(NULL) and the stream's
-// close at task teardown waited for it for good.
-static void thread_flock_release(FILE *fp)
-{
-    struct thread_flock *fl = current_thread->thr_flocks;
-    for (int i = 0; i < THR_FLOCKS; i++) {
-        if (!fl[i].fl_fp || (fp && fl[i].fl_fp != fp))
-            continue;
-        while (fl[i].fl_n-- > 0)
-            CALL_FUNC(funlockfile, fl[i].fl_fp);
-        fl[i] = (struct thread_flock){ 0 };
-    }
-}
-
 /**
  * Detach the calling (non-last) thread from its task and terminate it: remove
  * it from the thread list, drop the task's thread/ref counts, and pthread_exit.
@@ -3127,7 +3089,7 @@ static void thread_flock_release(FILE *fp)
 __attribute__((noreturn))
 static void detach_current_thread_and_exit(void *retval)
 {
-    thread_flock_release(NULL);
+    stream_flocks_release_locked(current);
     list_del(&current_thread->thr_list);
     current->tsk_threads_cnt--;
     current->tsk_refcount--;
@@ -3256,9 +3218,9 @@ static void terminate_current_locked(int result)
     pthread_mutex_unlock(&vtimers_lock);
 
     // Drain sibling threads. Poke each one so blocked threads exit too: the
-    // pthread_kill interrupts blocking syscalls and (via TS_EXITING checks in
-    // signal_dispatch / tvm_sig_leave / waitpid) makes the sibling reap itself
-    // at its next safe point; SIGCONT is used as the carrier since its default
+    // pthread_kill interrupts blocking syscalls; a sibling in waitpid reaps
+    // itself (tsk_exiting_thread), any other leaves when it next calls
+    // pthread_exit or _exit. SIGCONT is used as the carrier since its default
     // action is harmless if it gets dispatched normally. The broadcast wakes
     // siblings sleeping in waitpid's cond wait. Then release both locks so
     // siblings can take task_lock(current) to decrement the count.
@@ -4018,6 +3980,8 @@ struct file_stream {
 
     char fs_mode[5]; // for files only
     int fs_discard;       // deallocate without flushing (execve)
+    pthread_t fs_flock_owner; // the thread the guest's flockfile() holds are by, while fs_flock_n > 0 (stream_flock_count)
+    int fs_flock_n;
     pid_t fs_pid;    // popen(): the child running the command, reaped by pclose()
 
     struct dirent fs_dirent; // for dirs only
@@ -4080,8 +4044,6 @@ int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
                 }
             }
             fp_setfileno(fs->fs_fp, -1);
-            if (t == current)
-                thread_flock_release(fs->fs_fp);
             (void)CALL_FUNC(fclose, fs->fs_fp);
             errno = last_errno;
             fs->fs_fp = NULL;
@@ -4102,6 +4064,23 @@ int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
     if (ret == EOF)
         errno = flush_errno;
     return ret;
+}
+
+// Let go of the guest's flockfile() holds the calling thread has on `t`'s
+// streams, as the kernel lets go of a thread's robust futexes when it exits:
+// left held, a lock outlived its thread, and fflush(NULL) and the streams'
+// close at task teardown waited for it for good (see stream_flock_count).
+// With t locked.
+static void stream_flocks_release_locked(struct task *t)
+{
+    struct file_stream_list_entry *fsle;
+    list_for_each_entry(fsle, &t->tsk_filestreams, fsle_list) {
+        struct file_stream *fs = fsle->fsle_stream;
+        if (__atomic_load_n(&fs->fs_flock_n, __ATOMIC_ACQUIRE) <= 0 || !pthread_equal(fs->fs_flock_owner, pthread_self()))
+            continue;
+        for (; fs->fs_flock_n > 0; fs->fs_flock_n--)
+            CALL_FUNC(funlockfile, fs->fs_fp);
+    }
 }
 
 // A new stream of `t`'s, on its list of directory streams if `dir`.
@@ -4223,6 +4202,7 @@ int task_filestreamrealloc_locked(struct task *t, struct file_stream *fs) {
             file_unlock(file, 1);
             return -1;
         }
+        fs->fs_flock_n = 0; // the parent's holds, not on this FILE
 
         VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
     }
@@ -14120,11 +14100,11 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
 
     if (old) {
         fp_setfileno(old, -1);
-        thread_flock_release(old);
         CALL_FUNC(funlockfile, old);
         CALL_FUNC(fclose, old);
     }
     fs->fs_fp = NULL;
+    fs->fs_flock_n = 0; // holds of the FILE closed, the caller's own (fclose waits for others')
 
     if (-1 == fd) {
         task_unlock(current);
@@ -14351,6 +14331,19 @@ FUNCTION_DEFINE_VOID1(rewind, FILE *, stream) {
     clearerr(stream);
 }
 
+// Count a guest flockfile() (`d` 1) or funlockfile() (-1) of `fs` by the
+// calling thread, which holds its lock: recorded in the stream, as the
+// kernel records a robust futex's owner in the lock, for the holder's exit to
+// let go of (detach_current_thread_and_exit). Only the holder writes them,
+// the owner before the count, so a count read above 0 names the holder.
+static void stream_flock_count(struct file_stream *fs, int d)
+{
+    if (d > 0)
+        fs->fs_flock_owner = pthread_self();
+    if (d > 0 || fs->fs_flock_n > 0)
+        __atomic_add_fetch(&fs->fs_flock_n, d, __ATOMIC_RELEASE);
+}
+
 // flockfile/ftrylockfile/funlockfile were not interposed either, and libc's
 // took the guest FILE for one of its own: flockfile() dereferences the
 // libc FILE's lock pointer (fp->_extra) at offset 8 of whatever it is
@@ -14367,39 +14360,32 @@ FUNCTION_DEFINE_VOID1(rewind, FILE *, stream) {
 // The *_unlocked accessors that usually go with these are inline macros over
 // the libc FILE's fields on Darwin and cannot be interposed; a program using
 // them must be built with them mapped back to the locking functions (see
-// third_party/include-shim/tvm_stdio_unlocked.h). Each thread's holds are
-// counted (thread_flock_count) to be let go of when it exits.
+// third_party/include-shim/tvm_stdio_unlocked.h). The holds are counted in
+// the stream (stream_flock_count), to be let go of when their thread exits.
 FUNCTION_DEFINE_VOID1(flockfile, FILE *, stream) {
-    FILE *fp = real_fp(stream);
-    if (!fp)
+    struct file_stream *fs = file_stream_fp(stream);
+    if (!fs->fs_fp)
         return;
-    CALL_FUNC(flockfile, fp);
-    tvm_sig_enter();
-    thread_flock_count(fp, 1);
-    tvm_sig_leave();
+    CALL_FUNC(flockfile, fs->fs_fp);
+    stream_flock_count(fs, 1);
 }
 
 FUNCTION_DEFINE1(int, ftrylockfile, FILE *, stream) {
-    FILE *fp = real_fp(stream);
-    if (!fp)
+    struct file_stream *fs = file_stream_fp(stream);
+    if (!fs->fs_fp)
         return 0;
-    int ret = CALL_FUNC(ftrylockfile, fp);
-    if (ret == 0) {
-        tvm_sig_enter();
-        thread_flock_count(fp, 1);
-        tvm_sig_leave();
-    }
+    int ret = CALL_FUNC(ftrylockfile, fs->fs_fp);
+    if (ret == 0)
+        stream_flock_count(fs, 1);
     return ret;
 }
 
 FUNCTION_DEFINE_VOID1(funlockfile, FILE *, stream) {
-    FILE *fp = real_fp(stream);
-    if (!fp)
+    struct file_stream *fs = file_stream_fp(stream);
+    if (!fs->fs_fp)
         return;
-    tvm_sig_enter();
-    thread_flock_count(fp, -1);
-    CALL_FUNC(funlockfile, fp);
-    tvm_sig_leave();
+    stream_flock_count(fs, -1);
+    CALL_FUNC(funlockfile, fs->fs_fp);
 }
 
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
