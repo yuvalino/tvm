@@ -12567,14 +12567,12 @@ static void ulinker_print_cb(char *msg) {
  * on a 4 GB boundary once the process has mapped ~4 GB of them: in a
  * long-lived sshd backend, after enough tasks.
  *
- * Two defenses. tvm_mmap_guarded() places the regions TVM maps and copies
- * (heap slabs, image segments) clear of [N<<32, N<<32 + TVM_MMAP_GUARD) for
- * every N, and tvm_reserve_boundary_pages() pins a PROT_NONE page at N<<32
- * for every N a descriptor number can be, so no mapping at all -- the
- * thread stacks libpthread places included -- can hold the address a pair
- * of descriptors forms. What stays ambiguous is a pair whose first int is
- * at least TVM_MMAP_GUARD (a page, on a stack) next to an int equal to the
- * 4 GB bucket of a copied region, and memory the emulator maps itself.
+ * So tvm_mmap_guarded() places every region fork copies -- heap slabs,
+ * image segments, the task threads' and the emulator's stacks (stack_alloc)
+ * -- clear of [N<<32, N<<32 + TVM_MMAP_GUARD) for every N. What stays
+ * ambiguous is a pair whose first int is at least TVM_MMAP_GUARD next to an
+ * int equal to the 4 GB bucket of a copied region, and a stack a guest
+ * brings itself (pthread_attr_setstack).
  */
 #define TVM_MMAP_GUARD ((uintptr_t)16 << 20)
 
@@ -12656,23 +12654,6 @@ static void *tvm_mmap_guarded(size_t size, int prot, int flags)
     INFO("mmap %p-%p moved off the guard window at %p", (void *)start, (void *)(start + size), (void *)w);
 #endif
     return (void *)start;
-}
-
-// A PROT_NONE page at N<<32 for every N a descriptor number can be (see
-// tvm_mmap_guarded). Pages already in use stay as they are: whatever is
-// there is not a region fork copies, and keeps our mappings out just the
-// same. Called once, before the first arena.
-static void tvm_reserve_boundary_pages(void)
-{
-    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-    for (uintptr_t n = 1; n < MAX_FILES; n++) {
-        void *hint = (void *)(n << 32);
-        void *p = CALL_FUNC(mmap, hint, pg, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED)
-            continue;
-        if (p != hint)
-            CALL_FUNC(munmap, p, pg);
-    }
 }
 
 /*
@@ -13322,8 +13303,6 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
     rmem_setopt(RMEM_OPS, (void *)&rmem_ops);
-
-    tvm_reserve_boundary_pages();
 
     global_arena = rmem_arena_create(NULL);
     if (!global_arena)
