@@ -2235,6 +2235,45 @@ TEST(StackFreedAfterJoin) {
     ASSERT_EQ(0, page_mapped(a));
 }
 
+// fflush(NULL) waits for a stream another thread holds (flockfile) and
+// flushes it once released, however long that takes: it used to retry a busy
+// stream for ~200 ms and then return with its buffer unflushed
+static FILE *flush_held_fp;
+static volatile int flush_held;
+
+static void *hold_and_write(void *arg) {
+    (void)arg;
+    flockfile(flush_held_fp);
+    fputs("data", flush_held_fp);
+    flush_held = 1;
+    usleep(500000);
+    funlockfile(flush_held_fp);
+    return NULL;
+}
+
+TEST(FflushAllWaitsForLockedStream) {
+    char path[] = "/tmp/tvm_fflush_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NEQ(fd, -1);
+    flush_held_fp = fdopen(fd, "w");
+    ASSERT_NEQ(flush_held_fp, NULL);
+    ASSERT_EQ(0, setvbuf(flush_held_fp, NULL, _IOFBF, 4096));
+
+    flush_held = 0;
+    pthread_t t;
+    ASSERT_EQ(0, pthread_create(&t, NULL, hold_and_write, NULL));
+    while (!flush_held)
+        usleep(1000);
+    ASSERT_EQ(0, fflush(NULL));
+
+    struct stat st;
+    ASSERT_EQ(0, stat(path, &st));
+    ASSERT_EQ(4, st.st_size);
+    ASSERT_EQ(0, pthread_join(t, NULL));
+    ASSERT_EQ(0, fclose(flush_held_fp));
+    ASSERT_EQ(0, unlink(path));
+}
+
 // realpath and getcwd answer in the guest namespace: a mount point hides
 // its source, a cpio link is followed, a host link too.
 TEST(VfsRealpath) {
