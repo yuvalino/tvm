@@ -2366,17 +2366,45 @@ TEST(FlockReleasedAtThreadExit) {
     ASSERT_EQ(7, WEXITSTATUS(s));
 }
 
-// F_SETLKW on a range another task holds sleeps until that task releases it,
-// and a signal ends the wait with EINTR
-static int rlock_open_locked(const char *path, short type, int cmd) {
-    int fd = open(path, O_RDWR);
-    struct flock fl = { .l_type = type, .l_whence = SEEK_SET };
-    if (fd < 0 || 0 != fcntl(fd, cmd, &fl))
+// F_SETLKW on a range another task holds sleeps until that task releases it;
+// a signal ends the wait with EINTR, unless its handler has SA_RESTART
+static void rlock_on_usr1(int sig) { (void)sig; }
+
+// A child that F_SETLKWs `path` (held by the caller) with a SIGUSR1 handler
+// installed with `sa_flags`, and exits 0 once it has the lock, 2 on EINTR.
+// Returns once the child is about to wait.
+static pid_t rlock_waiter(const char *path, int sa_flags) {
+    int ready[2];
+    if (pipe(ready))
         return -1;
-    return fd;
+    pid_t p = fork();
+    if (!p) {
+        struct sigaction sa = { .sa_handler = rlock_on_usr1, .sa_flags = sa_flags };
+        sigaction(SIGUSR1, &sa, NULL);
+        int fd = open(path, O_RDWR);
+        struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+        write(ready[1], "", 1);
+        if (fd >= 0 && 0 == fcntl(fd, F_SETLKW, &fl))
+            _exit(0);
+        _exit(errno == EINTR ? 2 : 1);
+    }
+    char c;
+    if (p > 0)
+        read(ready[0], &c, 1);
+    close(ready[0]);
+    close(ready[1]);
+    usleep(100000); // into the wait
+    return p;
 }
 
-static void rlock_on_usr1(int sig) { (void)sig; }
+// Releases the lock on `fd` and returns how child `p` exited.
+static int rlock_release_and_reap(int fd, pid_t p) {
+    struct flock fl = { .l_type = F_UNLCK, .l_whence = SEEK_SET };
+    int s;
+    if (0 != fcntl(fd, F_SETLK, &fl) || p != waitpid(p, &s, 0) || !WIFEXITED(s))
+        return -1;
+    return WEXITSTATUS(s);
+}
 
 TEST(RlockWaitWakesOnRelease) {
     char path[] = "/tmp/tvm_rlock_XXXXXX";
@@ -2385,19 +2413,10 @@ TEST(RlockWaitWakesOnRelease) {
     struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
     ASSERT_EQ(0, fcntl(fd, F_SETLK, &fl));
 
-    pid_t p = fork();
+    pid_t p = rlock_waiter(path, 0);
     ASSERT_NEQ(p, -1);
-    if (!p)
-        _exit(rlock_open_locked(path, F_WRLCK, F_SETLKW) >= 0 ? 0 : 1);
-
-    usleep(200000);
     ASSERT_EQ(0, waitpid(p, NULL, WNOHANG)); // still waiting
-    fl.l_type = F_UNLCK;
-    ASSERT_EQ(0, fcntl(fd, F_SETLK, &fl));
-    int s;
-    ASSERT_EQ(p, waitpid(p, &s, 0));
-    ASSERT_EQ(1, WIFEXITED(s));
-    ASSERT_EQ(0, WEXITSTATUS(s));
+    ASSERT_EQ(0, rlock_release_and_reap(fd, p));
     close(fd);
     ASSERT_EQ(0, unlink(path));
 }
@@ -2409,21 +2428,28 @@ TEST(RlockWaitInterrupted) {
     struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
     ASSERT_EQ(0, fcntl(fd, F_SETLK, &fl));
 
-    pid_t p = fork();
+    pid_t p = rlock_waiter(path, 0);
     ASSERT_NEQ(p, -1);
-    if (!p) {
-        struct sigaction sa = { .sa_handler = rlock_on_usr1 }; // no SA_RESTART
-        sigaction(SIGUSR1, &sa, NULL);
-        int r = rlock_open_locked(path, F_WRLCK, F_SETLKW);
-        _exit(r == -1 && errno == EINTR ? 0 : 1);
-    }
-
-    usleep(200000);
     ASSERT_EQ(0, kill(p, SIGUSR1));
-    int s;
-    ASSERT_EQ(p, waitpid(p, &s, 0));
-    ASSERT_EQ(1, WIFEXITED(s));
-    ASSERT_EQ(0, WEXITSTATUS(s));
+    usleep(100000);
+    ASSERT_EQ(2, rlock_release_and_reap(fd, p)); // EINTR before the release
+    close(fd);
+    ASSERT_EQ(0, unlink(path));
+}
+
+TEST(RlockWaitRestarted) {
+    char path[] = "/tmp/tvm_rlock_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NEQ(fd, -1);
+    struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    ASSERT_EQ(0, fcntl(fd, F_SETLK, &fl));
+
+    pid_t p = rlock_waiter(path, SA_RESTART);
+    ASSERT_NEQ(p, -1);
+    ASSERT_EQ(0, kill(p, SIGUSR1));
+    usleep(100000);
+    ASSERT_EQ(0, waitpid(p, NULL, WNOHANG)); // waiting again
+    ASSERT_EQ(0, rlock_release_and_reap(fd, p));
     close(fd);
     ASSERT_EQ(0, unlink(path));
 }
