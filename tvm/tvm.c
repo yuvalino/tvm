@@ -1994,6 +1994,7 @@ struct thread {
     siginfo_t thr_pending_siginfo[MAX_SIGNALS];
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
+    int thr_wake[2];  // a non-blocking pipe an F_SETLKW sleeps on, made on the thread's first (thread_wake_fd); -1 until then
     struct tvm_stack *thr_stack;  // the stack TVM allocated the thread, if (see stack_alloc)
 };
 
@@ -2351,7 +2352,7 @@ struct rlock_waiter {
     struct list_head rw_list;
     struct task *rw_waiter;
     struct task *rw_owner;
-    int rw_wake[2];     // a pipe, its write end non-blocking
+    int rw_wake;        // the waiting thread's wake pipe, write end (thr_wake)
 };
 static LIST_HEAD(rlock_waiters);
 
@@ -2365,7 +2366,7 @@ static void rlock_wake_locked(void)
         struct rlock_waiter *w = list_first_entry(&rlock_waiters, struct rlock_waiter, rw_list);
         list_del(&w->rw_list);
         INIT_LIST_HEAD(&w->rw_list);
-        (void)CALL_FUNC(write, w->rw_wake[1], "", 1);
+        (void)CALL_FUNC(write, w->rw_wake, "", 1);
     }
 }
 
@@ -3577,6 +3578,10 @@ out:
 
 void threaddealloc(struct thread *thr)
 {
+    for (int i = 0; i < 2; i++)
+        if (thr->thr_wake[i] >= 0)
+            CALL_FUNC(close, thr->thr_wake[i]);
+
     if (thr->thr_emulator) {
         emulator_context_destroy(thr->thr_emulator);
         thr->thr_emulator = NULL;
@@ -3595,6 +3600,7 @@ struct thread *threadalloc(struct task *parent)
         return NULL;
 
     memset(thr, 0, sizeof(*thr));
+    thr->thr_wake[0] = thr->thr_wake[1] = -1;
 
     INIT_LIST_HEAD(&thr->thr_list);
     thr->thr_refcount = 1;
@@ -4838,6 +4844,14 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         if (ucontext)
             thr->thr_pending_ucontext[signum] = *(ucontext_t *)ucontext;
         __atomic_fetch_or(&thr->thr_pending_sigs, 1u << signum, __ATOMIC_RELEASE);
+        // ...and end an F_SETLKW's sleep, as the kernel's signal delivery
+        // wakes an interruptible one (rlock_sleep)
+        int wake = __atomic_load_n(&thr->thr_wake[1], __ATOMIC_ACQUIRE);
+        if (wake >= 0) {
+            int last_errno = errno;
+            (void)CALL_FUNC(write, wake, "", 1);
+            errno = last_errno;
+        }
         tvm_sig_depth--;
         return;
     }
@@ -15863,22 +15877,39 @@ static int signal_deliverable(void)
     return 0;
 }
 
-// An F_SETLKW's sleep: until `fd` is readable (a release, rlock_wake_locked),
-// `timeout` (NULL: none) passes, or a signal comes, which ends it with EINTR
-// (fcntl() restarts it after an SA_RESTART handler, as the kernel does).
-// The host's signals are blocked from the check for a pending one to the
-// wait, which unblocks them atomically (tvm_poll_host_masked): one arriving
-// in between interrupts it instead of going unnoticed until a release.
-static int rlock_sleep(int fd, const struct timespec *timeout)
+// The calling thread's wake pipe, read end, made on its first F_SETLKW and
+// emptied: what is in it from before is no news. -1 if it cannot be made.
+static int thread_wake_fd(void)
 {
-    sigset_t all, old;
-    sigfillset(&all);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &old);
+    struct thread *thr = current_thread;
+    if (thr->thr_wake[0] < 0) {
+        int p[2];
+        if (0 != CALL_FUNC(pipe, p))
+            return -1;
+        CALL_FUNC(fcntl, p[0], F_SETFL, O_NONBLOCK);
+        CALL_FUNC(fcntl, p[1], F_SETFL, O_NONBLOCK);
+        thr->thr_wake[0] = p[0];
+        __atomic_store_n(&thr->thr_wake[1], p[1], __ATOMIC_RELEASE); // signal_handler's
+    }
+    char buf[64];
+    while (CALL_FUNC(read, thr->thr_wake[0], buf, sizeof(buf)) > 0)
+        ;
+    return thr->thr_wake[0];
+}
+
+// An F_SETLKW's sleep, on its thread's wake pipe `fd` (thread_wake_fd,
+// emptied before the waiter was listed): until a release writes to it
+// (rlock_wake_locked), `timeout_ms` (-1: none) passes, or a signal comes,
+// which ends it with EINTR (fcntl() restarts it after an SA_RESTART handler,
+// as the kernel does). signal_handler writes to the pipe too, the way the
+// kernel's signal delivery wakes an interruptible sleep: a signal arriving
+// after the check for a pending one below is waiting in the pipe, not lost.
+static int rlock_sleep(int fd, int timeout_ms)
+{
     if (!signal_deliverable()) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        (void)tvm_poll_host_masked(&pfd, 1, timeout, &old);
+        (void)CALL_FUNC(poll, &pfd, 1, timeout_ms);
     }
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old, NULL);
     if (!signal_deliverable())
         return 0;
     errno = EINTR;
@@ -15934,6 +15965,12 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
         }
         else if (0 == rlock_spare_alloc(&spare, fl->l_type)) {
             for (;;) {
+                int wake = -1;
+                if (cmd == F_SETLKW && fl->l_type != F_UNLCK && (wake = thread_wake_fd()) < 0) {
+                    errno = ENOLCK;
+                    ret = -1;
+                    break;
+                }
                 pthread_mutex_lock(&rlocks_lock);
                 struct rlock *c = (fl->l_type == F_UNLCK) ? NULL :
                     rlock_conflict_locked(st.st_dev, st.st_ino, current, fl->l_type, start, end);
@@ -15954,7 +15991,7 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                         break;
                     // F_SETLKW held off by a process outside TVM, whose
                     // release wakes nobody: look again every 20 ms
-                    if (0 != rlock_sleep(-1, &(struct timespec){ 0, 20 * 1000000L })) {
+                    if (0 != rlock_sleep(wake, 20)) {
                         ret = -1;
                         break;
                     }
@@ -15973,22 +16010,14 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                         break;
                     }
                     // F_SETLKW: sleep until a release or a signal
-                    struct rlock_waiter waiter = { .rw_waiter = current, .rw_owner = c->rl_owner };
-                    if (0 != CALL_FUNC(pipe, waiter.rw_wake)) {
-                        pthread_mutex_unlock(&rlocks_lock);
-                        errno = ENOLCK;
-                        ret = -1;
-                        break;
-                    }
-                    CALL_FUNC(fcntl, waiter.rw_wake[1], F_SETFL, O_NONBLOCK);
+                    struct rlock_waiter waiter = { .rw_waiter = current, .rw_owner = c->rl_owner,
+                                                   .rw_wake = current_thread->thr_wake[1] };
                     list_add(&waiter.rw_list, &rlock_waiters);
                     pthread_mutex_unlock(&rlocks_lock);
-                    int r = rlock_sleep(waiter.rw_wake[0], NULL);
+                    int r = rlock_sleep(wake, -1);
                     pthread_mutex_lock(&rlocks_lock);
                     list_del(&waiter.rw_list); // a no-op if a release took it off
                     pthread_mutex_unlock(&rlocks_lock);
-                    CALL_FUNC(close, waiter.rw_wake[0]);
-                    CALL_FUNC(close, waiter.rw_wake[1]);
                     if (0 != r) {
                         ret = -1;
                         break;
