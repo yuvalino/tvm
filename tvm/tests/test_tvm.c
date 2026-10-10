@@ -2274,6 +2274,98 @@ TEST(FflushAllWaitsForLockedStream) {
     ASSERT_EQ(0, unlink(path));
 }
 
+// A thread holding a stream (flockfile) that uses stdio on it, or opens a
+// directory, while another thread is waiting for the stream's lock: in
+// fclose(), which waited for it holding the task lock; in fflush(NULL),
+// which waited holding the stream-list lock, which opendir() took too.
+static void *hold_then_write(void *arg) {
+    (void)arg;
+    flockfile(flush_held_fp);
+    flush_held = 1;
+    usleep(200000);
+    fputs("data", flush_held_fp);
+    funlockfile(flush_held_fp);
+    return NULL;
+}
+
+static void *hold_then_opendir(void *arg) {
+    (void)arg;
+    flockfile(flush_held_fp);
+    flush_held = 1;
+    usleep(200000);
+    DIR *d = opendir("/tmp");
+    if (d)
+        closedir(d);
+    funlockfile(flush_held_fp);
+    return (void *)(uintptr_t)(d != NULL);
+}
+
+static void flush_held_open(char *path) {
+    int fd = mkstemp(path);
+    flush_held_fp = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (flush_held_fp)
+        setvbuf(flush_held_fp, NULL, _IOFBF, 4096);
+    flush_held = 0;
+}
+
+TEST(FcloseWaitsForLockedStream) {
+    char path[] = "/tmp/tvm_fclose_XXXXXX";
+    flush_held_open(path);
+    ASSERT_NEQ(flush_held_fp, NULL);
+    pthread_t t;
+    ASSERT_EQ(0, pthread_create(&t, NULL, hold_then_write, NULL));
+    while (!flush_held)
+        usleep(1000);
+    ASSERT_EQ(0, fclose(flush_held_fp));
+    ASSERT_EQ(0, pthread_join(t, NULL));
+
+    struct stat st;
+    ASSERT_EQ(0, stat(path, &st));
+    ASSERT_EQ(4, st.st_size);
+    ASSERT_EQ(0, unlink(path));
+}
+
+TEST(OpendirWhileFflushAllWaits) {
+    char path[] = "/tmp/tvm_fflush_XXXXXX";
+    flush_held_open(path);
+    ASSERT_NEQ(flush_held_fp, NULL);
+    pthread_t t;
+    ASSERT_EQ(0, pthread_create(&t, NULL, hold_then_opendir, NULL));
+    while (!flush_held)
+        usleep(1000);
+    ASSERT_EQ(0, fflush(NULL));
+    void *opened;
+    ASSERT_EQ(0, pthread_join(t, &opened));
+    ASSERT_EQ(1, (int)(uintptr_t)opened);
+    ASSERT_EQ(0, fclose(flush_held_fp));
+    ASSERT_EQ(0, unlink(path));
+}
+
+// A thread that exits holding a stream (flockfile) lets go of it: the
+// stream's close when the task went away waited for the lock for good
+static void *hold_and_exit(void *arg) {
+    flockfile((FILE *)arg);
+    return NULL;
+}
+
+TEST(FlockReleasedAtThreadExit) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    char path[] = "/tmp/tvm_flock_XXXXXX";
+    if (!p) {
+        flush_held_open(path);
+        unlink(path);
+        pthread_t t;
+        if (!flush_held_fp || pthread_create(&t, NULL, hold_and_exit, flush_held_fp) || pthread_join(t, NULL))
+            _exit(1);
+        _exit(7);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(7, WEXITSTATUS(s));
+}
+
 // realpath and getcwd answer in the guest namespace: a mount point hides
 // its source, a cpio link is followed, a host link too.
 TEST(VfsRealpath) {

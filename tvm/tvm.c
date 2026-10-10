@@ -1951,7 +1951,8 @@ struct task {
     struct rusage tsk_rusage_base;  // that thread's CPU time when the task started on it
     pthread_mutex_t tsk_lock;
     struct file *tsk_files[MAX_FILES];
-    struct list_head tsk_filestreams;  // file_stream_container
+    struct list_head tsk_filestreams;  // file_stream_container: FILE streams
+    struct list_head tsk_dirstreams;   // DIR streams, with tsk_lock alone: off the list fflush(NULL) walks, as glibc's and Darwin's DIRs are off their FILE lists
     pthread_mutex_t tsk_streams_lock;  // changes to tsk_filestreams (with tsk_lock), fflush(NULL)'s walk; before a stream's lock, before tsk_lock
     struct file_stream *tsk_io_filestreams[3];
     int tsk_state;
@@ -1979,6 +1980,9 @@ struct task {
     unsigned tsk_rlocks; // POSIX record locks held (entries in rlocks owned by this task, see fcntl_rlock)
 };
 
+#define THR_FLOCKS 8
+struct thread_flock { FILE *fl_fp; int fl_n; };
+
 struct thread {
     struct list_head thr_list;
     struct task *thr_task;  // back pointer to owning task
@@ -1993,6 +1997,7 @@ struct thread {
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
     struct tvm_stack *thr_stack;  // the stack TVM allocated the thread, if (see stack_alloc)
+    struct thread_flock thr_flocks[THR_FLOCKS];  // libc FILEs the guest holds by flockfile() on this thread, and how often (thread_flock_count)
 };
 
 static struct rmem_arena *global_arena = NULL;
@@ -2235,6 +2240,7 @@ static struct task *taskalloc_common()
     INIT_LIST_HEAD(&t->tsk_list);
     INIT_LIST_HEAD(&t->tsk_threads);
     INIT_LIST_HEAD(&t->tsk_filestreams);
+    INIT_LIST_HEAD(&t->tsk_dirstreams);
 
     t->tsk_refcount = 1;
 
@@ -2638,6 +2644,7 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
     stack_task_gone(t);
 
     task_filestreamdealloc_list(t, &t->tsk_filestreams);
+    task_filestreamdealloc_list(t, &t->tsk_dirstreams);
 
     for (int i = 0; i < 3; i++)
         t->tsk_io_filestreams[i] = NULL;
@@ -3076,6 +3083,41 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
     return childt;
 }
 
+// Count a flockfile() (`d` 1) or funlockfile() (-1) of `fp` by the guest on
+// this thread. A thread holding more streams at once than thr_flocks has
+// room for is not counted for the rest.
+static void thread_flock_count(FILE *fp, int d)
+{
+    struct thread_flock *fl = current_thread->thr_flocks, *unused = NULL;
+    for (int i = 0; i < THR_FLOCKS; i++) {
+        if (fl[i].fl_fp == fp) {
+            if (!(fl[i].fl_n += d))
+                fl[i].fl_fp = NULL;
+            return;
+        }
+        if (!unused && !fl[i].fl_fp)
+            unused = &fl[i];
+    }
+    if (d > 0 && unused)
+        *unused = (struct thread_flock){ fp, d };
+}
+
+// Let go of what the guest holds of `fp` (NULL: of every stream) by
+// flockfile() on this thread: the thread is leaving, or closing the stream.
+// Left held, a lock outlived its thread, and fflush(NULL) and the stream's
+// close at task teardown waited for it for good.
+static void thread_flock_release(FILE *fp)
+{
+    struct thread_flock *fl = current_thread->thr_flocks;
+    for (int i = 0; i < THR_FLOCKS; i++) {
+        if (!fl[i].fl_fp || (fp && fl[i].fl_fp != fp))
+            continue;
+        while (fl[i].fl_n-- > 0)
+            CALL_FUNC(funlockfile, fl[i].fl_fp);
+        fl[i] = (struct thread_flock){ 0 };
+    }
+}
+
 /**
  * Detach the calling (non-last) thread from its task and terminate it: remove
  * it from the thread list, drop the task's thread/ref counts, and pthread_exit.
@@ -3085,6 +3127,7 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
 __attribute__((noreturn))
 static void detach_current_thread_and_exit(void *retval)
 {
+    thread_flock_release(NULL);
     list_del(&current_thread->thr_list);
     current->tsk_threads_cnt--;
     current->tsk_refcount--;
@@ -3993,15 +4036,16 @@ static struct file *file_for_task_stream_locked(struct task *t, struct file_stre
 int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
 {
     int ret = 0, flush_errno = 0;
-    struct file_stream_list_entry *fsle;
-    list_for_each_entry(fsle, &t->tsk_filestreams, fsle_list) {
-        if (fsle->fsle_stream == fs)
-            break;
-    }
-
-    if (!list_entry_is_head(fsle, &t->tsk_filestreams, fsle_list)) {
-        list_del(&fsle->fsle_list);
-        kfree(fsle);
+    struct list_head *lists[] = { &t->tsk_filestreams, &t->tsk_dirstreams };
+    for (int i = 0; i < 2; i++) {
+        struct file_stream_list_entry *fsle;
+        list_for_each_entry(fsle, lists[i], fsle_list) {
+            if (fsle->fsle_stream == fs) {
+                list_del(&fsle->fsle_list);
+                kfree(fsle);
+                break;
+            }
+        }
     }
 
     if (fs->fs_type == FS_FILE) {
@@ -4036,6 +4080,8 @@ int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
                 }
             }
             fp_setfileno(fs->fs_fp, -1);
+            if (t == current)
+                thread_flock_release(fs->fs_fp);
             (void)CALL_FUNC(fclose, fs->fs_fp);
             errno = last_errno;
             fs->fs_fp = NULL;
@@ -4058,7 +4104,8 @@ int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
     return ret;
 }
 
-struct file_stream *task_filestreamalloc_locked(struct task *t) {
+// A new stream of `t`'s, on its list of directory streams if `dir`.
+struct file_stream *task_filestreamalloc_locked(struct task *t, int dir) {
     struct file_stream *fs = rmem_arena_alloc(t->tsk_ar, sizeof(struct file_stream));
     if (!fs)
         return NULL;
@@ -4072,7 +4119,7 @@ struct file_stream *task_filestreamalloc_locked(struct task *t) {
     memset(fs, 0, sizeof(*fs));
     fs->fs_nfd = -1;
 
-    list_add(&fsle->fsle_list, &t->tsk_filestreams);
+    list_add(&fsle->fsle_list, dir ? &t->tsk_dirstreams : &t->tsk_filestreams);
     fsle->fsle_stream = fs;
 
     return fs;
@@ -4119,10 +4166,11 @@ static void task_exec_reset_streams_locked(struct task *t)
         fsle->fsle_stream->fs_discard = 1;
         task_filestreamdealloc_locked(t, fsle->fsle_stream);
     }
+    task_filestreamdealloc_list(t, &t->tsk_dirstreams);
 
     for (int i = 0; i < 3; i++) {
         t->tsk_io_filestreams[i] = NULL;
-        struct file_stream *fs = task_filestreamalloc_locked(t);
+        struct file_stream *fs = task_filestreamalloc_locked(t, 0);
         if (!fs)
             panic("execve: std stream %d", i);
         fs->fs_type = FS_FILE;
@@ -13135,7 +13183,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
 
     // allocate stdin, stdout, stderr filestreams
     for (int i = 0; i < 3; i++) {
-        struct file_stream *fs = task_filestreamalloc_locked(current);
+        struct file_stream *fs = task_filestreamalloc_locked(current, 0);
         VERIFY(fs);
 
         struct file *file = file_for_task_locked(current, i);
@@ -13556,12 +13604,10 @@ FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
 
 FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     tvm_sig_enter();
-    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
-    struct file_stream *fs = task_filestreamalloc_locked(current);
+    struct file_stream *fs = task_filestreamalloc_locked(current, 1);
     if (!fs) {
         task_unlock(current);
-        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         return NULL;
     }
@@ -13570,7 +13616,6 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     if (!file) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
-        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         return NULL;
     }
@@ -13603,7 +13648,6 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
         file_unlock(file, 1);
-        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         errno = last_errno;
         return NULL;
@@ -13618,7 +13662,6 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     fs->fs_type = FS_DIR;
     fs->fs_dp = dp;
 
-    pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
     
     return (DIR *)fs;
@@ -13634,11 +13677,9 @@ FUNCTION_DEFINE1(int, closedir, DIR *, dir) {
     int nfd = fs->fs_nfd;
 
     tvm_sig_enter();
-    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
     task_filestreamdealloc_locked(current, fs);
     task_unlock(current);
-    pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
     
     if (-1 == close(nfd))
@@ -13796,7 +13837,7 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     tvm_sig_enter();
     pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
-    struct file_stream *fs = task_filestreamalloc_locked(current);
+    struct file_stream *fs = task_filestreamalloc_locked(current, 0);
     if (!fs) {
         task_unlock(current);
         pthread_mutex_unlock(&current->tsk_streams_lock);
@@ -13941,7 +13982,6 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
 
     tvm_sig_enter();
     pthread_mutex_lock(&current->tsk_streams_lock);
-    task_lock(current);
 
     // fclose(stdout): the guest names libc's own stdout object, which every
     // other stdio interposer translates to the task's stream
@@ -13961,12 +14001,24 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     if (std >= 0) {
         fs = current->tsk_io_filestreams[std];
         if (!fs || fs->fs_nfd < 0) {
-            task_unlock(current);
             pthread_mutex_unlock(&current->tsk_streams_lock);
             tvm_sig_leave();
             errno = EBADF;
             return EOF;
         }
+    }
+
+    // The stream's lock before the task's, in fflush(NULL)'s order: a thread
+    // between flockfile() and funlockfile() of the stream takes the task lock
+    // for every stdio call it makes on it, and libc's fclose() waited for the
+    // stream's lock with the task lock held. Let go of before the stream is
+    // closed: libc's FILE is freed with it.
+    FILE *fp = fs->fs_type == FS_FILE ? fs->fs_fp : NULL;
+    if (fp)
+        CALL_FUNC(flockfile, fp);
+    task_lock(current);
+
+    if (std >= 0) {
         int nfd = fs->fs_nfd;
         int ret = 0, last_errno = errno;
         if (fs->fs_fp) {
@@ -13987,6 +14039,8 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
         }
         fs->fs_nfd = -1;
         task_unlock(current);
+        if (fp)
+            CALL_FUNC(funlockfile, fp);
         pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         errno = last_errno;
@@ -13999,6 +14053,8 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     }
 
     int nfd = fs->fs_nfd;
+    if (fp)
+        CALL_FUNC(funlockfile, fp);
     // The fclose-time flush failed: EOF with its errno, like libc's fclose
     // (this returned close()'s 0 and the caller never learned of the lost
     // output, e.g. EPIPE with SIGPIPE ignored).
@@ -14055,12 +14111,18 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
 
     tvm_sig_enter();
 
+    // The old FILE's lock between the list's and the task's, as in fclose()
     pthread_mutex_lock(&current->tsk_streams_lock);
+    FILE *old = fs->fs_fp;
+    if (old)
+        CALL_FUNC(flockfile, old);
     task_lock(current);
 
-    if (fs->fs_fp) {
-        fp_setfileno(fs->fs_fp, -1);
-        CALL_FUNC(fclose, fs->fs_fp);
+    if (old) {
+        fp_setfileno(old, -1);
+        thread_flock_release(old);
+        CALL_FUNC(funlockfile, old);
+        CALL_FUNC(fclose, old);
     }
     fs->fs_fp = NULL;
 
@@ -14305,24 +14367,39 @@ FUNCTION_DEFINE_VOID1(rewind, FILE *, stream) {
 // The *_unlocked accessors that usually go with these are inline macros over
 // the libc FILE's fields on Darwin and cannot be interposed; a program using
 // them must be built with them mapped back to the locking functions (see
-// third_party/include-shim/tvm_stdio_unlocked.h).
+// third_party/include-shim/tvm_stdio_unlocked.h). Each thread's holds are
+// counted (thread_flock_count) to be let go of when it exits.
 FUNCTION_DEFINE_VOID1(flockfile, FILE *, stream) {
     FILE *fp = real_fp(stream);
-    if (fp)
-        CALL_FUNC(flockfile, fp);
+    if (!fp)
+        return;
+    CALL_FUNC(flockfile, fp);
+    tvm_sig_enter();
+    thread_flock_count(fp, 1);
+    tvm_sig_leave();
 }
 
 FUNCTION_DEFINE1(int, ftrylockfile, FILE *, stream) {
     FILE *fp = real_fp(stream);
     if (!fp)
         return 0;
-    return CALL_FUNC(ftrylockfile, fp);
+    int ret = CALL_FUNC(ftrylockfile, fp);
+    if (ret == 0) {
+        tvm_sig_enter();
+        thread_flock_count(fp, 1);
+        tvm_sig_leave();
+    }
+    return ret;
 }
 
 FUNCTION_DEFINE_VOID1(funlockfile, FILE *, stream) {
     FILE *fp = real_fp(stream);
-    if (fp)
-        CALL_FUNC(funlockfile, fp);
+    if (!fp)
+        return;
+    tvm_sig_enter();
+    thread_flock_count(fp, -1);
+    CALL_FUNC(funlockfile, fp);
+    tvm_sig_leave();
 }
 
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
@@ -14334,7 +14411,10 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
     //
     // - Wait for a stream's lock with the task unlocked: a thread between
     //   flockfile() and funlockfile() takes the task lock for every stdio call
-    //   it makes on that stream (exit() calls fflush(NULL)).
+    //   it makes on that stream (exit() calls fflush(NULL)). exit() waits as
+    //   glibc's does (2.39, _IO_cleanup): for a sibling blocked reading a
+    //   stream it holds, for as long as that read takes. Darwin's exit()
+    //   flushes without the streams' locks and never waits.
     // - Go through file_for_task_stream_locked(), which re-syncs the libc
     //   FILE's descriptor and skips a stream whose descriptor is gone, rather
     //   than flushing into a stale or reused host descriptor.
@@ -17302,19 +17382,23 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
         goto fail;
     }
 
-    // duplicate file-stream entries
+    // duplicate file-stream entries, FILE's and DIR's
     task_lock(arg->parent);
     struct file_stream_list_entry *old_fsle;
     struct file_stream_list_entry *new_fsle;
-    list_for_each_entry(old_fsle, &arg->parent->tsk_filestreams, fsle_list) {
-        new_fsle = kalloc(sizeof(struct file_stream_list_entry));
-        if (!new_fsle)
-            goto fail;
-        list_add(&new_fsle->fsle_list, &arg->tsk->tsk_filestreams);
-        new_fsle->fsle_stream = old_fsle->fsle_stream;
+    struct list_head *old_lists[] = { &arg->parent->tsk_filestreams, &arg->parent->tsk_dirstreams };
+    struct list_head *new_lists[] = { &arg->tsk->tsk_filestreams, &arg->tsk->tsk_dirstreams };
+    for (int i = 0; i < 2; i++) {
+        list_for_each_entry(old_fsle, old_lists[i], fsle_list) {
+            new_fsle = kalloc(sizeof(struct file_stream_list_entry));
+            if (!new_fsle)
+                goto fail;
+            list_add(&new_fsle->fsle_list, new_lists[i]);
+            new_fsle->fsle_stream = old_fsle->fsle_stream;
 
-        if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&new_fsle->fsle_stream, (void *)&old_fsle->fsle_stream, sizeof(new_fsle->fsle_stream), 1))
-            goto fail;
+            if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)&new_fsle->fsle_stream, (void *)&old_fsle->fsle_stream, sizeof(new_fsle->fsle_stream), 1))
+                goto fail;
+        }
     }
     memcpy(arg->tsk->tsk_io_filestreams, arg->parent->tsk_io_filestreams, sizeof(arg->tsk->tsk_io_filestreams));
     if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_io_filestreams, (void *)arg->parent->tsk_io_filestreams, sizeof(arg->tsk->tsk_io_filestreams), 1))
@@ -17335,15 +17419,17 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
         goto fail;
     }
 
-    list_for_each_entry(new_fsle, &arg->tsk->tsk_filestreams, fsle_list) {
-        if (new_fsle->fsle_stream)
-            new_fsle->fsle_stream->fs_dp = NULL;
-    }
-    
-    list_for_each_entry(new_fsle, &arg->tsk->tsk_filestreams, fsle_list) {
-        // fixup gencnts and open new streams
-        if (0 != task_filestreamrealloc_locked(arg->tsk, new_fsle->fsle_stream))
-            goto fail;
+    for (int i = 0; i < 2; i++) {
+        list_for_each_entry(new_fsle, new_lists[i], fsle_list) {
+            if (new_fsle->fsle_stream)
+                new_fsle->fsle_stream->fs_dp = NULL;
+        }
+
+        list_for_each_entry(new_fsle, new_lists[i], fsle_list) {
+            // fixup gencnts and open new streams
+            if (0 != task_filestreamrealloc_locked(arg->tsk, new_fsle->fsle_stream))
+                goto fail;
+        }
     }
 
     task_unlock(arg->parent);
