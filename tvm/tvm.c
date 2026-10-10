@@ -1952,6 +1952,7 @@ struct task {
     pthread_mutex_t tsk_lock;
     struct file *tsk_files[MAX_FILES];
     struct list_head tsk_filestreams;  // file_stream_container
+    pthread_mutex_t tsk_streams_lock;  // changes to tsk_filestreams (with tsk_lock), fflush(NULL)'s walk; before a stream's lock, before tsk_lock
     struct file_stream *tsk_io_filestreams[3];
     int tsk_state;
     pthread_cond_t tsk_wait_cond;
@@ -2248,6 +2249,9 @@ static struct task *taskalloc_common()
     if (pthread_mutex_init(&t->tsk_lock, NULL) != 0) {
         goto out;
     }
+    if (pthread_mutex_init(&t->tsk_streams_lock, NULL) != 0) {
+        goto out;
+    }
     if (pthread_cond_init(&t->tsk_wait_cond, NULL) != 0) {
         goto out;
     }
@@ -2284,6 +2288,7 @@ static void taskdealloc(struct task *t)
     // unlocks it explicitly in terminate_current_locked before pthread_exit.
     pthread_cond_destroy(&t->tsk_wait_cond);
     pthread_mutex_destroy(&t->tsk_lock);
+    pthread_mutex_destroy(&t->tsk_streams_lock);
 
     kfree(t);
 }
@@ -3969,7 +3974,6 @@ struct file_stream {
     };
 
     char fs_mode[5]; // for files only
-    int fs_flush_pending; // fflush(NULL): lock was busy, retry this stream
     int fs_discard;       // deallocate without flushing (execve)
     pid_t fs_pid;    // popen(): the child running the command, reaped by pclose()
 
@@ -13552,10 +13556,12 @@ FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
 
 FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     tvm_sig_enter();
+    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
     struct file_stream *fs = task_filestreamalloc_locked(current);
     if (!fs) {
         task_unlock(current);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         return NULL;
     }
@@ -13564,6 +13570,7 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     if (!file) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         return NULL;
     }
@@ -13596,6 +13603,7 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
         file_unlock(file, 1);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         errno = last_errno;
         return NULL;
@@ -13610,6 +13618,7 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     fs->fs_type = FS_DIR;
     fs->fs_dp = dp;
 
+    pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
     
     return (DIR *)fs;
@@ -13625,9 +13634,11 @@ FUNCTION_DEFINE1(int, closedir, DIR *, dir) {
     int nfd = fs->fs_nfd;
 
     tvm_sig_enter();
+    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
     task_filestreamdealloc_locked(current, fs);
     task_unlock(current);
+    pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
     
     if (-1 == close(nfd))
@@ -13783,10 +13794,12 @@ FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
 
 FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     tvm_sig_enter();
+    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
     struct file_stream *fs = task_filestreamalloc_locked(current);
     if (!fs) {
         task_unlock(current);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         return NULL;
     }
@@ -13795,6 +13808,7 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     if (!file) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         return NULL;
     }
@@ -13806,6 +13820,7 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
         file_unlock(file, 1);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         return NULL;
     }
@@ -13822,6 +13837,7 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
     fs->fs_type = FS_FILE;
     fs->fs_fp = fp;
     
+    pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
 
     return (FILE *)fs;
@@ -13924,6 +13940,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     struct file_stream *fs = (struct file_stream *)stream;
 
     tvm_sig_enter();
+    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
 
     // fclose(stdout): the guest names libc's own stdout object, which every
@@ -13945,6 +13962,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
         fs = current->tsk_io_filestreams[std];
         if (!fs || fs->fs_nfd < 0) {
             task_unlock(current);
+            pthread_mutex_unlock(&current->tsk_streams_lock);
             tvm_sig_leave();
             errno = EBADF;
             return EOF;
@@ -13969,6 +13987,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
         }
         fs->fs_nfd = -1;
         task_unlock(current);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         errno = last_errno;
         if (ret == EOF)
@@ -13986,6 +14005,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     int ret = task_filestreamdealloc_locked(current, fs);
     int flush_errno = errno;
     task_unlock(current);
+    pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
 
     if (close(nfd) == -1)
@@ -14035,6 +14055,7 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
 
     tvm_sig_enter();
 
+    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
 
     if (fs->fs_fp) {
@@ -14045,6 +14066,7 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
 
     if (-1 == fd) {
         task_unlock(current);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         // open()'s, not what closing the old FILE above left behind
         errno = open_errno;
@@ -14054,6 +14076,7 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     struct file *file = file_for_task_locked(current, fd);
     if (!file) {
         task_unlock(current);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         close(fd);
         return NULL;
@@ -14065,6 +14088,7 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     if (!fp) {
         task_unlock(current);
         file_unlock(file, 1);
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         close(fd);
         return NULL;
@@ -14082,6 +14106,7 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     fs->fs_type = FS_FILE;
     fs->fs_fp = fp;
 
+    pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
 
     // a standard stream keeps its identity (callers compare with stdout)
@@ -14303,13 +14328,13 @@ FUNCTION_DEFINE_VOID1(funlockfile, FILE *, stream) {
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
     tvm_sig_enter();
 
-    // fflush all open streams
+    // fflush all open streams, in glibc's order: the stream list
+    // (tsk_streams_lock: no stream opened or closed meanwhile), then each
+    // stream's lock, then the task lock.
     //
-    // - Never block on a stream's lock while holding the task lock: a thread
-    //   between flockfile() and funlockfile() needs the task lock for every
-    //   stdio call it makes on that stream, so waiting for it here deadlocked
-    //   both (exit() calls fflush(NULL)). A stream whose lock is taken is
-    //   retried after dropping the task lock, a bounded number of times.
+    // - Wait for a stream's lock with the task unlocked: a thread between
+    //   flockfile() and funlockfile() takes the task lock for every stdio call
+    //   it makes on that stream (exit() calls fflush(NULL)).
     // - Go through file_for_task_stream_locked(), which re-syncs the libc
     //   FILE's descriptor and skips a stream whose descriptor is gone, rather
     //   than flushing into a stale or reused host descriptor.
@@ -14318,40 +14343,27 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
     //   SIGPIPE it should raise. EPIPE is remembered explicitly.
     if (!stream) {
         int ret = 0, saw_epipe = 0;
-        for (int attempt = 0; attempt < 200; attempt++) {
-            int busy = 0;
+        pthread_mutex_lock(&current->tsk_streams_lock);
+        struct file_stream_list_entry *fsle;
+        list_for_each_entry(fsle, &current->tsk_filestreams, fsle_list) {
+            struct file_stream *fs = fsle->fsle_stream;
+            if (fs->fs_type != FS_FILE || !fs->fs_fp || !strpbrk(fs->fs_mode, "wa+"))
+                continue;
+            CALL_FUNC(flockfile, fs->fs_fp);
             task_lock(current);
-            struct file_stream_list_entry *fsle;
-            list_for_each_entry(fsle, &current->tsk_filestreams, fsle_list) {
-                struct file_stream *fs = fsle->fsle_stream;
-                if (fs->fs_type != FS_FILE || !fs->fs_fp || fs->fs_nfd < 0)
-                    continue;
-                if (!strpbrk(fs->fs_mode, "wa+"))
-                    continue;
-                if (attempt > 0 && !(fs->fs_flush_pending))
-                    continue;
-                if (0 != CALL_FUNC(ftrylockfile, fs->fs_fp)) {
-                    fs->fs_flush_pending = 1;
-                    busy = 1;
-                    continue;
+            struct file *file = fs->fs_nfd >= 0 ? file_for_task_stream_locked(current, fs, FS_FILE) : NULL;
+            if (file) {
+                if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                    ret = EOF;
+                    if (errno == EPIPE)
+                        saw_epipe = 1;
                 }
-                fs->fs_flush_pending = 0;
-                struct file *file = file_for_task_stream_locked(current, fs, FS_FILE);
-                if (file) {
-                    if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
-                        ret = EOF;
-                        if (errno == EPIPE)
-                            saw_epipe = 1;
-                    }
-                    file_unlock(file, 1);
-                }
-                CALL_FUNC(funlockfile, fs->fs_fp);
+                file_unlock(file, 1);
             }
             task_unlock(current);
-            if (!busy)
-                break;
-            usleep(1000);
+            CALL_FUNC(funlockfile, fs->fs_fp);
         }
+        pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         if (saw_epipe) {
             errno = EPIPE;
@@ -19498,9 +19510,11 @@ do_exec:
     }
     errno = last_errno;
 
+    pthread_mutex_lock(&current->tsk_streams_lock);
     task_lock(current);
     task_exec_reset_streams_locked(current);
     task_unlock(current);
+    pthread_mutex_unlock(&current->tsk_streams_lock);
 
     // POSIX execve: caught signals go back to the default, ignored signals
     // stay ignored (so `trap '' PIPE`, nohup and shells backgrounding a job
