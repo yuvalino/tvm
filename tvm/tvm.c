@@ -2342,17 +2342,26 @@ static LIST_HEAD(rlocks);
 // kfree and the CALL_FUNC(fcntl) syscalls run under rlocks_lock). Nothing
 // takes a task lock under rlocks_lock.
 static pthread_mutex_t rlocks_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t rlocks_cond = PTHREAD_COND_INITIALIZER;   // broadcast on every release, for F_SETLKW waiters
 
 // F_SETLKW waiters, each "waiter is blocked on a lock owner holds", for
-// deadlock detection. Entries live on the waiting thread's stack and are
-// linked only while it sleeps, under rlocks_lock.
+// deadlock detection, and woken by every release through rw_wake (see
+// rlock_sleep). Entries live on the waiting thread's stack and are linked
+// only while it sleeps, under rlocks_lock.
 struct rlock_waiter {
     struct list_head rw_list;
     struct task *rw_waiter;
     struct task *rw_owner;
+    int rw_wake[2];     // a pipe, its write end non-blocking
 };
 static LIST_HEAD(rlock_waiters);
+
+// A lock was released: wake every waiter to look again. With rlocks_lock held.
+static void rlock_wake_locked(void)
+{
+    struct rlock_waiter *w;
+    list_for_each_entry(w, &rlock_waiters, rw_list)
+        (void)CALL_FUNC(write, w->rw_wake[1], "", 1);
+}
 
 // Would `self` blocking on a lock held by `owner` close a cycle? Follows
 // owner -> the owner it is itself waiting for -> ... A kernel refuses such a
@@ -2609,7 +2618,7 @@ static void rlock_release(struct task *t, int rfd)
         kfree(rl);
         t->tsk_rlocks--;
     }
-    pthread_cond_broadcast(&rlocks_cond);
+    rlock_wake_locked();
     pthread_mutex_unlock(&rlocks_lock);
 }
 
@@ -15834,6 +15843,43 @@ FUNCTION_DEFINE6(int, pselect, int, nfds, fd_set *, readfds, fd_set *, writefds,
     return r;
 }
 
+// Whether the calling thread has a pending signal it does not block: one
+// deferred while signals are (tvm_sig_enter), which a wait must not outlast.
+// signal_handler records them per thread (thr_pending_sigs), kill() per task.
+static int signal_deliverable(void)
+{
+    uint32_t pend = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE) |
+                    __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
+    for (int sig = 1; sig < MAX_SIGNALS; sig++)
+        if ((pend & (1u << sig)) && !sigismember(&current_thread->thr_sigmask, sig))
+            return 1;
+    return 0;
+}
+
+// An F_SETLKW's sleep: until `fd` is readable (a release, rlock_wake_locked),
+// `timeout` (NULL: none) passes, or a signal comes, which ends it with EINTR
+// as the kernel's would. The host's signals are blocked from the check for a
+// pending one to pselect(), which unblocks them atomically: one arriving in
+// between interrupts the pselect instead of going unnoticed until a release.
+static int rlock_sleep(int fd, const struct timespec *timeout)
+{
+    sigset_t all, old;
+    sigfillset(&all);
+    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &old);
+    if (!signal_deliverable()) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        if (fd >= 0)
+            FD_SET(fd, &fds);
+        (void)CALL_FUNC(pselect, fd + 1, fd >= 0 ? &fds : NULL, NULL, NULL, timeout, &old);
+    }
+    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old, NULL);
+    if (!signal_deliverable())
+        return 0;
+    errno = EINTR;
+    return -1;
+}
+
 // fcntl(F_GETLK/F_SETLK/F_SETLKW) on a task's descriptor: the record-lock
 // table (see "POSIX record locks" above) decides between tasks, the kernel
 // between this process and the outside.
@@ -15896,14 +15942,17 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                     if (0 == ret)
                         rlock_apply_locked(&spare, st.st_dev, st.st_ino, current, fl->l_type, start, end);
                     if (fl->l_type == F_UNLCK)
-                        pthread_cond_broadcast(&rlocks_cond);
+                        rlock_wake_locked();
                     int held_outside = (-1 == ret && cmd == F_SETLKW && (errno == EAGAIN || errno == EACCES));
                     pthread_mutex_unlock(&rlocks_lock);
                     if (!held_outside)
                         break;
-                    // F_SETLKW held off by a process outside TVM, which the
-                    // condition variable knows nothing about: poll.
-                    usleep(20000);
+                    // F_SETLKW held off by a process outside TVM, whose
+                    // release wakes nobody: look again every 20 ms
+                    if (0 != rlock_sleep(-1, &(struct timespec){ 0, 20 * 1000000L })) {
+                        ret = -1;
+                        break;
+                    }
                 }
                 else if (cmd == F_SETLK) {
                     pthread_mutex_unlock(&rlocks_lock);
@@ -15918,37 +15967,26 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                         ret = -1;
                         break;
                     }
-                    // F_SETLKW: sleep until a release, in short slices so a
-                    // signal that arrived meanwhile interrupts the wait with
-                    // EINTR, as the kernel's would.
+                    // F_SETLKW: sleep until a release or a signal
                     struct rlock_waiter waiter = { .rw_waiter = current, .rw_owner = c->rl_owner };
-                    list_add(&waiter.rw_list, &rlock_waiters);
-                    struct timespec ts;
-                    clock_gettime(CLOCK_REALTIME, &ts);
-                    ts.tv_nsec += 20 * 1000000L;
-                    if (ts.tv_nsec >= 1000000000L) {
-                        ts.tv_sec++;
-                        ts.tv_nsec -= 1000000000L;
+                    if (0 != CALL_FUNC(pipe, waiter.rw_wake)) {
+                        pthread_mutex_unlock(&rlocks_lock);
+                        ret = -1;
+                        break;
                     }
-                    pthread_cond_timedwait(&rlocks_cond, &rlocks_lock, &ts);
+                    CALL_FUNC(fcntl, waiter.rw_wake[1], F_SETFL, O_NONBLOCK);
+                    list_add(&waiter.rw_list, &rlock_waiters);
+                    pthread_mutex_unlock(&rlocks_lock);
+                    int r = rlock_sleep(waiter.rw_wake[0], NULL);
+                    pthread_mutex_lock(&rlocks_lock);
                     list_del(&waiter.rw_list);
                     pthread_mutex_unlock(&rlocks_lock);
-                }
-                // A deliverable signal ends the wait with EINTR. Deferred
-                // signals are recorded per thread (signal_handler sets
-                // thr_pending_sigs); checking only tsk_pending_sigs, which
-                // nothing sets, made the wait impossible to interrupt, even
-                // by SIGKILL.
-                uint32_t pend = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE) |
-                                __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
-                int deliverable = 0;
-                for (int sig = 1; sig < MAX_SIGNALS && !deliverable; sig++)
-                    if ((pend & (1u << sig)) && !sigismember(&current_thread->thr_sigmask, sig))
-                        deliverable = 1;
-                if (deliverable) {
-                    errno = EINTR;
-                    ret = -1;
-                    break;
+                    CALL_FUNC(close, waiter.rw_wake[0]);
+                    CALL_FUNC(close, waiter.rw_wake[1]);
+                    if (0 != r) {
+                        ret = -1;
+                        break;
+                    }
                 }
             }
             rlock_spare_free(&spare);
@@ -18425,7 +18463,6 @@ static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
             tvm_sig_leave();
             return 0;
         }
-        pthread_cond_wait(&current->tsk_wait_cond, &tasks_lock);
 
         // A sibling thread is tearing our task down (its exit()/_exit(), or a
         // fatal signal it took). Its drain loop is waiting for us to leave;
@@ -18440,25 +18477,20 @@ static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
         // not EINTR-interruptible, so without this a task sleeping here is
         // unkillable — even by SIGKILL. task_kill_locked broadcasts our wait
         // cond after delivering; drain the pending signal at a safe point
-        // (fatal → terminate, no return; handlers just run) and restart. Only
-        // *deliverable* (unblocked) pending signals count — a blocked one keeps
-        // its pending bit and would otherwise spin this check forever.
-        uint32_t pend = __atomic_load_n(&current->tsk_pending_sigs, __ATOMIC_ACQUIRE);
-        if (current_thread)
-            pend |= __atomic_load_n(&current_thread->thr_pending_sigs, __ATOMIC_ACQUIRE);
-        int deliverable = 0;
-        for (int sig = 1; sig < MAX_SIGNALS; sig++) {
-            if ((pend & (1u << sig)) && !sigismember(&current_thread->thr_sigmask, sig)) {
-                deliverable = 1;
-                break;
-            }
-        }
-        if (deliverable) {
+        // (fatal → terminate, no return; handlers just run) and look again.
+        // Before each wait, not after it only: a signal that came after
+        // tvm_sig_enter above but before tasks_lock was taken had its
+        // broadcast before anyone waited, and went unnoticed until a child
+        // exited.
+        if (signal_deliverable()) {
             pthread_mutex_unlock(&tasks_lock);
             tvm_sig_leave();  // may not return
             tvm_sig_enter();
             pthread_mutex_lock(&tasks_lock);
+            continue;
         }
+
+        pthread_cond_wait(&current->tsk_wait_cond, &tasks_lock);
     }
 
     task_lock(zombiet);

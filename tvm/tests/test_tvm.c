@@ -2366,6 +2366,68 @@ TEST(FlockReleasedAtThreadExit) {
     ASSERT_EQ(7, WEXITSTATUS(s));
 }
 
+// F_SETLKW on a range another task holds sleeps until that task releases it,
+// and a signal ends the wait with EINTR
+static int rlock_open_locked(const char *path, short type, int cmd) {
+    int fd = open(path, O_RDWR);
+    struct flock fl = { .l_type = type, .l_whence = SEEK_SET };
+    if (fd < 0 || 0 != fcntl(fd, cmd, &fl))
+        return -1;
+    return fd;
+}
+
+static void rlock_on_usr1(int sig) { (void)sig; }
+
+TEST(RlockWaitWakesOnRelease) {
+    char path[] = "/tmp/tvm_rlock_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NEQ(fd, -1);
+    struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    ASSERT_EQ(0, fcntl(fd, F_SETLK, &fl));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p)
+        _exit(rlock_open_locked(path, F_WRLCK, F_SETLKW) >= 0 ? 0 : 1);
+
+    usleep(200000);
+    ASSERT_EQ(0, waitpid(p, NULL, WNOHANG)); // still waiting
+    fl.l_type = F_UNLCK;
+    ASSERT_EQ(0, fcntl(fd, F_SETLK, &fl));
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+    close(fd);
+    ASSERT_EQ(0, unlink(path));
+}
+
+TEST(RlockWaitInterrupted) {
+    char path[] = "/tmp/tvm_rlock_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NEQ(fd, -1);
+    struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    ASSERT_EQ(0, fcntl(fd, F_SETLK, &fl));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct sigaction sa = { .sa_handler = rlock_on_usr1 }; // no SA_RESTART
+        sigaction(SIGUSR1, &sa, NULL);
+        int r = rlock_open_locked(path, F_WRLCK, F_SETLKW);
+        _exit(r == -1 && errno == EINTR ? 0 : 1);
+    }
+
+    usleep(200000);
+    ASSERT_EQ(0, kill(p, SIGUSR1));
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(0, WEXITSTATUS(s));
+    close(fd);
+    ASSERT_EQ(0, unlink(path));
+}
+
 // realpath and getcwd answer in the guest namespace: a mount point hides
 // its source, a cpio link is followed, a host link too.
 TEST(VfsRealpath) {
