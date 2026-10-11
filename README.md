@@ -14,7 +14,7 @@ An open-source, userspace framework that allows running unsigned code and multi-
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/yuvalino/tvm?sort=semver)](https://github.com/yuvalino/tvm/releases)
 
-[Website](https://yuvalino.com) ·
+[Website](https://tvm.yuvalino.com) ·
 [Research paper](https://yuvalino.com/rage-against-the-sandbox)
 
 <a href="https://x.com/jachashx"><img alt="Follow Yuval on X" src="https://img.shields.io/badge/X-000000?logo=x&amp;logoColor=white" /></a>
