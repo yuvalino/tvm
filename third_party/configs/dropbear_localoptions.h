@@ -10,9 +10,6 @@
 #define ECDSA_PRIV_FILENAME "~/.dropbear/dropbear_ecdsa_host_key"
 #define ED25519_PRIV_FILENAME "~/.dropbear/dropbear_ed25519_host_key"
 
-#define DROPBEAR_EMBEDDED_PASSWORD "alpine"
-#define DROPBEAR_PASSWORD_ENVNAME_ENABLED 1
-
 #define DROPBEAR_MULTI 1
 
 /* Our own sftp-server applet, symlinked into the initrd next to the other
@@ -22,6 +19,10 @@
  * so plain "scp" would need -O. */
 #define SFTPSERVER_PATH "/tvm/bin/sftp-server"
 
-#define DROPBEAR_FORKLESS 1
+/* A session's shell gets the server's PATH (run with -e, the environment is
+ * passed on), not upstream's fixed one: under TVM the programs are in
+ * /tvm/bin, and on iOS the launchers find their dylibs through PATH. */
+#define DEFAULT_PATH getenv("PATH")
+#define DEFAULT_ROOT_PATH getenv("PATH")
 
 #endif /* DROPBEAR_LOCALOPTIONS_H_ */

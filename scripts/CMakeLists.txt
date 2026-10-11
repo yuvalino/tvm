@@ -33,7 +33,7 @@ set(TOYBOX_APPLETS
 )
 
 # Dropbear multi-call names
-set(DROPBEAR_APPLETS scp dbclient ssh dropbearkey ssh-keygen sshd)
+set(DROPBEAR_APPLETS scp dbclient ssh dropbearkey ssh-keygen)
 
 # Vim runtime files to bundle
 set(VIM_RUNTIME_FILES

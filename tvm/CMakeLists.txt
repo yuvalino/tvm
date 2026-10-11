@@ -23,7 +23,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # "Dependencies"). CoreFoundation stays on Darwin for the interposer
     # of CFDictionaryApplyFunction, resolved at startup.
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_link_libraries(tvm_exe PRIVATE unicorn pthread util m ${CMAKE_DL_LIBS})
+        target_link_libraries(tvm_exe PRIVATE unicorn pthread util m crypt ${CMAKE_DL_LIBS})
         target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         target_link_libraries(tvm_exe PRIVATE unicorn pthread m "-framework CoreFoundation")

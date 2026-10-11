@@ -3,7 +3,7 @@
 	url = git@github.com:yuvalino/unicorn-forkless.git
 [submodule "third_party/dropbear"]
 	path = third_party/dropbear
-	url = git@github.com:yuvalino/dropbear-forkless.git
+	url = https://github.com/mkj/dropbear.git
 [submodule "third_party/toybox"]
 	path = third_party/toybox
 	url = https://github.com/landley/toybox.git
