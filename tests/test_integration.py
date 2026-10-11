@@ -41,7 +41,7 @@ def _pick_port():
         return s.getsockname()[1]
 
 def _start_tvm_backend(port: int) -> subprocess.Popen:
-    cmd = f"{TVM_BIN} /tvm/bin/sshd -R -e -F -E -p {port}"
+    cmd = f"{TVM_BIN} /tvm/bin/dropbear -R -e -F -E -p {port}"
     logpath = tempfile.mktemp(prefix="tvm_", suffix=".log")
     logfile = open(logpath, "w+")
     env = dict(os.environ)
@@ -121,7 +121,7 @@ def forkless(request, device, backend, ssh_user) -> Iterator[Forkless]:
         address = "localhost"
         proc = _start_tvm_backend(port)
 
-    ready = f"Not backgrounding, port {port}"
+    ready = "Not backgrounding"
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         if proc.poll() is not None:

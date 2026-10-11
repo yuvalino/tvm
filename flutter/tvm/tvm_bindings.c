@@ -165,7 +165,7 @@ static void *worker_entry(void *arg)
 
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", worker_port);
-    char *argv[] = {"sshd", "-R", "-e", "-F", "-E", "-p", port_str, NULL};
+    char *argv[] = {"dropbear", "-R", "-e", "-F", "-E", "-p", port_str, NULL};
 
     app_log("tvm_app_start: booting, exec dropbear\n");
     if (0 != fn_tvm_start("dropbear", argv, worker_envp, &cfg))
@@ -247,7 +247,7 @@ TVM_EXPORT int tvm_app_start(const char *libtvm_path, int port,
     overrides[no++] = env_tmpdir;
     overrides[no++] = env_path;
     if (password) {
-        snprintf(env_password, sizeof(env_password), "DROPBEAR_PASSWORD=%s", password);
+        snprintf(env_password, sizeof(env_password), "TVM_PASSWORD=%s", password);
         overrides[no++] = env_password;
     }
     overrides[no] = NULL;

@@ -66,6 +66,7 @@
 #include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <pty.h>
+#include <crypt.h>
 #include <sys/vfs.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
@@ -13093,6 +13094,7 @@ static int is_noemu_binary(const char *pathname)
 
 
 static void usershell_cache_init(void);
+static void user_passwd_init(void);
 
 #if defined(__linux__)
 /*
@@ -13290,6 +13292,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
 
     // after the initrc, so a `setenv TVM_SHELL=...` there is honored
     usershell_cache_init();
+    user_passwd_init();
 
     // Exec. Never returns on success (ends in the in-VM exit()).
 
@@ -19245,6 +19248,34 @@ static void usershell_cache_init(void)
     usershell_cache_count = n;
 }
 
+// The guest user's password, as crypt() hashes it: what getpwnam() and
+// getpwuid() give as pw_passwd, so a stock sshd (dropbear) checks a login
+// against it with crypt() like any password database's. Set at boot from
+// TVM_PASSWORD, "alpine" without one.
+static char user_passwd_hash[32];
+
+// Hash TVM_PASSWORD once, after the initrc (which may set it), and take it
+// out of the environment: nothing started from here on sees it.
+static void user_passwd_init(void)
+{
+    const char *pw = getenv("TVM_PASSWORD");
+    if (!pw || !*pw)
+        pw = "alpine";
+
+    // BSDi extended DES ("_", 4 characters of rounds, 4 of salt): the one
+    // format both Darwin's crypt() and glibc's libcrypt take, and that uses
+    // all of a password (DES stops at 8 characters; Darwin has no $1$/$6$).
+    static const char itoa64[] = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    char salt[10] = "_J9..";
+    for (int i = 5; i < 9; i++)
+        salt[i] = itoa64[arc4random_uniform(64)];
+    const char *hash = crypt(pw, salt);
+    if (!hash || strlen(hash) >= sizeof(user_passwd_hash))
+        panic("tvm_start::crypt");
+    strcpy(user_passwd_hash, hash);
+    unsetenv("TVM_PASSWORD");
+}
+
 FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
     struct passwd *result = NULL;
     size_t bufsz = 256;
@@ -19264,6 +19295,8 @@ FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
     const char *tvm_shell = getenv("TVM_SHELL");
     if (tvm_shell && *tvm_shell)
         current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
+    if (user_passwd_hash[0])
+        current->tsk_data->pw_buf.pw_passwd = user_passwd_hash;
     return &current->tsk_data->pw_buf;
 }
 
@@ -19286,6 +19319,8 @@ FUNCTION_DEFINE1(struct passwd *, getpwuid, uid_t, uid) {
     const char *tvm_shell = getenv("TVM_SHELL");
     if (tvm_shell && *tvm_shell)
         current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
+    if (user_passwd_hash[0])
+        current->tsk_data->pw_buf.pw_passwd = user_passwd_hash;
     return &current->tsk_data->pw_buf;
 }
 
