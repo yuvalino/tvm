@@ -193,11 +193,9 @@ statically links libcurl and OpenSSL 3 (Apache-2.0) for HTTPS, a combination
 the FSF considers incompatible with GPLv2 (Debian builds git against GnuTLS for
 this reason); review that before redistributing the git binaries.
 
-The login shell is `-bash`: it reads `/tvm/etc/profile` (a login shell does not
-read `$ENV`), which sources `$ENV` (e.g. `ENV=$HOME/.forklessrc` in the app's
-rc) so per-user rc files keep working; `/tvm/bin/sh` is bash invoked as `sh`
-(POSIX mode, reads `$ENV` when interactive) and is what `system(3)` and
-`#!/bin/sh` scripts get.
+The login shell is `-bash`: it reads `/tvm/etc/profile`, which sources the
+user's `~/.bashrc`, then `~/.bash_profile`; `/tvm/bin/sh` is bash invoked as
+`sh` (POSIX mode) and is what `system(3)` and `#!/bin/sh` scripts get.
 
 ### Examples (`examples/`)
 

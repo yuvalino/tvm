@@ -225,8 +225,7 @@ def ssh_interactive(port: int, address: str = "localhost", user: str = "") -> It
         #    (EPERM), but provides a sandbox-accessible TMPDIR ($HOME/Documents/
         #    tmp). Hardcoding /tmp broke every file-writing flutter test.
         # So use /tmp iff writable, else keep the provided/HOME tmpdir.
-        # (Guard `. $ENV`: bash's `.` with an empty $ENV is a usage error.)
-        p.sendline('[ -f "$ENV" ] && . "$ENV"; if touch /tmp/.tvmwt 2>/dev/null; '
+        p.sendline('if touch /tmp/.tvmwt 2>/dev/null; '
                    'then rm -f /tmp/.tvmwt; export TMPDIR=/tmp; '
                    'else export TMPDIR="${TMPDIR:-$HOME/tmp}"; fi; mkdir -p "$TMPDIR"')
         p.expect([r'\$\s*$', r'#\s*$', r'%\s*$'], timeout=5)
@@ -244,8 +243,7 @@ def sshi(forkless: Forkless) -> Iterator[spawn]:
         #    (EPERM), but provides a sandbox-accessible TMPDIR ($HOME/Documents/
         #    tmp). Hardcoding /tmp broke every file-writing flutter test.
         # So use /tmp iff writable, else keep the provided/HOME tmpdir.
-        # (Guard `. $ENV`: bash's `.` with an empty $ENV is a usage error.)
-        p.sendline('[ -f "$ENV" ] && . "$ENV"; if touch /tmp/.tvmwt 2>/dev/null; '
+        p.sendline('if touch /tmp/.tvmwt 2>/dev/null; '
                    'then rm -f /tmp/.tvmwt; export TMPDIR=/tmp; '
                    'else export TMPDIR="${TMPDIR:-$HOME/tmp}"; fi; mkdir -p "$TMPDIR"')
         p.expect(r"\$ ")
@@ -2440,18 +2438,12 @@ def test_tty_columns(sshi: spawn):
 
 # ── Getopt isolation across tasks ────────────────────────────
 
-def test_getopt_concurrent_tasks(forkless: Forkless, device):
+def test_getopt_concurrent_tasks(forkless: Forkless):
     """getopt/optind isolation — two sessions using getopt simultaneously."""
     with ssh(forkless.port, address=forkless.address, user=forkless.user) as s1:
         s1.expect(r"\$ ")
-        if device:
-            s1.sendline(". $ENV 2>/dev/null")
-            s1.expect(r"\$ ")
         with ssh(forkless.port, address=forkless.address, user=forkless.user) as s2:
             s2.expect(r"\$ ")
-            if device:
-                s2.sendline(". $ENV 2>/dev/null")
-                s2.expect(r"\$ ")
             for _ in range(3):
                 s1.sendline("wc -l /dev/null")
                 s2.sendline("wc -w /dev/null")

@@ -2,9 +2,9 @@
 #
 # A login shell does not read /tvm/etc/bash.bashrc, so it is sourced here:
 # the prompt and the TERM fallback are the same for login and non-login
-# shells. Before $ENV, so a user's rc file can override them.
+# shells. Before ~/.bashrc, so a user's rc file can override them.
 [ -f /tvm/etc/bash.bashrc ] && . /tvm/etc/bash.bashrc
 
-# TVM's rc files export ENV (e.g. ENV=$HOME/.forklessrc); bash only honours
-# $ENV itself when invoked as `sh`, so source it here for login shells too.
-[ -n "$ENV" ] && [ -f "$ENV" ] && . "$ENV"
+# Nor does a login shell read ~/.bashrc; no skeleton ~/.bash_profile is
+# created to source it (as distributions do), so source it here.
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
