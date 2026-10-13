@@ -96,7 +96,9 @@ if (tvm_start("sh", argv, envp, &cfg))  // envp NULL = inherit; cfg NULL = all d
 
 `flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
 on-device, letting you `ssh` into a full POSIX environment. The TVM core is
-built as `libtvm.dylib`; dropbear/bash/toybox/vim/curl/less/nano/sqlite3/git as dylibs; the
+built as `libtvm.framework`; dropbear/bash/toybox/vim/curl/less/nano/sqlite3/git
+as frameworks too (`lib<tool>.framework`, an App Store bundle may hold no loose
+dylib); the
 rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
 native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
 `tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
@@ -186,7 +188,7 @@ pytest tests/test_integration.py --device <device-name> --backend flutter
 
 Licensing note: bash, nano and less are GPLv3, git is GPLv2 (unicorn is
 already GPLv2); everything else is permissively licensed. Nothing links against
-them — each is shipped as a separate program (`/tvm/bin/bash`, `libbash.dylib`
+them — each is shipped as a separate program (`/tvm/bin/bash`, `libbash.framework`
 in the apps, and likewise for nano, less and git) — so the GPL covers those
 binaries and their sources only. One caveat: git is GPLv2-only, and its image
 statically links libcurl and OpenSSL 3 (Apache-2.0) for HTTPS, a combination

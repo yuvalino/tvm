@@ -84,31 +84,38 @@ else()
     set(TVM_CC "cc")
 endif()
 
-# Launcher — tiny executable that execs a dylib via PATH
+# Launcher — tiny executable that execs a framework's binary (TVM_FRAMEWORKS)
 set(LAUNCHER_SRC ${SCRIPTS_DIR}/launcher.c)
 function(add_launcher NAME)
     add_custom_target(${NAME}_launcher
         COMMAND ${CMAKE_COMMAND} -E make_directory ${BIN_OUT}
         COMMAND cc -o ${BIN_OUT}/${NAME}_launcher
-            ${LAUNCHER_SRC} -DTARGET=\\\"lib${NAME}.dylib\\\"
+            ${LAUNCHER_SRC} -DTARGET=\\\"lib${NAME}\\\"
         COMMENT "Building ${NAME} launcher"
     )
     set_target_properties(${NAME}_launcher PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endfunction()
 
 # add_shared_lib(<name> <exe-target> <exe-path>)
-# The Flutter apps load each tool as lib<name>.dylib from the app bundle's
-# Frameworks directory (an App Store bundle may not contain standalone
-# executables). <name>_shared converts the tool's own upstream executable,
-# built by <exe-target>, with scripts/exe2lib.py: same code, dylib metadata.
-# No tool is linked twice.
+# The Flutter apps load each tool as lib<name>.framework from the app bundle's
+# Frameworks directory (an App Store bundle may contain neither standalone
+# executables nor loose dylibs). <name>_shared converts the tool's own
+# upstream executable, built by <exe-target>, with scripts/exe2lib.py (same
+# code, dylib metadata) and wraps it with scripts/mkframework.sh. No tool is
+# linked twice.
 find_program(TVM_PYTHON3 python3 REQUIRED)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(TVM_FRAMEWORK_PLATFORM ios)
+else()
+    set(TVM_FRAMEWORK_PLATFORM macos)
+endif()
 function(add_shared_lib NAME EXE_TARGET EXE_PATH)
     add_custom_target(${NAME}_shared
         COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}
-        COMMAND ${TVM_PYTHON3} ${SCRIPTS_DIR}/exe2lib.py ${EXE_PATH} ${LIB_OUT}/lib${NAME}.dylib
-        DEPENDS ${EXE_TARGET} ${SCRIPTS_DIR}/exe2lib.py
-        COMMENT "Converting ${NAME} to lib${NAME}.dylib"
+        COMMAND ${CMAKE_COMMAND} -E env PYTHON3=${TVM_PYTHON3} sh ${SCRIPTS_DIR}/mkframework.sh
+            ${TVM_FRAMEWORK_PLATFORM} exe lib${NAME} ${EXE_PATH} ${LIB_OUT} ${CMAKE_OSX_DEPLOYMENT_TARGET}
+        DEPENDS ${EXE_TARGET} ${SCRIPTS_DIR}/exe2lib.py ${SCRIPTS_DIR}/mkframework.sh
+        COMMENT "Converting ${NAME} to lib${NAME}.framework"
     )
     set_target_properties(${NAME}_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endfunction()

@@ -45,6 +45,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # as for tvm_exe: nothing on the tools' behalf.
     target_link_libraries(tvm_shared PRIVATE unicorn pthread m "-framework CoreFoundation")
     set_target_properties(tvm_shared PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    # The apps embed it as libtvm.framework (see scripts/mkframework.sh)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(TVM_FRAMEWORK_PLATFORM ios)
+    else()
+        set(TVM_FRAMEWORK_PLATFORM macos)
+    endif()
+    add_custom_command(TARGET tvm_shared POST_BUILD
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/mkframework.sh ${TVM_FRAMEWORK_PLATFORM}
+            dylib libtvm $<TARGET_FILE:tvm_shared> ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY} ${CMAKE_OSX_DEPLOYMENT_TARGET}
+        COMMENT "Wrapping libtvm.dylib in libtvm.framework"
+    )
 endif()
 
 # tests (not for iOS)
