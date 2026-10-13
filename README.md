@@ -7,9 +7,9 @@
 
 # tvm
 
-**Bypass security sandbox restrictions without use of vulnerabilities.**
+**Bypass iOS security sandbox restrictions - no jailbreak or exploits required.**
 
-An open-source, userspace framework that allows running unsigned code and multi-process workflows in highly sandboxed environments (iOS).
+SSH into an iPhone and run unsigned code in a shell with bash, vim, toybox, and git.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/yuvalino/tvm?sort=semver)](https://github.com/yuvalino/tvm/releases)
