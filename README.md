@@ -23,13 +23,15 @@ SSH into an iPhone and run unsigned code in a shell with bash, vim, toybox, and 
 
 ![tvm demo screenshot](rsc/tvm-demo.gif)
 
-## What's TVM ?
+## What's TVM?
 
-Thread-based process virtualization framework. Lets sandboxed applications with no `fork()` permissions run POSIX-compliant and multi-process reliant software by implementing processes as thread groups.
+It's a combination of two novel technologies: **Thread-based Process Virtualization** and **Hybrid CPU Emulation**.
 
-With TVM, `fork()` creates a new thread group (task) that shares resources like file descriptors and signal handlers. Memory ranges are duplicated with pointer fixup to imitate copy-on-write. A dedicated heap (`rmem.c`) and linker (`ulinker.c`) optimize this to be as fast as possible.
+**Thread-based Process Virtualization.** iOS applications cannot create child processes (call `fork()`) per Sandbox policy, and are unable to run shells because of it. We virtualize multi-processing by overriding `fork()` (and a bunch of other functions). Our `fork()` implements thread-groups that imitate the isolation of processes (file-descriptor tables, signal handlers, etc.). This allows open-source projects that rely on multi-process environments (such as bash, git, or dropbear) to run without any modification. The novelty here is the implementation of COW ([Copy-on-write](https://en.wikipedia.org/wiki/Copy-on-write)) semantics in a [single address space](https://en.wikipedia.org/wiki/Single_address_space_operating_system), since we cannot manage virtual memory mappings for threads individually. Memory ranges are duplicated with pointer fixup to imitate COW. A dedicated heap (`rmem.c`) and linker (`ulinker.c`) optimize this to be as fast as possible.
 
-Unsigned code execution is supported via the [Unicorn](https://www.unicorn-engine.org/) CPU emulator. When the emulator hits a signed region, it traps and lets the real CPU take over.
+**Hybrid CPU Emulation.** Code signing on iPhones prevents the ability to run any executable that is not signed with Apple's services and shipped in its own application bundle. We use a pre-signed emulator to interpret unsigned code instructions without mapping them with `EXEC` protections or using [JIT](https://en.wikipedia.org/wiki/Just-in-time_compilation). The twist is integrating emulation into the host. Emulated memory operations are passed through to the host address space. When unsigned code calls any signed function, we configure the emulator to trap out and let the flow continue on the bare-metal CPU. When that code returns, we jump back to the emulator with the result. The outcome is hybrid execution that, to the program, appears continuous on a single CPU.
+
+TVM is a dynamic library (`.so`, `.dylib`) targeting **arm64 iOS**, **arm64 macOS** and **x86-64 Linux** (**arm64 Android** soon), each covered by unit and integration tests. This project also provides two ready-made frontends: a Flutter app and a CLI executable.
 
 ## Building
 
