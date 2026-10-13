@@ -21,7 +21,7 @@ An open-source, userspace framework that allows running unsigned code and multi-
 
 </div>
 
-![tvm demo screenshot](rsc/tvm-demo-screenshot.jpg)
+![tvm demo screenshot](rsc/tvm-demo.gif)
 
 ## What's TVM ?
 
