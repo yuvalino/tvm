@@ -9,7 +9,7 @@
 typedef void (*tvm_output_cb)(const char *data, int len);
 
 // Launches the TVM worker + output reader threads. Returns 0 on success.
-// Loads libtvm.dylib from libtvm_path, builds the guest environment, and
+// Loads libtvm from libtvm_path (Frameworks/libtvm.framework/libtvm), builds the guest environment, and
 // boots the VM with the initrd mounted at /tvm and dropbear listening on
 // the given port. Does not return until the threads are spawned (the worker
 // runs for the app's lifetime).

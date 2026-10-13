@@ -106,8 +106,8 @@ class WorkerController {
 
   static String _libtvmPath() {
     final appDir = _appDir();
-    if (Platform.isMacOS) return '$appDir/../Frameworks/libtvm.dylib';
-    return '$appDir/Frameworks/libtvm.dylib'; // iOS
+    if (Platform.isMacOS) return '$appDir/../Frameworks/libtvm.framework/libtvm';
+    return '$appDir/Frameworks/libtvm.framework/libtvm'; // iOS
   }
 
   static String _flutterAssetsDir() {

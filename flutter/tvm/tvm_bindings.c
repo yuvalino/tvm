@@ -200,14 +200,17 @@ TVM_EXPORT int tvm_app_start(const char *libtvm_path, int port,
         return -1;
     }
 
-    // Frameworks dir = dirname(libtvm_path). The sidecar dylibs live there,
-    // so it must be on PATH for the launchers' execvp to resolve them.
+    // Frameworks dir = libtvm_path less "/libtvm.framework/libtvm". The
+    // tools' frameworks live there; the launchers find them through
+    // TVM_FRAMEWORKS.
     char fwdir[PATH_MAX];
     strncpy(fwdir, libtvm_path, sizeof(fwdir) - 1);
     fwdir[sizeof(fwdir) - 1] = '\0';
-    char *slash = strrchr(fwdir, '/');
-    if (slash)
-        *slash = '\0';
+    for (int i = 0; i < 2; i++) {
+        char *slash = strrchr(fwdir, '/');
+        if (slash)
+            *slash = '\0';
+    }
 
     // Home is the app sandbox's Documents dir (the writable area on iOS),
     // matching devtool. The sandbox root itself is not writable.
@@ -237,15 +240,18 @@ TVM_EXPORT int tvm_app_start(const char *libtvm_path, int port,
     static char env_tmpdir[PATH_MAX + 8];
     static char env_password[256];
     static char env_path[PATH_MAX * 2 + 8];
+    static char env_frameworks[PATH_MAX + 16];
     snprintf(env_home, sizeof(env_home), "HOME=%s", worker_home);
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s", home_tmp);
     snprintf(env_path, sizeof(env_path), "PATH=%s:/tvm/bin:%s", fwdir, old_path);
+    snprintf(env_frameworks, sizeof(env_frameworks), "TVM_FRAMEWORKS=%s", fwdir);
 
-    const char *overrides[5];
+    const char *overrides[6];
     int no = 0;
     overrides[no++] = env_home;
     overrides[no++] = env_tmpdir;
     overrides[no++] = env_path;
+    overrides[no++] = env_frameworks;
     if (password) {
         snprintf(env_password, sizeof(env_password), "TVM_PASSWORD=%s", password);
         overrides[no++] = env_password;

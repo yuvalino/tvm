@@ -5,7 +5,7 @@ mount --bind /tvm/bin/sh:/bin/sh
 mount --bind /tvm/bin/bash:/bin/bash
 mount --bind /tvm/bin/env:/usr/bin/env
 setenv TVM_SHELL=/tvm/bin/bash
-setenv? TVM_NOEMU=libdropbear.dylib:libbash.dylib:libtoybox.dylib:libvim.dylib:libsftpserver.dylib:libcurl.dylib:libless.dylib:libnano.dylib:libsqlite.dylib:libgit.dylib:libgit-remote-http.dylib:libgit-http-fetch.dylib
+setenv? TVM_NOEMU=libdropbear:libbash:libtoybox:libvim:libsftpserver:libcurl:libless:libnano:libsqlite:libgit:libgit-remote-http:libgit-http-fetch
 setenv TERMINFO=/tvm/share/terminfo
 setenv? PAGER=less
 setenv? LESS=-R

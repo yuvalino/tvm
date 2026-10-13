@@ -3,10 +3,10 @@
 
 usage: exe2lib.py <executable> <output.dylib> [<install-name>]
 
-The Flutter apps load each tool as lib<tool>.dylib from the app bundle's
-Frameworks directory (an App Store bundle may contain no standalone
-executables, ITMS-90171), while the tools are built the upstream way as
-executables. This rewrites only the executable's metadata so the result is
+The Flutter apps load each tool as the binary of lib<tool>.framework in the
+app bundle's Frameworks directory (an App Store bundle may contain no
+standalone executables, ITMS-90171; scripts/mkframework.sh), while the tools
+are built the upstream way as executables. This rewrites only the executable's metadata so the result is
 a regular dylib, as ld would have written it:
 
 - the header's file type becomes MH_DYLIB; MH_PIE (executables only) is
@@ -18,7 +18,7 @@ a regular dylib, as ld would have written it:
 - LC_MAIN and LC_LOAD_DYLINKER (executables only) are removed and an
   LC_ID_DYLIB is added right after the segments, where ld puts it;
 - the old code signature is removed; sign the result afterwards
-  (codesign --force), as the app's build phase does for every dylib.
+  (codesign --force), as the app's build phase does for every framework.
 
 Segment addresses are left alone (__TEXT stays at 0x100000000, a valid
 preferred load address for a slid dylib), so code, data, symbols and fixup
