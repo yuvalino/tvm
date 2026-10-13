@@ -33,6 +33,44 @@ It's a combination of two novel technologies: **Thread-based Process Virtualizat
 
 TVM is a dynamic library (`.so`, `.dylib`) targeting **arm64 iOS**, **arm64 macOS** and **x86-64 Linux** (**arm64 Android** soon), each covered by unit and integration tests. This project also provides two ready-made frontends: a Flutter app and a CLI executable.
 
+## Getting Started
+
+Two steps to a shell on your iPhone.
+
+**1. Get the app**
+
+You need a Mac with Xcode and [Flutter](https://docs.flutter.dev/get-started/install), plus the [build requirements](#building).
+
+Open `flutter/ios/Runner.xcworkspace` in Xcode, set your own team and bundle identifier under *Signing & Capabilities* (see the [signing note](#running-on-an-ios-device)), then:
+
+```sh
+python3 build.py -a ios-arm64 -t flutter
+```
+
+Plug in the iPhone, tap *Trust*, and run:
+
+```sh
+xcrun devicectl device install app --device <device-name> output/ios-arm64/lib/flutter
+xcrun devicectl device process launch --device <device-name> com.yuvalino.tvm  # or your bundle identifier
+```
+
+**2. Connect**
+
+```sh
+ssh -p 2222 mobile@<device-name>.local  # password: alpine
+```
+
+Or over USB, with `iproxy` from [libimobiledevice](https://libimobiledevice.org):
+
+```sh
+iproxy 2222:2222 &
+ssh -p 2222 mobile@localhost
+```
+
+That's bash, running on a stock iPhone. Knock yourself out.
+
+![An iPhone running tvm next to an SSH session into it](rsc/iphone-screenshot.jpg)
+
 ## Building
 
 Requirements: CMake 3.16+, Ninja, Python 3, a C compiler.
