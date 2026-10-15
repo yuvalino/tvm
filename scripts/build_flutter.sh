@@ -15,10 +15,11 @@ cd "$SRCDIR"
 case "$(uname)" in
     Darwin)
         if [ "${TVM_IOS_CROSS:-}" = "1" ]; then
+            # Xcode never removes files from the bundle, so whatever an earlier
+            # build left there (e.g. a signed build's profile and signature)
+            # would end up in the IPA (Xcode's product, and flutter's copy)
+            rm -rf build/ios/Release-iphoneos/Runner.app build/ios/iphoneos/Runner.app
             if [ "${TVM_NO_CODESIGN:-}" = "1" ]; then
-                # an earlier signed build's profile and signature would stay
-                # in the bundle otherwise (Xcode's product, and flutter's copy)
-                rm -rf build/ios/Release-iphoneos/Runner.app build/ios/iphoneos/Runner.app
                 "$FLUTTER" build ios --release --no-codesign
             else
                 "$FLUTTER" build ios --release
