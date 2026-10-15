@@ -50,7 +50,7 @@ python3 build.py -a ios-arm64 -t flutter
 Plug in the iPhone, tap *Trust*, and run:
 
 ```sh
-xcrun devicectl device install app --device <device-name> output/ios-arm64/lib/flutter
+xcrun devicectl device install app --device <device-name> output/ios-arm64/bin/tvm.ipa
 xcrun devicectl device process launch --device <device-name> com.yuvalino.tvm  # or your bundle identifier
 ```
 
@@ -150,9 +150,10 @@ python3 build.py -a ios-arm64   -t flutter
 python3 build.py -a macos-arm64 -t flutter
 ```
 
-The build symlinks the app at `output/<arch>/lib/flutter` (→ `Runner.app` on
-iOS, `tvm.app` on macOS) — use that path, consistent with the rest of the
-`output/<arch>` layout.
+On iOS the build packages the app as `output/ios-arm64/bin/tvm.ipa`; on macOS
+the app is `flutter/build/macos/Build/Products/Release/tvm.app`. Pass
+`--no-codesign` (iOS only) to build the IPA unsigned, for others to re-sign with
+their own identity.
 
 ### Running on an iOS device
 
@@ -160,7 +161,7 @@ The device must be paired/trusted (over USB once, then usable over the network
 tunnel). Use `xcrun devicectl` with the device name:
 
 ```sh
-xcrun devicectl device install app --device <device-name> output/ios-arm64/lib/flutter
+xcrun devicectl device install app --device <device-name> output/ios-arm64/bin/tvm.ipa
 xcrun devicectl device process launch --device <device-name> com.yuvalino.tvm
 # then: ssh -p 2222 mobile@<device-name>.local   (default password: alpine)
 ```

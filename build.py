@@ -122,10 +122,17 @@ def main():
                         help="show full build commands")
     parser.add_argument("-l", action="store_true",
                         help="list available targets")
+    parser.add_argument("--no-codesign", action="store_true",
+                        help="build the iOS flutter app unsigned")
     args = parser.parse_args()
 
     if args.a is None:
         args.a = detect_platform()
+
+    if args.no_codesign:
+        if args.a != "ios-arm64":
+            parser.error("--no-codesign is only supported with -a ios-arm64")
+        os.environ["TVM_NO_CODESIGN"] = "1"
 
     if args.l:
         list_targets(args.a)
