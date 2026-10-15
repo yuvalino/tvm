@@ -39,6 +39,15 @@ Two steps to a shell on your iPhone.
 
 **1. Get the app**
 
+Download [`tvm.ipa`](https://github.com/yuvalino/tvm/releases/latest/download/tvm.ipa) from the [latest release](https://github.com/yuvalino/tvm/releases/latest). It is unsigned, so sign and install it with [Sideloadly](https://sideloadly.io) (macOS / Windows): plug in the iPhone, drag `tvm.ipa` into Sideloadly, enter your Apple ID and click *Start*.
+
+On the iPhone, enable *Settings → Privacy & Security → Developer Mode* (iOS 16+, restarts the phone), then trust your Apple ID under *Settings → General → VPN & Device Management*, and open tvm.
+
+With a free Apple ID the app expires after 7 days; sideload it again to renew.
+
+<details>
+<summary>Or build it from source</summary>
+
 You need a Mac with Xcode and [Flutter](https://docs.flutter.dev/get-started/install), plus the [build requirements](#building).
 
 Open `flutter/ios/Runner.xcworkspace` in Xcode, set your own team and bundle identifier under *Signing & Capabilities* (see the [signing note](#running-on-an-ios-device)), then:
@@ -53,6 +62,8 @@ Plug in the iPhone, tap *Trust*, and run:
 xcrun devicectl device install app --device <device-name> output/ios-arm64/bin/tvm.ipa
 xcrun devicectl device process launch --device <device-name> com.yuvalino.tvm  # or your bundle identifier
 ```
+
+</details>
 
 **2. Connect**
 
