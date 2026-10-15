@@ -35,7 +35,7 @@ TVM is a dynamic library (`.so`, `.dylib`) targeting **arm64 iOS**, **arm64 macO
 
 ## Getting Started
 
-Two steps to a shell on your iPhone.
+Three steps to a shell on your iPhone.
 
 **1. Get the app**
 
@@ -43,27 +43,7 @@ Download [`tvm.ipa`](https://github.com/yuvalino/tvm/releases/latest/download/tv
 
 On the iPhone, enable *Settings → Privacy & Security → Developer Mode* (iOS 16+, restarts the phone), then trust your Apple ID under *Settings → General → VPN & Device Management*, and open tvm.
 
-With a free Apple ID the app expires after 7 days; sideload it again to renew.
-
-<details>
-<summary>Or build it from source</summary>
-
-You need a Mac with Xcode and [Flutter](https://docs.flutter.dev/get-started/install), plus the [build requirements](#building).
-
-Open `flutter/ios/Runner.xcworkspace` in Xcode, set your own team and bundle identifier under *Signing & Capabilities* (see the [signing note](#running-on-an-ios-device)), then:
-
-```sh
-python3 build.py -a ios-arm64 -t flutter
-```
-
-Plug in the iPhone, tap *Trust*, and run:
-
-```sh
-xcrun devicectl device install app --device <device-name> output/ios-arm64/bin/tvm.ipa
-xcrun devicectl device process launch --device <device-name> com.yuvalino.tvm  # or your bundle identifier
-```
-
-</details>
+With a free Apple ID the app expires after 7 days; sideload it again to renew. Or [build it from source](#building-from-source).
 
 **2. Connect**
 
@@ -78,30 +58,64 @@ iproxy 2222:2222 &
 ssh -p 2222 mobile@localhost
 ```
 
+**3. Change the password**
+
+Anyone on your network can log in with the default password. Change it in the app (gear icon → *SSH Pass*), then quit and reopen tvm for it to take effect.
+
 That's bash, running on a stock iPhone. Knock yourself out.
 
 ![An iPhone running tvm next to an SSH session into it](rsc/iphone-screenshot.jpg)
 
-## Building
+## What's inside
 
-Requirements: CMake 3.16+, Ninja, Python 3, a C compiler.
+bash 5.3, vim, nano, less, git, curl, sqlite3, the toybox utilities (`ls`, `cat`, `grep`, …), Apple's BSD userland (`ifconfig`, `netstat`), and `scp`/`sftp` through dropbear. Versions, build details and licenses are under [Third-party software](#third-party-software).
 
-On macOS, also install: `brew install gnu-sed openssl`
+The login shell is `-bash`: it reads `/tvm/etc/profile`, which sources the
+user's `~/.bashrc`, then `~/.bash_profile`; `/tvm/bin/sh` is bash invoked as
+`sh` (POSIX mode) and is what `system(3)` and `#!/bin/sh` scripts get.
+
+## Building from source
+
+Requirements: CMake 3.16+, Ninja, Python 3, a C compiler. On macOS, also
+`brew install gnu-sed openssl`, and for the apps Xcode and
+[Flutter](https://docs.flutter.dev/get-started/install).
 
 ```sh
-# Build TVM CLI executable (default)
+# TVM CLI executable (default)
 python3 build.py
 
-# Build TVM flutter app for iOS
-python3 build.py -a ios-arm64 -t flutter
+# The app (always release). Pick the platform with -a.
+python3 build.py -a ios-arm64   -t flutter
+python3 build.py -a macos-arm64 -t flutter
 
-# Build tests
+# Unit tests, examples
 python3 build.py -t tests
+python3 build.py -t examples
 ```
 
-Output goes to `output/<platform>/bin/` (auto-detected: `linux-x64` or `macos-arm64`).
+Without `-a` the platform is auto-detected (`linux-x64` or `macos-arm64`).
+Output goes to `output/<platform>/`: executables and tests in `bin/`, libtvm
+and the tools' frameworks in `lib/`. The iOS app is packaged as
+`output/ios-arm64/bin/tvm.ipa`; the macOS app is
+`flutter/build/macos/Build/Products/Release/tvm.app`.
 
-## Running
+### The app
+
+`flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
+on-device. The TVM core is built as `libtvm.framework`, and
+dropbear/bash/toybox/vim/curl/less/nano/sqlite3/git as frameworks too
+(`lib<tool>.framework`). The rootfs is a per-platform Flutter asset
+(`initrd.flutter.<arch>.cpio`). The native glue (`flutter/tvm/tvm_bindings.c`)
+`dlopen`s libtvm, resolves `tvm_start` from it (see
+[Embedding libtvm](#embedding-libtvm)) and calls it on a worker thread.
+
+Signing: open `flutter/ios/Runner.xcworkspace` in Xcode and set your own team
+and bundle identifier under *Signing & Capabilities* (the project is set up
+with the author's). `iOS.entitlements` requests `increased-memory-limit`, so
+that capability must be enabled on your App ID. To build the IPA unsigned,
+for others to sign with their own identity, pass `--no-codesign` (iOS only).
+
+## The CLI (macOS / Linux)
 
 ```sh
 # Run a program in TVM
@@ -121,143 +135,7 @@ The CLI launcher sets `HOME` to the directory it is started from, so per-user
 files the guest writes (`.bash_history`, `.gitconfig`, `.dropbear/`, rc files)
 land there, not in your real home directory.
 
-## Embedding
-
-`libtvm` exposes one entry point, declared in `tvm/tvm.h`. It boots the VM and
-execs the program inside it, on a thread of its own, and returns:
-
-```c
-#include "tvm.h"
-
-struct tvm_mount initrd = { .path = "/tvm", .data = cpio_bytes, .size = cpio_len };
-struct tvm_config cfg = {
-    .log_fd  = STDOUT_FILENO,       // -1 disables kernel logging
-    .cwd     = "/some/dir",         // NULL = host cwd
-    .initrc  = "/tvm/etc/init.rc",  // NULL = none; may live inside a mount
-    .mounts  = &initrd,
-    .nmounts = 1,
-};
-char *argv[] = { "sh", "-l", NULL };
-if (tvm_start("sh", argv, envp, &cfg))  // envp NULL = inherit; cfg NULL = all defaults
-    perror("tvm_start");                // a pre-boot failure
-// else sh runs as the init task, on a thread of its own; its exit ends the process
-```
-
-## Flutter app (iOS / macOS)
-
-`flutter/` is a Flutter app that embeds TVM and runs an SSH server (dropbear)
-on-device, letting you `ssh` into a full POSIX environment. The TVM core is
-built as `libtvm.framework`; dropbear/bash/toybox/vim/curl/less/nano/sqlite3/git
-as frameworks too (`lib<tool>.framework`, an App Store bundle may hold no loose
-dylib); the
-rootfs is a per-platform Flutter asset (`initrd.flutter.<arch>.cpio`). The
-native glue (`flutter/tvm/tvm_bindings.c`) `dlopen`s libtvm, resolves
-`tvm_start` from it (see [Embedding](#embedding)) and calls it on a worker
-thread.
-
-```sh
-# Build the app (always release). Pick the platform with -a.
-python3 build.py -a ios-arm64   -t flutter
-python3 build.py -a macos-arm64 -t flutter
-```
-
-On iOS the build packages the app as `output/ios-arm64/bin/tvm.ipa`; on macOS
-the app is `flutter/build/macos/Build/Products/Release/tvm.app`. Pass
-`--no-codesign` (iOS only) to build the IPA unsigned, for others to re-sign with
-their own identity.
-
-### Running on an iOS device
-
-The device must be paired/trusted (over USB once, then usable over the network
-tunnel). Use `xcrun devicectl` with the device name:
-
-```sh
-xcrun devicectl device install app --device <device-name> output/ios-arm64/bin/tvm.ipa
-xcrun devicectl device process launch --device <device-name> com.yuvalino.tvm
-# then: ssh -p 2222 mobile@<device-name>.local   (default password: alpine)
-```
-
-Signing note: the Runner target is pinned to a development team, and
-`iOS.entitlements` requests `increased-memory-limit` — that capability must be
-enabled on the App ID in the Apple Developer portal, otherwise signing fails.
-
-### Viewing logs on a device
-
-The app writes its startup info and TVM kernel logs to its in-app console **and**
-to real `stderr` (fd 2). To see them from your Mac, launch with
-`--terminate-existing --console`:
-
-```sh
-xcrun devicectl device process launch --terminate-existing --console \
-    --device <device-name> com.yuvalino.tvm
-```
-
-**`--terminate-existing` is required.** devicectl only connects the app's
-stdout/stderr *"if the app is not already running"* — i.e. on a fresh launch.
-A plain launch, or `--console` while the app is already up, shows nothing.
-
-### Testing on a device
-
-```sh
-# Runs the integration suite against the app's SSH server on the device.
-pytest tests/test_integration.py --device <device-name> --backend flutter
-```
-
-## Programs
-
-### Builtin
-
-`tvm` - diagnostics tool (registered at fake `/usr/bin/tvm` path):
-- `tvm ps` - task list
-- `tvm lsof` - file descriptor tables
-- `tvm pwd` - working directory
-- `tvm env` - environment variables
-- `tvm sorunner` - run shared object
-- `tvm cpio` - CPIO archive reader
-- `tvm mount [-t cpio] FILE TARGET` - mount a CPIO archive (see [INITRC.md](INITRC.md))
-- `tvm mount --bind SOURCE TARGET` - bind a path over another
-- `tvm shell` - execute command via `system()`
-
-### Third-party (`third_party/`)
-
-| Program | Description |
-|---|---|
-| [dropbear](https://github.com/mkj/dropbear) | SSH server, client, and `scp` |
-| sftp-server | Standalone SFTPv3 server (exec'd by dropbear for sftp/scp subsystem) |
-| [bash](https://www.gnu.org/software/bash/) | GNU Bourne-Again Shell 5.3, the login shell and `/tvm/bin/sh` (unpatched upstream, configured via cache variables and `-D` overrides only; see `scripts/build_bash.sh`). Readline's terminal handling through the bundled ncurses and terminfo database. License: GPLv3 |
-| [toybox](http://landley.net/toybox/) | Unix utilities (`ls`, `cat`, `grep`, `id`, etc.) |
-| [vim](https://github.com/vim/vim) | Text editor (unpatched upstream, see `scripts/build_vim.sh`). Terminal handling through the bundled ncurses and terminfo database. License: Vim |
-| [curl](https://curl.se/) | HTTP(S) client, TLS via OpenSSL; certificate verification through the OS trust store on macOS/iOS (Apple SecTrust), Mozilla's CA bundle on Linux. License: curl |
-| [OpenSSL](https://www.openssl.org/) | TLS/crypto library, statically linked into curl. License: Apache-2.0 |
-| [less](https://greenwoodsoftware.com/less/) | Pager (less 710, unpatched upstream; `PAGER=less`, `LESS=-R` by default). Terminal handling through the bundled ncurses and terminfo database. License: GPLv3 / Less License |
-| [nano](https://www.nano-editor.org/) | GNU nano 9.2 text editor (unpatched upstream, built from git with the pinned gnulib; `EDITOR=nano` by default unless set). Syntax highlighting from its own definitions via `/tvm/etc/nanorc`. License: GPLv3 |
-| [ncurses](https://invisible-island.net/ncurses/) | ncurses 6.6 (wide-char), statically linked into bash, vim, less and nano on every platform; a small terminfo database (xterm, screen, tmux, vt100/vt220, linux, ansi, dumb and a few terminal emulators' entries: `TERMINFO_ENTRIES` in `scripts/CMakeLists.txt`) is compiled from its `terminfo.src` into `/tvm/share/terminfo` (`TERMINFO`); `/tvm/etc/bash.bashrc` maps any other `TERM` to xterm-256color. License: MIT |
-| [sqlite3](https://sqlite.org/) | SQLite 3.53.4 command-line shell (unpatched upstream, amalgamation generated by its own configure/make; see `scripts/build_sqlite.sh`). FTS4/FTS5, R*Tree/geopoly, JSON, math functions, dbstat/dbpage/stmt/bytecode virtual tables and zlib (`.archive`) compiled in; no extension loading (`SQLITE_OMIT_LOAD_EXTENSION`, there is no dlopen). Plain POSIX file locking on every platform, emulated between tasks by TVM's `fcntl()`. License: public domain |
-| [linenoise](https://github.com/antirez/linenoise) | Line editing and history for the sqlite3 shell (statically compiled in). License: BSD-2-Clause |
-| [git](https://git-scm.com/) | Git 2.55.0 (unpatched upstream; build knobs in `third_party/configs/git_config.mak`, see `scripts/build_git.sh`). HTTPS through the static libcurl/OpenSSL of the curl tool (Apple SecTrust on macOS/iOS, no CA file needed); the curl helpers `git-remote-http` (`https`, `ftp`, `ftps` are links to it) and `git-http-fetch` are upstream's separate programs in the exec path `/tvm/libexec/git-core`, together with the shell-script helpers; templates in `/tvm/share/git-core/templates`, system config `/tvm/etc/gitconfig`. Pages through `less` (`PAGER`) and edits commit messages in `nano` (`EDITOR`); hooks and `!` aliases run under `/tvm/bin/sh`. No gettext, expat (WebDAV `http-push`), pcre, Perl/Python/Tcl commands, fsmonitor daemon or ssh transport. Set your identity once with `git config --global user.name "Your Name"` and `git config --global user.email you@example.com` (stored in `$HOME/.gitconfig`: the app's data container in the Flutter app; on the CLI, `$HOME` is the directory `tvm` was launched from, see [Running](#running)). License: GPLv2 |
-| [unicorn](https://www.unicorn-engine.org/) | CPU emulator (TCI interpreter mode for iOS) |
-| Apple *_cmds | BSD userland from apple-oss-distributions (`ifconfig`, `netstat`, `ps`, `sysctl`, etc.) |
-
-Licensing note: bash, nano and less are GPLv3, git is GPLv2 (unicorn is
-already GPLv2); everything else is permissively licensed. Nothing links against
-them — each is shipped as a separate program (`/tvm/bin/bash`, `libbash.framework`
-in the apps, and likewise for nano, less and git) — so the GPL covers those
-binaries and their sources only. One caveat: git is GPLv2-only, and its image
-statically links libcurl and OpenSSL 3 (Apache-2.0) for HTTPS, a combination
-the FSF considers incompatible with GPLv2 (Debian builds git against GnuTLS for
-this reason); review that before redistributing the git binaries.
-
-The login shell is `-bash`: it reads `/tvm/etc/profile`, which sources the
-user's `~/.bashrc`, then `~/.bash_profile`; `/tvm/bin/sh` is bash invoked as
-`sh` (POSIX mode) and is what `system(3)` and `#!/bin/sh` scripts get.
-
-### Examples (`examples/`)
-
-Small test programs: `fork`, `snake`, `stopit`, `hello_jmpbuf`, `gdb_backtrace`.
-
-Build with `python3 build.py -t examples`.
-
-## initrc
+### initrc
 
 TVM runs an init script during `tvm_start()` before the main program starts. The script path is the `initrc` field of `struct tvm_config` (NULL = none); a relative path resolves against the init task's cwd and may live inside a config mount.
 
@@ -285,7 +163,47 @@ All arguments support variable expansion (`$VAR` or `${VAR}`).
 
 See [INITRC.md](INITRC.md) for the full specification.
 
-## Tests
+## Embedding libtvm
+
+`libtvm` exposes one entry point, declared in `tvm/tvm.h`. It boots the VM and
+execs the program inside it, on a thread of its own, and returns:
+
+```c
+#include "tvm.h"
+
+struct tvm_mount initrd = { .path = "/tvm", .data = cpio_bytes, .size = cpio_len };
+struct tvm_config cfg = {
+    .log_fd  = STDOUT_FILENO,       // -1 disables kernel logging
+    .cwd     = "/some/dir",         // NULL = host cwd
+    .initrc  = "/tvm/etc/init.rc",  // NULL = none; may live inside a mount
+    .mounts  = &initrd,
+    .nmounts = 1,
+};
+char *argv[] = { "sh", "-l", NULL };
+if (tvm_start("sh", argv, envp, &cfg))  // envp NULL = inherit; cfg NULL = all defaults
+    perror("tvm_start");                // a pre-boot failure
+// else sh runs as the init task, on a thread of its own; its exit ends the process
+```
+
+## Development
+
+### Running on an iOS device
+
+The device must be paired/trusted (over USB once, then usable over the network
+tunnel). Use `xcrun devicectl` with the device name:
+
+```sh
+xcrun devicectl device install app --device <device-name> output/ios-arm64/bin/tvm.ipa
+xcrun devicectl device process launch --terminate-existing --device <device-name> com.yuvalino.tvm  # or your bundle identifier
+# then: ssh -p 2222 mobile@<device-name>.local   (default password: alpine)
+```
+
+Add `--console` to the launch to see the app's startup info and TVM kernel logs
+on your Mac (the app writes them to `stderr` as well as its in-app console).
+devicectl only connects the app's output on a fresh launch, which is why
+`--terminate-existing` is needed.
+
+### Tests
 
 ```sh
 # Unit tests (rmem + tvm)
@@ -297,12 +215,64 @@ python3 build.py -t tests
 pip install pytest pexpect
 python3 build.py -t initrd
 pytest tests/test_integration.py
+
+# Integration tests against the app's SSH server on a device
+# (expects the bundle identifier com.yuvalino.tvm, see tests/test_integration.py)
+pytest tests/test_integration.py --device <device-name> --backend flutter
 ```
 
 Test runner flags: `-l` list tests, `-k=TEST` filter, `-v` verbose, `-g` debug with gdb.
+
+Small example programs live in `examples/`: `fork`, `snake`, `stopit`,
+`hello_jmpbuf`, `gdb_backtrace`.
 
 ## Platforms
 
 - Linux x86-64
 - macOS arm64
 - iOS arm64 (via the Flutter app)
+- Android arm64 (planned)
+
+## Third-party software
+
+The programs and libraries tvm builds from `third_party/` (git submodules,
+unpatched upstream unless noted), and their licenses.
+
+| Program | Description | License |
+|---|---|---|
+| [unicorn](https://www.unicorn-engine.org/) | CPU emulator, linked into libtvm (TCI interpreter mode, no JIT) | GPLv2 |
+| [dropbear](https://github.com/mkj/dropbear) | SSH server, client, and `scp` | MIT-style (see its LICENSE) |
+| [bash](https://www.gnu.org/software/bash/) | GNU Bourne-Again Shell 5.3, the login shell and `/tvm/bin/sh` (configured via cache variables and `-D` overrides only; see `scripts/build_bash.sh`). Readline's terminal handling through the bundled ncurses and terminfo database. | GPLv3 |
+| [toybox](http://landley.net/toybox/) | Unix utilities (`ls`, `cat`, `grep`, `id`, etc.) | 0BSD |
+| [vim](https://github.com/vim/vim) | Text editor (see `scripts/build_vim.sh`). Terminal handling through the bundled ncurses and terminfo database. | Vim |
+| [curl](https://curl.se/) | HTTP(S) client, TLS via OpenSSL; certificate verification through the OS trust store on macOS/iOS (Apple SecTrust), Mozilla's CA bundle on Linux. | curl |
+| [OpenSSL](https://www.openssl.org/) | TLS/crypto library, statically linked into curl | Apache-2.0 |
+| [less](https://greenwoodsoftware.com/less/) | Pager (less 710; `PAGER=less`, `LESS=-R` by default). Terminal handling through the bundled ncurses and terminfo database. | GPLv3 / Less License |
+| [nano](https://www.nano-editor.org/) | GNU nano 9.2 text editor (built from git with the pinned gnulib; `EDITOR=nano` by default unless set). Syntax highlighting from its own definitions via `/tvm/etc/nanorc`. | GPLv3 |
+| [ncurses](https://invisible-island.net/ncurses/) | ncurses 6.6 (wide-char), statically linked into bash, vim, less and nano on every platform; a small terminfo database (xterm, screen, tmux, vt100/vt220, linux, ansi, dumb and a few terminal emulators' entries: `TERMINFO_ENTRIES` in `scripts/CMakeLists.txt`) is compiled from its `terminfo.src` into `/tvm/share/terminfo` (`TERMINFO`); `/tvm/etc/bash.bashrc` maps any other `TERM` to xterm-256color. | MIT |
+| [sqlite3](https://sqlite.org/) | SQLite 3.53.4 command-line shell (amalgamation generated by its own configure/make; see `scripts/build_sqlite.sh`). FTS4/FTS5, R*Tree/geopoly, JSON, math functions, dbstat/dbpage/stmt/bytecode virtual tables and zlib (`.archive`) compiled in; no extension loading (`SQLITE_OMIT_LOAD_EXTENSION`, there is no dlopen). Plain POSIX file locking on every platform, emulated between tasks by TVM's `fcntl()`. | Public domain |
+| [linenoise](https://github.com/antirez/linenoise) | Line editing and history for the sqlite3 shell (statically compiled in) | BSD-2-Clause |
+| [git](https://git-scm.com/) | Git 2.55.0 (build knobs in `third_party/configs/git_config.mak`, see `scripts/build_git.sh`). HTTPS through the static libcurl/OpenSSL of the curl tool (Apple SecTrust on macOS/iOS, no CA file needed); the curl helpers `git-remote-http` (`https`, `ftp`, `ftps` are links to it) and `git-http-fetch` are upstream's separate programs in the exec path `/tvm/libexec/git-core`, together with the shell-script helpers; templates in `/tvm/share/git-core/templates`, system config `/tvm/etc/gitconfig`. Pages through `less` (`PAGER`) and edits commit messages in `nano` (`EDITOR`); hooks and `!` aliases run under `/tvm/bin/sh`. No gettext, expat (WebDAV `http-push`), pcre, Perl/Python/Tcl commands, fsmonitor daemon or ssh transport. | GPLv2 |
+| Apple *_cmds | BSD userland from [apple-oss-distributions](https://github.com/apple-oss-distributions) (`adv_cmds`, `network_cmds`, `system_cmds`, `diskdev_cmds`: `ifconfig`, `netstat`, `ps`, `sysctl`, etc.) | APSL 2.0 / BSD |
+
+### Licensing notes
+
+tvm's own code is MIT ([LICENSE](LICENSE)). unicorn is GPLv2 and statically
+linked into libtvm, so the libtvm, CLI and app binaries built from this
+repository are covered by GPLv2 as a whole.
+
+bash, nano and less are GPLv3, git is GPLv2; everything else is permissively
+licensed. Nothing links against them — each is shipped as a separate program
+(`/tvm/bin/bash`, `libbash.framework` in the apps, and likewise for nano, less
+and git) — so the GPL covers those binaries and their sources only.
+
+One caveat: git is GPLv2-only, and its image statically links libcurl and
+OpenSSL 3 (Apache-2.0) for HTTPS, a combination the FSF considers incompatible
+with GPLv2 (Debian builds git against GnuTLS for this reason); review that
+before redistributing the git binaries.
+
+## License
+
+tvm's own code is MIT ([LICENSE](LICENSE)). The binaries include unicorn
+(GPLv2), and the bundled programs keep their own licenses; see
+[Third-party software](#third-party-software).
