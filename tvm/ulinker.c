@@ -2282,7 +2282,17 @@ struct dlinfo_macho64 {
     struct image_slot_key dlm64_slot_key;
     int dlm64_slot_cacheable;   // native image with executable segments, all mapped
     int dlm64_slot_reused;      // executable segments came from a parked slot
+
+    // thread-local variables, see "Thread-local variables"
+    int           dlm64_tlv_has_key;
+    pthread_key_t dlm64_tlv_key;        // each thread's block of the image's TLVs
+    uintptr_t     dlm64_tlv_template;   // their initial values, in the image
+    size_t        dlm64_tlv_size;       // size of a block
 };
+
+// thread-local variables, see "Thread-local variables"
+static int macho64_tlv_setup(struct dlinfo_macho64 *dl);
+static void macho64_tlv_release(struct dlinfo_macho64 *dl);
 
 struct dlinfo_external {
     struct dlinfo dlext_base;
@@ -3975,8 +3985,10 @@ static void free_library(struct dlinfo *dl)
 
     if (dl->dl_type == DLT_ELF64)
         free_elf64_library((struct dlinfo_elf64 *)dl);
-    else if (dl->dl_type == DLT_MACHO64)
+    else if (dl->dl_type == DLT_MACHO64) {
+        macho64_tlv_release((struct dlinfo_macho64 *)dl);
         free_macho64_library((struct dlinfo_macho64 *)dl);
+    }
     else {
         // TODO abort
         abort();
@@ -4321,6 +4333,265 @@ static void call_macho64_constructors(struct dlinfo_macho64 *dl) {
         }
     }
 }
+
+/* -------------------- Thread-local variables -------------------- */
+
+/*
+ * Mach-O thread-local variables (C11 _Thread_local, C++ thread_local, the
+ * one CPython keeps its current thread state in) are dyld's to set up, and
+ * dyld does not know the images loaded here. An access loads a descriptor
+ * from S_THREAD_LOCAL_VARIABLES ({thunk, key, offset}) and calls its thunk
+ * with the descriptor in x0, which returns the variable's address in x0. The
+ * static linker binds every thunk to dyld's _tlv_bootstrap, which for an
+ * image dyld did not load ends in _tlv_bootstrap_error: abort().
+ *
+ * As dyld does: each image with TLVs gets a pthread key, each thread a block
+ * holding all of the image's variables, initialized from the image's
+ * template (its S_THREAD_LOCAL_REGULAR and S_THREAD_LOCAL_ZEROFILL sections,
+ * contiguous, the zerofill part never written), and every descriptor the key
+ * and our thunk. The thunk is called like dyld's: it may clobber only x0,
+ * x16 and x17, so the fast path is assembly reading the thread's pthread
+ * slot directly (Darwin's thread-specific data array, at TPIDRRO_EL0) and
+ * the first access of a thread goes to C with every other caller-saved
+ * register saved around the call. Emulated images use the same thunk: the
+ * call leaves the emulator, which passes x0 in and takes x0 back only.
+ *
+ * Blocks are allocated from the image's task (uo_malloc), so a fork copies
+ * them with the rest of the task's memory. The child's thread is a new one,
+ * though, with nothing in its slots: the parent's blocks are recorded before
+ * the fork (ulinker_tlv_snapshot, on the forking thread) and the child points
+ * its own keys at the copies (ulinker_tlv_restore).
+ */
+#if defined(__APPLE__) && defined(__aarch64__)
+
+struct tlv_descriptor {
+    void *(*thunk)(struct tlv_descriptor *);
+    unsigned long key;
+    unsigned long offset;
+};
+
+// The image a key belongs to, for a thread's first access.
+#define TLV_KEYS_MAX 1024
+static pthread_mutex_t tlv_mtx = PTHREAD_MUTEX_INITIALIZER;
+static struct dlinfo_macho64 *tlv_images[TLV_KEYS_MAX];
+
+void *ulinker_tlv_get_addr(struct tlv_descriptor *d);
+void *ulinker_tlv_allocate(struct tlv_descriptor *d) __attribute__((visibility("hidden")));
+
+// A thread's first access to one of an image's TLVs: allocate its block.
+void *ulinker_tlv_allocate(struct tlv_descriptor *d)
+{
+    pthread_key_t key = (pthread_key_t)d->key;
+    char *block = pthread_getspecific(key);
+    if (!block) {
+        pthread_mutex_lock(&tlv_mtx);
+        struct dlinfo_macho64 *dl = key < TLV_KEYS_MAX ? tlv_images[key] : NULL;
+        pthread_mutex_unlock(&tlv_mtx);
+        if (!dl) {
+            ERROR("thread-local variable with unknown key %lu", (unsigned long)key);
+            abort();
+        }
+        block = uo.uo_malloc(DLBASE(dl)->dl_linker->ul_private, dl->dlm64_tlv_size);
+        if (!block) {
+            ERROR("out of memory for the thread-local variables of \"%s\"", DLBASE(dl)->dl_name);
+            abort();
+        }
+        memcpy(block, (const void *)dl->dlm64_tlv_template, dl->dlm64_tlv_size);
+        pthread_setspecific(key, block);
+    }
+    return block + d->offset;
+}
+
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".private_extern _ulinker_tlv_get_addr\n"
+    "_ulinker_tlv_get_addr:\n"
+    "    ldr  x16, [x0, #8]\n"              // key
+    "    mrs  x17, TPIDRRO_EL0\n"
+    "    and  x17, x17, #-8\n"              // the thread's pthread slots
+    "    ldr  x17, [x17, x16, lsl #3]\n"    // its block
+    "    cbz  x17, 1f\n"
+    "    ldr  x16, [x0, #16]\n"             // offset
+    "    add  x0, x17, x16\n"
+    "    ret\n"
+    "1:\n"
+    "    stp  x29, x30, [sp, #-16]!\n"
+    "    mov  x29, sp\n"
+    "    stp  x1, x2, [sp, #-16]!\n"
+    "    stp  x3, x4, [sp, #-16]!\n"
+    "    stp  x5, x6, [sp, #-16]!\n"
+    "    stp  x7, x8, [sp, #-16]!\n"
+    "    stp  x9, x10, [sp, #-16]!\n"
+    "    stp  x11, x12, [sp, #-16]!\n"
+    "    stp  x13, x14, [sp, #-16]!\n"
+    "    stp  x15, xzr, [sp, #-16]!\n"
+    "    stp  q0, q1, [sp, #-32]!\n"
+    "    stp  q2, q3, [sp, #-32]!\n"
+    "    stp  q4, q5, [sp, #-32]!\n"
+    "    stp  q6, q7, [sp, #-32]!\n"
+    "    stp  q16, q17, [sp, #-32]!\n"
+    "    stp  q18, q19, [sp, #-32]!\n"
+    "    stp  q20, q21, [sp, #-32]!\n"
+    "    stp  q22, q23, [sp, #-32]!\n"
+    "    stp  q24, q25, [sp, #-32]!\n"
+    "    stp  q26, q27, [sp, #-32]!\n"
+    "    stp  q28, q29, [sp, #-32]!\n"
+    "    stp  q30, q31, [sp, #-32]!\n"
+    "    bl   _ulinker_tlv_allocate\n"
+    "    ldp  q30, q31, [sp], #32\n"
+    "    ldp  q28, q29, [sp], #32\n"
+    "    ldp  q26, q27, [sp], #32\n"
+    "    ldp  q24, q25, [sp], #32\n"
+    "    ldp  q22, q23, [sp], #32\n"
+    "    ldp  q20, q21, [sp], #32\n"
+    "    ldp  q18, q19, [sp], #32\n"
+    "    ldp  q16, q17, [sp], #32\n"
+    "    ldp  q6, q7, [sp], #32\n"
+    "    ldp  q4, q5, [sp], #32\n"
+    "    ldp  q2, q3, [sp], #32\n"
+    "    ldp  q0, q1, [sp], #32\n"
+    "    ldp  x15, xzr, [sp], #16\n"
+    "    ldp  x13, x14, [sp], #16\n"
+    "    ldp  x11, x12, [sp], #16\n"
+    "    ldp  x9, x10, [sp], #16\n"
+    "    ldp  x7, x8, [sp], #16\n"
+    "    ldp  x5, x6, [sp], #16\n"
+    "    ldp  x3, x4, [sp], #16\n"
+    "    ldp  x1, x2, [sp], #16\n"
+    "    ldp  x29, x30, [sp], #16\n"
+    "    ret\n"
+);
+
+// Give the image a key (the first time) and point its descriptors at it and
+// at the thunk. Again for a fork child once its writable segments hold the
+// parent's descriptors, which name the parent's key.
+static int macho64_tlv_setup(struct dlinfo_macho64 *dl)
+{
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    int has_vars = 0;
+    const struct load_command *lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+        for (size_t j = 0; j < sc->nsects; j++, sect++) {
+            uint32_t type = sect->flags & SECTION_TYPE;
+            if (type == S_THREAD_LOCAL_REGULAR || type == S_THREAD_LOCAL_ZEROFILL) {
+                uintptr_t start = dl->dlm64_load_bias + sect->addr;
+                if (start < lo)
+                    lo = start;
+                if (start + sect->size > hi)
+                    hi = start + sect->size;
+            }
+            else if (type == S_THREAD_LOCAL_VARIABLES)
+                has_vars = 1;
+        }
+    }
+    if (!has_vars)
+        return 0;
+
+    if (!dl->dlm64_tlv_has_key) {
+        pthread_key_t key;
+        if (pthread_key_create(&key, NULL)) {
+            ERROR("failed to set up the thread-local variables of \"%s\": no pthread key", DLBASE(dl)->dl_name);
+            return 1;
+        }
+        if (key >= TLV_KEYS_MAX) {
+            pthread_key_delete(key);
+            ERROR("failed to set up the thread-local variables of \"%s\": pthread key %lu out of range", DLBASE(dl)->dl_name, (unsigned long)key);
+            return 1;
+        }
+        dl->dlm64_tlv_key = key;
+        dl->dlm64_tlv_has_key = 1;
+        dl->dlm64_tlv_template = lo == UINTPTR_MAX ? 0 : lo;
+        dl->dlm64_tlv_size = lo == UINTPTR_MAX ? 0 : hi - lo;
+        // a key reused from an image unloaded on this thread starts empty
+        pthread_setspecific(key, NULL);
+        pthread_mutex_lock(&tlv_mtx);
+        tlv_images[key] = dl;
+        pthread_mutex_unlock(&tlv_mtx);
+    }
+
+    lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+        for (size_t j = 0; j < sc->nsects; j++, sect++) {
+            if ((sect->flags & SECTION_TYPE) != S_THREAD_LOCAL_VARIABLES)
+                continue;
+            struct tlv_descriptor *d = (struct tlv_descriptor *)(dl->dlm64_load_bias + sect->addr);
+            struct tlv_descriptor *end = (struct tlv_descriptor *)((uintptr_t)d + sect->size);
+            for (; d < end; d++) {
+                d->thunk = ulinker_tlv_get_addr;
+                d->key = dl->dlm64_tlv_key;
+            }
+        }
+    }
+    return 0;
+}
+
+// Unloading: this thread's block goes back (exec unloads on its only thread),
+// and the key, so that a key reused later starts empty here.
+static void macho64_tlv_release(struct dlinfo_macho64 *dl)
+{
+    if (!dl->dlm64_tlv_has_key)
+        return;
+    void *block = pthread_getspecific(dl->dlm64_tlv_key);
+    if (block) {
+        pthread_setspecific(dl->dlm64_tlv_key, NULL);
+        uo.uo_free(DLBASE(dl)->dl_linker->ul_private, block);
+    }
+    pthread_mutex_lock(&tlv_mtx);
+    tlv_images[dl->dlm64_tlv_key] = NULL;
+    pthread_mutex_unlock(&tlv_mtx);
+    pthread_key_delete(dl->dlm64_tlv_key);
+    dl->dlm64_tlv_has_key = 0;
+}
+
+size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max)
+{
+    size_t n = 0;
+    DLINFO_LOCK(ulinker);
+    for (struct dlinfo *dl = ulinker->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL; dl = dl->dl_next) {
+        if (dl->dl_type != DLT_MACHO64 || !((struct dlinfo_macho64 *)dl)->dlm64_tlv_has_key)
+            continue;
+        if (n < max)
+            blocks[n] = pthread_getspecific(((struct dlinfo_macho64 *)dl)->dlm64_tlv_key);
+        n++;
+    }
+    DLINFO_UNLOCK(ulinker);
+    return n;
+}
+
+void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
+                         void *(*translate)(void *arg, void *p), void *arg)
+{
+    size_t n = 0;
+    DLINFO_LOCK(ulinker);
+    for (struct dlinfo *dl = ulinker->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL && n < count; dl = dl->dl_next) {
+        if (dl->dl_type != DLT_MACHO64 || !((struct dlinfo_macho64 *)dl)->dlm64_tlv_has_key)
+            continue;
+        if (blocks[n])
+            pthread_setspecific(((struct dlinfo_macho64 *)dl)->dlm64_tlv_key, translate(arg, blocks[n]));
+        n++;
+    }
+    DLINFO_UNLOCK(ulinker);
+}
+
+#else
+
+static int macho64_tlv_setup(struct dlinfo_macho64 *dl) { (void)dl; return 0; }
+static void macho64_tlv_release(struct dlinfo_macho64 *dl) { (void)dl; }
+size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max) { (void)ulinker; (void)blocks; (void)max; return 0; }
+void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
+                         void *(*translate)(void *arg, void *p), void *arg)
+{ (void)ulinker; (void)blocks; (void)count; (void)translate; (void)arg; }
+
+#endif
 
 static void call_elf64_constructors(struct dlinfo_elf64 *dl)
 {
@@ -4769,12 +5040,21 @@ static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename
     else if (link_library(dl))
         goto out;
 
+    // thread-local variables, before any of the image's code runs
+    if (dl->dl_type == DLT_MACHO64 && macho64_tlv_setup((struct dlinfo_macho64 *)dl))
+        goto out;
+
     if (!ulinker->ul_duplicating)
         call_constructors(dl);
 
     // calls mmap_cb, load event is reported right at mmap time.
     // this is purely for post-processing memory after initialization is done.
     notify_loaded_segments(ulinker, dl);
+
+    // a fork child's writable segments now hold the parent's descriptors,
+    // naming the parent's key: give them the child's
+    if (ulinker->ul_duplicating && dl->dl_type == DLT_MACHO64 && macho64_tlv_setup((struct dlinfo_macho64 *)dl))
+        goto out;
 
     ret = dl;
 

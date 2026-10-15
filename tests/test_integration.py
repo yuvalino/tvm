@@ -2184,8 +2184,10 @@ def test_ls_root_shows_tvm(sshi: spawn):
 def test_vfs_readonly(sshi: spawn):
     """A cpio mount is read-only: creating in it is "Read-only file system"
     (the host used to answer for a path it has not got, ENOENT), and the
-    mount point itself is busy."""
-    out, rc = _sh(sshi, "mkdir /tvm/x 2>&1; touch /tvm/etc/x 2>&1; rm /tvm/etc/profile 2>&1; rmdir /tvm 2>&1; true")
+    mount point itself is busy. (rm's stdin is not the terminal: access(W_OK)
+    says EROFS, as a read-only file system does, and toybox's rm would ask
+    "rm ro ...?" on a tty before trying.)"""
+    out, rc = _sh(sshi, "mkdir /tvm/x 2>&1; touch /tvm/etc/x 2>&1; rm /tvm/etc/profile </dev/null 2>&1; rmdir /tvm 2>&1; true")
     assert out.count("Read-only file system") == 3, out
     assert "busy" in out.lower(), out
 
@@ -2228,7 +2230,8 @@ def test_bind_mounts(sshi: spawn):
                         "printf '#!/bin/sh\\necho SH_OK\\n' > $d/s && printf '#!/usr/bin/env bash\\necho ENV_OK\\n' > $d/e && "
                         "chmod +x $d/b $d/s $d/e && $d/b && $d/s && $d/e; rm -rf $d")
     assert rc == 0 and "ARR=y" in out and "SH_OK" in out and "ENV_OK" in out, out
-    out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh 2>&1; [ -f /bin/sh ] && echo still_there")
+    # rm's stdin not the tty: it would ask "rm ro /bin/sh?" (see test_vfs_readonly)
+    out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh </dev/null 2>&1; [ -f /bin/sh ] && echo still_there")
     assert out.lower().count("busy") == 2 and "still_there" in out, out
 
 def test_bind_dir_listing(sshi: spawn):

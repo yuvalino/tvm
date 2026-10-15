@@ -73,6 +73,15 @@ int   ulinker_dlclose(void *handle);
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all);
 char *ulinker_dlerror(void);
 
+// Thread-local variables across a fork (ulinker.c, "Thread-local variables"):
+// on the forking thread, record its TLV block of each image (returns how many
+// images have TLVs; up to max are recorded); in the child, once the parent's
+// memory is copied, point the child's thread at the copies (translate maps an
+// address in the parent's memory to the child's copy).
+size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max);
+void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
+                         void *(*translate)(void *arg, void *p), void *arg);
+
 enum {
     ULARCH_NONE = 0,
     ULARCH_X86_64,

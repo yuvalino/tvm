@@ -62,6 +62,7 @@
 #include <sys/mount.h>
 #include <sys/fileport.h>
 #include <mach-o/getsect.h>
+#include <mach-o/dyld.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <sys/sysctl.h>
 #elif defined(__linux__)
@@ -375,6 +376,7 @@ DECL_FUNC(vwarnc);
 DECL_FUNC(verrc);
 DECL_FUNC(getprogname);
 DECL_FUNC(setprogname);
+DECL_FUNC(_NSGetExecutablePath);
 #endif
 DECL_FUNC(freopen);
 DECL_FUNC(fclose);
@@ -1965,6 +1967,7 @@ struct task {
     pid_t tsk_sid;
     pid_t tsk_pgid;
     char tsk_comm[16];
+    char tsk_exe[PATH_MAX];  // absolute path of the image execve() loaded ("" before the first)
     struct rmem_arena *tsk_ar;
     struct ulinker *tsk_linker;
     char tsk_cwd[PATH_MAX];
@@ -2716,6 +2719,7 @@ static struct task *taskalloc()
     t->tsk_pgid = current->tsk_pgid;
     t->tsk_state = current->tsk_state & TS_CTTY;
     memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
+    memcpy(t->tsk_exe, current->tsk_exe, sizeof(t->tsk_exe));
     memcpy(&t->tsk_exits, &current->tsk_exits, sizeof(t->tsk_exits));
     memcpy(&t->tsk_exit_args, &current->tsk_exit_args, sizeof(t->tsk_exit_args));
 
@@ -4005,6 +4009,10 @@ struct file_stream {
     pthread_t fs_flock_owner; // the thread the guest's flockfile() holds are by, while fs_flock_n > 0 (stream_flock_count)
     int fs_flock_n;
     pid_t fs_pid;    // popen(): the child running the command, reaped by pclose()
+    // ungetc() on a stream read through f_ops (a VFS file: no libc FILE
+    // buffer to push into): the character + 1, 0 for none. The next fgetc(),
+    // fgets() or fread() of the stream starts with it; fseek() drops it.
+    int fs_ungetc;
 
     struct dirent fs_dirent; // for dirs only
     char fs_dirent_name[NAME_MAX+1]; // incase dirent->d_name is defined as zero-length array
@@ -7832,6 +7840,13 @@ static int vfs_node_access(struct vfs_node *vn, const char *path, int mode, int 
 {
     if (vn->vn_ops->o_access)
         return vn->vn_ops->o_access(vn, path, mode, flags);
+    // a cpio mount is read-only whatever its modes say, as access(2) answers
+    // for a read-only file system (pip, for one, installs into a writable
+    // site-packages and falls back to the user's only when this says no)
+    if (vn->vn_kind == VN_CPIO && (mode & W_OK)) {
+        errno = EROFS;
+        return -1;
+    }
     struct stat st;
     if (0 != vfs_node_stat(vn, path, &st, flags))
         return -1;
@@ -8714,7 +8729,8 @@ static int vfsop_fchown(struct file *file, uid_t owner, gid_t group)
 
 static int vfsop_ioctl(struct file *file, unsigned long request, void *arg)
 {
-    errno = ENOTSUP;
+    // not a device: what the kernel answers for a regular file or directory
+    errno = ENOTTY;
     return -1;
 }
 
@@ -13629,6 +13645,7 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
         tvm_sig_leave();
+        errno = EBADF;
         return NULL;
     }
 
@@ -14291,11 +14308,19 @@ retry:
         return 0;
     }
     
-    ssize_t r = file->f_ops->f_read(file, ptr, size * nmemb, -1);
+    size_t pushed = 0;
+    struct file_stream *ufs = file_stream_fp(stream);
+    if (ufs->fs_ungetc && nmemb) {
+        *(unsigned char *)ptr = (unsigned char)(ufs->fs_ungetc - 1);
+        ufs->fs_ungetc = 0;
+        pushed = 1;
+    }
+    ssize_t r = size * nmemb > pushed ?
+        file->f_ops->f_read(file, (char *)ptr + pushed, size * nmemb - pushed, -1) : 0;
     if (r < 0)
-        ret = 0;
+        ret = pushed;
     else
-        ret = (size_t)r;
+        ret = pushed + (size_t)r;
     
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14312,6 +14337,10 @@ FUNCTION_DEFINE3(int, fseek, FILE *, stream, long, offset, int, whence) {
 
     int ret;
     if (file->f_ops && file->f_ops->f_lseek) {
+        // SEEK_CUR is from the stream's position, before a pushed-back char
+        if (whence == SEEK_CUR && file_stream_fp(stream)->fs_ungetc)
+            offset--;
+        file_stream_fp(stream)->fs_ungetc = 0;
         ret = file->f_ops->f_lseek(file, offset, whence) < 0 ? -1 : 0;
     } else {
         file_unlock(file, 0);
@@ -14334,6 +14363,8 @@ FUNCTION_DEFINE1(long, ftell, FILE *, stream) {
     long ret;
     if (file->f_ops && file->f_ops->f_lseek) {
         ret = (long)file->f_ops->f_lseek(file, 0, SEEK_CUR);
+        if (ret > 0 && file_stream_fp(stream)->fs_ungetc)
+            ret--;
     } else {
         file_unlock(file, 0);
         ret = CALL_FUNC(ftell, real_fp(stream));
@@ -14685,7 +14716,16 @@ retry:
         return ret;
     }
     
-    char c;
+    struct file_stream *ufs = file_stream_fp(stream);
+    if (ufs->fs_ungetc) {
+        int uc = ufs->fs_ungetc - 1;
+        ufs->fs_ungetc = 0;
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        return uc;
+    }
+
+    unsigned char c;
     ssize_t r = file->f_ops->f_read(file, &c, 1, -1);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14734,9 +14774,15 @@ retry:
     }
     
     int err = 0;
-    int i;
+    int i = 0;
     char c = 0;
-    for (i = 0; i < (size - 1) && c != '\n'; i++)
+    struct file_stream *ufs = file_stream_fp(stream);
+    if (ufs->fs_ungetc) {
+        c = (char)(ufs->fs_ungetc - 1);
+        ufs->fs_ungetc = 0;
+        s[i++] = c;
+    }
+    for (; i < (size - 1) && c != '\n'; i++)
     {
         ssize_t r = file->f_ops->f_read(file, &c, 1, -1);
         if (r == -1)
@@ -14770,7 +14816,25 @@ FUNCTION_DEFINE0(int, getchar) {
 // EBADF where an errno is due -- instead of handing NULL to libc.
 
 FUNCTION_DEFINE2(int, ungetc, int, c, FILE *, stream) {
-    // TODO support for file->f_ops
+    // A stream read through f_ops keeps one character of its own (all that
+    // POSIX guarantees); libc's FILE under it is never read.
+    tvm_sig_enter();
+    struct file *file = file_for_task_fp(current, stream);
+    if (file && file->f_ops && file->f_ops->f_read) {
+        struct file_stream *ufs = file_stream_fp(stream);
+        int ret = EOF;
+        if (c != EOF && !ufs->fs_ungetc) {
+            ufs->fs_ungetc = (unsigned char)c + 1;
+            ret = (unsigned char)c;
+        }
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        return ret;
+    }
+    if (file)
+        file_unlock(file, 1);
+    tvm_sig_leave();
+
     FILE *fp = real_fp(stream);
     if (!fp) {
         errno = EBADF;
@@ -16078,9 +16142,10 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     }
 #endif
 
-    if (cmd == F_DUPFD) {
-        // TODO: F_DUPFD_CLOEXEC
-
+    // F_DUPFD_CLOEXEC: F_DUPFD with close-on-exec set on the new descriptor
+    // (Python duplicates every descriptor this way). Passed to the host it
+    // returned a host descriptor number, not one of the task's.
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         tvm_sig_enter();
 
         task_lock(current);
@@ -16120,6 +16185,8 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         file_unlock(newfile, 1);
         tvm_sig_leave();
 
+        if (cmd == F_DUPFD_CLOEXEC)
+            (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
         return fd;
     }
 
@@ -17150,6 +17217,14 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     if (!can_enter_tvm(NULL))
         return CALL_FUNC(ioctl, fd, request, arg);
 
+#if defined(FIOCLEX) && defined(FIONCLEX)
+    // Close-on-exec belongs to the descriptor, whatever the file: the kernel
+    // does FIOCLEX/FIONCLEX itself for every file type, and Python sets it
+    // this way on each file it opens. TVM keeps it where fcntl(F_SETFD) does.
+    if (request == FIOCLEX || request == FIONCLEX)
+        return fcntl(fd, F_SETFD, request == FIOCLEX ? FD_CLOEXEC : 0);
+#endif
+
     tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
@@ -17210,7 +17285,17 @@ struct fork_arg {
     // copied emulator_call_ex frames, so it must resume emulation with the same
     // depth or its signal-deferral (and the frames' decrements) go out of sync.
     int emu_call_depth;
+
+    // the forking thread's thread-local variable blocks, one per image with
+    // TLVs (ulinker_tlv_snapshot): the child's thread gets their copies
+    void *tlv_blocks[64];
+    size_t tlv_count;
 };
+
+static void *fork_translate_cb(void *fixup, void *p)
+{
+    return cow_fixup_translate((struct cow_fixup_context *)fixup, p);
+}
 
 static void fork_dup_emulator_cb(struct fork_arg *arg, void *old_mem, void *new_mem, size_t size) {
     if (0 != cow_fixup_ctx_add(&arg->fixup, new_mem, old_mem, size, 1)) {
@@ -17491,6 +17576,10 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
         goto fail;
     }
 
+    // the parent thread's thread-local variables: their copies in the child's
+    // heap become this thread's
+    ulinker_tlv_restore(arg->tsk->tsk_linker, arg->tlv_blocks, arg->tlv_count, fork_translate_cb, &arg->fixup);
+
     for (int i = 0; i < 2; i++) {
         list_for_each_entry(new_fsle, new_lists[i], fsle_list) {
             if (new_fsle->fsle_stream)
@@ -17603,6 +17692,10 @@ pid_t fork(void) {
     arg->parent = current;
     arg->parent_thr = current_thread;
     arg->emu_call_depth = tvm_emu_call_depth;  // child resumes emulation at this depth
+    arg->tlv_count = ulinker_tlv_snapshot(current->tsk_linker, arg->tlv_blocks,
+                                          sizeof(arg->tlv_blocks) / sizeof(arg->tlv_blocks[0]));
+    if (arg->tlv_count > sizeof(arg->tlv_blocks) / sizeof(arg->tlv_blocks[0]))
+        panic("fork: %zu images with thread-local variables", arg->tlv_count);
 
     arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #ifdef TRACE_MMAP
@@ -18446,6 +18539,23 @@ FUNCTION_DEFINE_NORET_VA3(errc, int, eval, int, code, const char *, fmt) {
 // The BSD program name is per task, not the host process's ("tvm").
 FUNCTION_DEFINE0(const char *, getprogname) {
     return current->tsk_comm;
+}
+
+// The executable path is per task too: dyld's answer is the host process's
+// (tvm, or the app), and programs that locate themselves through it (Python
+// sets sys.executable and finds its prefix from it) would find the host's.
+// Before the task's first execve() there is no image of its own; give the
+// host's then.
+FUNCTION_DEFINE2(int, _NSGetExecutablePath, char *, buf, uint32_t *, bufsize) {
+    if (!current->tsk_exe[0])
+        return CALL_FUNC(_NSGetExecutablePath, buf, bufsize);
+    uint32_t need = (uint32_t)strlen(current->tsk_exe) + 1;
+    if (*bufsize < need) {
+        *bufsize = need;
+        return -1;
+    }
+    memcpy(buf, current->tsk_exe, need);
+    return 0;
 }
 
 FUNCTION_DEFINE_VOID1(setprogname, const char *, name) {
@@ -19676,6 +19786,7 @@ do_exec:
     task_lock(current);
     memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
     strncpy(current->tsk_comm, basename, sizeof(current->tsk_comm) - 1);
+    snprintf(current->tsk_exe, sizeof(current->tsk_exe), "%s", pathname);
     memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
     memset(&current->tsk_exit_args, 0, sizeof(current->tsk_exit_args));
     task_unlock(current);
