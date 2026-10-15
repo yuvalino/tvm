@@ -5,6 +5,13 @@
 # shells. Before ~/.bashrc, so a user's rc file can override them.
 [ -f /tvm/etc/bash.bashrc ] && . /tvm/etc/bash.bashrc
 
+# Commands `pip install` puts in the user scheme (~/.local/bin; the
+# system site-packages under /tvm is read-only).
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
+
 # Nor does a login shell read ~/.bashrc; no skeleton ~/.bash_profile is
 # created to source it (as distributions do), so source it here.
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"

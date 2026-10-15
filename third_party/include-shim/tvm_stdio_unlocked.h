@@ -1,7 +1,7 @@
 /*
- * Force-included (-include) into every translation unit of git, bash and
- * nano (scripts/build_git.sh, build_bash.sh, build_nano.sh). Not a patch to
- * any of them.
+ * Force-included (-include) into every translation unit of git, bash, nano
+ * and python (scripts/build_git.sh, build_bash.sh, build_nano.sh,
+ * build_python.sh). Not a patch to any of them.
  *
  * A guest FILE is a TVM file_stream, not a libc FILE: stdio reaches the
  * task's descriptors only through the functions TVM interposes. Darwin's
@@ -25,6 +25,10 @@
  */
 #ifndef TVM_STDIO_UNLOCKED_H
 #define TVM_STDIO_UNLOCKED_H
+
+/* -include reaches assembler sources too (python's CFLAGS build its .S
+ * files): C only. */
+#ifndef __ASSEMBLER__
 
 /*
  * glibc: the same holds there (getc_unlocked() & co. are extern inlines
@@ -79,5 +83,7 @@
 #define ferror_unlocked(fp) ferror(fp)
 #define clearerr_unlocked(fp) clearerr(fp)
 #define fileno_unlocked(fp) fileno(fp)
+
+#endif /* __ASSEMBLER__ */
 
 #endif

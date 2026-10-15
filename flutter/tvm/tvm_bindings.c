@@ -13,6 +13,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 extern char **environ;
 
@@ -241,17 +244,32 @@ TVM_EXPORT int tvm_app_start(const char *libtvm_path, int port,
     static char env_password[256];
     static char env_path[PATH_MAX * 2 + 8];
     static char env_frameworks[PATH_MAX + 16];
+    static char env_resources[PATH_MAX + 32];
     snprintf(env_home, sizeof(env_home), "HOME=%s", worker_home);
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s", home_tmp);
     snprintf(env_path, sizeof(env_path), "PATH=%s:/tvm/bin:%s", fwdir, old_path);
     snprintf(env_frameworks, sizeof(env_frameworks), "TVM_FRAMEWORKS=%s", fwdir);
 
-    const char *overrides[6];
+    // The bundle's resources directory, the Frameworks dir's parent on iOS
+    // (Runner.app) and Contents/Resources on macOS. init.flutter.rc binds
+    // the Python standard library from it (scripts/embed_frameworks.sh).
+    char resdir[PATH_MAX];
+    snprintf(resdir, sizeof(resdir), "%s", fwdir);
+    char *res_slash = strrchr(resdir, '/');
+    if (res_slash)
+        *res_slash = '\0';
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
+    strncat(resdir, "/Resources", sizeof(resdir) - strlen(resdir) - 1);
+#endif
+    snprintf(env_resources, sizeof(env_resources), "TVM_RESOURCES=%s", resdir);
+
+    const char *overrides[7];
     int no = 0;
     overrides[no++] = env_home;
     overrides[no++] = env_tmpdir;
     overrides[no++] = env_path;
     overrides[no++] = env_frameworks;
+    overrides[no++] = env_resources;
     if (password) {
         snprintf(env_password, sizeof(env_password), "TVM_PASSWORD=%s", password);
         overrides[no++] = env_password;

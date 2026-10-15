@@ -4,8 +4,11 @@ umask 022
 mount --bind /tvm/bin/sh:/bin/sh
 mount --bind /tvm/bin/bash:/bin/bash
 mount --bind /tvm/bin/env:/usr/bin/env
+# The Python standard library ships in the app bundle (scripts/embed_frameworks.sh),
+# not in the initrd, which is read into memory whole
+mount --bind $TVM_RESOURCES/python/lib:/tvm/lib
 setenv TVM_SHELL=/tvm/bin/bash
-setenv? TVM_NOEMU=libdropbear:libbash:libtoybox:libvim:libsftpserver:libcurl:libless:libnano:libsqlite:libgit:libgit-remote-http:libgit-http-fetch
+setenv? TVM_NOEMU=libdropbear:libbash:libtoybox:libvim:libsftpserver:libcurl:libless:libnano:libsqlite:libgit:libgit-remote-http:libgit-http-fetch:libpython
 setenv TERMINFO=/tvm/share/terminfo
 setenv? PAGER=less
 setenv? LESS=-R

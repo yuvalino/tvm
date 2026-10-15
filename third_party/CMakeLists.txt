@@ -540,3 +540,76 @@ add_shared_lib(git-remote-http git_exe ${GIT_BUILD}/src/git-remote-http)
 add_launcher(git-remote-http)
 add_shared_lib(git-http-fetch git_exe ${GIT_BUILD}/src/git-http-fetch)
 add_launcher(git-http-fetch)
+
+###############################################################################
+# libffi (static libffi.a for Python's ctypes; macOS / iOS only)
+#
+# Unpatched upstream, autoreconf'd and configured in a shadow tree by
+# scripts/build_libffi.sh. Installed into ${TVM_LIBFFI_PREFIX}.
+###############################################################################
+if(APPLE)
+    set(LIBFFI_BUILD ${THIRDPARTY_BUILD}/libffi)
+    set(TVM_LIBFFI_PREFIX ${LIBFFI_BUILD}/prefix)
+
+    ExternalProject_Add(libffi_ext
+        SOURCE_DIR ${THIRDPARTY_SRC}/libffi
+        BINARY_DIR ${LIBFFI_BUILD}
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_libffi.sh ${THIRDPARTY_SRC}/libffi ${LIBFFI_BUILD}
+        INSTALL_COMMAND ""
+        EXCLUDE_FROM_ALL TRUE
+    )
+    tvm_ext_inputs(libffi_ext ${SCRIPTS_DIR}/build_libffi.sh SUBMODULE:third_party/libffi)
+endif()
+
+###############################################################################
+# python (macOS / iOS only)
+#
+# Unpatched CPython, out-of-tree autotools build by scripts/build_python.sh:
+# every extension module built into the interpreter (no dlopen in a TVM
+# image), pip unpacked into site-packages. Installed (DESTDIR) into
+# ${PYTHON_BUILD}/stage/tvm: bin/python3.X is the exe, converted for the
+# Flutter apps by add_shared_lib; lib/python3.X is the standard library,
+# which the CLI initrd carries and the apps ship as a bundle resource
+# (python_stdlib, scripts/embed_frameworks.sh).
+###############################################################################
+if(APPLE)
+    file(STRINGS ${THIRDPARTY_SRC}/python/Include/patchlevel.h _py_major REGEX "^#define PY_MAJOR_VERSION")
+    file(STRINGS ${THIRDPARTY_SRC}/python/Include/patchlevel.h _py_minor REGEX "^#define PY_MINOR_VERSION")
+    string(REGEX MATCH "[0-9]+$" _py_major "${_py_major}")
+    string(REGEX MATCH "[0-9]+$" _py_minor "${_py_minor}")
+    set(TVM_PYTHON_VERSION ${_py_major}.${_py_minor} PARENT_SCOPE)
+    set(TVM_PYTHON_VERSION ${_py_major}.${_py_minor})
+    set(PYTHON_BUILD ${THIRDPARTY_BUILD}/python)
+
+    ExternalProject_Add(python_ext
+        SOURCE_DIR ${THIRDPARTY_SRC}/python
+        BINARY_DIR ${PYTHON_BUILD}
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_python.sh
+            ${THIRDPARTY_SRC}/python ${PYTHON_BUILD} ${TVM_LIBFFI_PREFIX} ${TVM_OPENSSL_PREFIX} ${TVM_NCURSES_PREFIX}
+        INSTALL_COMMAND ""
+        DEPENDS libffi_ext openssl_ext ncurses_ext
+        EXCLUDE_FROM_ALL TRUE
+    )
+    tvm_ext_inputs(python_ext ${SCRIPTS_DIR}/build_python.sh SUBMODULE:third_party/python
+        ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_ios_libc.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h)
+    add_custom_target(python_exe DEPENDS python_ext)
+    set_target_properties(python_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    add_shared_lib(python python_exe ${PYTHON_BUILD}/stage/tvm/bin/python${TVM_PYTHON_VERSION})
+    add_launcher(python)
+
+    # The standard library for the Flutter apps, at ${LIB_OUT}/python/lib
+    # (the prefix layout), where scripts/embed_frameworks.sh copies it into
+    # the app bundle's resources.
+    add_custom_target(python_stdlib
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIB_OUT}/python
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}/python
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${PYTHON_BUILD}/stage/tvm/lib ${LIB_OUT}/python/lib
+        DEPENDS python_exe
+        COMMENT "Staging the Python standard library"
+    )
+    set_target_properties(python_stdlib PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()

@@ -165,6 +165,33 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/cacert.pem' \"$ROOTFS/etc/ssl/cacert.pem\"\n\n")
     endif()
 
+    # ── python ──
+    # bin/python3.X is the interpreter: a launcher stub for libpython in the
+    # Flutter initrd, the real executable in the CLI one; python3 and python
+    # link to it (TVM_NOEMU resolves the links to /tvm/bin/python3.X), and
+    # pip, pip3 and pip3.X are pip's console script. The standard library is
+    # /tvm/lib/python3.X, the interpreter's compiled-in prefix: carried by
+    # the CLI initrd; the apps ship it in the bundle and bind it there
+    # (init.flutter.rc), since an initrd is read into memory whole.
+    if(APPLE)
+        set(PYV ${TVM_PYTHON_VERSION})
+        set(PYTHON_STAGE ${THIRDPARTY_BUILD}/python/stage/tvm)
+        if(ARG_FLUTTER)
+            string(APPEND SCRIPT "cp '${BIN_OUT}/python_launcher' \"$ROOTFS/bin/python${PYV}\"\n")
+        else()
+            string(APPEND SCRIPT "cp '${PYTHON_STAGE}/bin/python${PYV}' \"$ROOTFS/bin/python${PYV}\"\n")
+            string(APPEND SCRIPT "mkdir -p \"$ROOTFS/lib\"\n")
+            string(APPEND SCRIPT "cp -R '${PYTHON_STAGE}/lib/python${PYV}' \"$ROOTFS/lib/\"\n")
+        endif()
+        string(APPEND SCRIPT "ln -sf python${PYV} \"$ROOTFS/bin/python3\"\n")
+        string(APPEND SCRIPT "ln -sf python3 \"$ROOTFS/bin/python\"\n")
+        foreach(pip pip pip3 pip${PYV})
+            string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/pip' \"$ROOTFS/bin/${pip}\"\n")
+            string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/${pip}\"\n")
+        endforeach()
+        string(APPEND SCRIPT "\n")
+    endif()
+
     # ── apple *_cmds ──
     foreach(module ${APPLE_CMDS_MODULES})
         foreach(cmd ${APPLE_CMDS_${module}})
@@ -225,17 +252,24 @@ endfunction()
 # The apple *_cmds modules go into both initrds as real executables, so both
 # targets depend on them. Empty on Linux, where the subdirectory is not added.
 set(APPLE_CMDS_DEPS "")
+# python: macOS / iOS only (third_party/CMakeLists.txt)
+set(PYTHON_CLI_DEPS "")
+set(PYTHON_FLUTTER_DEPS "")
+if(APPLE)
+    set(PYTHON_CLI_DEPS python_exe)
+    set(PYTHON_FLUTTER_DEPS python_launcher)
+endif()
 foreach(module ${APPLE_CMDS_MODULES})
     list(APPEND APPLE_CMDS_DEPS ${module}_exe)
 endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_CLI_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git-remote-http_launcher git-http-fetch_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git-remote-http_launcher git-http-fetch_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_FLUTTER_DEPS}
 )

@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch:/tvm/bin/python3.15"
 # where build.py -t flutter leaves the built app
 FLUTTER_APP = "./flutter/build/macos/Build/Products/Release/tvm.app"
 IOS_APP = "./output/ios-arm64/bin/tvm.ipa"
@@ -2586,3 +2586,168 @@ def test_shell_survives_child_crash(sshi: spawn):
     sshi.sendline("echo still_ok")
     sshi.expect("still_ok")
     sshi.expect(r"\$ ")
+
+# ── python ──────────────────────────────────────────────────────
+#
+# CPython (third_party/python, scripts/build_python.sh): every extension module
+# built into the interpreter, the standard library at /tvm/lib/python3.X, pip
+# in its site-packages. Only built for the Darwin targets.
+
+PYTHON_VERSION = "3.15"
+
+pytestmark_python = pytest.mark.skipif(
+    not PLATFORM.startswith(("macos-", "ios-")),
+    reason="python is only built for the Darwin targets")
+
+@pytestmark_python
+def test_python_version(sshi: spawn):
+    """python3, python and python3.X are the same interpreter."""
+    for name in ("python3", "python", f"python{PYTHON_VERSION}"):
+        out, rc = _sh(sshi, f"{name} --version")
+        assert rc == 0, out
+        assert any(re.fullmatch(rf"Python {re.escape(PYTHON_VERSION)}\.\d+", l) for l in _lines(out)), out
+
+@pytestmark_python
+def test_python_paths(sshi: spawn):
+    """The prefix is /tvm, found from the executable, and sys.executable is
+    the guest's interpreter, not the host process (TVM's
+    _NSGetExecutablePath)."""
+    out, rc = _sh(sshi, "python3 -c 'import sys; print(\"prefix=\" + sys.prefix); print(\"exe=\" + sys.executable)'")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "prefix=/tvm" in lines, out
+    # /tvm/bin/python3 as invoked (found on PATH); never the host's tvm
+    exe = next(l[len("exe="):] for l in lines if l.startswith("exe="))
+    assert exe.startswith("/tvm/bin/python") or exe.endswith("/libpython"), out
+    out, rc = _sh(sshi, "python3 -c 'import subprocess, sys; "
+                        "r = subprocess.run([sys.executable, \"-c\", \"print(6*7)\"], capture_output=True, text=True); "
+                        "print(\"inner\", r.returncode, repr(r.stdout), repr(r.stderr))'")
+    assert rc == 0, out
+    assert "inner 0 '42\\n' ''" in _lines(out), out
+
+@pytestmark_python
+def test_python_builtin_modules(sshi: spawn):
+    """The extension modules are built in (no lib-dynload), with their
+    dependencies: OpenSSL, libffi, sqlite3, zlib, bz2, expat, ncurses."""
+    mods = ["_ssl", "_hashlib", "_ctypes", "_sqlite3", "zlib", "_bz2", "pyexpat",
+            "_decimal", "_curses", "_socket", "select", "termios", "_json"]
+    names = ",".join(f'"{m}"' for m in mods)
+    out, rc = _sh(sshi, "python3 -c 'import sys; "
+                        f"missing = [m for m in [{names}] if m not in sys.builtin_module_names]; "
+                        "print(\"missing=\" + \",\".join(missing))'")
+    assert rc == 0, out
+    assert "missing=" in _lines(out), out
+    out, rc = _sh(sshi, f"ls /tvm/lib/python{PYTHON_VERSION}/lib-dynload 2>/dev/null | grep -c '\\.so$'")
+    assert "0" in _lines(out), out
+    out, rc = _sh(sshi, "python3 -c 'import ssl, sqlite3, hashlib, zlib, bz2, json, decimal; "
+                        "print(ssl.OPENSSL_VERSION.split()[0]); print(hashlib.sha256(b\"tvm\").hexdigest()[:8]); "
+                        "print(zlib.decompress(zlib.compress(b\"zz\")).decode()); "
+                        "print(sqlite3.connect(\":memory:\").execute(\"select 6*7\").fetchone()[0]); "
+                        "print(decimal.Decimal(\"0.1\") + decimal.Decimal(\"0.2\"))'")
+    assert rc == 0, out
+    lines = _lines(out)
+    for want in ("OpenSSL", "3973a32c", "zz", "42", "0.3"):
+        assert want in lines, f"{want}: {out}"
+
+@pytestmark_python
+def test_python_ctypes(sshi: spawn):
+    """ctypes calls a host function, and a Python callback through a libffi
+    closure (the trampoline table on arm64 Apple targets)."""
+    out, rc = _sh(sshi, "python3 -c 'import ctypes; libc = ctypes.CDLL(None); "
+                        "print(\"strlen=%d\" % libc.strlen(b\"hello\")); "
+                        "a = (ctypes.c_int * 5)(5, 1, 4, 2, 3); "
+                        "CMP = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)); "
+                        "libc.qsort(a, 5, ctypes.sizeof(ctypes.c_int), CMP(lambda x, y: x[0] - y[0])); "
+                        "print(\"sorted=\" + \",\".join(map(str, a)))'")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "strlen=5" in lines and "sorted=1,2,3,4,5" in lines, out
+
+@pytestmark_python
+def test_python_subprocess_fork(sshi: spawn):
+    """subprocess (fork/exec through TVM) and os.fork with a pipe."""
+    out, rc = _sh(sshi, "python3 -c 'import subprocess; "
+                        "print(subprocess.run([\"echo\", \"from-child\"], capture_output=True, text=True).stdout.strip()); "
+                        "print(subprocess.check_output(\"echo $((2+3))\", shell=True, text=True).strip())'")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "from-child" in lines and "5" in lines, out
+    out, rc = _sh(sshi, "python3 -c 'import os; r, w = os.pipe(); pid = os.fork()\n"
+                        "if pid == 0:\n    os.write(w, b\"forked\"); os._exit(7)\n"
+                        "_, st = os.waitpid(pid, 0); print(os.read(r, 16).decode(), os.waitstatus_to_exitcode(st))'")
+    assert rc == 0, out
+    assert "forked 7" in _lines(out), out
+
+@pytestmark_python
+def test_python_repl(sshi: spawn):
+    """The interactive interpreter (_pyrepl, terminfo from /tvm/share/terminfo)."""
+    sshi.sendline("python3")
+    sshi.expect(">>> ")
+    sshi.sendline("6 * 7")
+    sshi.expect("42")
+    sshi.expect(">>> ")
+    sshi.sendline("exit()")
+    sshi.sendline("echo repl_done=$?")
+    sshi.expect("repl_done=0")
+    sshi.expect(r"\$ ")
+
+@pytestmark_python
+def test_pip_version(sshi: spawn):
+    """pip, pip3 and python3 -m pip are the pip in /tvm's site-packages."""
+    for cmd in ("pip --version", "pip3 --version", "python3 -m pip --version"):
+        out, rc = _sh(sshi, cmd)
+        assert rc == 0, out
+        assert re.search(rf"pip \d+\.\d+(\.\d+)? from /tvm/lib/python{re.escape(PYTHON_VERSION)}/site-packages/pip "
+                         rf"\(python {re.escape(PYTHON_VERSION)}\)", out), out
+
+@pytestmark_python
+def test_pip_install_local_wheel(sshi: spawn):
+    """pip installs a wheel into the user scheme (~/.local: the system
+    site-packages is read-only), with a console script, and uninstalls it."""
+    make_wheel = (
+        "import zipfile, base64, hashlib\n"
+        "files = {'tvmdemo/__init__.py': 'def hello():\\n    return \"hello from tvmdemo\"\\n'\n"
+        "      'def main():\\n    print(hello())\\n',\n"
+        "  'tvmdemo-1.0.dist-info/METADATA': 'Metadata-Version: 2.1\\nName: tvmdemo\\nVersion: 1.0\\n',\n"
+        "  'tvmdemo-1.0.dist-info/WHEEL': 'Wheel-Version: 1.0\\nGenerator: tvm\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n',\n"
+        "  'tvmdemo-1.0.dist-info/entry_points.txt': '[console_scripts]\\ntvmdemo = tvmdemo:main\\n'}\n"
+        "rec = []\n"
+        "with zipfile.ZipFile('/tmp/tvmdemo-1.0-py3-none-any.whl'.replace('/tmp', __import__('os').environ['TMPDIR']), 'w') as z:\n"
+        "    for n, c in files.items():\n"
+        "        d = base64.urlsafe_b64encode(hashlib.sha256(c.encode()).digest()).rstrip(b'=').decode()\n"
+        "        z.writestr(n, c); rec.append(f'{n},sha256={d},{len(c)}')\n"
+        "    rec.append('tvmdemo-1.0.dist-info/RECORD,,')\n"
+        "    z.writestr('tvmdemo-1.0.dist-info/RECORD', '\\n'.join(rec) + '\\n')\n"
+    )
+    sshi.sendline("cat > $TMPDIR/mkwheel.py <<'PYEOF'\n" + make_wheel + "PYEOF")
+    sshi.expect(r"\$ ")
+    out, rc = _sh(sshi, "python3 $TMPDIR/mkwheel.py")
+    assert rc == 0, out
+    # a run that failed half way may have left it installed
+    _sh(sshi, "pip uninstall -y -q --disable-pip-version-check tvmdemo")
+    out, rc = _sh(sshi, "pip install --no-index --disable-pip-version-check $TMPDIR/tvmdemo-1.0-py3-none-any.whl")
+    assert rc == 0, out
+    assert "Successfully installed tvmdemo-1.0" in out, out
+    out, rc = _sh(sshi, "python3 -c 'import tvmdemo; print(tvmdemo.hello())'")
+    assert rc == 0, out
+    assert "hello from tvmdemo" in _lines(out), out
+    out, rc = _sh(sshi, "$HOME/.local/bin/tvmdemo")
+    assert rc == 0, out
+    assert "hello from tvmdemo" in _lines(out), out
+    out, rc = _sh(sshi, "pip uninstall -y --disable-pip-version-check tvmdemo")
+    assert rc == 0, out
+    assert "Successfully uninstalled tvmdemo-1.0" in out, out
+
+@pytestmark_python
+@network_required
+def test_pip_install_from_pypi(sshi: spawn):
+    """pip downloads and installs a pure-Python package from PyPI over HTTPS
+    (OpenSSL with pip's certificate handling)."""
+    _sh(sshi, "pip uninstall -y -q --disable-pip-version-check six")
+    out, rc = _sh(sshi, "pip install --no-cache-dir --disable-pip-version-check six", timeout=120)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "python3 -c 'import six; print(\"six\", six.__version__)'")
+    assert rc == 0, out
+    assert any(l.startswith("six ") for l in _lines(out)), out
+    out, rc = _sh(sshi, "pip uninstall -y --disable-pip-version-check six")
+    assert rc == 0, out
