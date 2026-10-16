@@ -60,3 +60,7 @@
 	path = third_party/libffi
 	url = https://github.com/libffi/libffi.git
 	shallow = true
+[submodule "third_party/llvm-project"]
+	path = third_party/llvm-project
+	url = https://github.com/llvm/llvm-project.git
+	shallow = true

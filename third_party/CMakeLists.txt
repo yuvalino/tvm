@@ -613,3 +613,51 @@ if(APPLE)
     )
     set_target_properties(python_stdlib PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
+
+###############################################################################
+# llvm: clang and lld (macOS / iOS only)
+#
+# Unpatched upstream, built by scripts/build_llvm.sh: one multicall program,
+# ${LLVM_BUILD}/target/bin/llvm (clang, clang++, ld64.lld & co. are its names),
+# converted for the Flutter apps by add_shared_lib; and the bundle a guest
+# compiles against, ${LLVM_BUILD}/bundle (clang's resource directory and the
+# SDK), staged at ${LIB_OUT}/llvm by llvm_bundle, where the CLI's init.rc
+# binds it at /tvm/llvm and scripts/embed_frameworks.sh copies it into the
+# app bundle's resources. The iOS build runs the macOS build's programs (see
+# the script), which `python3 build.py -a macos-arm64 -t llvm_exe` makes.
+###############################################################################
+if(APPLE)
+    file(STRINGS ${THIRDPARTY_SRC}/llvm-project/cmake/Modules/LLVMVersion.cmake _llvm_major
+        REGEX "set\\(LLVM_VERSION_MAJOR [0-9]+\\)")
+    string(REGEX MATCH "[0-9]+" _llvm_major "${_llvm_major}")
+    set(TVM_LLVM_MAJOR ${_llvm_major} PARENT_SCOPE)
+    set(LLVM_BUILD ${THIRDPARTY_BUILD}/llvm)
+    set(LLVM_HOST_BIN "")
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(LLVM_HOST_BIN ${CMAKE_BINARY_DIR}/../../macos-arm64/build/third_party/llvm/llvm/bin)
+    endif()
+
+    ExternalProject_Add(llvm_ext
+        SOURCE_DIR ${THIRDPARTY_SRC}/llvm-project
+        BINARY_DIR ${LLVM_BUILD}
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} -E env ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_llvm.sh
+            ${THIRDPARTY_SRC}/llvm-project ${LLVM_BUILD} ${LLVM_HOST_BIN}
+        INSTALL_COMMAND ""
+        EXCLUDE_FROM_ALL TRUE
+    )
+    tvm_ext_inputs(llvm_ext ${SCRIPTS_DIR}/build_llvm.sh SUBMODULE:third_party/llvm-project)
+    add_custom_target(llvm_exe DEPENDS llvm_ext)
+    set_target_properties(llvm_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    add_shared_lib(llvm llvm_exe ${LLVM_BUILD}/target/bin/llvm)
+    add_launcher(llvm)
+
+    add_custom_target(llvm_bundle
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIB_OUT}/llvm
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${LLVM_BUILD}/bundle ${LIB_OUT}/llvm
+        DEPENDS llvm_exe
+        COMMENT "Staging the clang toolchain bundle"
+    )
+    set_target_properties(llvm_bundle PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()

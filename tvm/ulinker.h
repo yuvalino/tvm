@@ -1,6 +1,7 @@
 #pragma once
 #include <dlfcn.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #include <unicorn/unicorn.h>
@@ -72,6 +73,18 @@ void *ulinker_dlopen(struct ulinker *ulinker, const char *filename, int flags);
 int   ulinker_dlclose(void *handle);
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all);
 char *ulinker_dlerror(void);
+
+// The unwind tables of the Mach-O image TVM loaded that holds addr, as
+// dyld's _dyld_find_unwind_sections() gives them (mh: its mach header).
+// Returns 0 when no image of the linker holds addr.
+struct ulinker_unwind_sections {
+    const void *mh;
+    const void *dwarf_section;
+    uintptr_t   dwarf_section_length;
+    const void *compact_unwind_section;
+    uintptr_t   compact_unwind_section_length;
+};
+int ulinker_find_unwind_sections(struct ulinker *ulinker, const void *addr, struct ulinker_unwind_sections *out);
 
 // Thread-local variables across a fork (ulinker.c, "Thread-local variables"):
 // on the forking thread, record its TLV block of each image (returns how many

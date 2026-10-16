@@ -37,11 +37,17 @@ set(FLUTTER_PYTHON_DEPS "")
 if(APPLE)
     set(FLUTTER_PYTHON_DEPS python_shared python_stdlib)
 endif()
+# clang (macOS / iOS only): its framework, and the toolchain bundle that
+# scripts/embed_frameworks.sh copies into the bundle
+set(FLUTTER_LLVM_DEPS "")
+if(APPLE)
+    set(FLUTTER_LLVM_DEPS llvm_shared llvm_bundle)
+endif()
 add_custom_target(flutter
     COMMAND ${FLUTTER_ENV} sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_flutter.sh
         ${CMAKE_CURRENT_SOURCE_DIR}/flutter
     ${FLUTTER_IPA}
-    DEPENDS tvm_shared dropbear_shared sftpserver_shared bash_shared toybox_shared vim_shared curl_shared less_shared nano_shared sqlite_shared git_shared git-remote-http_shared git-http-fetch_shared ${FLUTTER_PYTHON_DEPS} initrd_flutter
+    DEPENDS tvm_shared dropbear_shared sftpserver_shared bash_shared toybox_shared vim_shared curl_shared less_shared nano_shared sqlite_shared git_shared git-remote-http_shared git-http-fetch_shared ${FLUTTER_PYTHON_DEPS} ${FLUTTER_LLVM_DEPS} initrd_flutter
     COMMENT "Building Flutter app"
 )
 set_target_properties(flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)

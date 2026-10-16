@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch:/tvm/bin/python3.15"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch:/tvm/bin/python3.15:/tvm/bin/llvm"
 # where build.py -t flutter leaves the built app
 FLUTTER_APP = "./flutter/build/macos/Build/Products/Release/tvm.app"
 IOS_APP = "./output/ios-arm64/bin/tvm.ipa"
@@ -886,6 +886,12 @@ def _sh(sshi: spawn, cmd: str, timeout: float = CURL_TIMEOUT) -> tuple[str, int]
 
 def _lines(out: str) -> list[str]:
     return [l.strip() for l in out.splitlines() if l.strip()]
+
+def _write(sshi: spawn, path: str, content: str):
+    """Write content to path in the guest, through a quoted here-document."""
+    assert "TVMEOF" not in content
+    sshi.sendline(f"cat > {path} <<'TVMEOF'\n{content}TVMEOF")
+    sshi.expect(r"\$ ")
 
 # curl's exit codes that say the request never got an answer: name resolution,
 # connection, and the -m 20 deadline. Everything else, rc=60 (verification)
@@ -2626,6 +2632,35 @@ def test_python_paths(sshi: spawn):
     assert "inner 0 '42\\n' ''" in _lines(out), out
 
 @pytestmark_python
+def test_posix_spawn(sshi: spawn):
+    """posix_spawn and posix_spawnp, which TVM implements (with their file
+    actions): the child runs in the VM, its stdout a pipe or a file the
+    actions set up; a program that cannot be run is posix_spawn's error, not
+    the child's exit status."""
+    _write(sshi, "$TMPDIR/spawn.py",
+           "import os\n"
+           "r, w = os.pipe()\n"
+           "pid = os.posix_spawnp('echo', ['echo', 'spawned'], os.environ,\n"
+           "                      file_actions=[(os.POSIX_SPAWN_DUP2, w, 1), (os.POSIX_SPAWN_CLOSE, r)])\n"
+           "os.close(w)\n"
+           "print('pipe', os.read(r, 100).decode().strip())\n"
+           "print('status', os.waitpid(pid, 0)[1])\n"
+           "out = os.environ['TMPDIR'] + '/spawn.out'\n"
+           "pid = os.posix_spawn('/tvm/bin/sh', ['sh', '-c', 'echo to-file; exit 3'], os.environ,\n"
+           "                     file_actions=[(os.POSIX_SPAWN_OPEN, 1, out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)])\n"
+           "print('exit', os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))\n"
+           "print('file', open(out).read().strip())\n"
+           "try:\n"
+           "    os.posix_spawn('/nonexistent/prog', ['prog'], os.environ)\n"
+           "except FileNotFoundError:\n"
+           "    print('enoent')\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/spawn.py")
+    assert rc == 0, out
+    lines = _lines(out)
+    for want in ("pipe spawned", "status 0", "exit 3", "file to-file", "enoent"):
+        assert want in lines, out
+
+@pytestmark_python
 def test_python_builtin_modules(sshi: spawn):
     """The extension modules are built in (no lib-dynload), with their
     dependencies: OpenSSL, libffi, sqlite3, zlib, bz2, expat, ncurses."""
@@ -2751,3 +2786,154 @@ def test_pip_install_from_pypi(sshi: spawn):
     assert any(l.startswith("six ") for l in _lines(out)), out
     out, rc = _sh(sshi, "pip uninstall -y --disable-pip-version-check six")
     assert rc == 0, out
+
+# ── clang ──────────────────────────────────────────────────────
+
+pytestmark_clang = pytest.mark.skipif(
+    not PLATFORM.startswith(("macos-", "ios-")),
+    reason="clang is only built for the Darwin targets")
+
+# Compiling is native (clang is a TVM_NOEMU program), the compiled program is
+# not: it is emulated, as anything built on the device is unsigned.
+CLANG_TIMEOUT = 180
+
+@pytestmark_clang
+def test_clang_c_hello(sshi: spawn):
+    """cc compiles and links a C program (clang, lld, the SDK in /tvm/llvm),
+    which runs, with arguments, stdio and libm."""
+    _write(sshi, "$TMPDIR/hello.c",
+           '#include <stdio.h>\n'
+           '#include <math.h>\n'
+           '#include <stdlib.h>\n'
+           'int main(int argc, char **argv) {\n'
+           '    printf("hello %s %.3f\\n", argc > 1 ? argv[1] : "?", sqrt(atof(argv[2])));\n'
+           '    return 7;\n'
+           '}\n')
+    out, rc = _sh(sshi, "cc -O2 -Wall -o $TMPDIR/hello $TMPDIR/hello.c -lm", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/hello clang 2", timeout=CLANG_TIMEOUT)
+    assert rc == 7, out
+    assert "hello clang 1.414" in _lines(out), out
+
+@pytestmark_clang
+def test_clang_cxx(sshi: spawn):
+    """c++ compiles a C++ program against libc++ (static, from the SDK in
+    /tvm/llvm): iostream, containers and algorithms, virtual dispatch and
+    RTTI, static constructors and destructors, and exceptions, which the
+    program's own libunwind unwinds through its emulated frames."""
+    _write(sshi, "$TMPDIR/prog.cpp",
+           '#include <algorithm>\n'
+           '#include <iostream>\n'
+           '#include <map>\n'
+           '#include <memory>\n'
+           '#include <stdexcept>\n'
+           '#include <string>\n'
+           '#include <vector>\n'
+           'struct Global {\n'
+           '    Global() { std::cout << "ctor" << std::endl; }\n'
+           '    ~Global() { std::cout << "dtor" << std::endl; }\n'
+           '} global;\n'
+           'struct Shape { virtual ~Shape() = default; virtual int area() const = 0; };\n'
+           'struct Square : Shape { int s; explicit Square(int s) : s(s) {} int area() const override { return s * s; } };\n'
+           'static int depth(int n) {\n'
+           '    if (n == 0) throw std::runtime_error("bottom");\n'
+           '    return depth(n - 1) + 1;\n'
+           '}\n'
+           'int main() {\n'
+           '    std::vector<int> v{5, 3, 9, 1};\n'
+           '    std::sort(v.begin(), v.end());\n'
+           '    std::map<std::string, int> m{{"b", 2}, {"a", 1}};\n'
+           '    std::cout << "sorted " << v[0] << v[1] << v[2] << v[3]\n'
+           '              << " first " << m.begin()->first << std::endl;\n'
+           '    std::unique_ptr<Shape> sh = std::make_unique<Square>(4);\n'
+           '    std::cout << "area " << sh->area()\n'
+           '              << " square " << (dynamic_cast<Square *>(sh.get()) != nullptr) << std::endl;\n'
+           '    try {\n'
+           '        depth(10);\n'
+           '    } catch (const std::exception &e) {\n'
+           '        std::cout << "caught " << e.what() << std::endl;\n'
+           '    }\n'
+           '    try {\n'
+           '        throw 42;\n'
+           '    } catch (int i) {\n'
+           '        std::cout << "caught int " << i << std::endl;\n'
+           '    }\n'
+           '    return 0;\n'
+           '}\n')
+    out, rc = _sh(sshi, "c++ -std=c++20 -O1 -o $TMPDIR/prog $TMPDIR/prog.cpp", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/prog", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    lines = _lines(out)
+    for want in ("ctor", "sorted 1359 first a", "area 16 square 1",
+                 "caught bottom", "caught int 42", "dtor"):
+        assert want in lines, out
+    assert lines.index("ctor") < lines.index("caught int 42") < lines.index("dtor"), out
+
+@pytestmark_clang
+def test_clang_objects_and_archive(sshi: spawn):
+    """Separate compilation: objects, a static library made with ar, and a
+    link of both (clang driving ld64.lld)."""
+    _write(sshi, "$TMPDIR/add.c", "int add(int a, int b) { return a + b; }\n")
+    _write(sshi, "$TMPDIR/mul.c", "int mul(int a, int b) { return a * b; }\n")
+    _write(sshi, "$TMPDIR/calc.c",
+           '#include <stdio.h>\n'
+           'int add(int, int);\n'
+           'int mul(int, int);\n'
+           'int main(void) { printf("calc %d\\n", add(mul(6, 7), 1)); return 0; }\n')
+    out, rc = _sh(sshi, "cd $TMPDIR && cc -c add.c mul.c calc.c && ar rcs libcalc.a add.o mul.o"
+                        " && cc -o calc calc.o -L. -lcalc; rc2=$?; cd - >/dev/null; (exit $rc2)",
+                  timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/calc", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    assert "calc 43" in _lines(out), out
+    out, rc = _sh(sshi, "nm $TMPDIR/libcalc.a")
+    assert rc == 0, out
+    assert any(l.endswith(" T _add") for l in _lines(out)), out
+
+@pytestmark_clang
+def test_clang_preprocessor_and_errors(sshi: spawn):
+    """cpp preprocesses; a compile error is reported with its location, and
+    cc fails."""
+    out, rc = _sh(sshi, "printf '#define X 6*7\\nvalue X\\n' | cpp -P -")
+    assert rc == 0, out
+    assert "value 6*7" in _lines(out), out
+    _write(sshi, "$TMPDIR/bad.c", "int main(void) { return undefined_name; }\n")
+    out, rc = _sh(sshi, "cc -o $TMPDIR/bad $TMPDIR/bad.c", timeout=CLANG_TIMEOUT)
+    assert rc != 0, out
+    assert "bad.c:1:" in out and "undefined_name" in out, out
+
+@pytestmark_clang
+def test_clang_cxx_threads(sshi: spawn):
+    """A compiled C++ program's threads: std::thread, a mutex, thread_local
+    variables, and an exception thrown and caught in each thread (libc++abi's
+    per-thread state, whose pthread key destructor TVM runs as the thread
+    exits)."""
+    _write(sshi, "$TMPDIR/thr.cpp",
+           '#include <atomic>\n'
+           '#include <iostream>\n'
+           '#include <mutex>\n'
+           '#include <stdexcept>\n'
+           '#include <string>\n'
+           '#include <thread>\n'
+           '#include <vector>\n'
+           'thread_local int tl = 0;\n'
+           'int main() {\n'
+           '    std::atomic<int> caught{0};\n'
+           '    std::mutex m;\n'
+           '    std::vector<std::thread> ts;\n'
+           '    for (int i = 0; i < 4; i++)\n'
+           '        ts.emplace_back([&, i] {\n'
+           '            tl = i + 1;\n'
+           '            try { throw std::runtime_error("t" + std::to_string(i)); }\n'
+           '            catch (const std::exception &) { std::lock_guard<std::mutex> g(m); caught += tl; }\n'
+           '        });\n'
+           '    for (auto &t : ts) t.join();\n'
+           '    std::cout << "caught " << caught << " main tl " << tl << std::endl;\n'
+           '}\n')
+    out, rc = _sh(sshi, "c++ -std=c++20 -O1 -o $TMPDIR/thr $TMPDIR/thr.cpp", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/thr", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    assert "caught 10 main tl 0" in _lines(out), out

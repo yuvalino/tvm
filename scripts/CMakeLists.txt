@@ -15,6 +15,18 @@ else()
     set(FLUTTER_ARCH linux-x64)
 endif()
 
+# clang's configuration (third_party/configs/clang.cfg): the deployment target
+# is the one scripts/build_llvm.sh builds the runtimes for
+if(APPLE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(TVM_CLANG_MIN_VERSION_FLAG -mios-version-min=15.0)
+    else()
+        set(TVM_CLANG_MIN_VERSION_FLAG -mmacosx-version-min=13.0)
+    endif()
+    set(CLANG_CFG ${CMAKE_CURRENT_BINARY_DIR}/clang.cfg)
+    configure_file(${ROOTDIR}/third_party/configs/clang.cfg ${CLANG_CFG} @ONLY)
+endif()
+
 # ── Toybox applets ──────────────────────────────────────────────
 set(TOYBOX_APPLETS
     ascii awk base32 base64 basename bzcat cal cat chgrp chmod chown
@@ -192,6 +204,35 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "\n")
     endif()
 
+    # ── clang ──
+    # bin/llvm is the toolchain (scripts/build_llvm.sh): a launcher stub for
+    # libllvm in the Flutter initrd; in the CLI one, init.rc binds the
+    # executable from the build tree there, as an initrd is read into memory
+    # whole. The tools are names of it, which it tells apart by argv[0]
+    # (links, which TVM_NOEMU resolves to /tvm/bin/llvm); cc, c++ and cpp,
+    # names it does not know, are scripts. The configuration in /tvm/etc/clang
+    # points clang at the bundle init.rc binds at /tvm/llvm.
+    if(APPLE)
+        if(ARG_FLUTTER)
+            string(APPEND SCRIPT "cp '${BIN_OUT}/llvm_launcher' \"$ROOTFS/bin/llvm\"\n")
+        endif()
+        foreach(tool clang clang++ clang-cpp ld64.lld ld ar ranlib nm objdump otool strip size c++filt addr2line)
+            string(APPEND SCRIPT "ln -sf llvm \"$ROOTFS/bin/${tool}\"\n")
+        endforeach()
+        foreach(pair cc:clang c++:clang++ cpp:clang-cpp)
+            string(REPLACE ":" ";" pair "${pair}")
+            list(GET pair 0 name)
+            list(GET pair 1 tool)
+            string(APPEND SCRIPT "printf '#!/tvm/bin/sh\\nexec ${tool} \"$@\"\\n' > \"$ROOTFS/bin/${name}\"\n")
+            string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/${name}\"\n")
+        endforeach()
+        string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/clang\"\n")
+        foreach(cfg clang clang++ clang-cpp)
+            string(APPEND SCRIPT "cp '${CLANG_CFG}' \"$ROOTFS/etc/clang/${cfg}.cfg\"\n")
+        endforeach()
+        string(APPEND SCRIPT "\n")
+    endif()
+
     # ── apple *_cmds ──
     foreach(module ${APPLE_CMDS_MODULES})
         foreach(cmd ${APPLE_CMDS_${module}})
@@ -259,17 +300,25 @@ if(APPLE)
     set(PYTHON_CLI_DEPS python_exe)
     set(PYTHON_FLUTTER_DEPS python_launcher)
 endif()
+# clang: macOS / iOS only (third_party/CMakeLists.txt). The CLI's init.rc
+# binds the program and the bundle from the build output.
+set(LLVM_CLI_DEPS "")
+set(LLVM_FLUTTER_DEPS "")
+if(APPLE)
+    set(LLVM_CLI_DEPS llvm_exe llvm_bundle)
+    set(LLVM_FLUTTER_DEPS llvm_launcher)
+endif()
 foreach(module ${APPLE_CMDS_MODULES})
     list(APPEND APPLE_CMDS_DEPS ${module}_exe)
 endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_CLI_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_CLI_DEPS} ${LLVM_CLI_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git-remote-http_launcher git-http-fetch_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_FLUTTER_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git-remote-http_launcher git-http-fetch_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_FLUTTER_DEPS} ${LLVM_FLUTTER_DEPS}
 )

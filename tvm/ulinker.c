@@ -1624,6 +1624,25 @@ struct linkedit_data_command {
     uint32_t	datasize;	/* file size of data in __LINKEDIT segment  */
 };
 
+/*
+ * The dyld_info_command contains the file offsets and sizes of the opcode
+ * streams dyld uses to rebase and bind an image that predates chained fixups.
+ */
+struct dyld_info_command {
+    uint32_t   cmd;		/* LC_DYLD_INFO or LC_DYLD_INFO_ONLY */
+    uint32_t   cmdsize;		/* sizeof(struct dyld_info_command) */
+    uint32_t   rebase_off;	/* file offset to rebase info  */
+    uint32_t   rebase_size;	/* size of rebase info   */
+    uint32_t   bind_off;	/* file offset to binding info   */
+    uint32_t   bind_size;	/* size of binding info  */
+    uint32_t   weak_bind_off;	/* file offset to weak binding info   */
+    uint32_t   weak_bind_size;  /* size of weak binding info  */
+    uint32_t   lazy_bind_off;	/* file offset to lazy binding info */
+    uint32_t   lazy_bind_size;  /* size of lazy binding infs */
+    uint32_t   export_off;	/* file offset to lazy binding info */
+    uint32_t   export_size;	/* size of lazy binding infs */
+};
+
 // header of the LC_DYLD_CHAINED_FIXUPS payload
 struct dyld_chained_fixups_header
 {
@@ -2268,6 +2287,7 @@ struct dlinfo_macho64 {
 
     size_t dlm64_dysymtab_iextdefsym;
     size_t dlm64_dysymtab_nextdefsym;
+    int dlm64_extdef_sorted;    // the exported symbols are sorted by name (see macho64_check_extdef_sorted)
 
     const struct dyld_chained_starts_in_image *dlm64_chainedfixups_starts;
 
@@ -2997,10 +3017,59 @@ static void *lookup_symbol_elf64(struct dlinfo_elf64 *dl, const char *s, int all
     return lookup_symbol_elf64_all(dl, s);
 }
 
+// The name an exported symbol is looked up by: without the leading underscore
+static const char *macho64_extdef_name(struct dlinfo_macho64 *dl, size_t i)
+{
+    struct nlist_64 *n = &dl->dlm64_symtab[i];
+    if (!n->n_un.n_strx || n->n_un.n_strx >= dl->dlm64_strtabsize)
+        return NULL;
+    return &dl->dlm64_strtab[n->n_un.n_strx] + 1;
+}
+
+/*
+ * Static linkers write the exported symbols (LC_DYSYMTAB's extdef range)
+ * sorted by name, which is what let dyld binary-search them. A linear scan
+ * per lookup made loading a large image quadratic: clang (~10^5 exports)
+ * looked up every one of its imports in itself first, and took 6 s to
+ * start. The order is checked once, and an image not in it is scanned.
+ */
+static void macho64_check_extdef_sorted(struct dlinfo_macho64 *dl)
+{
+    dl->dlm64_extdef_sorted = 0;
+    if (!dl->dlm64_symtab || !dl->dlm64_strtab)
+        return;
+    size_t first = dl->dlm64_dysymtab_iextdefsym, end = first + dl->dlm64_dysymtab_nextdefsym;
+    if (end > dl->dlm64_symtabsize)
+        return;
+    const char *prev = NULL;
+    for (size_t i = first; i < end; i++) {
+        const char *name = macho64_extdef_name(dl, i);
+        if (!name || (prev && strcmp(prev, name) > 0))
+            return;
+        prev = name;
+    }
+    dl->dlm64_extdef_sorted = 1;
+}
+
 static void *lookup_symbol_macho64(struct dlinfo_macho64 *dl, const char *s)
 {
     if (!dl->dlm64_symtab)
         return NULL;
+
+    if (dl->dlm64_extdef_sorted) {
+        size_t lo = dl->dlm64_dysymtab_iextdefsym, hi = lo + dl->dlm64_dysymtab_nextdefsym;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int c = strcmp(s, macho64_extdef_name(dl, mid));
+            if (c == 0)
+                return (void *)(dl->dlm64_load_bias + dl->dlm64_symtab[mid].n_value);
+            if (c < 0)
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        return NULL;
+    }
 
     for (size_t i = dl->dlm64_dysymtab_iextdefsym; i < (dl->dlm64_dysymtab_iextdefsym + dl->dlm64_dysymtab_nextdefsym) && i < dl->dlm64_symtabsize; i++) {
         struct nlist_64 *n = &dl->dlm64_symtab[i];
@@ -3953,7 +4022,23 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             dl->dlm64_chainedfixups_imports_count = dcfhdr->imports_count;
             dl->dlm64_chainedfixups_imports_format = dcfhdr->imports_format;
         }
+
+        // Rebase and bind opcodes (what static linkers emit for targets
+        // older than macOS 13 / iOS 13.4, or with -no_fixup_chains) are not
+        // implemented: such an image would run with its pointers unslid and
+        // its imports unbound, and its first initializer call jumps to its
+        // link-time address. Refuse it.
+        if (curr_lc->cmd == LC_DYLD_INFO || curr_lc->cmd == LC_DYLD_INFO_ONLY) {
+            const struct dyld_info_command *dic = (const struct dyld_info_command *)curr_lc;
+            if (dic->rebase_size || dic->bind_size || dic->weak_bind_size || dic->lazy_bind_size) {
+                ERROR("unsupported Mach-O \"%s\": rebase/bind opcodes (LC_DYLD_INFO) instead of chained fixups", filename);
+                ret = NULL;
+                goto out;
+            }
+        }
     }
+
+    macho64_check_extdef_sorted(dl);
 
     if (gdb_jit && 0 == create_macho64_jit_entry(dl, filename))
         gdb_jit_register(&dl->dlm64_jit_entry);
@@ -4112,12 +4197,16 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
     if (!dl->dlm64_chainedfixups_imports)
         return 0;
 
-    if (dl->dlm64_chainedfixups_imports_format != DYLD_CHAINED_IMPORT) {
-        ERROR("failed to link Mach-O \"%s\": unknown chained fixups imports format %d", DLBASE(dl)->dl_name, dl->dlm64_chainedfixups_imports_format);
+    // All three import formats: the plain one, and those carrying an addend
+    // per import (a reference into another image's data at an offset, C++
+    // typeinfo/vtable references among them, which a static linker emits as
+    // DYLD_CHAINED_IMPORT_ADDEND once any import needs one).
+    int imports_format = dl->dlm64_chainedfixups_imports_format;
+    if (imports_format != DYLD_CHAINED_IMPORT && imports_format != DYLD_CHAINED_IMPORT_ADDEND &&
+        imports_format != DYLD_CHAINED_IMPORT_ADDEND64) {
+        ERROR("failed to link Mach-O \"%s\": unknown chained fixups imports format %d", DLBASE(dl)->dl_name, imports_format);
         return 1;
     }
-
-    struct dyld_chained_import *imports = dl->dlm64_chainedfixups_imports;
 
     uintptr_t starts_base = (uintptr_t)dl->dlm64_chainedfixups_starts;
     for (uint32_t sg = 0; sg < dl->dlm64_chainedfixups_starts->seg_count; sg++) {
@@ -4160,23 +4249,45 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                     case DYLD_CHAINED_PTR_64_OFFSET:
                         if (p.ptr_64_rebase->bind) {
                             next = p.ptr_64_bind->next * 4;
-                            struct dyld_chained_import *import = &imports[p.ptr_64_bind->ordinal];
+                            uint32_t ordinal = p.ptr_64_bind->ordinal;
+                            uint32_t name_offset;
+                            int weak_import;
+                            int64_t addend = p.ptr_64_bind->addend;   // inline, 0..255
+                            if (imports_format == DYLD_CHAINED_IMPORT) {
+                                const struct dyld_chained_import *imp = &((const struct dyld_chained_import *)dl->dlm64_chainedfixups_imports)[ordinal];
+                                name_offset = imp->name_offset;
+                                weak_import = imp->weak_import;
+                            }
+                            else if (imports_format == DYLD_CHAINED_IMPORT_ADDEND) {
+                                const struct dyld_chained_import_addend *imp = &((const struct dyld_chained_import_addend *)dl->dlm64_chainedfixups_imports)[ordinal];
+                                name_offset = imp->name_offset;
+                                weak_import = imp->weak_import;
+                                addend += imp->addend;
+                            }
+                            else {
+                                const struct dyld_chained_import_addend64 *imp = &((const struct dyld_chained_import_addend64 *)dl->dlm64_chainedfixups_imports)[ordinal];
+                                name_offset = (uint32_t)imp->name_offset;
+                                weak_import = imp->weak_import;
+                                addend += (int64_t)imp->addend;
+                            }
                             // skip the leading underscore
-                            const char *s = dl->dlm64_chainedfixups_strtab + import->name_offset + 1;
+                            const char *s = dl->dlm64_chainedfixups_strtab + name_offset + 1;
                             uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1, 0, DLBASE(dl));
-                            if (!sym_addr && !import->weak_import) {
+                            if (!sym_addr && !weak_import) {
                                 ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
                                 return 1;
                             }
-                            *p.ptr8 = sym_addr;
+                            // a missing weak import stays 0, addend or not, as dyld leaves it
+                            *p.ptr8 = sym_addr ? sym_addr + addend : 0;
                         }
                         else {
                             next = p.ptr_64_rebase->next * 4;
                             // DYLD_CHAINED_PTR_64 targets are vmaddrs,
                             // DYLD_CHAINED_PTR_64_OFFSET ones offsets from
-                            // the mach header
-                            *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target +
-                                (seg_starts->pointer_format == DYLD_CHAINED_PTR_64_OFFSET ? dl->dlm64_hdr_vmaddr : 0);
+                            // the mach header; high8 is the top byte (a tag)
+                            *p.ptr8 = ((uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target +
+                                (seg_starts->pointer_format == DYLD_CHAINED_PTR_64_OFFSET ? dl->dlm64_hdr_vmaddr : 0)) |
+                                ((uintptr_t)p.ptr_64_rebase->high8 << 56);
                         }
                         break;
                 }
@@ -4317,6 +4428,17 @@ static void call_macho64_constructors(struct dlinfo_macho64 *dl) {
         const struct section_64 *curr_sect = (const struct section_64 *)((uintptr_t)curr_sc + sizeof(struct segment_command_64));
         for (size_t j = 0; j < curr_sc->nsects; ++j, curr_sect++) {
             
+            // __mod_init_func: pointers, already fixed up (what static linkers
+            // emitted before __init_offsets, and still do for some targets)
+            if ( (curr_sect->flags & SECTION_TYPE) == S_MOD_INIT_FUNC_POINTERS ) {
+                const uintptr_t *funcs = (const uintptr_t *)(dl->dlm64_load_bias + curr_sect->addr);
+                const uintptr_t *funcs_end = (const uintptr_t *)((uintptr_t)funcs + curr_sect->size);
+                for (const uintptr_t *f = funcs; f < funcs_end; ++f)
+                    if (*f)
+                        call_function(DLBASE(dl)->dl_linker, (struct dlinfo *)dl, (void *)*f);
+                continue;
+            }
+
             if ( (curr_sect->flags & SECTION_TYPE) != S_INIT_FUNC_OFFSETS )
                 continue;
             
@@ -5239,6 +5361,43 @@ void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, i
 
 char *ulinker_dlerror(void) {
     return errormsg;
+}
+
+/*
+ * An image's unwind tables, for the unwinder of a program whose images TVM
+ * loaded: a guest's own libunwind (statically linked into C++ programs, so
+ * that exceptions unwind its emulated frames) asks dyld for them with
+ * _dyld_find_unwind_sections(), and dyld does not know these images.
+ */
+int ulinker_find_unwind_sections(struct ulinker *ulinker, const void *addr, struct ulinker_unwind_sections *out)
+{
+    memset(out, 0, sizeof(*out));
+    DLINFO_LOCK(ulinker);
+    struct dlinfo *dl = library_for_address_locked(ulinker, addr);
+    DLINFO_UNLOCK(ulinker);
+    if (!dl || dl->dl_type != DLT_MACHO64)
+        return 0;
+
+    struct dlinfo_macho64 *dlm = (struct dlinfo_macho64 *)dl;
+    out->mh = (const void *)(dlm->dlm64_load_bias + dlm->dlm64_hdr_vmaddr);
+    const struct load_command *lc = dlm->dlm64_lc;
+    for (size_t i = 0; i < dlm->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+        for (size_t j = 0; j < sc->nsects; j++, sect++) {
+            if (0 == strncmp(sect->sectname, "__eh_frame", sizeof(sect->sectname))) {
+                out->dwarf_section = (const void *)(dlm->dlm64_load_bias + sect->addr);
+                out->dwarf_section_length = sect->size;
+            }
+            else if (0 == strncmp(sect->sectname, "__unwind_info", sizeof(sect->sectname))) {
+                out->compact_unwind_section = (const void *)(dlm->dlm64_load_bias + sect->addr);
+                out->compact_unwind_section_length = sect->size;
+            }
+        }
+    }
+    return 1;
 }
 
 /*
