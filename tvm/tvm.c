@@ -68,6 +68,7 @@
 #include <spawn.h>
 #elif defined(__linux__)
 #include <pty.h>
+#include <utmp.h>
 #include <crypt.h>
 #include <sys/vfs.h>
 #include <sys/epoll.h>
@@ -367,6 +368,7 @@ DECL_FUNC(fdopen);
 DECL_FUNC(popen);
 DECL_FUNC(pclose);
 DECL_FUNC(wait4);
+DECL_FUNC(waitid);
 DECL_FUNC(wait3);
 DECL_FUNC(vwarn);
 DECL_FUNC(vwarnx);
@@ -615,6 +617,8 @@ DECL_FUNC_OPT(posix_spawnattr_set_csm_np);
 #endif
 
 DECL_FUNC(openpty);
+DECL_FUNC(forkpty);
+DECL_FUNC(login_tty);
 
 DECL_FUNC(tcgetpgrp);
 DECL_FUNC(tcsetpgrp);
@@ -664,6 +668,8 @@ DECL_FUNC(bsearch);
 DECL_FUNC(qsort);
 
 DECL_FUNC(setitimer);
+DECL_FUNC(alarm);
+DECL_FUNC(ualarm);
 DECL_FUNC(getitimer);
 
 DECL_FUNC_OPT(timer_create);
@@ -2042,8 +2048,9 @@ struct thread {
     siginfo_t thr_pending_siginfo[MAX_SIGNALS];
     ucontext_t thr_pending_ucontext[MAX_SIGNALS];
     sigset_t thr_sigmask;  // virtual signal mask (sigprocmask)
-    int thr_wake[2];  // a non-blocking pipe an F_SETLKW sleeps on, made on the thread's first (thread_wake_fd); -1 until then
+    int thr_wake[2];  // a non-blocking pipe an F_SETLKW or a poll() waits on, which signal_handler writes to, made on the thread's first (thread_wake_fd); -1 until then
     struct tvm_stack *thr_stack;  // the stack TVM allocated the thread, if (see stack_alloc)
+    int thr_sigkill;  // the SIGCONT on its way to the thread is a SIGKILL (see thread_signal; atomic)
 };
 
 static struct rmem_arena *global_arena = NULL;
@@ -3056,6 +3063,22 @@ static int stop_signal_dropped(int signum, pid_t pid)
 
 static int task_signal_ignored_locked(struct task *t, int signum);
 
+// Signal a task's thread through the host. SIGKILL cannot be sent as it is:
+// it cannot be caught either, and on a host thread it is the whole host
+// process's, which the kernel kills at once -- every task, every session,
+// the app. kill -9 of any task did that. It travels as a SIGCONT marked on
+// the thread (thr_sigkill), which signal_handler takes for a SIGKILL of the
+// task, dispatched (or deferred) like any other signal. A real SIGCONT
+// arriving with it is absorbed, the task being killed anyway.
+static int thread_signal(struct thread *thr, int signum)
+{
+    if (signum == SIGKILL) {
+        __atomic_store_n(&thr->thr_sigkill, 1, __ATOMIC_RELEASE);
+        signum = SIGCONT;
+    }
+    return CALL_FUNC(pthread_kill, thr->thr_pthread, signum);
+}
+
 /**
  * needs tasks_lock and t locked.
  * Prefers delivering to a thread that isn't in a signal-deferred section.
@@ -3090,7 +3113,7 @@ static int task_kill_locked(struct task *t, int signum) {
         if (!fallback)
             fallback = thr;
         if (!__atomic_load_n(&thr->thr_sig_blocked, __ATOMIC_ACQUIRE)) {
-            r = CALL_FUNC(pthread_kill, thr->thr_pthread, signum);
+            r = thread_signal(thr, signum);
             goto delivered;
         }
     }
@@ -3101,7 +3124,7 @@ static int task_kill_locked(struct task *t, int signum) {
     // gets drained on the next tvm_sig_leave().
     if (!fallback)
         panic("fallback thread NULL");
-    r = CALL_FUNC(pthread_kill, fallback->thr_pthread, signum);
+    r = thread_signal(fallback, signum);
 
 delivered:
     // pthread_cond_wait is not EINTR-interruptible, so a thread sleeping in
@@ -4631,7 +4654,11 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
             INFO("signum=%d at %p pc=0x%lx lr=0x%lx si_code=%d in_emu=%d sigblk=%d depth=%d", signum, siginfo->si_addr, fault_pc, fault_lr, siginfo->si_code, tvm_in_emu, tvm_sig_blocked, tvm_sig_depth);
             dump_stacktrace();
         }
-        else if (signum != SIGCHLD) {
+        // not the SIGCONT terminate_current_locked pokes the task's other
+        // threads with, every 500 us until they leave: a line each flooded
+        // the app's console and hung its UI
+        else if (signum != SIGCHLD &&
+                 !(signum == SIGCONT && __atomic_load_n(&current->tsk_exiting_thread, __ATOMIC_ACQUIRE))) {
             INFO("signum=%d", signum);
             if (signum == SIGABRT)
                 dump_stacktrace();
@@ -4798,13 +4825,14 @@ static inline void tvm_sig_leave(void)
  * wait and holds no lock of the host's libraries.
  */
 #if defined(__APPLE__) && defined(__aarch64__)
-static uintptr_t kernel_wait_stubs[5];
+static uintptr_t kernel_wait_stubs[6];
 
 __attribute__((constructor))
 static void kernel_wait_stubs_init(void)
 {
     static const char *const names[] = {
-        "__psynch_cvwait", "__psynch_mutexwait", "__semwait_signal", "__ulock_wait", "__ulock_wait2" };
+        "__psynch_cvwait", "__psynch_mutexwait", "__semwait_signal", "__ulock_wait", "__ulock_wait2",
+        "__sigsuspend" };
     for (size_t i = 0; i < sizeof(names) / sizeof(*names); i++)
         kernel_wait_stubs[i] = (uintptr_t)dlsym(RTLD_DEFAULT, names[i]);
 }
@@ -4877,7 +4905,11 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     // std::condition_variable, which goes to libsystem_pthread directly:
     // lld's thread pool) never comes back into TVM to do so, and the exit
     // hung. Blocked in one of those traps it holds none of the host's locks,
-    // so it leaves from here.
+    // so it leaves from here. The same for a thread parked in TVM's pause()
+    // or sigsuspend(), which wait in the host's sigsuspend holding nothing:
+    // CPython (3.14+) parks a daemon thread that outlives the interpreter in
+    // pause() for good (PyThread_hang_thread), as http.server's handlers of
+    // a browser's idle connections do, and exit() after Ctrl+C hung on them.
     if (signum == SIGCONT && thread_in_kernel_wait(ucontext)) {
         struct thread *exiting = __atomic_load_n(&tls->tls_current->tsk_exiting_thread, __ATOMIC_ACQUIRE);
         if (exiting && exiting != current_thread) {
@@ -4885,6 +4917,16 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             task_lock(current);
             thread_exit_for_task_exit_locked();  // releases both locks, no return
         }
+    }
+
+    // a SIGKILL, which travels as SIGCONT (thread_signal)
+    siginfo_t kill_info;
+    if (signum == SIGCONT && current_thread &&
+        __atomic_exchange_n(&current_thread->thr_sigkill, 0, __ATOMIC_ACQ_REL)) {
+        signum = SIGKILL;
+        kill_info = *siginfo;
+        kill_info.si_signo = SIGKILL;
+        siginfo = &kill_info;
     }
 
     int hardware_fault = siginfo->si_code > 0 && (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL || signum == SIGFPE);
@@ -5009,6 +5051,9 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 #define TTM_SLAVE  2
 #define TTM_ALL    (TTM_MASTER | TTM_SLAVE)
 
+#define TTY_CANON  1024     // longest input line in ICANON (MAX_CANON)
+#define TTY_NEOF   16       // VEOFs not yet read by the slave
+
 struct tty {
     struct list_head t_list;
     pthread_mutex_t t_lock;
@@ -5037,7 +5082,37 @@ struct tty {
     int t_sfd;
     ino_t t_sfd_ino;
 
+    // Hangup. Once the last slave file closes, the master reads what is
+    // left and then an end of file, as on the host: the slave's end is shut
+    // down for writing (t_hup), which t_sfd held open before, so a reader of
+    // the master (pty.spawn, pexpect) waited for the child's output to end
+    // forever. A slave opened again after that gets a new socket pair, whose
+    // master end replaces the host descriptor of every master file
+    // (t_masters).
+    unsigned t_slave_refcnt;
+    int t_hup;
+    struct file **t_masters;
+    unsigned t_nmasters;
+
     int t_col;
+
+    // ICANON: the line being typed, which reaches the slave when it ends
+    // (newline, VEOL, VEOL2, VEOF); t_cancol is the output column it starts
+    // at, for erasing; t_lnext, VLNEXT took the next character literally.
+    uint8_t t_can[TTY_CANON];
+    size_t t_canlen;
+    int t_cancol;
+    int t_lnext;
+
+    // VEOF on an empty line is an end of file for one read of the slave.
+    // It reaches the slave as a byte too, so the slave polls readable for
+    // it; t_eof holds the input stream offsets of those bytes, against
+    // t_inwr and t_inrd, the bytes written to and read from the slave's
+    // input.
+    uint64_t t_inwr;
+    uint64_t t_inrd;
+    uint64_t t_eof[TTY_NEOF];
+    unsigned t_neof;
 };
 
 LIST_HEAD(ttys);
@@ -5086,9 +5161,20 @@ static struct tty *ttyalloc()
     tt->t_master_refcnt = 0;
     tt->t_mfd = ends[0];
     tt->t_sfd = ends[1];
+    tt->t_slave_refcnt = 0;
+    tt->t_hup = 0;
+    tt->t_masters = NULL;
+    tt->t_nmasters = 0;
 
     tt->t_sid = -1;
     tt->t_pgid = -1;
+
+    tt->t_col = 0;
+    tt->t_canlen = 0;
+    tt->t_cancol = 0;
+    tt->t_lnext = 0;
+    tt->t_inwr = tt->t_inrd = 0;
+    tt->t_neof = 0;
 
     tt->t_mode = S_IRUSR | S_IWUSR | S_IWGRP;
     tt->t_uid = getuid();
@@ -5159,6 +5245,7 @@ static void ttydealloc(struct tty *tt)
         CALL_FUNC(close, tt->t_mfd);
     if (tt->t_sfd != -1)
         CALL_FUNC(close, tt->t_sfd);
+    kfree(tt->t_masters);
 
     pthread_mutex_destroy(&tt->t_lock);
 
@@ -5361,6 +5448,93 @@ static struct tty *tty_for_rfd(int rfd, int *out_ttymode) {
 
 static struct fops *ttyops();
 
+// A socket's inode, stat'ed twice when the first says 0 (see ttyalloc).
+static int tty_socket_ino(int fd, ino_t *ino)
+{
+    struct stat st;
+    if (-1 == CALL_FUNC(fstat, fd, &st))
+        return -1;
+#if defined(__APPLE__)
+    if (st.st_ino == 0 && -1 == CALL_FUNC(fstat, fd, &st))
+        return -1;
+#endif
+    *ino = st.st_ino;
+    return 0;
+}
+
+static int tty_master_add_locked(struct tty *tt, struct file *file)
+{
+    struct file **m = krealloc(tt->t_masters, (tt->t_nmasters + 1) * sizeof(*m));
+    if (!m) {
+        errno = ENOMEM;
+        return -1;
+    }
+    m[tt->t_nmasters++] = file;
+    tt->t_masters = m;
+    return 0;
+}
+
+static void tty_master_del_locked(struct tty *tt, struct file *file)
+{
+    for (unsigned i = 0; i < tt->t_nmasters; i++) {
+        if (tt->t_masters[i] == file) {
+            tt->t_masters[i] = tt->t_masters[--tt->t_nmasters];
+            return;
+        }
+    }
+}
+
+// A new socket pair for a pty that hung up (see t_hup): its ends take the
+// place of t_mfd, t_sfd and every master file's host descriptor, which keep
+// their numbers (the pty's name is t_mfd's) and status flags (O_NONBLOCK).
+// What the master had not read of the old one is gone.
+static int tty_rebuild_locked(struct tty *tt)
+{
+    int ends[2];
+    if (-1 == CALL_FUNC(socketpair, AF_UNIX, SOCK_STREAM, 0, ends))
+        return -1;
+    ino_t mino, sino;
+    if (0 != tty_socket_ino(ends[0], &mino) || 0 != tty_socket_ino(ends[1], &sino))
+        goto fail;
+    for (unsigned i = 0; i < tt->t_nmasters; i++) {
+        int rfd = tt->t_masters[i]->f_rfd;
+        int fl = CALL_FUNC(fcntl, rfd, F_GETFL);
+        if (-1 == fl || -1 == CALL_FUNC(dup2, ends[0], rfd) || -1 == CALL_FUNC(fcntl, rfd, F_SETFL, fl))
+            goto fail;
+    }
+    if (-1 == CALL_FUNC(dup2, ends[0], tt->t_mfd) || -1 == CALL_FUNC(dup2, ends[1], tt->t_sfd))
+        goto fail;
+    CALL_FUNC(close, ends[0]);
+    CALL_FUNC(close, ends[1]);
+    tt->t_mfd_ino = mino;
+    tt->t_sfd_ino = sino;
+    tt->t_hup = 0;
+    tt->t_canlen = 0;
+    tt->t_lnext = 0;
+    tt->t_inwr = tt->t_inrd = 0;
+    tt->t_neof = 0;
+    return 0;
+fail:
+    {
+        int err = errno;
+        CALL_FUNC(close, ends[0]);
+        CALL_FUNC(close, ends[1]);
+        errno = err;
+    }
+    return -1;
+}
+
+// A host descriptor for a new slave file of `tt` (locked), which counts it.
+static int tty_slave_rfd_locked(struct tty *tt)
+{
+    if (tt->t_hup && 0 != tty_rebuild_locked(tt))
+        return -1;
+    int sfd = CALL_FUNC(dup, tt->t_sfd);
+    if (-1 != sfd)
+        tt->t_slave_refcnt++;
+    return sfd;
+}
+
 /**
  * Open the slave side of `tt` (locked and referenced; the reference is
  * consumed) into `out` (unlocked, reachable by nobody yet: file_open's,
@@ -5402,7 +5576,7 @@ static int tty_open_file(struct tty *tt, int flags, struct file *out)
     if (tt->t_sfd == -1)
         panic("tty %d t_sfd invalid?", tt->t_mfd);
 
-    int r_sfd = CALL_FUNC(dup, tt->t_sfd);
+    int r_sfd = tty_slave_rfd_locked(tt);
     if (r_sfd == -1) {
         if (0 == (flags & O_NOCTTY))
             task_unlock(current);
@@ -5443,9 +5617,15 @@ static int ttyop_dup(struct file *oldfile, struct file *newfile) {
         return -1;
     }
 
+    if (ttymode == TTM_MASTER && 0 != tty_master_add_locked(tt, newfile)) {
+        tty_unlock(tt, 1);
+        return -1;
+    }
     tt->t_refcnt++;
     if (ttymode == TTM_MASTER)
         tt->t_master_refcnt++;
+    else
+        tt->t_slave_refcnt++;
     newfile->f_data = (void *)tt;
     tty_unlock(tt, 1);
     return 0;
@@ -5515,6 +5695,8 @@ static int ttyop_fchown(struct file *file, uid_t owner, gid_t group)
     return ret;
 }
 
+static int tty_canon_flush_locked(struct tty *tt, int fd);
+
 static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
 {
     int ttymode;
@@ -5548,10 +5730,47 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
         case TIOCSETAW:
         case TIOCSETAF:
 #endif
+        {
+#if defined(__linux__)
+            int flush = request == TCSETSF;
+#elif defined(__APPLE__)
+            int flush = request == TIOCSETAF;
+#endif
+            int was_canon = (tt->t_lflag & ICANON) != 0;
             memcpy(&tt->t_termios, arg, sizeof(tt->t_termios));
+            if (flush) {
+                // the line being typed; what the slave has not read is
+                // left (as tcflush(TCIFLUSH) is not done either)
+                tt->t_canlen = 0;
+                tt->t_lnext = 0;
+            } else if (was_canon && !(tt->t_lflag & ICANON) && tt->t_canlen) {
+                // the line typed so far is input as it is
+                int mfd = CALL_FUNC(dup, tt->t_mfd);
+                if (-1 != mfd) {
+                    if (-1 != CALL_FUNC(fcntl, mfd, F_SETFL, O_NONBLOCK))
+                        (void)tty_canon_flush_locked(tt, mfd);
+                    CALL_FUNC(close, mfd);
+                }
+                tt->t_canlen = 0;
+            }
             ret = 0;
             break;
+        }
         
+
+#if defined(TIOCGETD)
+        // the line discipline: the standard one only (toybox's stty asks)
+        case TIOCGETD:
+            *(int *)arg = 0;
+            ret = 0;
+            break;
+        case TIOCSETD:
+            if (*(int *)arg == 0)
+                ret = 0;
+            else
+                errno = EINVAL;
+            break;
+#endif
 
         case TIOCGWINSZ:
             memcpy(arg, &tt->t_winsize, sizeof(tt->t_winsize));
@@ -5756,16 +5975,20 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
     uint8_t *out = buf;
     struct pollfd pfd = { .fd = file->f_rfd, .events = POLLIN };
 
-    int vmin = termios.c_cc[VMIN];
-    int vtime = termios.c_cc[VTIME]; // in tenths of a second
+    // ICANON: what is there is whole lines (the line discipline sends a
+    // line when it ends), and a read returns at most one of them, waiting
+    // for it, whatever VMIN and VTIME say.
+    int canon = (termios.c_lflag & ICANON) != 0;
+    int vmin = canon ? 1 : termios.c_cc[VMIN];
+    int vtime = canon ? 0 : termios.c_cc[VTIME]; // in tenths of a second
 
     int timer_started = 0;
     struct timespec start_time;
     long remaining_ms = vtime * 100; // VTIME in 0.1s units → ms
 
-    while (1) {
+    while (total_read < count) {
         // Check if we have enough bytes for VMIN
-        if (vmin > 0 && total_read >= (size_t)vmin)
+        if (!canon && vmin > 0 && total_read >= (size_t)vmin)
             break;
 
         // If VMIN == 0 and some bytes already read, return immediately
@@ -5773,7 +5996,9 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
             break;
 
         int poll_timeout;
-        if (vmin == 0 && vtime == 0) {
+        if (canon && total_read > 0) {
+            poll_timeout = 0;  // the rest of the line, which is there
+        } else if (vmin == 0 && vtime == 0) {
             poll_timeout = 0;  // poll returns immediately
         } else if (vmin == 0 && vtime > 0) {
             poll_timeout = remaining_ms; // timer starts immediately
@@ -5795,21 +6020,44 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
             return -1;
         }
 
-        // Data is available: read one byte at a time
+        // Data is available: read one byte at a time, under the tty lock
+        // to tell an end of file (tty_eof_locked) from data. Not waiting:
+        // another reader may have taken what poll saw.
         unsigned char c;
-        ssize_t n = CALL_FUNC(read, file->f_rfd, &c, 1);
+        tty_lock(tt, 0);
+        while (tt->t_neof && tt->t_eof[0] < tt->t_inrd) {
+            // read past, by a way not counted: not an end of file anymore
+            memmove(tt->t_eof, tt->t_eof + 1, --tt->t_neof * sizeof(tt->t_eof[0]));
+        }
+        int at_eof = tt->t_neof && tt->t_eof[0] == tt->t_inrd;
+        if (at_eof && total_read > 0) {
+            // the end of file is the next read's
+            tty_unlock(tt, 0);
+            break;
+        }
+        ssize_t n = CALL_FUNC(recv, file->f_rfd, &c, 1, MSG_DONTWAIT);
+        if (n > 0) {
+            tt->t_inrd++;
+            if (at_eof)
+                memmove(tt->t_eof, tt->t_eof + 1, --tt->t_neof * sizeof(tt->t_eof[0]));
+        }
+        tty_unlock(tt, 0);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
         if (n < 0) {
             tty_lock(tt, 0);
             tty_unlock(tt, 1);
             file_lock(file, 0);
             return -1;
         }
-        if (n == 0)
+        if (n == 0 || at_eof)
             break; // EOF
 
         // Store the byte
-        if (total_read < count)
-            out[total_read++] = c;
+        out[total_read++] = c;
+
+        if (canon && (c == '\n' || CCEQ(termios.c_cc[VEOL], c) || CCEQ(termios.c_cc[VEOL2], c)))
+            break;
 
         // Start timer after first byte if VMIN>0 and VTIME>0
         if (vmin > 0 && vtime > 0 && !timer_started) {
@@ -6044,7 +6292,37 @@ static ssize_t tty_output_buffer_locked(struct tty *tt, struct file *file, const
     return ret;
 }
 
-static void tty_echo_locked(struct tty *tt, int c)
+// Echo goes back to the master through the slave's end of the socket, as
+// the slave's own output does (OPOST).
+static int tty_echo_open_locked(struct tty *tt, struct tty_obuf *o)
+{
+    // no slave to echo for, and a write to the shut down end would raise
+    // the host's SIGPIPE
+    if (tt->t_hup)
+        return -1;
+    int slave = CALL_FUNC(dup, tt->t_sfd);
+    if (-1 == slave)
+        return -1;
+
+    if (-1 == CALL_FUNC(fcntl, slave, F_SETFL, O_NONBLOCK)) {
+        CALL_FUNC(close, slave);
+        return -1;
+    }
+
+    o->tt = tt;
+    o->fd = slave;
+    o->n = 0;
+    return 0;
+}
+
+static void tty_echo_close_locked(struct tty_obuf *o)
+{
+    (void)tty_obuf_flush(o);
+    CALL_FUNC(close, o->fd);
+}
+
+// c as the user sees it typed: a control character as ^X with ECHOCTL.
+static void tty_echo_char_locked(struct tty *tt, struct tty_obuf *o, int c)
 {
 	if ((!ISSET(tt->t_lflag, ECHO) &&
 	    (c != '\n' || !ISSET(tt->t_lflag, ECHONL))) ||
@@ -6052,20 +6330,10 @@ static void tty_echo_locked(struct tty *tt, int c)
 		return;
 	}
 
-    int slave = CALL_FUNC(dup, tt->t_sfd);
-    if (-1 == slave)
-        return;
-    
-    if (-1 == CALL_FUNC(fcntl, slave, F_SETFL, O_NONBLOCK)) {
-        CALL_FUNC(close, slave);
-        return;
-    }
-
-    struct tty_obuf o = { .tt = tt, .fd = slave };
 	if (ISSET(tt->t_lflag, ECHOCTL) &&
 	    ((ISSET(c, TTY_CHARMASK) <= 037 && c != '\t' && c != '\n') ||
 	    ISSET(c, TTY_CHARMASK) == 0177)) {
-		(void)tty_output_locked(tt, &o, '^');
+		(void)tty_output_locked(tt, o, '^');
 		CLR(c, ~TTY_CHARMASK);
 		if (c == 0177) {
 			c = '?';
@@ -6074,9 +6342,191 @@ static void tty_echo_locked(struct tty *tt, int c)
 		}
 	}
 
-	tty_output_locked(tt, &o, c);
-    (void)tty_obuf_flush(&o);
-    CALL_FUNC(close, slave);
+	(void)tty_output_locked(tt, o, c);
+}
+
+static void tty_echo_locked(struct tty *tt, int c)
+{
+    struct tty_obuf o;
+    if (0 != tty_echo_open_locked(tt, &o))
+        return;
+    tty_echo_char_locked(tt, &o, c);
+    tty_echo_close_locked(&o);
+}
+
+// Input for the slave to read. fd is the master's end of the socket.
+static int tty_deliver_locked(struct tty *tt, int fd, const uint8_t *buf, size_t n)
+{
+    struct tty_obuf o = { .tt = tt, .fd = fd };
+    for (size_t i = 0; i < n; i++)
+        if (tty_putc_locked(&o, buf[i]))
+            return -1;
+    if (tty_obuf_flush(&o))
+        return -1;
+    tt->t_inwr += n;
+    return 0;
+}
+
+// The line typed so far goes to the slave.
+static int tty_canon_flush_locked(struct tty *tt, int fd)
+{
+    size_t n = tt->t_canlen;
+    tt->t_canlen = 0;
+    return n ? tty_deliver_locked(tt, fd, tt->t_can, n) : 0;
+}
+
+// VEOF on an empty line: the slave's next read returns 0. The byte is
+// listed before it is written, as the write may let a reader in.
+static int tty_eof_locked(struct tty *tt, int fd)
+{
+    if (tt->t_neof == TTY_NEOF)
+        return 0;
+    tt->t_eof[tt->t_neof++] = tt->t_inwr;
+    static const uint8_t z = 0;
+    if (0 != tty_deliver_locked(tt, fd, &z, 1)) {
+        tt->t_neof--;
+        return -1;
+    }
+    return 0;
+}
+
+// The output column after echoing c at column col.
+static int tty_echo_col(struct tty *tt, uint8_t c, int col)
+{
+    if (ISSET(tt->t_iflag, IUTF8) && (c & 0xc0) == 0x80)
+        return col;     // a UTF-8 continuation byte
+    if (c == '\t')
+        return (col + 8) & ~7;
+    if (c <= 037 || c == 0177)
+        return ISSET(tt->t_lflag, ECHOCTL) ? col + 2 : col;
+    return col + 1;
+}
+
+// Take the last character of the line back (a UTF-8 one as a whole with
+// IUTF8), and off the screen with ECHOE.
+static void tty_rub_locked(struct tty *tt, struct tty_obuf *o)
+{
+    if (!tt->t_canlen)
+        return;
+
+    size_t n = tt->t_canlen;
+    do
+        n--;
+    while (n > 0 && ISSET(tt->t_iflag, IUTF8) && (tt->t_can[n] & 0xc0) == 0x80);
+    uint8_t c = tt->t_can[n];
+    tt->t_canlen = n;
+
+    if (!ISSET(tt->t_lflag, ECHO) || ISSET(tt->t_lflag, EXTPROC))
+        return;
+    if (!ISSET(tt->t_lflag, ECHOE)) {
+        tty_echo_char_locked(tt, o, tt->t_cc[VERASE]);
+        return;
+    }
+
+    int col = tt->t_cancol;
+    for (size_t i = 0; i < n; i++)
+        col = tty_echo_col(tt, tt->t_can[i], col);
+
+    if (c == '\t') {
+        // back to where the rest of the line ends
+        for (int i = tt->t_col - col; i > 0; i--)
+            (void)tty_output_locked(tt, o, '\b');
+        return;
+    }
+    for (int i = tty_echo_col(tt, c, col) - col; i > 0; i--) {
+        (void)tty_output_locked(tt, o, '\b');
+        (void)tty_output_locked(tt, o, ' ');
+        (void)tty_output_locked(tt, o, '\b');
+    }
+}
+
+static int tty_is_blank(uint8_t c)
+{
+    return c == ' ' || c == '\t';
+}
+
+// A character in ICANON: line editing, or one more of the line.
+static int tty_canon_locked(struct tty *tt, int fd, int c)
+{
+    struct tty_obuf o;
+    if (0 != tty_echo_open_locked(tt, &o))
+        return -1;
+
+    int ret = 0;
+    int literal = tt->t_lnext;
+    tt->t_lnext = 0;
+
+    if (!literal) {
+        if (CCEQ(tt->t_cc[VERASE], c)
+#ifdef VERASE2
+            || CCEQ(tt->t_cc[VERASE2], c)
+#endif
+            ) {
+            tty_rub_locked(tt, &o);
+            goto out;
+        }
+        if (CCEQ(tt->t_cc[VKILL], c)) {
+            if (ISSET(tt->t_lflag, ECHOKE) && ISSET(tt->t_lflag, ECHOE)) {
+                while (tt->t_canlen)
+                    tty_rub_locked(tt, &o);
+            } else {
+                tty_echo_char_locked(tt, &o, c);
+                if (ISSET(tt->t_lflag, ECHOK) || ISSET(tt->t_lflag, ECHOKE))
+                    tty_echo_char_locked(tt, &o, '\n');
+                tt->t_canlen = 0;
+            }
+            goto out;
+        }
+        if (CCEQ(tt->t_cc[VEOF], c)) {
+            tty_echo_close_locked(&o);
+            return tt->t_canlen ? tty_canon_flush_locked(tt, fd) : tty_eof_locked(tt, fd);
+        }
+        if (ISSET(tt->t_lflag, IEXTEN)) {
+            if (CCEQ(tt->t_cc[VWERASE], c)) {
+                while (tt->t_canlen && tty_is_blank(tt->t_can[tt->t_canlen - 1]))
+                    tty_rub_locked(tt, &o);
+                while (tt->t_canlen && !tty_is_blank(tt->t_can[tt->t_canlen - 1]))
+                    tty_rub_locked(tt, &o);
+                goto out;
+            }
+            if (CCEQ(tt->t_cc[VREPRINT], c)) {
+                tty_echo_char_locked(tt, &o, c);
+                tty_echo_char_locked(tt, &o, '\n');
+                tt->t_cancol = tt->t_col;
+                for (size_t i = 0; i < tt->t_canlen; i++)
+                    tty_echo_char_locked(tt, &o, tt->t_can[i]);
+                goto out;
+            }
+            if (CCEQ(tt->t_cc[VLNEXT], c)) {
+                if (ISSET(tt->t_lflag, ECHO) && ISSET(tt->t_lflag, ECHOCTL)) {
+                    (void)tty_output_locked(tt, &o, '^');
+                    (void)tty_output_locked(tt, &o, '\b');
+                }
+                tt->t_lnext = 1;
+                goto out;
+            }
+        }
+    }
+
+    int eol = !literal && (c == '\n' || CCEQ(tt->t_cc[VEOL], c) || CCEQ(tt->t_cc[VEOL2], c));
+    // the last place is kept for the end of the line
+    if (tt->t_canlen >= TTY_CANON - (eol ? 0 : 1)) {
+        if (ISSET(tt->t_iflag, IMAXBEL))
+            (void)tty_output_locked(tt, &o, '\a');
+        goto out;
+    }
+    if (!tt->t_canlen)
+        tt->t_cancol = tt->t_col;
+    tt->t_can[tt->t_canlen++] = (uint8_t)c;
+    tty_echo_char_locked(tt, &o, c);
+    if (eol) {
+        tty_echo_close_locked(&o);
+        return tty_canon_flush_locked(tt, fd);
+    }
+
+out:
+    tty_echo_close_locked(&o);
+    return ret;
 }
 
 static int tty_input_locked(struct tty *tt, int fd, int c)
@@ -6084,10 +6534,13 @@ static int tty_input_locked(struct tty *tt, int fd, int c)
     if (ISSET(tt->t_iflag, ISTRIP))
 		CLR(c, 0x80);
     
-    if (!ISSET(tt->t_lflag, EXTPROC)) {
+    // the character after VLNEXT is taken as it is
+    if (!ISSET(tt->t_lflag, EXTPROC) && !tt->t_lnext) {
         // Signals
         if (ISSET(tt->t_lflag, ISIG)) {
             if (CCEQ(tt->t_cc[VINTR], c) || CCEQ(tt->t_cc[VQUIT], c) || CCEQ(tt->t_cc[VSUSP], c)) {
+                if (!ISSET(tt->t_lflag, NOFLSH))
+                    tt->t_canlen = 0;
                 tty_echo_locked(tt, c);
                 int pgid = tt->t_pgid;
                 int sig = CCEQ(tt->t_cc[VINTR], c) ? SIGINT : (CCEQ(tt->t_cc[VQUIT], c) ? SIGQUIT : SIGTSTP);
@@ -6109,11 +6562,13 @@ static int tty_input_locked(struct tty *tt, int fd, int c)
         
     }
 
+    if (ISSET(tt->t_lflag, ICANON) && !ISSET(tt->t_lflag, EXTPROC))
+        return tty_canon_locked(tt, fd, c);
+
     // keystrokes, one at a time: an ISIG character above acts between them
-    struct tty_obuf o = { .tt = tt, .fd = fd };
-    if (tty_putc_locked(&o, c))
-        return -1;
-    return tty_obuf_flush(&o);
+    tty_echo_locked(tt, c);
+    uint8_t b = (uint8_t)c;
+    return tty_deliver_locked(tt, fd, &b, 1);
 }
 
 static ssize_t tty_input_buffer_locked(struct tty *tt, struct file *file, const uint8_t *buf, size_t count)
@@ -6194,6 +6649,13 @@ static void ttyop_close(struct file *file) {
 
     // we took ref in tty_for_file_locked()
     tt->t_refcnt--;
+    if (ttymode == TTM_MASTER)
+        tty_master_del_locked(tt, file);
+    else if (--tt->t_slave_refcnt == 0 && tt->t_master_refcnt && !tt->t_hup) {
+        // the last slave: the master reads an end of file (see t_hup)
+        if (0 == CALL_FUNC(shutdown, tt->t_sfd, SHUT_WR))
+            tt->t_hup = 1;
+    }
     int master_closed = (ttymode == TTM_MASTER && --tt->t_master_refcnt == 0);
     int last_file = (tt->t_refcnt == 1); // only the temp ref from tty_for_file_locked remains
 
@@ -6367,6 +6829,11 @@ static int ptm_open_file(struct file *file)
         ttydealloc(tt);
         return -1;
     }
+    if (0 != tty_master_add_locked(tt, file)) {
+        CALL_FUNC(close, mfd);
+        ttydealloc(tt);
+        return -1;
+    }
 
     tt->t_refcnt++;
     tt->t_master_refcnt++;
@@ -6403,13 +6870,14 @@ static struct file *ptm_open()
 }
 
 static struct file *pts_open_locked(struct tty *tt) {
-    int sfd = CALL_FUNC(dup, tt->t_sfd);
+    int sfd = tty_slave_rfd_locked(tt);
     if (-1 == sfd)
         return NULL;
 
     struct file *file = filealloc_from_rfd(sfd);
     if (!file) {
         VERIFY(0 == CALL_FUNC(close, sfd));
+        tt->t_slave_refcnt--;
         return NULL;
     }
 
@@ -7318,6 +7786,55 @@ static struct vfs_node *vfs_host_node(const char *path, int mount_id)
     return vn;
 }
 
+/*
+ * A link of the host's on the way to the host path `path`, whose target
+ * the host would look for in its own namespace: a link into a mount
+ * (venv's bin/python3 -> /tvm/bin/python3, `ln -s /tvm/bin/bash ~/sh`)
+ * was not found at all, as the host has no /tvm. Only when the host does
+ * not find `path` (followed to the end unless `nofollow`): then the first
+ * link on the way is spliced in as the resolver splices a cpio link, its
+ * target (relative: from its directory) with the rest of the path behind
+ * it, in `next` (normalized), for the walk to start over with: 1. 0 when
+ * the host's answer stands (it found the path, or no link is on the way).
+ */
+static int vfs_host_link(const char *path, int nofollow, char *next)
+{
+    struct stat st;
+    if (0 == CALL_FUNC(fstatat, AT_FDCWD, path, &st, nofollow ? AT_SYMLINK_NOFOLLOW : 0) ||
+        (errno != ENOENT && errno != ENOTDIR))
+        return 0;
+
+    size_t n = strlen(path);
+    char prefix[PATH_MAX];
+    for (size_t i = 1; i <= n; i++) {
+        if (path[i] != '/' && path[i] != 0)
+            continue;
+        if (i == n && nofollow)
+            break;
+        memcpy(prefix, path, i);
+        prefix[i] = 0;
+        if (0 != CALL_FUNC(fstatat, AT_FDCWD, prefix, &st, AT_SYMLINK_NOFOLLOW))
+            break;      /* not there: the host's ENOENT */
+        if (!S_ISLNK(st.st_mode))
+            continue;
+
+        char target[PATH_MAX];
+        ssize_t len = CALL_FUNC(readlink, prefix, target, sizeof(target) - 1);
+        if (len <= 0)
+            break;
+        target[len] = 0;
+        if (path[i] && vfs_path_join(target, path + i + 1))
+            return 0;
+        char *slash = strrchr(prefix, '/');
+        slash[slash == prefix ? 1 : 0] = 0;     /* the link's directory */
+        if (!normalize_path(prefix, target, next))
+            return 0;
+        return 1;
+    }
+    errno = ENOENT;
+    return 0;
+}
+
 static int vfs_resolve_walk(const char *abspath, unsigned flags, struct vfs_res *out, struct vfs_walk *w)
 {
     memset(out, 0, sizeof(*out));
@@ -7546,6 +8063,17 @@ restart:;
     return 0;
 
 host:
+    /* a link of the host's into a mount (vfs_host_link): from the root
+       again, in the namespace it names */
+    if (vfs_root && vfs_host_link(out->path, (flags & VR_NOFOLLOW) && !trailing, tmp)) {
+        if (++w->nlinks > MAXSYMLINKS) {
+            errno = ELOOP;
+            return -1;
+        }
+        w->host_mount_id = 0;
+        goto restart;
+    }
+
     /* the host's: a transient node of the path in out->path, of the bind
        it is under; with the "/" for the host to apply */
     if (trailing && path_add_slash(out->path))
@@ -13279,6 +13807,7 @@ static int tvm_cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
 static void tvm_tlv_atexit(void (*func)(void *), void *obj);
 static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sections *info);
 #endif
+static void *tvm_guest_dlsym(void *handle, const char *symbol);
 
 static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
 {
@@ -13320,6 +13849,7 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
 #endif
 
     if (0 == strcmp(base, "pthread_create")) return &emulator_pthread_create;
+    if (0 == strcmp(base, "dlsym"))          return &tvm_guest_dlsym;
 
     if (0 == strcmp(base, "optarg"))   return &current->tsk_data->optarg;
     if (0 == strcmp(base, "optind"))   return &current->tsk_data->optind;
@@ -16085,13 +16615,17 @@ static int tvm_poll_host_masked(struct pollfd *realfds, nfds_t nfds, const struc
 #endif
 }
 
+static int signal_deliverable(void);
+static int thread_wake_fd(void);
+
 // poll() over the task's descriptors: each translated to the host
 // descriptor behind it for the host wait, which is poll() with `timeout`,
 // or with `os_mask` the masked wait of tvm_poll_host_masked with `ts`.
 static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const struct timespec *ts, const sigset_t *os_mask)
 {
     int ret = -1;
-    struct pollfd *realfds = malloc(nfds * sizeof(*fds));
+    // one more entry: the thread's wake pipe (see the wait below)
+    struct pollfd *realfds = malloc((nfds + 1) * sizeof(*fds));
     if (!realfds) {
         errno = ENOMEM;
         return ret;
@@ -16107,33 +16641,88 @@ static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const str
 
     tvm_sig_enter();
 
+    // As the kernel's poll: a negative descriptor is skipped (revents 0)
+    // and one that is not open is reported POLLNVAL, in its entry, without
+    // failing the call or waiting. CPython on Apple platforms tests exactly
+    // that at import (select_have_broken_poll) and drops select.poll when
+    // it fails, which disabled its interactive console (pyrepl).
+    int nval = 0;
     for (int i = 0; i < nfds; i++) {
-        files[i] = file_for_task(current, fds[i].fd);
+        realfds[i].revents = 0;
+        files[i] = fds[i].fd < 0 ? NULL : file_for_task(current, fds[i].fd);
         if (!files[i]) {
-            for (int j = 0; j < i; j++) {
-                file_lock(files[j], 0);
-                file_unlock(files[j], 1);
-            }
-            tvm_sig_leave();
-            free(files);
-            free(realfds);
-            return ret;
+            if (fds[i].fd >= 0)
+                nval++;
+            realfds[i].fd = -1;
+            continue;
         }
         realfds[i].fd = files[i]->f_rfd;
         file_unlock(files[i], 0);
     }
 
+    struct timespec zero = { 0, 0 };
+    int wake = os_mask || !current_thread ? -1 : thread_wake_fd();
     if (os_mask)
-        ret = tvm_poll_host_masked(realfds, nfds, ts, os_mask);
-    else
-        ret = CALL_FUNC(poll, realfds, nfds, timeout);
+        ret = tvm_poll_host_masked(realfds, nfds, nval ? &zero : ts, os_mask);
+    else if (wake < 0)
+        ret = CALL_FUNC(poll, realfds, nfds, nval ? 0 : timeout);
+    else {
+        // A signal ends the wait, as the kernel's: one that came from here
+        // on was deferred (signals are blocked, tvm_sig_enter) and is
+        // dispatched on the way out, but did not interrupt a host poll()
+        // that was not running yet, which then waited on with it pending.
+        // signal_handler writes to the thread's wake pipe as it defers one
+        // (see rlock_sleep), so the wait watches the pipe too. Seen as
+        // dropbear's session missing its child's SIGCHLD now and then, its
+        // handler being what wakes its select(): the client hung once the
+        // sftp-server had exited.
+        int ms = nval ? 0 : timeout;
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        realfds[nfds] = (struct pollfd){ .fd = wake, .events = POLLIN };
+        for (;;) {
+            if (signal_deliverable()) {
+                errno = EINTR;
+                ret = -1;
+                break;
+            }
+            ret = CALL_FUNC(poll, realfds, nfds + 1, ms);
+            if (ret <= 0 || !realfds[nfds].revents)
+                break;
+            if (--ret > 0)
+                break;  // descriptors are ready: those
+            // only the pipe: a signal the guest blocks, which stays pending
+            // and must not end the wait. Again, for what is left of it.
+            (void)thread_wake_fd();
+            if (ms > 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long long gone = (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000;
+                ms = gone >= timeout ? 0 : (int)(timeout - gone);
+            }
+            if (ms == 0)
+                break;  // its time is up, ret 0
+        }
+    }
     int err = errno;
+
+    if (ret >= 0 && nval) {
+        ret = 0;
+        for (int i = 0; i < nfds; i++) {
+            if (!files[i])
+                realfds[i].revents = fds[i].fd < 0 ? 0 : POLLNVAL;
+            if (realfds[i].revents)
+                ret++;
+        }
+    }
 
     for (int i = 0; i < nfds; i++)
         realfds[i].fd = fds[i].fd;
     memcpy(fds, realfds, nfds * sizeof(*fds));
 
     for (int i = 0; i < nfds; i++) {
+        if (!files[i])
+            continue;
         file_lock(files[i], 0);
         file_unlock(files[i], 1);
     }
@@ -16269,8 +16858,9 @@ static int signal_deliverable(void)
     return 0;
 }
 
-// The calling thread's wake pipe, read end, made on its first F_SETLKW and
-// emptied: what is in it from before is no news. -1 if it cannot be made.
+// The calling thread's wake pipe, read end, made on its first F_SETLKW or
+// poll() and emptied: what is in it from before is no news. -1 if it cannot
+// be made.
 static int thread_wake_fd(void)
 {
     struct thread *thr = current_thread;
@@ -18407,7 +18997,11 @@ FUNCTION_DEFINE2(int, pthread_kill, pthread_t, thread, int, sig) {
     struct tvm_stack *st;
     list_for_each_entry(st, &stacks, st_list)
         live |= pthread_equal(st->st_pthread, thread);
-    if (live)
+    if (live && stop_signal_dropped(sig, current->tsk_pid))
+        ret = 0;
+    else if (live && sig == SIGKILL)
+        ret = thread_signal(current_thread, sig);   // the task's, whichever thread
+    else if (live)
         ret = CALL_FUNC(pthread_kill, thread, sig);
     pthread_mutex_unlock(&stacks_lock);
     task_unlock(current);
@@ -18656,6 +19250,42 @@ static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sec
     return _dyld_find_unwind_sections(addr, info);
 }
 #endif
+
+/*
+ * dlsym(3) as a task's program calls it. dyld (ld.so) does not know the
+ * images TVM loaded for the task, and the host's dlsym found none of their
+ * symbols: ctypes' pythonapi (dlopen(NULL), then dlsym) had no Py_*
+ * function at all. A lookup in the whole program -- RTLD_DEFAULT, RTLD_SELF,
+ * RTLD_MAIN_ONLY or the handle dlopen(NULL) returns -- finds what an import
+ * of the name binds to: the task's images first, then TVM's own functions
+ * and the host's (ulinker_external_dlsym). A library the program dlopen()ed
+ * itself, and RTLD_NEXT, are the host's to search.
+ */
+static void *main_program_handle;
+
+static void main_program_handle_init(void)
+{
+    main_program_handle = dlopen(NULL, RTLD_LAZY);
+}
+
+static void *tvm_guest_dlsym(void *handle, const char *symbol)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, main_program_handle_init);
+
+    int whole = handle == RTLD_DEFAULT || (main_program_handle && handle == main_program_handle);
+#if defined(RTLD_SELF)
+    whole |= handle == RTLD_SELF;
+#endif
+#if defined(RTLD_MAIN_ONLY)
+    whole |= handle == RTLD_MAIN_ONLY;
+#endif
+    if (!whole || !symbol || !current || !current->tsk_linker)
+        return dlsym(handle, symbol);
+
+    void *a = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, symbol, 0);
+    return a ? a : ulinker_external_dlsym(NULL, symbol, 0);
+}
 
 //FUNCTION_DEFINE1(int, atexit, exit_t, function) {
 int atexit(exit_t function) {
@@ -19070,7 +19700,9 @@ FUNCTION_DEFINE1(pid_t, wait, int *, wstatus) {
     return waitpid(-1, wstatus, 0);
 }
 
-static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
+// nowait: report the child but leave it a zombie, to be waited for again
+// (waitid's WNOWAIT).
+static pid_t tvm_wait_ex(pid_t pid, int *wstatus, int options, struct rusage *ru, int nowait)
 {
     struct task *zombiet = NULL;
     int found;
@@ -19129,6 +19761,17 @@ static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
     }
 
     task_lock(zombiet);
+    if (nowait) {
+        pid_t childpid = zombiet->tsk_pid;
+        if (wstatus)
+            *wstatus = zombiet->tsk_result;
+        if (ru)
+            *ru = zombiet->tsk_rusage;
+        task_unlock(zombiet);
+        pthread_mutex_unlock(&tasks_lock);
+        tvm_sig_leave();
+        return childpid;
+    }
     // Claim the zombie AND remove it from the task list atomically under
     // tasks_lock, before dropping the lock for pthread_join. TS_REAPED alone
     // left a window: between here and taskfreelastref()'s list_del (after the
@@ -19171,8 +19814,56 @@ static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
     return childpid;
 }
 
+static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
+{
+    return tvm_wait_ex(pid, wstatus, options, ru, 0);
+}
+
 FUNCTION_DEFINE3(pid_t, waitpid, pid_t, pid, int *, wstatus, int, options) {
     return tvm_wait4(pid, wstatus, options, NULL);
+}
+
+// waitid(2) on TVM's children. It went to the host's, which waited for the
+// host process's own children (Python's os.waitid(P_ALL, ...) reaped one of
+// those, with a host pid). Tasks do not stop or continue, so WEXITED is the
+// only state there is to wait for.
+FUNCTION_DEFINE4(int, waitid, idtype_t, idtype, id_t, id, siginfo_t *, infop, int, options) {
+    pid_t pid;
+    switch (idtype) {
+        case P_PID:  pid = (pid_t)id; break;
+        case P_PGID: pid = id ? -(pid_t)id : 0; break;
+        case P_ALL:  pid = -1; break;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+    if (!infop || !(options & (WEXITED | WSTOPPED | WCONTINUED))) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(infop, 0, sizeof(*infop));
+    if (!(options & WEXITED)) {
+        if (options & WNOHANG)
+            return 0;   // no child will ever be in the state asked for
+        errno = EINVAL;
+        return -1;
+    }
+
+    int status;
+    pid_t r = tvm_wait_ex(pid, &status, options & WNOHANG, NULL, (options & WNOWAIT) != 0);
+    if (r <= 0)
+        return r;   // -1 (ECHILD, EINTR), or 0: WNOHANG with none, infop zeroed
+    infop->si_signo = SIGCHLD;
+    infop->si_pid = r;
+    infop->si_uid = getuid();
+    if (WIFSIGNALED(status)) {
+        infop->si_code = WCOREDUMP(status) ? CLD_DUMPED : CLD_KILLED;
+        infop->si_status = WTERMSIG(status);
+    } else {
+        infop->si_code = CLD_EXITED;
+        infop->si_status = WEXITSTATUS(status);
+    }
+    return 0;
 }
 
 // Not interposed before: toybox time's wait4() went to the host libc, which
@@ -19330,7 +20021,7 @@ FUNCTION_DEFINE1(int, raise, int, sig) {
         return 0;
     }
 
-    int r = CALL_FUNC(pthread_kill, pthread_self(), sig);
+    int r = sig == SIGKILL ? thread_signal(current_thread, sig) : CALL_FUNC(pthread_kill, pthread_self(), sig);
     if (r != 0) {
         errno = r;
         r = -1;
@@ -21163,10 +21854,6 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, cons
 #elif defined(__APPLE__)
 FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, struct termios *, termp, struct winsize *, winp) {
 #endif
-    // TODO
-    if (name || termp || winp)
-        panic("openpty todo");
-
     tvm_sig_enter();
 
     struct file *master = ptm_open();
@@ -21210,7 +21897,7 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
     //   tty -> task -> slave
 
     int fslave = task_assign_file_locked(current, slave, 0);
-    if (-1 == fmaster) {
+    if (-1 == fslave) {
         task_unlock(current);
         tty_unlock(tt, 1);
         file_unlock(slave, 1);
@@ -21223,11 +21910,86 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
     tty_unlock(tt, 1);
     file_unlock(slave, 1);
 
+    // the optional arguments, as the BSD/glibc openpty applies them: the
+    // slave's name (no size is given: these are short), its termios and its
+    // window size
+    int err = 0;
+    if (termp && 0 != tcsetattr(fslave, TCSAFLUSH, termp))
+        err = errno;
+    if (!err && winp && 0 != ioctl(fslave, TIOCSWINSZ, winp))
+        err = errno;
+    if (!err && name) {
+        const char *n = ttyname(fslave);
+        if (n)
+            strcpy(name, n);
+        else
+            err = errno;
+    }
+    if (err) {
+        close(fslave);
+        close(fmaster);
+        tvm_sig_leave();
+        errno = err;
+        return -1;
+    }
+
     tvm_sig_leave();
 
     *amaster = fmaster;
     *aslave = fslave;
     return 0;
+}
+
+// login_tty(3): fd becomes the controlling terminal of a new session, and
+// stdin, stdout and stderr. libutil's makes the same calls inside the host's
+// libraries, which TVM does not see: the session and the descriptors were
+// the host process's.
+FUNCTION_DEFINE1(int, login_tty, int, fd) {
+    (void)setsid();
+    if (-1 == ioctl(fd, TIOCSCTTY, 0))
+        return -1;
+    for (int i = 0; i < 3; i++)
+        if (i != fd && -1 == dup2(fd, i))
+            return -1;
+    if (fd > 2)
+        close(fd);
+    return 0;
+}
+
+// forkpty(3): openpty(), then fork(), the child on the slave (login_tty).
+// libutil's opened a pty of the host's and forked the host process. Like
+// fork() (which copies the stack of the frames up to the program's), it is
+// no FUNCTION_DEFINE wrapper: a wrapper's frame holds the parent thread's
+// TLS, which the child's copy of it would then write to.
+FUNCTION_METADATA(forkpty, &forkpty);
+#if defined(__linux__)
+pid_t forkpty(int *amaster, char *name, const struct termios *termp, const struct winsize *winp) {
+#else
+pid_t forkpty(int *amaster, char *name, struct termios *termp, struct winsize *winp) {
+#endif
+    if (!can_enter_tvm(__builtin_return_address(0)))
+        return CALL_FUNC(forkpty, amaster, name, termp, winp);
+
+    int m, sl;
+    if (-1 == openpty(&m, &sl, name, termp, winp))
+        return -1;
+    pid_t pid = fork();
+    if (pid == -1) {
+        int err = errno;
+        close(m);
+        close(sl);
+        errno = err;
+        return -1;
+    }
+    if (pid == 0) {
+        close(m);
+        if (-1 == login_tty(sl))
+            _exit(1);
+        return 0;
+    }
+    close(sl);
+    *amaster = m;
+    return pid;
 }
 
 FUNCTION_DEFINE1(int, isatty, int, fd) {
@@ -21351,7 +22113,26 @@ FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
 FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct termios *, termios_p) {
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(tcsetattr, __rfd, optional_actions, termios_p));
-    
+
+    struct termios t;
+#ifdef TCSASOFT
+    // BSD's TCSASOFT (CIGNORE): the hardware settings are left as they are.
+    // CPython's getpass passes it, and EINVAL had it echo the password
+    // ("Can not control echo on the terminal").
+    if (optional_actions & TCSASOFT) {
+        struct termios cur;
+        if (0 != tcgetattr(fd, &cur))
+            return -1;
+        t = *termios_p;
+        t.c_cflag = cur.c_cflag;
+        t.c_ispeed = cur.c_ispeed;
+        t.c_ospeed = cur.c_ospeed;
+        termios_p = &t;
+        optional_actions &= ~TCSASOFT;
+    }
+#endif
+    (void)t;
+
     int request;
     switch (optional_actions) {
         default:
@@ -22556,6 +23337,29 @@ FUNCTION_DEFINE2(int, getitimer, ITIMER_WHICH_T, which, struct itimerval *, curr
 
     itimerspec_to_itimerval(&its, curr_value);
     return 0;
+}
+
+// alarm() and ualarm() on the task's ITIMER_REAL (setitimer above). The
+// host's set the host process's timer: libc implements them with its own
+// setitimer (glibc's alarm is the syscall), which TVM never saw, and the
+// SIGALRM went to the host process, whose default action ended every task
+// at once (Python's signal.alarm in any task).
+FUNCTION_DEFINE1(unsigned int, alarm, unsigned int, seconds) {
+    struct itimerval nv = { .it_value = { .tv_sec = seconds } }, ov;
+    if (0 != __tvm_setitimer(ITIMER_REAL, &nv, &ov))
+        return 0;
+    // what is left of the earlier alarm, rounded up as BSD's alarm() does
+    return (unsigned int)ov.it_value.tv_sec + (ov.it_value.tv_usec ? 1 : 0);
+}
+
+FUNCTION_DEFINE2(useconds_t, ualarm, useconds_t, usecs, useconds_t, interval) {
+    struct itimerval nv = {
+        .it_value = { .tv_sec = usecs / 1000000, .tv_usec = usecs % 1000000 },
+        .it_interval = { .tv_sec = interval / 1000000, .tv_usec = interval % 1000000 },
+    }, ov;
+    if (0 != __tvm_setitimer(ITIMER_REAL, &nv, &ov))
+        return (useconds_t)-1;
+    return (useconds_t)(ov.it_value.tv_sec * 1000000 + ov.it_value.tv_usec);
 }
 
 #if defined(__linux__)

@@ -747,6 +747,44 @@ def test_concurrent_interactive(forkless: Forkless):
             s2.expect(r"\$ ")
         s1.expect(r"\$ ")
 
+def test_tty_canonical_input(sshi: spawn):
+    """The pty's line discipline in cooked mode (ICANON|ECHO, what a program
+    that does not set the terminal up reads with): typing is echoed, the
+    line is edited with VERASE, VWERASE and VKILL before the program gets
+    it, and VEOF on an empty line is an end of file."""
+    def read_line(keys: str) -> str:
+        # READY is printed once bash has put the terminal back in cooked
+        # mode for the command; keys typed earlier would go in raw
+        sshi.sendline('echo READY; read -r v; echo "got=[$v]"')
+        sshi.expect("READY\r\n")
+        sshi.send(keys)
+        sshi.expect(r"got=\[(.*?)\]\r\n")
+        line = sshi.match.group(1).decode()
+        sshi.expect(r"\$ ")
+        return line
+
+    sshi.sendline('echo READY; read -r v; echo "got=[$v]"')
+    sshi.expect("READY\r\n")
+    sshi.send("abc")
+    sshi.expect("abc")                  # echoed as typed
+    sshi.send("\x7f")
+    sshi.expect("\b \b")                # rubbed out
+    sshi.send("d\r")
+    sshi.expect("d\r\n")                # the newline is echoed (ICRNL, ONLCR)
+    sshi.expect(r"got=\[abd\]")
+    sshi.expect(r"\$ ")
+
+    assert read_line("one two\x17three\r") == "one three"   # ^W
+    assert read_line("junk\x15ok\r") == "ok"                # ^U
+
+    sshi.sendline("echo READY; cat; echo cat_rc=$?")
+    sshi.expect("READY\r\n")
+    sshi.send("line\r")
+    sshi.expect("line\r\nline\r\n")     # the echo, then cat's copy
+    sshi.send("\x04")                   # ^D
+    sshi.expect("cat_rc=0")
+    sshi.expect(r"\$ ")
+
 # ── SCP extended ──────────────────────────────────────────────
 
 def test_scp_large_file(forkless: Forkless, device):
@@ -2632,6 +2670,24 @@ def test_python_paths(sshi: spawn):
     assert "inner 0 '42\\n' ''" in _lines(out), out
 
 @pytestmark_python
+def test_python_subprocess_argv_reused_blocks(sshi: spawn):
+    """A forked child's argv survives fork's pointer relocation when the
+    argv copies land in reused pymalloc blocks: 16-byte object()s (a type
+    pointer at offset 8) are freed right before each subprocess.run, and
+    "print(6*7)" ends in the word that held that pointer. pymalloc reusing
+    blocks without zeroing them made every run fail ("print(6*7)~e\\x01");
+    see scripts/build_python.sh."""
+    out, rc = _sh(sshi, "python3 -c 'import subprocess, sys\n"
+                        "bad = 0\n"
+                        "for i in range(10):\n"
+                        "    objs = [object() for _ in range(5000)]; del objs\n"
+                        "    r = subprocess.run([sys.executable, \"-c\", \"print(6*7)\"], capture_output=True, text=True)\n"
+                        "    bad += (r.returncode, r.stdout) != (0, \"42\\n\")\n"
+                        "print(\"bad\", bad)'", timeout=120)
+    assert rc == 0, out
+    assert "bad 0" in _lines(out), out
+
+@pytestmark_python
 def test_posix_spawn(sshi: spawn):
     """posix_spawn and posix_spawnp, which TVM implements (with their file
     actions): the child runs in the VM, its stdout a pipe or a file the
@@ -2718,12 +2774,62 @@ def test_python_repl(sshi: spawn):
     """The interactive interpreter (_pyrepl, terminfo from /tvm/share/terminfo)."""
     sshi.sendline("python3")
     sshi.expect(">>> ")
+    # it falls back to the basic console (and says so) without select.poll
+    assert b"can't use pyrepl" not in sshi.before, sshi.before
     sshi.sendline("6 * 7")
     sshi.expect("42")
     sshi.expect(">>> ")
     sshi.sendline("exit()")
     sshi.sendline("echo repl_done=$?")
     sshi.expect("repl_done=0")
+    sshi.expect(r"\$ ")
+
+@pytestmark_python
+def test_python_basic_repl_echo(sshi: spawn):
+    """The basic console reads lines from the terminal in cooked mode, so
+    the pty echoes what is typed, the newline included."""
+    sshi.sendline("PYTHON_BASIC_REPL=1 python3 -q")
+    sshi.expect(">>> ")
+    sshi.send("6*7")
+    sshi.expect(r"6\*7")
+    sshi.send("\r")
+    sshi.expect("\r\n42\r\n")
+    sshi.expect(">>> ")
+    sshi.send("\x04")                   # ^D: end of file, the console exits
+    sshi.sendline("echo repl_done=$?")
+    sshi.expect("repl_done=0")
+    sshi.expect(r"\$ ")
+
+@pytestmark_python
+def test_python_http_server_ctrl_c(sshi: spawn):
+    """http.server exits on ^C while connections are open, as a browser
+    leaves them: their handler threads are daemon threads, which CPython
+    parks in pause() for good once the interpreter is finalizing, and the
+    exit must not wait for them."""
+    port = 18000 + os.getpid() % 2000
+    _write(sshi, "$TMPDIR/idle_clients.py",
+           "import socket, sys, time\n"
+           "port = int(sys.argv[1])\n"
+           "for _ in range(100):\n"
+           "    try:\n"
+           "        socket.create_connection(('127.0.0.1', port)).close()\n"
+           "        break\n"
+           "    except OSError:\n"
+           "        time.sleep(0.2)\n"
+           "conns = [socket.create_connection(('127.0.0.1', port)) for _ in range(3)]\n"
+           "conns[0].sendall(b'GET / HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n"
+           "conns[0].recv(65536)\n"
+           "conns[1].sendall(b'GET /fav')\n"
+           "print('IDLE_READY', flush=True)\n"
+           "time.sleep(300)\n")
+    sshi.sendline(f"python3 $TMPDIR/idle_clients.py {port} & "
+                  f"python3 -m http.server {port} --bind 127.0.0.1 -d $TMPDIR")
+    sshi.expect("IDLE_READY", timeout=60)
+    sshi.send("\x03")
+    sshi.expect("Keyboard interrupt received, exiting")
+    sshi.expect(r"\$ ", timeout=15)
+    sshi.sendline("kill %1; wait; echo cleaned")
+    sshi.expect("cleaned")
     sshi.expect(r"\$ ")
 
 @pytestmark_python
@@ -2786,6 +2892,111 @@ def test_pip_install_from_pypi(sshi: spawn):
     assert any(l.startswith("six ") for l in _lines(out)), out
     out, rc = _sh(sshi, "pip uninstall -y --disable-pip-version-check six")
     assert rc == 0, out
+
+@pytestmark_python
+@network_required
+def test_python_https_verifies(sshi: spawn):
+    """Python's ssl verifies servers with the CA bundle SSL_CERT_FILE names
+    (/tvm/etc/ssl/cacert.pem): OpenSSL's compiled-in default is the build
+    tree's prefix, so it had no CA at all. A bad certificate still fails."""
+    _write(sshi, "$TMPDIR/https.py",
+           "import urllib.request\n"
+           "print('status', urllib.request.urlopen('https://pypi.org/simple/six/', timeout=30).status)\n"
+           "try:\n"
+           "    urllib.request.urlopen('https://expired.badssl.com/', timeout=30)\n"
+           "except Exception as e:\n"
+           "    print('expired', 'CERTIFICATE_VERIFY_FAILED' in str(e))\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/https.py", timeout=120)
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "status 200" in lines and "expired True" in lines, out
+
+@pytestmark_python
+def test_python_ctypes_pythonapi(sshi: spawn):
+    """ctypes.pythonapi finds the interpreter's C API: a guest's dlsym() of
+    the whole program searches the images TVM loaded, which dyld does not
+    know."""
+    out, rc = _sh(sshi, "python3 -c 'import ctypes; print(\"init\", ctypes.pythonapi.Py_IsInitialized())'")
+    assert rc == 0, out
+    assert "init 1" in _lines(out), out
+
+@pytestmark_python
+def test_python_venv(sshi: spawn):
+    """A venv (symlinks, as on macOS by default): its bin/python3 is a link
+    of the host's file system to /tvm/bin/python3, which TVM follows into
+    its own tree; the host found nothing there."""
+    out, rc = _sh(sshi, "rm -rf $TMPDIR/venv && python3 -m venv --without-pip $TMPDIR/venv && "
+                        "$TMPDIR/venv/bin/python -c 'import sys; print(\"venv\", sys.prefix != sys.base_prefix)'",
+                  timeout=60)
+    assert rc == 0, out
+    assert "venv True" in _lines(out), out
+
+def test_symlink_into_tvm(sshi: spawn):
+    """A link of the host's file system into TVM's tree is followed by
+    exec, open and directory lookups (the host knows no /tvm)."""
+    out, rc = _sh(sshi, "rm -rf $TMPDIR/lnk && mkdir $TMPDIR/lnk && cd $TMPDIR/lnk && "
+                        "ln -s /tvm/bin/bash sh2 && ln -s /tvm/etc/profile prof && ln -s /tvm/bin bindir && "
+                        "./sh2 -c 'echo exec ok' && head -c 1 prof && echo && ls bindir/bash; cd - >/dev/null")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "exec ok" in lines and "#" in lines and "bindir/bash" in lines, out
+
+def test_kill_9_child(sshi: spawn):
+    """kill -9 of a child kills that child: SIGKILL sent as it was to a host
+    thread killed the host process, every session with it."""
+    out, rc = _sh(sshi, "sleep 30 & kill -9 $!; wait $!; echo status=$?")
+    assert rc == 0, out
+    assert "status=137" in _lines(out), out
+
+@pytestmark_python
+def test_python_alarm_and_waitid(sshi: spawn):
+    """signal.alarm() is the task's (the host's armed the host process's
+    timer, whose SIGALRM ended every task), and os.waitid waits for the
+    task's children (it reaped the host's)."""
+    _write(sshi, "$TMPDIR/alarm.py",
+           "import os, signal, subprocess, sys, time\n"
+           "r = subprocess.run([sys.executable, '-c', 'import signal, time; signal.alarm(1); time.sleep(5)'])\n"
+           "print('child', r.returncode)\n"
+           "got = []\n"
+           "signal.signal(signal.SIGALRM, lambda s, f: got.append(s))\n"
+           "signal.alarm(1); time.sleep(2); print('alarm', got)\n"
+           "p = subprocess.Popen(['sh', '-c', 'exit 5']); time.sleep(0.3)\n"
+           "w = os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)\n"
+           "print('waitid', w.si_pid == p.pid, w.si_status, p.wait())\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/alarm.py", timeout=60)
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "child -14" in lines and "alarm [14]" in lines and "waitid True 5 5" in lines, out
+
+@pytestmark_python
+def test_python_pty_getpass(sshi: spawn):
+    """A program on a pty (Python as pexpect drives one): getpass turns the
+    echo off (tcsetattr with TCSASOFT was EINVAL, and it echoed the
+    password), input() reads a line, and once the child is gone the master
+    reads an end of file (TVM held the slave's end open: readers waited)."""
+    _write(sshi, "$TMPDIR/ptyrun.py",
+           "import os, select, subprocess, sys\n"
+           "m, s = os.openpty()\n"
+           "child = ('import fcntl, termios, getpass; fcntl.ioctl(0, termios.TIOCSCTTY, 0); '\n"
+           "         'p = getpass.getpass(\"PW: \"); print(\"got\", p); print(\"line\", input(\"name? \"))')\n"
+           "p = subprocess.Popen([sys.executable, '-c', child], stdin=s, stdout=s, stderr=s, start_new_session=True)\n"
+           "os.close(s)\n"
+           "buf = b''; sent = 0\n"
+           "while True:\n"
+           "    r, _, _ = select.select([m], [], [], 20)\n"
+           "    if not r: print('STALLED'); break\n"
+           "    d = os.read(m, 100)\n"
+           "    if not d: print('EOF'); break\n"
+           "    buf += d\n"
+           "    if sent == 0 and b'PW: ' in buf: os.write(m, b'secret\\r'); sent = 1\n"
+           "    if sent == 1 and b'name? ' in buf: os.write(m, b'bob\\r'); sent = 2\n"
+           "print(repr(buf)); print('rc', p.wait())\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/ptyrun.py", timeout=60)
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "EOF" in lines and "rc 0" in lines, out
+    assert "got secret" in out and "line bob" in out, out
+    assert "PW: secret" not in out and "Warning" not in out, out
 
 # ── clang ──────────────────────────────────────────────────────
 

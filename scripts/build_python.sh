@@ -153,6 +153,34 @@ if [ ! -f Makefile ]; then
         --with-openssl="$OPENSSL" --with-openssl-rpath=no \
         --with-system-libmpdec=no --with-readline=no
 fi
+# pymalloc hands out zeroed blocks: Objects/obmalloc.c is compiled from a copy
+# here, which make's VPATH search finds before the source tree's.
+# TVM's fork copies a task's heap and relocates every word in it whose value
+# lies in a copied range, pointer or not, so a data word must not look like an
+# address (TVM's malloc zeroes its blocks for this). pymalloc reuses its freed
+# blocks as they are: a string shorter than its block left the rest of its
+# last word holding the upper bytes of a pointer the block had before, and
+# that word was "relocated". subprocess's argv copies
+# (_PySequence_BytesToCharpArray, which the forked child execs) reached the
+# new program as "print(6*7)~e\x01". (Building --without-pymalloc fixes it
+# too, but every allocation through TVM's malloc made Python 7x slower.)
+# (Its one include relative to its own directory gets the source tree's path.)
+mkdir -p Objects
+sed -e 's|^    return (void \*)bp;$|    memset(bp, 0, INDEX2SIZE(size));  /* TVM: see build_python.sh */\
+    return (void *)bp;|' \
+    -e "s|^#  include \"mimalloc/static.c\"$|#  include \"$SRCDIR/Objects/mimalloc/static.c\"|" \
+    "$SRCDIR/Objects/obmalloc.c" > Objects/obmalloc.c.new
+if [ "$(grep -c 'TVM: see build_python.sh' Objects/obmalloc.c.new)" != 1 ] ||
+   [ "$(grep -c "$SRCDIR/Objects/mimalloc/static.c" Objects/obmalloc.c.new)" != 1 ]; then
+    echo "error: Objects/obmalloc.c: pymalloc_alloc() not patched" >&2
+    exit 1
+fi
+if ! cmp -s Objects/obmalloc.c.new Objects/obmalloc.c; then
+    mv Objects/obmalloc.c.new Objects/obmalloc.c
+else
+    rm Objects/obmalloc.c.new
+fi
+
 make -j"$NPROC" EXTRA_CFLAGS="$TARGET_EXTRA_CFLAGS"
 
 # TVM finds the entry point by its exported symbol.

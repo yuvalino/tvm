@@ -200,6 +200,100 @@ TEST(ProcKill) {
     ASSERT_EQ(WTERMSIG(s), 11);
 }
 
+// SIGKILL kills the task it is sent to: the host's pthread_kill(SIGKILL)
+// killed the whole host process, every task with it.
+TEST(ProcSigkill) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        PHASE_SET(1);
+        for (;;)
+            pause();
+    }
+    PHASE_WAIT(1);
+    ASSERT_EQ(kill(p, SIGKILL), 0);
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(WIFSIGNALED(s), 1);
+    ASSERT_EQ(WTERMSIG(s), SIGKILL);
+
+    // and raise(SIGKILL) the task that raises it
+    p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        raise(SIGKILL);
+        _exit(1);
+    }
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(WIFSIGNALED(s), 1);
+    ASSERT_EQ(WTERMSIG(s), SIGKILL);
+}
+
+// alarm() is the task's: the host's armed the host process's timer, and its
+// SIGALRM ended every task.
+static volatile sig_atomic_t alarm_got;
+static void alarm_handler(int sig) { alarm_got = sig; }
+
+TEST(ProcAlarm) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        alarm(1);   // default action: this task ends
+        for (;;)
+            pause();
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(WIFSIGNALED(s), 1);
+    ASSERT_EQ(WTERMSIG(s), SIGALRM);
+
+    struct sigaction sa = { .sa_handler = alarm_handler }, old;
+    sigemptyset(&sa.sa_mask);
+    ASSERT_EQ(0, sigaction(SIGALRM, &sa, &old));
+    alarm_got = 0;
+    ASSERT_EQ(0u, alarm(5));
+    ASSERT_EQ(5u, alarm(1));       // what is left of the first, rounded up
+    while (!alarm_got)
+        pause();
+    ASSERT_EQ(alarm_got, SIGALRM);
+    ASSERT_EQ(0u, alarm(0));
+    ASSERT_EQ(0, sigaction(SIGALRM, &old, NULL));
+}
+
+// waitid() waits for the task's children (it went to the host's), and
+// WNOWAIT leaves the child to be waited for again.
+TEST(ProcWaitid) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p)
+        _exit(5);
+    siginfo_t si;
+    ASSERT_EQ(0, waitid(P_PID, p, &si, WEXITED | WNOWAIT));
+    ASSERT_EQ(si.si_pid, p);
+    ASSERT_EQ(si.si_code, CLD_EXITED);
+    ASSERT_EQ(si.si_status, 5);
+    ASSERT_EQ(0, waitid(P_ALL, 0, &si, WEXITED));
+    ASSERT_EQ(si.si_pid, p);
+    ASSERT_EQ(si.si_status, 5);
+    ASSERT_EQ(-1, waitid(P_PID, p, &si, WEXITED));
+    ASSERT_EQ(errno, ECHILD);
+
+    p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        PHASE_SET(1);
+        for (;;)
+            pause();
+    }
+    PHASE_WAIT(1);
+    ASSERT_EQ(0, waitid(P_PID, p, &si, WEXITED | WNOHANG));
+    ASSERT_EQ(si.si_pid, 0);
+    ASSERT_EQ(0, kill(p, SIGTERM));
+    ASSERT_EQ(0, waitid(P_PID, p, &si, WEXITED));
+    ASSERT_EQ(si.si_code, CLD_KILLED);
+    ASSERT_EQ(si.si_status, SIGTERM);
+}
+
 TEST(ProcParent) {
     int pip[2];
     int pip2[2];
@@ -600,6 +694,109 @@ TEST(FDsPoll) {
     ASSERT_EQ(select(nfds, &rfds, &wfds, NULL, &t), 2);
     ASSERT_NEQ(FD_ISSET(pp[1], &wfds), 0);
     ASSERT_NEQ(FD_ISSET(pp[0], &rfds), 0);
+}
+
+// A descriptor that is not open is POLLNVAL in its entry, at once, and a
+// negative one is skipped; neither fails the call. CPython tests the first
+// at import and leaves select.poll out (and its console with it) otherwise.
+TEST(FDsPollNval) {
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+    int closed = dup(pp[0]);
+    ASSERT_NEQ(closed, -1);
+    ASSERT_EQ(0, close(closed));
+
+    struct pollfd fd[3] = {
+        {.fd = closed, .events = POLLIN | POLLPRI | POLLOUT, .revents = POLLHUP},
+        {.fd = -1, .events = POLLIN, .revents = POLLIN},
+        {.fd = pp[1], .events = POLLOUT, .revents = 0},
+    };
+    // waits for nothing: the timeout would fail the test runner's deadline
+    ASSERT_EQ(poll(fd, 3, 60000), 2);
+    ASSERT_EQ(fd[0].revents, POLLNVAL);
+    ASSERT_EQ(fd[1].revents, 0);
+    ASSERT_EQ(fd[2].revents & POLLOUT, POLLOUT);
+
+    struct pollfd only = {.fd = closed, .events = POLLIN, .revents = 0};
+    ASSERT_EQ(poll(&only, 1, 0), 1);
+    ASSERT_EQ(only.revents, POLLNVAL);
+
+    struct pollfd none = {.fd = -1, .events = POLLIN, .revents = POLLIN};
+    ASSERT_EQ(poll(&none, 1, 0), 0);
+    ASSERT_EQ(none.revents, 0);
+
+    ASSERT_EQ(0, close(pp[0]));
+    ASSERT_EQ(0, close(pp[1]));
+}
+
+// A signal sent to a thread as it goes into poll() wakes it: its handler
+// writes to a self-pipe the thread polls, as dropbear's SIGCHLD handler
+// does. One landing after TVM had blocked signals for the call, and before
+// the host poll() began, was deferred until poll() returned, which it then
+// did not: dropbear missed its child's exit now and then.
+static int poll_wakeup_pipe[2];
+static void poll_wakeup_handler(int sig)
+{
+    (void)sig;
+    int e = errno;
+    (void)write(poll_wakeup_pipe[1], "", 1);
+    errno = e;
+}
+
+struct poll_wakeup_arg {
+    int seen;   // bytes the handler wrote that the thread read
+    int done;
+};
+
+static void *poll_wakeup_poller(void *p)
+{
+    struct poll_wakeup_arg *a = p;
+    while (!__atomic_load_n(&a->done, __ATOMIC_ACQUIRE)) {
+        struct pollfd pfd = { .fd = poll_wakeup_pipe[0], .events = POLLIN };
+        if (poll(&pfd, 1, -1) == 1) {
+            char buf[64];
+            ssize_t n = read(poll_wakeup_pipe[0], buf, sizeof(buf));
+            if (n > 0)
+                __atomic_add_fetch(&a->seen, (int)n, __ATOMIC_RELEASE);
+        }
+    }
+    return NULL;
+}
+
+TEST(PollSignalWakeup) {
+    ASSERT_EQ(0, pipe(poll_wakeup_pipe));
+    ASSERT_EQ(0, fcntl(poll_wakeup_pipe[0], F_SETFL, O_NONBLOCK));
+    struct sigaction sa = { .sa_handler = poll_wakeup_handler }, old;
+    sigemptyset(&sa.sa_mask);
+    ASSERT_EQ(0, sigaction(SIGUSR1, &sa, &old));
+
+    struct poll_wakeup_arg a = { 0, 0 };
+    pthread_t t;
+    ASSERT_EQ(0, pthread_create(&t, NULL, poll_wakeup_poller, &a));
+
+    int lost = -1;
+    for (int i = 0; i < 3000 && lost < 0; i++) {
+        ASSERT_EQ(0, pthread_kill(t, SIGUSR1));
+        struct timespec start, now;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        while (__atomic_load_n(&a.seen, __ATOMIC_ACQUIRE) < i + 1) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec - start.tv_sec >= 2) {
+                lost = i;
+                break;
+            }
+            sched_yield();
+        }
+    }
+
+    // let the thread go either way: a byte it reads ends its poll()
+    __atomic_store_n(&a.done, 1, __ATOMIC_RELEASE);
+    ASSERT_EQ(1, write(poll_wakeup_pipe[1], "", 1));
+    ASSERT_EQ(0, pthread_join(t, NULL));
+    ASSERT_EQ(0, sigaction(SIGUSR1, &old, NULL));
+    ASSERT_EQ(0, close(poll_wakeup_pipe[0]));
+    ASSERT_EQ(0, close(poll_wakeup_pipe[1]));
+    ASSERT_EQ(lost, -1);
 }
 
 // --- fork's pointer fixup and adjacent ints ---
@@ -3574,6 +3771,85 @@ TEST(TTYCloseSlave) {
 
     ASSERT_NEQ(-1, open(ptsname(master), O_RDWR | O_NOCTTY));
 }
+
+// Once the last slave closes, the master reads what was written and then an
+// end of file, and polls readable for it; a slave opened again works anew.
+// The master never saw the end: TVM itself held the slave's end open.
+TEST(TTYSlaveHangup) {
+    int master, slave;
+    ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    char name[64];
+    snprintf(name, sizeof(name), "%s", ptsname(master));
+    ASSERT_EQ(2, write(slave, "x\n", 2));
+    ASSERT_EQ(0, close(slave));
+
+    char buf[16];
+    ASSERT_EQ(3, read(master, buf, sizeof(buf)));
+    ASSERT_EQ(0, memcmp(buf, "x\r\n", 3));
+    struct pollfd pfd = { .fd = master, .events = POLLIN };
+    ASSERT_EQ(1, poll(&pfd, 1, 5000));
+    ASSERT_EQ(0, read(master, buf, sizeof(buf)));
+
+    slave = open(name, O_RDWR | O_NOCTTY);
+    ASSERT_NEQ(slave, -1);
+    ASSERT_EQ(1, write(slave, "y", 1));
+    ASSERT_EQ(1, read(master, buf, sizeof(buf)));
+    ASSERT_EQ(buf[0], 'y');
+    ASSERT_EQ(3, write(master, "in\n", 3));
+    ASSERT_EQ(3, read(slave, buf, sizeof(buf)));
+    ASSERT_EQ(0, memcmp(buf, "in\n", 3));
+    ASSERT_EQ(0, close(slave));
+    ASSERT_EQ(0, close(master));
+}
+
+// forkpty(): the child on the slave, as its controlling terminal in a new
+// session. libutil's opened a pty of the host's and forked the host process.
+TEST(TTYForkpty) {
+    int master;
+    struct winsize ws = { .ws_row = 24, .ws_col = 80 };
+    pid_t p = forkpty(&master, NULL, NULL, &ws);
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct winsize w;
+        int ok = isatty(0) && isatty(1) && getsid(0) == getpid() &&
+                 0 == ioctl(0, TIOCGWINSZ, &w) && w.ws_col == 80 &&
+                 -1 != open("/dev/tty", O_RDWR | O_NOCTTY);
+        (void)write(1, ok ? "ok\n" : "no\n", 3);
+        _exit(3);
+    }
+    char buf[64];
+    size_t n = 0;
+    ssize_t r;
+    while (n < sizeof(buf) && (r = read(master, buf + n, sizeof(buf) - n)) > 0)
+        n += r;
+    ASSERT_EQ(r, 0);    // the end, once the child is gone
+    ASSERT_EQ(n, 4);
+    ASSERT_EQ(0, memcmp(buf, "ok\r\n", 4));
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(WEXITSTATUS(s), 3);
+    ASSERT_EQ(0, close(master));
+}
+
+#ifdef TCSASOFT
+// TCSASOFT (CPython's getpass passes it) sets the rest and keeps the
+// hardware settings; it was EINVAL.
+TEST(TTYTcsetattrSoft) {
+    int master, slave;
+    ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    struct termios t;
+    ASSERT_EQ(0, tcgetattr(slave, &t));
+    tcflag_t cflag = t.c_cflag;
+    t.c_lflag &= ~ECHO;
+    t.c_cflag ^= CSTOPB;
+    ASSERT_EQ(0, tcsetattr(slave, TCSAFLUSH | TCSASOFT, &t));
+    ASSERT_EQ(0, tcgetattr(slave, &t));
+    ASSERT_EQ(t.c_lflag & ECHO, 0);
+    ASSERT_EQ(t.c_cflag, cflag);
+    ASSERT_EQ(0, close(slave));
+    ASSERT_EQ(0, close(master));
+}
+#endif
 
 static int got_sig = 0;
 static void sighup_handler(int signo) {
