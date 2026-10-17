@@ -9,6 +9,11 @@ mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 mount --bind /tvm/bin/sh:/bin/sh
 mount --bind /tvm/bin/bash:/bin/bash
 mount --bind /tvm/bin/env:/usr/bin/env
+# The macOS keychain tool, which TVM cannot run either (an arm64e system
+# binary): exec'ing it failed with ENOEXEC, which node throws, and Claude Code
+# (run on node) died at startup looking for its login there. Bound to
+# something that runs and finds nothing, it is a keychain with no entries.
+mount --bind /tvm/bin/false:/usr/bin/security
 
 # clang (macOS; scripts/build_llvm.sh): the toolchain bundle and the program
 # whose names /tvm/bin/clang & co. are, bound from the build output rather

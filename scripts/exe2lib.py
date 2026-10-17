@@ -16,7 +16,9 @@ a regular dylib, as ld would have written it:
   it the chained-fixup starts entry of that segment, which LIEF leaves in
   place (`dyld_info -fixups`: "seg_count exceeds number of segments");
 - LC_MAIN and LC_LOAD_DYLINKER (executables only) are removed and an
-  LC_ID_DYLIB is added right after the segments, where ld puts it;
+  LC_ID_DYLIB is added right after the segments, where ld puts it; LC_MAIN
+  stays when the executable exports no `main` (a stripped one, such as a
+  Bun program's), as TVM's entry point;
 - the old code signature is removed; sign the result afterwards
   (codesign --force), as the app's build phase does for every framework.
 
@@ -89,8 +91,9 @@ def main():
     if not b.header.has(M.Header.FLAGS.PIE):
         die(f"{src}: not position independent (link with -pie)")
 
+    exports_main = any(s.name == "_main" for s in b.exported_symbols)
     for c in list(b.commands):
-        if c.command in (M.LoadCommand.TYPE.MAIN, M.LoadCommand.TYPE.LOAD_DYLINKER):
+        if c.command == M.LoadCommand.TYPE.LOAD_DYLINKER or (c.command == M.LoadCommand.TYPE.MAIN and exports_main):
             b.remove(c)
 
     removed_index = None

@@ -661,3 +661,75 @@ if(APPLE)
     )
     set_target_properties(llvm_bundle PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
+
+###############################################################################
+# Claude Code (macOS / iOS apps only)
+#
+# Anthropic's own build, not built here: the Bun program the native installer
+# puts at ~/.local/share/claude/versions/<version> (a macOS arm64
+# executable). Shipped only when TVM_CLAUDE_CODE names one, as
+# libclaude.framework (exe2lib.py keeps its LC_MAIN entry point: it exports
+# no main) and /tvm/bin/claude in the Flutter initrd.
+###############################################################################
+set(TVM_CLAUDE_CODE "" CACHE FILEPATH "Claude Code's macOS arm64 executable to ship in the apps (empty: none)")
+if(APPLE AND TVM_CLAUDE_CODE)
+    add_shared_lib(claude ${TVM_CLAUDE_CODE} ${TVM_CLAUDE_CODE})
+    add_launcher(claude)
+endif()
+
+###############################################################################
+# ripgrep (macOS / iOS apps only)
+#
+# The release build (BurntSushi/ripgrep's aarch64-apple-darwin archive), not
+# built here: TVM_RIPGREP names its rg. Shipped as librg.framework and
+# /tvm/bin/rg in the Flutter initrd, the rg that opencode and Claude Code
+# search with (init.flutter.rc). They bring or download their own otherwise,
+# a program the app can only emulate, and searching with it emulated many
+# threads at once, which took the app down (unicorn's TCI aborting on a
+# translation block it could not decode).
+###############################################################################
+set(TVM_RIPGREP "" CACHE FILEPATH "ripgrep's macOS arm64 executable to ship in the apps (empty: none)")
+if(APPLE AND TVM_RIPGREP)
+    add_shared_lib(rg ${TVM_RIPGREP} ${TVM_RIPGREP})
+    add_launcher(rg)
+endif()
+
+###############################################################################
+# opencode (macOS / iOS apps only)
+#
+# Its own release build, not built here: the Bun program of npm's
+# opencode-darwin-arm64 package (bin/opencode, a macOS arm64 executable).
+# Shipped only when TVM_OPENCODE names one, as libopencode.framework (exported
+# no main either, see Claude Code above) and /tvm/bin/opencode in the Flutter
+# initrd.
+###############################################################################
+set(TVM_OPENCODE "" CACHE FILEPATH "opencode's macOS arm64 executable to ship in the apps (empty: none)")
+if(APPLE AND TVM_OPENCODE)
+    add_shared_lib(opencode ${TVM_OPENCODE} ${TVM_OPENCODE})
+    add_launcher(opencode)
+endif()
+
+###############################################################################
+# Node.js (macOS / iOS apps only)
+#
+# The official build (nodejs.org's node-vX-darwin-arm64, unpacked), not built
+# here: TVM_NODE names its directory. Shipped as libnode.framework (bin/node,
+# a macOS executable, which TVM loads on iOS as well) and /tvm/bin/node in
+# the Flutter initrd, its lib/node_modules (npm, corepack) as a bundle
+# resource that init.flutter.rc binds at /tvm/node. The app runs it jitless
+# (NODE_OPTIONS, init.flutter.rc): an app cannot map executable memory. With
+# them, scripts/node/tvm-fetch.cjs, the fetch() NODE_OPTIONS preloads.
+###############################################################################
+set(TVM_NODE "" CACHE PATH "An official Node.js darwin-arm64 distribution to ship in the apps (empty: none)")
+if(APPLE AND TVM_NODE)
+    add_shared_lib(node ${TVM_NODE}/bin/node ${TVM_NODE}/bin/node)
+    add_launcher(node)
+    add_custom_target(node_modules
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIB_OUT}/node
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${TVM_NODE}/lib/node_modules ${LIB_OUT}/node
+        COMMAND ${CMAKE_COMMAND} -E copy ${SCRIPTS_DIR}/node/tvm-fetch.cjs ${LIB_OUT}/node/tvm-fetch.cjs
+        DEPENDS ${SCRIPTS_DIR}/node/tvm-fetch.cjs
+        COMMENT "Staging node's npm and corepack"
+    )
+    set_target_properties(node_modules PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()

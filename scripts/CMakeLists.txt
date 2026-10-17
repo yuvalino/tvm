@@ -234,6 +234,37 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "\n")
     endif()
 
+    # ── Claude Code ── (TVM_CLAUDE_CODE, third_party/CMakeLists.txt): a
+    # launcher stub for libclaude in the Flutter initrd
+    if(APPLE AND TVM_CLAUDE_CODE AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/claude_launcher' \"$ROOTFS/bin/claude\"\n\n")
+    endif()
+
+    # ── ripgrep ── (TVM_RIPGREP, third_party/CMakeLists.txt): likewise
+    if(APPLE AND TVM_RIPGREP AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/rg_launcher' \"$ROOTFS/bin/rg\"\n\n")
+    endif()
+
+    # ── opencode ── (TVM_OPENCODE, third_party/CMakeLists.txt): likewise
+    if(APPLE AND TVM_OPENCODE AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/opencode_launcher' \"$ROOTFS/bin/opencode\"\n\n")
+    endif()
+
+    # ── Node.js ── (TVM_NODE, third_party/CMakeLists.txt): a launcher stub
+    # for libnode, and npm and npx run from the modules init.flutter.rc binds
+    # at /tvm/node
+    if(APPLE AND TVM_NODE AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/node_launcher' \"$ROOTFS/bin/node\"\n")
+        foreach(pair npm:npm-cli npx:npx-cli)
+            string(REPLACE ":" ";" pair "${pair}")
+            list(GET pair 0 name)
+            list(GET pair 1 cli)
+            string(APPEND SCRIPT "printf '#!/tvm/bin/sh\\nexec /tvm/bin/node /tvm/node/npm/bin/${cli}.js \"$@\"\\n' > \"$ROOTFS/bin/${name}\"\n")
+            string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/${name}\"\n")
+        endforeach()
+        string(APPEND SCRIPT "\n")
+    endif()
+
     # ── apple *_cmds ──
     foreach(module ${APPLE_CMDS_MODULES})
         foreach(cmd ${APPLE_CMDS_${module}})
@@ -308,6 +339,18 @@ set(LLVM_FLUTTER_DEPS "")
 if(APPLE)
     set(LLVM_CLI_DEPS llvm_exe llvm_bundle)
     set(LLVM_FLUTTER_DEPS llvm_launcher)
+    if(TVM_CLAUDE_CODE)
+        list(APPEND LLVM_FLUTTER_DEPS claude_launcher)
+    endif()
+    if(TVM_RIPGREP)
+        list(APPEND LLVM_FLUTTER_DEPS rg_launcher)
+    endif()
+    if(TVM_OPENCODE)
+        list(APPEND LLVM_FLUTTER_DEPS opencode_launcher)
+    endif()
+    if(TVM_NODE)
+        list(APPEND LLVM_FLUTTER_DEPS node_launcher)
+    endif()
 endif()
 foreach(module ${APPLE_CMDS_MODULES})
     list(APPEND APPLE_CMDS_DEPS ${module}_exe)

@@ -86,6 +86,16 @@ struct ulinker_unwind_sections {
 };
 int ulinker_find_unwind_sections(struct ulinker *ulinker, const void *addr, struct ulinker_unwind_sections *out);
 
+// The Mach-O images TVM loaded, as dyld's image list gives them
+// (_dyld_get_image_header & co.): the executable first, then the others
+// oldest first. Returns 0 past the last one.
+struct ulinker_image {
+    const void *mh;     // the mach header, where the image maps it
+    intptr_t    slide;  // its load address less its link-time one
+    const char *path;
+};
+int ulinker_image(struct ulinker *ulinker, size_t index, struct ulinker_image *out);
+
 // Thread-local variables across a fork (ulinker.c, "Thread-local variables"):
 // on the forking thread, record its TLV block of each image (returns how many
 // images have TLVs; up to max are recorded); in the child, once the parent's

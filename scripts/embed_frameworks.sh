@@ -17,7 +17,7 @@ DEST="${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}"
 SIGN_ID="${EXPANDED_CODE_SIGN_IDENTITY:--}"
 
 mkdir -p "$DEST"
-for name in libtvm libdropbear libsftpserver libbash libtoybox libvim libcurl libless libnano libsqlite libgit libgit-remote-http libgit-http-fetch libpython libllvm; do
+for name in libtvm libdropbear libsftpserver libbash libtoybox libvim libcurl libless libnano libsqlite libgit libgit-remote-http libgit-http-fetch libpython libllvm libclaude libopencode libnode librg; do
     SRC="$TVM_LIB/$name.framework"
     # the loose dylib an earlier build of this tree embedded
     rm -f "$DEST/$name.dylib"
@@ -38,7 +38,7 @@ done
 # The Python standard library and clang's toolchain bundle (its resource
 # directory and the SDK): plain files, sealed by the app's own signature like
 # any other resource.
-for res in python llvm; do
+for res in python llvm node; do
     if [ -d "$TVM_LIB/$res" ]; then
         RES="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/$res"
         rm -rf "$RES"

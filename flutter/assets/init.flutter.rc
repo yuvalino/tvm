@@ -10,8 +10,10 @@ mount --bind $TVM_RESOURCES/python/lib:/tvm/lib
 # Likewise clang's toolchain bundle: its resource directory and the SDK
 # (scripts/build_llvm.sh)
 mount --bind $TVM_RESOURCES/llvm:/tvm/llvm
+# Node's npm and corepack (when the app ships Node; scripts/embed_frameworks.sh)
+mount --bind $TVM_RESOURCES/node:/tvm/node
 setenv TVM_SHELL=/tvm/bin/bash
-setenv? TVM_NOEMU=libdropbear:libbash:libtoybox:libvim:libsftpserver:libcurl:libless:libnano:libsqlite:libgit:libgit-remote-http:libgit-http-fetch:libpython:libllvm
+setenv? TVM_NOEMU=libdropbear:libbash:libtoybox:libvim:libsftpserver:libcurl:libless:libnano:libsqlite:libgit:libgit-remote-http:libgit-http-fetch:libpython:libllvm:libclaude:libopencode:libnode:librg
 setenv TERMINFO=/tvm/share/terminfo
 setenv? PAGER=less
 setenv? LESS=-R
@@ -19,5 +21,27 @@ setenv? EDITOR=nano
 # CA certificates for OpenSSL's own verification (Python's ssl); see
 # scripts/CMakeLists.txt
 setenv? SSL_CERT_FILE=/tvm/etc/ssl/cacert.pem
+# Node runs V8 without its JIT: an app cannot map executable memory. That
+# leaves it no WebAssembly, which node's fetch() parses HTTP with; the
+# preload gives it one on node's http module (scripts/node/tvm-fetch.cjs).
+# npm installs global packages under ~/.local (bin/ is on PATH,
+# /tvm/etc/profile)
+setenv? NODE_OPTIONS=--jitless --require=/tvm/node/tvm-fetch.cjs
+setenv? NPM_CONFIG_PREFIX=$HOME/.local
+# Bun's JavaScriptCore (opencode) reserves a 64 GB "gigacage" at start,
+# more address space than an app gets, and aborts without it ("Could not
+# allocate gigacage memory"); this turns the cage off (it says so, once a run)
+setenv? GIGACAGE_ENABLED=0
+# Claude Code searches with the rg on PATH, the app's own (/tvm/bin/rg),
+# rather than the one in its package, which the app could only emulate
+setenv? USE_BUILTIN_RIPGREP=0
+# ...and stays the npm package that runs on node (2.1.112): its updater
+# installs the latest release, which is a native Bun binary since 2.1.113,
+# one the app can only emulate
+setenv? DISABLE_AUTOUPDATER=1
+# Its scratch files (each Bash command's output among them) go under /tmp
+# on Darwin, whatever TMPDIR says: /private/var/tmp on iOS, outside the
+# app's sandbox, and every Bash command failed (EPERM, mkdir claude-501)
+setenv? CLAUDE_CODE_TMPDIR=$TMPDIR
 mkdir $HOME/.dropbear
 echo TVM initialized

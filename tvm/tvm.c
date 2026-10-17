@@ -6,6 +6,7 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <libkern/OSCacheControl.h>
+#include <malloc/malloc.h>
 #if TARGET_OS_IOS
 #define __IOS_UNAVAILABLE
 #define __IOS_PROHIBITED
@@ -63,8 +64,12 @@
 #include <sys/fileport.h>
 #include <mach-o/getsect.h>
 #include <mach-o/dyld.h>
+#include <crt_externs.h>
+#include <sys/event.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <sys/sysctl.h>
+#include <sys/clonefile.h>
+#include <copyfile.h>
 #include <spawn.h>
 #elif defined(__linux__)
 #include <pty.h>
@@ -72,6 +77,7 @@
 #include <crypt.h>
 #include <sys/vfs.h>
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 #include <sys/timerfd.h>
 #include <asm/prctl.h>
 #include <link.h>
@@ -380,6 +386,10 @@ DECL_FUNC(verrc);
 DECL_FUNC(getprogname);
 DECL_FUNC(setprogname);
 DECL_FUNC(_NSGetExecutablePath);
+DECL_FUNC(_NSGetArgc);
+DECL_FUNC(_NSGetArgv);
+DECL_FUNC(_NSGetEnviron);
+DECL_FUNC(_NSGetProgname);
 #endif
 DECL_FUNC(freopen);
 DECL_FUNC(fclose);
@@ -445,6 +455,22 @@ DECL_FUNC(pipe);
 DECL_FUNC(select);
 DECL_FUNC(poll);
 DECL_FUNC(pselect);
+#if defined(__APPLE__)
+DECL_FUNC(kqueue);
+DECL_FUNC(kevent);
+DECL_FUNC(kevent64);
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+DECL_FUNC(sendfile);
+#endif
+#if defined(__APPLE__)
+ssize_t __getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep);  // libsystem_kernel's, undeclared
+DECL_FUNC(__getdirentries64);
+DECL_FUNC(malloc_size);
+#endif
+#if defined(__linux__)
+DECL_FUNC(malloc_usable_size);
+#endif
 #if defined(__linux__)
 DECL_FUNC(ppoll);
 #endif
@@ -477,6 +503,15 @@ DECL_FUNC(link);
 DECL_FUNC(linkat);
 DECL_FUNC(rename);
 DECL_FUNC(renameat);
+#if defined(__APPLE__)
+DECL_FUNC(renamex_np);
+DECL_FUNC(renameatx_np);
+DECL_FUNC(clonefile);
+DECL_FUNC(clonefileat);
+DECL_FUNC(fclonefileat);
+DECL_FUNC(copyfile);
+DECL_FUNC(fcopyfile);
+#endif
 DECL_FUNC(unlink);
 DECL_FUNC(unlinkat);
 DECL_FUNC(mkdir);
@@ -666,6 +701,9 @@ DECL_FUNC(getwd);
 
 DECL_FUNC(bsearch);
 DECL_FUNC(qsort);
+DECL_FUNC(pthread_once);
+DECL_FUNC(scandir);
+DECL_FUNC(readdir_r);
 
 DECL_FUNC(setitimer);
 DECL_FUNC(alarm);
@@ -1594,6 +1632,11 @@ struct file {
     // The program's own no-SIGPIPE choice (SO_NOSIGPIPE, F_SETNOSIGPIPE),
     // kept here because the host descriptor always has it on (rfd_adopt).
     int f_nosigpipe;
+    // The program's own O_NONBLOCK on a tty (F_SETFL, FIONBIO), which its
+    // reads go by: the host descriptor's status flags are TVM's as well,
+    // which writes to it non-blocking (tty_output_buffer_locked) and shares
+    // it among the tty's files.
+    int f_nonblock;
 };
 
 uint64_t next_gencnt = 0;
@@ -1887,6 +1930,7 @@ struct file *file_dup_locked(struct file *oldfile) {
     if (oldfile->f_pathname)
         newfile->f_pathname = kstrdup(oldfile->f_pathname);
     newfile->f_nosigpipe = oldfile->f_nosigpipe;
+    newfile->f_nonblock = oldfile->f_nonblock;
 
     // we can blatantly lock although oldfile is locked, as it was just created
     file_lock(newfile, 0);
@@ -1925,6 +1969,11 @@ static int stat_access(const struct stat *st, int mode)
  */
 struct task_data {
     char **__environ;
+
+    // what _NSGetArgc/_NSGetArgv/_NSGetProgname hand out (Darwin)
+    int    argc;
+    char **argv;
+    char  *progname;
 
     char  *optarg;
     int    optind, opterr, optopt, optpos, optreset;
@@ -2015,8 +2064,14 @@ struct task {
     struct rmem_arena *tsk_ar;
     struct ulinker *tsk_linker;
     char tsk_cwd[PATH_MAX];
-    exit_t tsk_exits[32];
-    void *tsk_exit_args[32];  // argument for each tsk_exits entry (__cxa_atexit), NULL for atexit
+    // exit handlers (atexit, and __cxa_atexit with its argument), in the
+    // order registered, in TVM's heap. Not a fixed table: a C++ program
+    // registers one per static object with a destructor -- node 446, of
+    // which all past the 32 of the table this was failed, OpenSSL's
+    // atexit(OPENSSL_cleanup) among them, and OpenSSL, taking its
+    // initialization for failed, then fetched no algorithm at all
+    struct task_exit { exit_t te_fn; void *te_arg; } *tsk_exits;
+    size_t tsk_nexits, tsk_exits_cap;
     // what the program mapped (see mmap), in TVM's heap
     struct task_map { uintptr_t start, end; } *tsk_maps;
     size_t tsk_nmaps;
@@ -2033,6 +2088,8 @@ struct task {
     struct thread *tsk_exiting_thread; // thread running terminate_current_locked; written under tasks_lock+tsk_lock, read with __atomic (lock-free checks in tvm_sig_leave/waitpid)
     mode_t tsk_umask; // per-task umask (real umask is process-wide, can't share across tasks)
     unsigned tsk_rlocks; // POSIX record locks held (entries in rlocks owned by this task, see fcntl_rlock)
+    siginfo_t tsk_chld_info; // the SIGCHLD a child's exit sent (si_code, si_status, si_pid), see terminate_current_locked; under tsk_lock
+    int tsk_chld_valid;
 };
 
 struct thread {
@@ -2078,6 +2135,7 @@ struct tvm_tls {
 
     compar_t tls_bsearch_compar;
     compar_t tls_qsort_compar;
+    void (*tls_once_routine)(void);   // pthread_once's, while the host runs it
 #if defined(__APPLE__)
     CFDictionaryApplierFunction tls_CFDictionaryApplyFunction_function;
     // sysctl(): the last name-to-mib translation, see the interposer
@@ -2150,6 +2208,7 @@ static inline struct tvm_tls *tvm_tls(void) {
 #define call                        (tvm_tls()->tls_call)
 #define bsearch_compar              (tvm_tls()->tls_bsearch_compar)
 #define qsort_compar                (tvm_tls()->tls_qsort_compar)
+#define once_routine                (tvm_tls()->tls_once_routine)
 #if defined(__APPLE__)
 #define CFDictionaryApplyFunction_function (tvm_tls()->tls_CFDictionaryApplyFunction_function)
 #endif
@@ -2337,6 +2396,8 @@ static void taskdealloc(struct task *t)
 
     task_keys_release(t);
     task_maps_unmap(t);
+    kfree(t->tsk_exits);
+    t->tsk_exits = NULL;
 
     if (t->tsk_linker) {
         ulinker_destroy(t->tsk_linker);
@@ -2777,8 +2838,13 @@ static struct task *taskalloc()
     t->tsk_state = current->tsk_state & TS_CTTY;
     memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
     memcpy(t->tsk_exe, current->tsk_exe, sizeof(t->tsk_exe));
-    memcpy(&t->tsk_exits, &current->tsk_exits, sizeof(t->tsk_exits));
-    memcpy(&t->tsk_exit_args, &current->tsk_exit_args, sizeof(t->tsk_exit_args));
+    if (current->tsk_nexits) {
+        t->tsk_exits = kalloc(current->tsk_nexits * sizeof(*t->tsk_exits));
+        if (!t->tsk_exits)
+            goto out;
+        memcpy(t->tsk_exits, current->tsk_exits, current->tsk_nexits * sizeof(*t->tsk_exits));
+        t->tsk_nexits = t->tsk_exits_cap = current->tsk_nexits;
+    }
     memcpy(t->tsk_keys, current->tsk_keys, sizeof(t->tsk_keys));
     memcpy(t->tsk_key_dtors, current->tsk_key_dtors, sizeof(t->tsk_key_dtors));
     task_keys_ref(t);
@@ -3272,6 +3338,10 @@ static void task_record_rusage(struct task *t)
     timeval_sub(&t->tsk_rusage.ru_stime, &t->tsk_rusage_base.ru_stime);
 }
 
+#if defined(__APPLE__)
+static void kq_proc_exited(pid_t pid, int status);
+#endif
+
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
@@ -3300,6 +3370,7 @@ static void terminate_current_locked(int result)
 
     // Decide now; `current` may be cleared before the exit below.
     int is_init = (current == main_task);
+    pid_t exiting_pid = current->tsk_pid;
     struct tvm_stack *stack = current_thread->thr_stack;
 
     // Destroy this task's timers so the vtimer manager spawns no new callbacks.
@@ -3409,8 +3480,33 @@ static void terminate_current_locked(int result)
         current = NULL;
     }
 
-    if (notify_parent)
+#if defined(__APPLE__)
+    // kqueue watchers of its exit (EVFILT_PROC, see kevent64)
+    kq_proc_exited(exiting_pid, result);
+#endif
+
+    if (notify_parent) {
+        // What a SIGCHLD handler's siginfo tells about the child (see
+        // signal_dispatch). The host's, from the pthread_kill that carries
+        // the signal, said nothing of it: si_code and si_status 0, which
+        // toybox's timeout reads as a child killed by signal 0, so every
+        // `timeout N cmd` exited 128 whatever cmd did.
+        siginfo_t *ci = &parent->tsk_chld_info;
+        memset(ci, 0, sizeof(*ci));
+        ci->si_signo = SIGCHLD;
+        ci->si_pid = exiting_pid;
+        ci->si_uid = getuid();
+        if (WIFSIGNALED(result)) {
+            ci->si_code = WCOREDUMP(result) ? CLD_DUMPED : CLD_KILLED;
+            ci->si_status = WTERMSIG(result);
+        }
+        else {
+            ci->si_code = CLD_EXITED;
+            ci->si_status = WEXITSTATUS(result);
+        }
+        parent->tsk_chld_valid = 1;
         task_kill_locked(parent, SIGCHLD);  // best-effort; parent may have already exited
+    }
 
     // parent may be blocked on waitpid but no more pids, wake him up!
     // broadcast, not signal: multiple parent threads can wait for different
@@ -4671,6 +4767,14 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
 
     struct sigaction *act = current->tsk_sighandlers + signum;
 
+    // a child's exit: its siginfo, not the host's (terminate_current_locked)
+    siginfo_t chld_info;
+    if (signum == SIGCHLD && current->tsk_chld_valid) {
+        chld_info = current->tsk_chld_info;
+        current->tsk_chld_valid = 0;
+        siginfo = &chld_info;
+    }
+
     // need to figure out what to do first
     int whatdo = SAD_CTCH;
     if ((act->sa_flags & SA_SIGINFO) == 0) {
@@ -4825,14 +4929,18 @@ static inline void tvm_sig_leave(void)
  * wait and holds no lock of the host's libraries.
  */
 #if defined(__APPLE__) && defined(__aarch64__)
-static uintptr_t kernel_wait_stubs[6];
+static uintptr_t kernel_wait_stubs[10];
 
 __attribute__((constructor))
 static void kernel_wait_stubs_init(void)
 {
+    // the Mach semaphore traps too: libuv's uv_sem_wait (node's inspector
+    // thread waits on one for its whole life) took a task's exit down to a
+    // hang, the thread never leaving its wait
     static const char *const names[] = {
         "__psynch_cvwait", "__psynch_mutexwait", "__semwait_signal", "__ulock_wait", "__ulock_wait2",
-        "__sigsuspend" };
+        "__sigsuspend", "semaphore_wait_trap", "semaphore_timedwait_trap",
+        "semaphore_wait_signal_trap", "semaphore_timedwait_signal_trap" };
     for (size_t i = 0; i < sizeof(names) / sizeof(*names); i++)
         kernel_wait_stubs[i] = (uintptr_t)dlsym(RTLD_DEFAULT, names[i]);
 }
@@ -5598,6 +5706,10 @@ static int tty_open_file(struct tty *tt, int flags, struct file *out)
     out->f_type = DEV_TTY;
     out->f_data = (void *)tt;
     out->f_ops = ttyops();
+    // Claude Code drains what is typed before it exits from an
+    // open("/dev/tty", O_RDONLY | O_NONBLOCK), until a read finds nothing:
+    // read as blocking, that waited for a key, and Ctrl-C did not exit
+    out->f_nonblock = (flags & O_NONBLOCK) != 0;
     tt->t_refcnt++;
 
     tty_unlock(tt, 1);
@@ -5719,6 +5831,15 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
 #endif
             memcpy(arg, &tt->t_termios, sizeof(tt->t_termios));
             ret = 0;
+            break;
+
+        // libuv's way to O_NONBLOCK on Darwin (uv__nonblock_ioctl). It
+        // failed here (ENOTSUP), which libuv does not check: node took the
+        // tty for non-blocking and read it until EAGAIN, and the read
+        // waited for a key instead -- Claude Code's exit hung in it.
+        case FIONBIO:
+            file->f_nonblock = *(int *)arg != 0;
+            ret = CALL_FUNC(ioctl, file->f_rfd, FIONBIO, arg);
             break;
         
 #if defined(__linux__)
@@ -5950,6 +6071,7 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
 
     struct termios termios;
     memcpy(&termios, &tt->t_termios, sizeof(termios));
+    int nonblock = file->f_nonblock;
 
     tty_unlock(tt, 0);
     file_unlock(file, 0);
@@ -5996,7 +6118,9 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
             break;
 
         int poll_timeout;
-        if (canon && total_read > 0) {
+        if (nonblock) {
+            poll_timeout = 0;  // what is there now, else EAGAIN (below)
+        } else if (canon && total_read > 0) {
             poll_timeout = 0;  // the rest of the line, which is there
         } else if (vmin == 0 && vtime == 0) {
             poll_timeout = 0;  // poll returns immediately
@@ -6011,7 +6135,14 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
 
         int ret = CALL_FUNC(poll, &pfd, 1, poll_timeout);
         if (ret == 0) {
-            // Timeout
+            // Timeout; non-blocking with nothing read: nothing to read
+            if (nonblock && total_read == 0) {
+                tty_lock(tt, 0);
+                tty_unlock(tt, 1);
+                file_lock(file, 0);
+                errno = EAGAIN;
+                return -1;
+            }
             break;
         } else if (ret < 0) {
             tty_lock(tt, 0);
@@ -8696,11 +8827,97 @@ static ssize_t host_readlink(struct vfs_node *vn, const char *path, char *buf, s
     return CALL_FUNC(readlink, path, buf, bufsiz);
 }
 
+/*
+ * A directory the host lets a program through but not open: the iOS
+ * sandbox refuses an app open(2) of the directories above its container
+ * (/private/var and on, EPERM) while every path through them works. A
+ * program that walks a path a directory descriptor at a time -- open("/"),
+ * then openat(fd, component) -- stopped there: toybox's xabspath() does, so
+ * tar extracted nothing in the app ("'x' bad symlink" for every entry), and
+ * opencode, which installs ripgrep with `tar -xzf`, took minutes and went
+ * without it. Such a directory opens as a descriptor for its path alone,
+ * as Linux's O_PATH: the *at() calls and fchdir() go by the name it records
+ * (f_pathname) as for any directory, fstat(), fchmod() and fchown() by the
+ * host path, and reading it is the sandbox's EPERM. Only for EPERM, the
+ * sandbox's answer: a directory its mode keeps from a program (EACCES) is
+ * refused as before.
+ */
+static int searchdirop_fstat(struct file *file, struct stat *st)
+{
+    return CALL_FUNC(stat, (const char *)file->f_data, st);
+}
+
+static int searchdirop_fchmod(struct file *file, mode_t mode)
+{
+    return CALL_FUNC(chmod, (const char *)file->f_data, mode);
+}
+
+static int searchdirop_fchown(struct file *file, uid_t owner, gid_t group)
+{
+    return CALL_FUNC(chown, (const char *)file->f_data, owner, group);
+}
+
+static int searchdirop_readdir(struct file *file, struct dirent *out)
+{
+    errno = EPERM;
+    return -1;
+}
+
+static int searchdirop_dup(struct file *oldfile, struct file *newfile)
+{
+    newfile->f_data = kstrdup((const char *)oldfile->f_data);
+    if (!newfile->f_data) {
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
+}
+
+static void searchdirop_close(struct file *file)
+{
+    kfree(file->f_data);
+    file->f_data = NULL;
+}
+
+static struct fops searchdir_fops = {
+    .f_dup = searchdirop_dup,
+    .f_fstat = searchdirop_fstat,
+    .f_fchmod = searchdirop_fchmod,
+    .f_fchown = searchdirop_fchown,
+    .f_readdir = searchdirop_readdir,
+    .f_close = searchdirop_close,
+};
+
+static int host_searchdir_open(const char *path, int flags, struct file *out)
+{
+    struct stat st;
+    if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) ||
+        0 != CALL_FUNC(stat, path, &st) || !S_ISDIR(st.st_mode)) {
+        errno = EPERM;
+        return -1;
+    }
+    char *hostpath = kstrdup(path);
+    if (!hostpath) {
+        errno = ENOMEM;
+        return -1;
+    }
+    int rfd = CALL_FUNC(open, "/", O_RDONLY | O_DIRECTORY | (flags & O_CLOEXEC));
+    if (rfd == -1) {
+        kfree(hostpath);
+        errno = EPERM;
+        return -1;
+    }
+    out->f_rfd = rfd_adopt(rfd);
+    out->f_data = hostpath;
+    out->f_ops = &searchdir_fops;
+    return 0;
+}
+
 static int host_open(struct vfs_node *vn, const char *path, int flags, mode_t mode, struct file *out)
 {
     int rfd = CALL_FUNC(openat, AT_FDCWD, path, flags, mode);
     if (rfd == -1)
-        return -1;
+        return errno == EPERM ? host_searchdir_open(path, flags, out) : -1;
     out->f_rfd = rfd_adopt(rfd);
     return 0;
 }
@@ -12305,6 +12522,7 @@ static void _fmc_ ## _name () { list_add_tail( & (_fm_ ## _name).fm_list, &all_f
 #define __MAP4(m,t,a,...) m(t,a), __MAP3(m,__VA_ARGS__)
 #define __MAP5(m,t,a,...) m(t,a), __MAP4(m,__VA_ARGS__)
 #define __MAP6(m,t,a,...) m(t,a), __MAP5(m,__VA_ARGS__)
+#define __MAP7(m,t,a,...) m(t,a), __MAP6(m,__VA_ARGS__)
 #define __MAP(n,...) __MAP##n(__VA_ARGS__)
 
 #define __LAST1(m,t,a,...) m(t,a)
@@ -12313,6 +12531,7 @@ static void _fmc_ ## _name () { list_add_tail( & (_fm_ ## _name).fm_list, &all_f
 #define __LAST4(m,t,a,...) __LAST3(m,__VA_ARGS__)
 #define __LAST5(m,t,a,...) __LAST4(m,__VA_ARGS__)
 #define __LAST6(m,t,a,...) __LAST5(m,__VA_ARGS__)
+#define __LAST7(m,t,a,...) __LAST6(m,__VA_ARGS__)
 #define __LAST(n,...) __LAST##n(__VA_ARGS__)
 
 #define __FN_DECL(t, a)	t a
@@ -12435,6 +12654,7 @@ void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 #define FUNCTION_DEFINE4(_rettype, _name, ...) __FUNCTION_DEFINEx(4, _rettype, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE5(_rettype, _name, ...) __FUNCTION_DEFINEx(5, _rettype, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE6(_rettype, _name, ...) __FUNCTION_DEFINEx(6, _rettype, _name, __VA_ARGS__)
+#define FUNCTION_DEFINE7(_rettype, _name, ...) __FUNCTION_DEFINEx(7, _rettype, _name, __VA_ARGS__)
 
 #define FUNCTION_DEFINE_VOID0(_name)      __FUNCTION_DEFINE_VOIDx(0, _name)
 #define FUNCTION_DEFINE_VOID1(_name, ...) __FUNCTION_DEFINE_VOIDx(1, _name, __VA_ARGS__)
@@ -13806,8 +14026,32 @@ extern bool _dyld_find_unwind_sections(void *, struct tvm_dyld_unwind_sections *
 static int tvm_cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
 static void tvm_tlv_atexit(void (*func)(void *), void *obj);
 static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sections *info);
+static uint32_t tvm_dyld_image_count(void);
+static const struct mach_header *tvm_dyld_get_image_header(uint32_t index);
+static intptr_t tvm_dyld_get_image_vmaddr_slide(uint32_t index);
+static const char *tvm_dyld_get_image_name(uint32_t index);
+static const struct mach_header *tvm_NSGetMachExecuteHeader(void);
+static const struct segment_command_64 *tvm_getsegbyname(const char *segname);
+static const struct section_64 *tvm_getsectbyname(const char *segname, const char *sectname);
+static char *tvm_getsectdata(const char *segname, const char *sectname, unsigned long *size);
 #endif
 static void *tvm_guest_dlsym(void *handle, const char *symbol);
+static int tvm_sqlite3_config(int op, ...);
+#if TARGET_OS_IPHONE
+static int tvm_spawn_fa_addchdir(posix_spawn_file_actions_t *fa, const char *path);
+static int tvm_spawn_fa_addfchdir(posix_spawn_file_actions_t *fa, int fd);
+static int tvm_spawnattr_noop(const posix_spawnattr_t *attr);
+#endif
+
+#if defined(__APPLE__)
+static void tvm_jit_write_protect_np(int enabled) { (void)enabled; }
+static int tvm_jit_write_protect_supported_np(void) { return 0; }
+static void tvm_clear_cache(void *start, void *end) { sys_icache_invalidate(start, (size_t)((char *)end - (char *)start)); }
+// macOS's trust settings (the user's, admin's, system's overrides of the
+// certificate trust); iOS has none (errSecItemNotFound), which node takes
+// as no settings at all when it reads the system's CA certificates
+static int32_t tvm_trust_settings_copy(uint32_t domain, void **certs) { (void)domain; if (certs) *certs = NULL; return -25300; }
+#endif
 
 static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
 {
@@ -13846,9 +14090,18 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(base, "__cxa_atexit"))               return &tvm_cxa_atexit;
     if (0 == strcmp(base, "_tlv_atexit"))                return &tvm_tlv_atexit;
     if (0 == strcmp(base, "_dyld_find_unwind_sections")) return &tvm_dyld_find_unwind_sections;
+    if (0 == strcmp(base, "_dyld_image_count"))            return &tvm_dyld_image_count;
+    if (0 == strcmp(base, "_dyld_get_image_header"))       return &tvm_dyld_get_image_header;
+    if (0 == strcmp(base, "_dyld_get_image_vmaddr_slide")) return &tvm_dyld_get_image_vmaddr_slide;
+    if (0 == strcmp(base, "_dyld_get_image_name"))         return &tvm_dyld_get_image_name;
+    if (0 == strcmp(base, "_NSGetMachExecuteHeader"))      return &tvm_NSGetMachExecuteHeader;
+    if (0 == strcmp(base, "getsegbyname"))                 return &tvm_getsegbyname;
+    if (0 == strcmp(base, "getsectbyname"))                return &tvm_getsectbyname;
+    if (0 == strcmp(base, "getsectdata"))                  return &tvm_getsectdata;
 #endif
 
     if (0 == strcmp(base, "pthread_create")) return &emulator_pthread_create;
+    if (0 == strcmp(base, "sqlite3_config")) return &tvm_sqlite3_config;
     if (0 == strcmp(base, "dlsym"))          return &tvm_guest_dlsym;
 
     if (0 == strcmp(base, "optarg"))   return &current->tsk_data->optarg;
@@ -13864,7 +14117,33 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
         if (0 == strcmp(fm->fm_name, base))
             return fm->fm_ptr;
     }
-    return dlsym(RTLD_DEFAULT, s);
+    void *p = dlsym(RTLD_DEFAULT, s);
+    // A variant suffix the host does not export: macOS's $DARWIN_EXTSN
+    // variants (syslog, realpath, ...) are no symbols of iOS's libSystem,
+    // whose plain one is the same function (a macOS program run on iOS).
+    if (!p && s[base_len] == '$')
+        p = dlsym(RTLD_DEFAULT, base);
+#if defined(__APPLE__)
+    // macOS functions iOS does not have, which a macOS program (Claude
+    // Code's Bun) imports: without them it did not link at all there. A JIT
+    // cannot run in the app anyway (no MAP_JIT), and JavaScriptCore, told
+    // that write protection is unsupported, does without.
+    if (!p) {
+        if (0 == strcmp(base, "pthread_jit_write_protect_np"))           return &tvm_jit_write_protect_np;
+        if (0 == strcmp(base, "pthread_jit_write_protect_supported_np")) return &tvm_jit_write_protect_supported_np;
+        if (0 == strcmp(base, "__clear_cache"))                          return &tvm_clear_cache;
+        if (0 == strcmp(base, "SecTrustSettingsCopyTrustSettings"))      return &tvm_trust_settings_copy;
+    }
+#endif
+#if TARGET_OS_IPHONE
+    if (0 == strcmp(base, "posix_spawn_file_actions_addchdir_np") ||
+        0 == strcmp(base, "posix_spawn_file_actions_addchdir"))           return &tvm_spawn_fa_addchdir;
+    if (0 == strcmp(base, "posix_spawn_file_actions_addfchdir_np") ||
+        0 == strcmp(base, "posix_spawn_file_actions_addfchdir"))          return &tvm_spawn_fa_addfchdir;
+    if (0 == strcmp(base, "posix_spawnattr_setnosmt_np") ||
+        0 == strcmp(base, "posix_spawnattr_set_csm_np"))                  return &tvm_spawnattr_noop;
+#endif
+    return p;
 }
 
 static struct ulinker_external_dlinfo_args ulinker_tvm_external_args = {
@@ -13967,11 +14246,17 @@ static int is_noemu_binary(const char *pathname)
 static void usershell_cache_init(void);
 static void user_passwd_init(void);
 
-#if defined(__linux__)
 /*
  * gdb JIT registration of guest images (see ULINKER_GDB_JIT): TVM_GDB_JIT=1
  * or 0 decides; otherwise only when a tracer is attached at startup
- * (`gdb --args tvm ...`). Runs before any task exists, on the host's calls.
+ * (`gdb --args tvm ...`, `lldb -- tvm ...`). Runs before any task exists, on
+ * the host's calls.
+ *
+ * On Darwin it was always on. A Mach-O entry is a copy of the whole image
+ * file, made at every load and every fork, in the task's own memory: 122 MB
+ * for node, held by each node task for its lifetime. Claude Code under node
+ * peaked at 3.4 GB on macOS, and iOS killed the app for its memory as soon
+ * as Claude Code started (jetsam, per-process-limit).
  */
 static int tvm_want_gdb_jit(void)
 {
@@ -13979,6 +14264,14 @@ static int tvm_want_gdb_jit(void)
     if (env && *env)
         return 0 != strcmp(env, "0");
 
+#if defined(__APPLE__)
+    struct kinfo_proc kp;
+    size_t len = sizeof(kp);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len != sizeof(kp))
+        return 0;
+    return (kp.kp_proc.p_flag & P_TRACED) != 0;
+#else
     char buf[4096];
     int fd = CALL_FUNC(open, "/proc/self/status", O_RDONLY);
     if (fd < 0)
@@ -13990,8 +14283,8 @@ static int tvm_want_gdb_jit(void)
     buf[n] = 0;
     const char *t = strstr(buf, "TracerPid:");
     return t && atoi(t + sizeof("TracerPid:") - 1) != 0;
-}
 #endif
+}
 
 // What the init task's thread starts with (tvm_start)
 struct tvm_init_arg {
@@ -14256,9 +14549,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
     ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
-#if defined(__linux__)
     ulinker_setopt(ULINKER_GDB_JIT, (void *)(long)tvm_want_gdb_jit());
-#endif
 
     // Config mounts. The VFS needs only the global arena, so a bad archive
     // is still reported to the caller before any task exists. A later
@@ -14519,7 +14810,12 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
     // before.
     DIR *dp = NULL;
     int ok;
-    if (file->f_ops && file->f_ops->f_readdir) {
+    if (file->f_ops == &searchdir_fops) {
+        // a directory the host does not let the program read (host_open)
+        ok = 0;
+        errno = EPERM;
+    }
+    else if (file->f_ops && file->f_ops->f_readdir) {
         struct stat st;
         ok = 0 == file->f_ops->f_fstat(file, &st) && S_ISDIR(st.st_mode);
         if (!ok)
@@ -14602,10 +14898,101 @@ FUNCTION_DEFINE1(struct dirent *, readdir, DIR *, dir) {
     return de;
 }
 
+/*
+ * readdir_r(3): the reentrant one, which Rust's std::fs::read_dir uses on
+ * Darwin. The host's was handed TVM's DIR (a struct file_stream) and read it
+ * as its own: SIGSEGV (ripgrep's directory walk). Each stream has its own
+ * entry buffer, so readdir() here is reentrant per stream already.
+ */
+FUNCTION_DEFINE3(int, readdir_r, DIR *, dir, struct dirent *, entry, struct dirent **, result) {
+    int saved = errno;
+    errno = 0;
+    struct dirent *de = readdir(dir);
+    if (!de) {
+        int err = errno;
+        errno = saved;
+        *result = NULL;
+        return err;
+    }
+    memcpy(entry, de, offsetof(struct dirent, d_name));
+    snprintf(entry->d_name, sizeof(entry->d_name), "%s", de->d_name);
+    *result = entry;
+    errno = saved;
+    return 0;
+}
+
 FUNCTION_DEFINE1(int, dirfd, DIR *, dir) {
     struct file_stream *fs = (struct file_stream *)dir;
     return fs->fs_nfd;
 }
+
+#if defined(__APPLE__)
+/*
+ * __getdirentries64(2), the system call under Darwin's readdir(), which Bun
+ * (Claude Code) makes itself to list a directory: it reached the host with
+ * the program's descriptor number (EBADF, or another directory's entries).
+ * A host directory is read through the host descriptor; one TVM serves
+ * (f_readdir: a cpio mount) has its entries packed here as the kernel packs
+ * them, a struct dirent each, cut to its name and 8-byte aligned.
+ */
+FUNCTION_DEFINE4(ssize_t, __getdirentries64, int, fd, void *, buf, size_t, bufsize, off_t *, basep) {
+    tvm_sig_enter();
+    struct file *file = file_for_task(current, fd);
+    if (!file) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+    if (!file->f_ops || !file->f_ops->f_readdir) {
+        int rfd = file->f_rfd;
+        file_unlock(file, 0);
+        ssize_t r = CALL_FUNC(__getdirentries64, rfd, buf, bufsize, basep);
+        int err = errno;
+        file_lock(file, 0);
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        errno = err;
+        return r;
+    }
+
+    size_t used = 0;
+    struct dirent de;
+    for (;;) {
+        off_t pos = file->f_ops->f_lseek ? file->f_ops->f_lseek(file, 0, SEEK_CUR) : 0;
+        memset(&de, 0, sizeof(de));
+        if (0 != file->f_ops->f_readdir(file, &de))
+            break;
+        size_t namlen = strnlen(de.d_name, sizeof(de.d_name) - 1);
+        size_t reclen = (offsetof(struct dirent, d_name) + namlen + 1 + 7) & ~(size_t)7;
+        if (used + reclen > bufsize) {
+            // no room for it: the next call returns it
+            if (file->f_ops->f_lseek)
+                (void)file->f_ops->f_lseek(file, pos, SEEK_SET);
+            if (used == 0) {
+                file_unlock(file, 1);
+                tvm_sig_leave();
+                errno = EINVAL;
+                return -1;
+            }
+            break;
+        }
+        struct dirent *out = (struct dirent *)((char *)buf + used);
+        memset(out, 0, reclen);
+        out->d_ino = de.d_ino ? de.d_ino : 1;
+        out->d_seekoff = (uint64_t)pos + 1;
+        out->d_reclen = (uint16_t)reclen;
+        out->d_namlen = (uint16_t)namlen;
+        out->d_type = de.d_type;
+        memcpy(out->d_name, de.d_name, namlen);
+        used += reclen;
+    }
+    if (basep)
+        *basep = file->f_ops->f_lseek ? file->f_ops->f_lseek(file, 0, SEEK_CUR) : 0;
+    file_unlock(file, 1);
+    tvm_sig_leave();
+    return (ssize_t)used;
+}
+#endif
 
 // rewinddir(3), telldir(3) and seekdir(3) were not interposed, so the libc
 // got the guest's DIR * -- TVM's struct file_stream -- and dereferenced it
@@ -16618,6 +17005,42 @@ static int tvm_poll_host_masked(struct pollfd *realfds, nfds_t nfds, const struc
 static int signal_deliverable(void);
 static int thread_wake_fd(void);
 
+/*
+ * Whether another thread of the caller's task is tearing it down
+ * (terminate_current_locked), waiting for this one to leave.
+ */
+static int task_exiting_by_other(void)
+{
+    if (!current || !current_thread)
+        return 0;
+    struct thread *exiting = __atomic_load_n(&current->tsk_exiting_thread, __ATOMIC_ACQUIRE);
+    return exiting && exiting != current_thread;
+}
+
+/*
+ * Leave the task if it is being torn down, from a wait of TVM's own that
+ * the teardown ended (EINTR), holding nothing by then: as waitpid() does.
+ * Such a wait used to end only for a signal the thread did not block, and
+ * the program then waited again: the teardown pokes the task's threads
+ * with SIGCONT, which a thread blocking it never saw, and a program that
+ * retries an interrupted wait (an event loop's kevent()) never came back
+ * for good either way. Bun's "HTTP Client" thread is both: every `bun add`
+ * and opencode run in the app hung at exit until the thread's next event,
+ * close to a minute later.
+ */
+static void thread_leave_if_task_exiting(void)
+{
+    // only from the outermost call, which holds nothing of TVM's: a nested
+    // one's caller holds what it took (kevent64 the kqueue's file) and
+    // leaves itself once it has let go
+    if (tvm_sig_blocked || !task_exiting_by_other())
+        return;
+    tvm_sig_enter();
+    pthread_mutex_lock(&tasks_lock);
+    task_lock(current);
+    thread_exit_for_task_exit_locked();  // releases both locks, no return
+}
+
 // poll() over the task's descriptors: each translated to the host
 // descriptor behind it for the host wait, which is poll() with `timeout`,
 // or with `os_mask` the masked wait of tvm_poll_host_masked with `ts`.
@@ -16681,7 +17104,7 @@ static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const str
         clock_gettime(CLOCK_MONOTONIC, &start);
         realfds[nfds] = (struct pollfd){ .fd = wake, .events = POLLIN };
         for (;;) {
-            if (signal_deliverable()) {
+            if (signal_deliverable() || task_exiting_by_other()) {
                 errno = EINTR;
                 ret = -1;
                 break;
@@ -16731,6 +17154,8 @@ static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const str
 
     free(files);
     free(realfds);
+    if (ret == -1 && err == EINTR)
+        thread_leave_if_task_exiting();
     errno = err;
     return ret;
 }
@@ -16738,6 +17163,398 @@ static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const str
 FUNCTION_DEFINE3(int, poll, struct pollfd *, fds, nfds_t, nfds, int, timeout) {
     return tvm_poll_host(fds, nfds, timeout, NULL, NULL);
 }
+
+#if defined(__APPLE__)
+/*
+ * kqueue(2). A kqueue is the host's, held as one of the task's descriptors,
+ * and kevent() translates what in it names something of the task's:
+ *  - a descriptor (EVFILT_READ, _WRITE, _VNODE, _EXCEPT): the program's
+ *    descriptor number goes to the host as the host descriptor behind it,
+ *    and comes back as the program's. They were passed as they were, so
+ *    the host watched whatever its own descriptor of that number was (or
+ *    none: EBADF), and Bun's event loop -- every socket, pipe and child of
+ *    a Bun program, Claude Code's API connection -- never saw its events.
+ *  - a process (EVFILT_PROC): a task is no host process, and its pid none
+ *    the host knows. Its exit is watched here instead: an EVFILT_USER event
+ *    in the same host kqueue stands for it, which the task's exit triggers
+ *    (kq_proc_exited) and which is reported as the EVFILT_PROC event asked
+ *    for. NOTE_EXIT only, which is what a parent waits for (Bun's spawned
+ *    processes); NOTE_FORK, NOTE_EXEC and NOTE_SIGNAL are not reported.
+ * Everything else (timers, EVFILT_USER, mach ports) is the host's as it is.
+ * A wait is a host wait for the kqueue to become readable (TVM's poll, so
+ * that a signal interrupts it, as the kernel's), then the events collected
+ * without blocking.
+ */
+struct kq_proc_watch {
+    struct list_head w_list;
+    uint64_t w_kqgen;   // the kqueue's: its file's f_gencnt
+    int      w_kq;      // a host descriptor of it: the program may close its own
+    pid_t    w_pid;
+    uint64_t w_ident;   // the EVFILT_USER event standing for it
+    uint32_t w_fflags;  // what the program asked for (NOTE_EXIT, NOTE_EXITSTATUS)
+    uint64_t w_udata;   // its udata: every change to an event replaces the event's
+    int      w_fired;
+    int      w_status;
+};
+
+static LIST_HEAD(kq_proc_watches);
+static pthread_mutex_t kq_proc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t kq_proc_seq;
+#define KQ_PROC_IDENT_BASE 0x74766d0000000000ULL   // "tvm": EVFILT_USER idents of TVM's own
+#define KQ_PROC_IDENT_MASK 0xffffff0000000000ULL
+
+static void kq_proc_fire_locked(struct kq_proc_watch *w, int status)
+{
+    w->w_fired = 1;
+    w->w_status = status;
+    struct kevent64_s ev = { .ident = w->w_ident, .filter = EVFILT_USER, .fflags = NOTE_TRIGGER, .udata = w->w_udata };
+    (void)CALL_FUNC(kevent64, w->w_kq, &ev, 1, NULL, 0, KEVENT_FLAG_IMMEDIATE, NULL);
+}
+
+static void kq_proc_free_locked(struct kq_proc_watch *w)
+{
+    list_del(&w->w_list);
+    CALL_FUNC(close, w->w_kq);
+    kfree(w);
+}
+
+// A task exited (terminate_current_locked, with tasks_lock held): the
+// events watching it fire.
+static void kq_proc_exited(pid_t pid, int status)
+{
+    struct kq_proc_watch *w;
+    pthread_mutex_lock(&kq_proc_lock);
+    list_for_each_entry(w, &kq_proc_watches, w_list)
+        if (w->w_pid == pid && !w->w_fired)
+            kq_proc_fire_locked(w, status);
+    pthread_mutex_unlock(&kq_proc_lock);
+}
+
+// An EVFILT_PROC change to the kqueue `rkq` (generation `gen`): 0 or an
+// errno, as the kernel would report it.
+static int kq_proc_change(int rkq, uint64_t gen, const struct kevent64_s *ch)
+{
+    const uint16_t pass = EV_ONESHOT | EV_DISPATCH | EV_ENABLE | EV_DISABLE;
+    int err = 0;
+    // tasks_lock first (the exit path holds it when it fires): a task that
+    // exits is either found exited here or fires the watch made here
+    pthread_mutex_lock(&tasks_lock);
+    pthread_mutex_lock(&kq_proc_lock);
+    struct kq_proc_watch *w, *found = NULL;
+    list_for_each_entry(w, &kq_proc_watches, w_list) {
+        if (w->w_kqgen == gen && w->w_pid == (pid_t)ch->ident) {
+            found = w;
+            break;
+        }
+    }
+    if (ch->flags & EV_DELETE) {
+        if (!found)
+            err = ENOENT;
+        else {
+            struct kevent64_s ev = { .ident = found->w_ident, .filter = EVFILT_USER, .flags = EV_DELETE };
+            (void)CALL_FUNC(kevent64, rkq, &ev, 1, NULL, 0, KEVENT_FLAG_IMMEDIATE, NULL);
+            kq_proc_free_locked(found);
+        }
+    }
+    else if (ch->flags & EV_ADD) {
+        struct task *t = task_lookup_pid((pid_t)ch->ident, 0);
+        int zombie = t && (t->tsk_state & TS_ZOMBIE);
+        int status = t ? t->tsk_result : 0;
+        if (t)
+            task_unlock(t);
+        if (!t)
+            err = ESRCH;
+        else {
+            w = found;
+            if (!w && (w = kalloc(sizeof(*w)))) {
+                memset(w, 0, sizeof(*w));
+                w->w_kq = CALL_FUNC(dup, rkq);
+                if (w->w_kq < 0) {
+                    err = errno;
+                    kfree(w);
+                    w = NULL;
+                }
+                else {
+                    w->w_kqgen = gen;
+                    w->w_pid = (pid_t)ch->ident;
+                    w->w_ident = KQ_PROC_IDENT_BASE | ++kq_proc_seq;
+                    list_add(&w->w_list, &kq_proc_watches);
+                }
+            }
+            else if (!w)
+                err = ENOMEM;
+            if (w) {
+                w->w_fflags = ch->fflags;
+                w->w_udata = ch->udata;
+                struct kevent64_s ev = {
+                    .ident = w->w_ident, .filter = EVFILT_USER,
+                    .flags = EV_ADD | EV_CLEAR | (ch->flags & pass),
+                    .udata = ch->udata,
+                };
+                if (CALL_FUNC(kevent64, rkq, &ev, 1, NULL, 0, KEVENT_FLAG_IMMEDIATE, NULL) < 0) {
+                    err = errno;
+                    kq_proc_free_locked(w);
+                }
+                else if (zombie && !w->w_fired)
+                    kq_proc_fire_locked(w, status);
+            }
+        }
+    }
+    else if (ch->flags & (EV_ENABLE | EV_DISABLE)) {
+        if (!found)
+            err = ENOENT;
+        else {
+            struct kevent64_s ev = { .ident = found->w_ident, .filter = EVFILT_USER, .flags = ch->flags & pass, .udata = ch->udata };
+            if (CALL_FUNC(kevent64, rkq, &ev, 1, NULL, 0, KEVENT_FLAG_IMMEDIATE, NULL) < 0)
+                err = errno;
+            else
+                found->w_udata = ch->udata;
+        }
+    }
+    pthread_mutex_unlock(&kq_proc_lock);
+    pthread_mutex_unlock(&tasks_lock);
+    return err;
+}
+
+static int kq_filter_is_fd(int16_t filter)
+{
+    return filter == EVFILT_READ || filter == EVFILT_WRITE || filter == EVFILT_VNODE || filter == EVFILT_EXCEPT;
+}
+
+// The task's descriptor behind host descriptor `rfd`, or -1.
+static int task_nfd_for_rfd(struct task *t, int rfd)
+{
+    int nfd = -1;
+    task_lock(t);
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (t->tsk_files[i] && t->tsk_files[i]->f_rfd == rfd) {
+            nfd = i;
+            break;
+        }
+    }
+    task_unlock(t);
+    return nfd;
+}
+
+// An event the host returned, as the program's.
+static void kq_event_from_host(struct kevent64_s *ev)
+{
+    if (kq_filter_is_fd(ev->filter)) {
+        int nfd = task_nfd_for_rfd(current, (int)ev->ident);
+        if (nfd >= 0)
+            ev->ident = (uint64_t)nfd;
+        return;
+    }
+    if (ev->filter != EVFILT_USER || (ev->ident & KQ_PROC_IDENT_MASK) != KQ_PROC_IDENT_BASE)
+        return;
+    pthread_mutex_lock(&kq_proc_lock);
+    struct kq_proc_watch *w;
+    list_for_each_entry(w, &kq_proc_watches, w_list) {
+        if (w->w_ident != ev->ident)
+            continue;
+        ev->filter = EVFILT_PROC;
+        ev->ident = (uint64_t)w->w_pid;
+        if (!(ev->flags & EV_ERROR)) {
+            // the process is gone: its event goes with it, as the kernel's
+            ev->fflags = NOTE_EXIT | (w->w_fflags & NOTE_EXITSTATUS);
+            ev->data = (w->w_fflags & NOTE_EXITSTATUS) ? w->w_status : 0;
+            ev->flags |= EV_EOF | EV_ONESHOT;
+            struct kevent64_s del = { .ident = w->w_ident, .filter = EVFILT_USER, .flags = EV_DELETE };
+            (void)CALL_FUNC(kevent64, w->w_kq, &del, 1, NULL, 0, KEVENT_FLAG_IMMEDIATE, NULL);
+            kq_proc_free_locked(w);
+        }
+        break;
+    }
+    pthread_mutex_unlock(&kq_proc_lock);
+}
+
+static int tvm_kevent64(int kq, const struct kevent64_s *changelist, int nchanges,
+                        struct kevent64_s *eventlist, int nevents, unsigned int flags,
+                        const struct timespec *timeout)
+{
+    if (nchanges < 0 || nevents < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    tvm_sig_enter();
+    struct file *kqf = file_for_task(current, kq);
+    if (!kqf) {
+        tvm_sig_leave();
+        errno = EBADF;
+        return -1;
+    }
+    int rkq = kqf->f_rfd;
+    uint64_t gen = kqf->f_gencnt;
+    file_unlock(kqf, 0);
+
+    int ret = -1, err = 0;
+    int nlocal = 0;     // errors and receipts made here, at the head of eventlist
+    struct kevent64_s *hostch = nchanges ? malloc(nchanges * sizeof(*hostch)) : NULL;
+    int nhost = 0;
+    if (nchanges && !hostch) {
+        err = ENOMEM;
+        goto out;
+    }
+    for (int i = 0; i < nchanges; i++) {
+        struct kevent64_s ch = changelist[i];
+        int cherr = 0, local = 0;
+        if (ch.filter == EVFILT_PROC) {
+            cherr = kq_proc_change(rkq, gen, &ch);
+            local = 1;
+        }
+        else if (kq_filter_is_fd(ch.filter)) {
+            struct file *f = file_for_task(current, (int)ch.ident);
+            if (!f || f->f_rfd < 0)
+                cherr = EBADF;
+            else
+                ch.ident = (uint64_t)f->f_rfd;
+            if (f)
+                file_unlock(f, 1);
+            local = cherr != 0;
+        }
+        if (!local) {
+            hostch[nhost++] = ch;
+            continue;
+        }
+        if (cherr || (ch.flags & EV_RECEIPT)) {
+            if (nlocal >= nevents) {
+                // no room to report it: the call fails with it
+                if (cherr) {
+                    err = cherr;
+                    goto out;
+                }
+                continue;
+            }
+            struct kevent64_s *e = &eventlist[nlocal++];
+            *e = changelist[i];
+            e->flags = EV_ERROR;
+            e->data = cherr;
+        }
+    }
+
+    int zero = timeout && timeout->tv_sec == 0 && timeout->tv_nsec == 0;
+    int room = nevents - nlocal;
+    int r = CALL_FUNC(kevent64, rkq, hostch, nhost, eventlist + nlocal, room, flags | KEVENT_FLAG_IMMEDIATE, NULL);
+    if (r < 0) {
+        err = errno;
+        goto out;
+    }
+
+    // KEVENT_FLAG_ERROR_EVENTS: the changes' errors only, never a wait
+    if (r == 0 && nlocal == 0 && room > 0 && !zero && !(flags & (KEVENT_FLAG_IMMEDIATE | KEVENT_FLAG_ERROR_EVENTS))) {
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;) {
+            int ms = -1;
+            if (timeout) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long long left = (timeout->tv_sec - (now.tv_sec - start.tv_sec)) * 1000000000LL
+                               + (timeout->tv_nsec - (now.tv_nsec - start.tv_nsec));
+                if (left <= 0)
+                    break;
+                ms = (int)((left + 999999) / 1000000);
+            }
+            struct pollfd pfd = { .fd = kq, .events = POLLIN };
+            int pr = tvm_poll_host(&pfd, 1, ms, NULL, NULL);
+            if (pr < 0) {
+                err = errno;
+                goto out;
+            }
+            if (pr == 0 || (pfd.revents & POLLNVAL)) {
+                if (pfd.revents & POLLNVAL) {
+                    err = EBADF;
+                    goto out;
+                }
+                break;
+            }
+            r = CALL_FUNC(kevent64, rkq, NULL, 0, eventlist, room, flags | KEVENT_FLAG_IMMEDIATE, NULL);
+            if (r < 0) {
+                err = errno;
+                goto out;
+            }
+            if (r > 0)
+                break;
+        }
+    }
+
+    for (int i = nlocal; i < nlocal + r; i++)
+        kq_event_from_host(&eventlist[i]);
+    ret = nlocal + r;
+
+out:
+    free(hostch);
+    file_lock(kqf, 0);
+    file_unlock(kqf, 1);
+    tvm_sig_leave();
+    if (ret < 0 && err == EINTR)
+        thread_leave_if_task_exiting();
+    if (ret < 0)
+        errno = err;
+    return ret;
+}
+
+FUNCTION_DEFINE0(int, kqueue) {
+    tvm_sig_enter();
+    int r = CALL_FUNC(kqueue);
+    if (r < 0) {
+        tvm_sig_leave();
+        return -1;
+    }
+    int f = task_new_fd(current, r);
+    if (f < 0) {
+        CALL_FUNC(close, r);
+        errno = EMFILE;
+    }
+    tvm_sig_leave();
+    return f;
+}
+
+FUNCTION_DEFINE7(int, kevent64, int, kq, const struct kevent64_s *, changelist, int, nchanges,
+                 struct kevent64_s *, eventlist, int, nevents, unsigned int, flags,
+                 const struct timespec *, timeout) {
+    return tvm_kevent64(kq, changelist, nchanges, eventlist, nevents, flags, timeout);
+}
+
+static void kevent_to64(const struct kevent *k, struct kevent64_s *k64)
+{
+    *k64 = (struct kevent64_s){
+        .ident = k->ident, .filter = k->filter, .flags = k->flags,
+        .fflags = k->fflags, .data = k->data, .udata = (uint64_t)(uintptr_t)k->udata,
+    };
+}
+
+FUNCTION_DEFINE6(int, kevent, int, kq, const struct kevent *, changelist, int, nchanges,
+                 struct kevent *, eventlist, int, nevents, const struct timespec *, timeout) {
+    if (nchanges < 0 || nevents < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct kevent64_s *ch = nchanges ? malloc(nchanges * sizeof(*ch)) : NULL;
+    struct kevent64_s *ev = nevents ? malloc(nevents * sizeof(*ev)) : NULL;
+    if ((nchanges && !ch) || (nevents && !ev)) {
+        free(ch);
+        free(ev);
+        errno = ENOMEM;
+        return -1;
+    }
+    for (int i = 0; i < nchanges; i++)
+        kevent_to64(&changelist[i], &ch[i]);
+    int r = tvm_kevent64(kq, ch, nchanges, ev, nevents, 0, timeout);
+    int err = errno;
+    for (int i = 0; i < r; i++) {
+        eventlist[i] = (struct kevent){
+            .ident = (uintptr_t)ev[i].ident, .filter = ev[i].filter, .flags = ev[i].flags,
+            .fflags = ev[i].fflags, .data = (intptr_t)ev[i].data, .udata = (void *)(uintptr_t)ev[i].udata,
+        };
+    }
+    free(ch);
+    free(ev);
+    errno = err;
+    return r;
+}
+#endif
 
 // A signal pending for this task or thread that the mask `mask` lets through.
 static int tvm_sig_pending_unblocked(const sigset_t *mask)
@@ -17103,6 +17920,30 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         if (cmd == F_DUPFD_CLOEXEC)
             (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
         return fd;
+    }
+
+    // A tty's O_NONBLOCK is the program's own (see f_nonblock): kept as it
+    // sets it, and reported so, whatever TVM has set on the host descriptor
+    if (cmd == F_SETFL || cmd == F_GETFL) {
+        tvm_sig_enter();
+        struct file *file = file_for_task(current, fd);
+        if (!file) {
+            tvm_sig_leave();
+            errno = EBADF;
+            return -1;
+        }
+        int ret = CALL_FUNC(fcntl, file->f_rfd, cmd, arg);
+        if (ret != -1 && file->f_ops == ttyops()) {
+            if (cmd == F_SETFL)
+                file->f_nonblock = ((int)(long)arg & O_NONBLOCK) != 0;
+            else
+                ret = (ret & ~O_NONBLOCK) | (file->f_nonblock ? O_NONBLOCK : 0);
+        }
+        int last_errno = errno;
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        errno = last_errno;
+        return ret;
     }
 
     return CURRENT_RFD(fd, CALL_FUNC(fcntl, __rfd, cmd, arg));
@@ -17611,6 +18452,184 @@ FUNCTION_DEFINE4(int, renameat, int, olddirfd, const char *, oldpath, int, newdi
     return tvm_rename(oldpath_abs, newpath_abs);
 }
 
+#if defined(__APPLE__)
+FUNCTION_DEFINE5(int, renameatx_np, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath, unsigned int, flags) {
+    char oldpath_abs[PATH_MAX], newpath_abs[PATH_MAX];
+    if (!dirfd_normalize_path(olddirfd, oldpath, oldpath_abs) ||
+        !dirfd_normalize_path(newdirfd, newpath, newpath_abs))
+        return -1;
+    if (!flags)
+        return tvm_rename(oldpath_abs, newpath_abs);
+
+    // RENAME_SWAP removes neither name, RENAME_EXCL replaces nothing; the
+    // checks are rename's all the same, a swap's both ways
+    struct vfs_mut src, dst;
+    tvm_sig_enter();
+    int ret = -1;
+    if (0 == vfs_remove_path(oldpath_abs, &src) && 0 == vfs_replace_path(newpath_abs, &dst)) {
+        if (src.mount_id != dst.mount_id)
+            errno = EXDEV;
+        else
+            ret = CALL_FUNC(renameatx_np, AT_FDCWD, src.path, AT_FDCWD, dst.path, flags);
+    }
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE3(int, renamex_np, const char *, oldpath, const char *, newpath, unsigned int, flags) {
+    return renameatx_np(AT_FDCWD, oldpath, AT_FDCWD, newpath, flags);
+}
+
+/*
+ * clonefile(2) and copyfile(3). Not interposed, so the host got the
+ * program's paths and descriptors as they were: a path of the guest's
+ * namespace (a bind, /tvm), a descriptor number of the task's table. Bun
+ * installs packages by cloning each one from its cache with
+ * clonefileat(cachefd, name, node_modules_fd, name): in the iOS app every
+ * package failed ("failed copying files from cache to destination", 27 of
+ * opencode's 28), the descriptors being nothing of the host's there. A clone
+ * is a hard link's kin: the source must be the host's and in the
+ * destination's mount, else EXDEV, on which callers copy instead.
+ */
+static int tvm_clonefile(const char *src_abs, const char *dst_abs, uint32_t flags)
+{
+    tvm_sig_enter();
+    int ret = -1;
+    struct vfs_res src;
+    struct vfs_mut m;
+    if (0 != vfs_resolve(src_abs, (flags & CLONE_NOFOLLOW) ? VR_NOFOLLOW : 0, &src))
+        goto out;
+    int host = src.vn->vn_kind == VN_HOST;
+    vn_release(src.vn);
+    if (!host) {
+        errno = EXDEV;
+        goto out;
+    }
+    if (0 != vfs_create_path(dst_abs, &m))
+        goto out;
+    if (src.mount_id != m.mount_id) {
+        errno = EXDEV;
+        goto out;
+    }
+    ret = CALL_FUNC(clonefileat, AT_FDCWD, src.path, AT_FDCWD, m.path, flags);
+out:
+    tvm_sig_leave();
+    return ret;
+}
+
+FUNCTION_DEFINE3(int, clonefile, const char *, src, const char *, dst, uint32_t, flags) {
+    char src_abs[PATH_MAX], dst_abs[PATH_MAX];
+    if (!normalize_path(NULL, src, src_abs) ||
+        !normalize_path(NULL, dst, dst_abs))
+        return -1;
+    return tvm_clonefile(src_abs, dst_abs, flags);
+}
+
+FUNCTION_DEFINE5(int, clonefileat, int, src_dirfd, const char *, src, int, dst_dirfd, const char *, dst, uint32_t, flags) {
+    char src_abs[PATH_MAX], dst_abs[PATH_MAX];
+    if (!dirfd_normalize_path(src_dirfd, src, src_abs) ||
+        !dirfd_normalize_path(dst_dirfd, dst, dst_abs))
+        return -1;
+    return tvm_clonefile(src_abs, dst_abs, flags);
+}
+
+// The source by its descriptor: a host file's (one TVM serves itself is no
+// file of the host's to clone: EXDEV)
+FUNCTION_DEFINE4(int, fclonefileat, int, srcfd, int, dst_dirfd, const char *, dst, uint32_t, flags) {
+    char dst_abs[PATH_MAX];
+    if (!dirfd_normalize_path(dst_dirfd, dst, dst_abs))
+        return -1;
+    tvm_sig_enter();
+    int ret = -1;
+    struct vfs_mut m;
+    struct file *file = file_for_task(current, srcfd);
+    if (!file)
+        errno = EBADF;
+    else if (file->f_ops)
+        errno = EXDEV;
+    else if (0 == vfs_create_path(dst_abs, &m)) {
+        int rfd = file->f_rfd;
+        file_unlock(file, 0);
+        ret = CALL_FUNC(fclonefileat, rfd, AT_FDCWD, m.path, flags);
+        file_lock(file, 0);
+    }
+    if (file)
+        file_unlock(file, 1);
+    tvm_sig_leave();
+    return ret;
+}
+
+// copyfile(3) by the host paths of both names: a source TVM serves itself
+// (a cpio entry) has none (ENOTSUP)
+FUNCTION_DEFINE4(int, copyfile, const char *, from, const char *, to, copyfile_state_t, state, copyfile_flags_t, flags) {
+    char from_abs[PATH_MAX], to_abs[PATH_MAX];
+    if (!normalize_path(NULL, from, from_abs) ||
+        !normalize_path(NULL, to, to_abs))
+        return -1;
+    tvm_sig_enter();
+    int ret = -1;
+    struct vfs_res src;
+    struct vfs_mut m;
+    if (0 != vfs_resolve(from_abs, (flags & COPYFILE_NOFOLLOW_SRC) ? VR_NOFOLLOW : 0, &src))
+        goto out;
+    int host = src.vn->vn_kind == VN_HOST;
+    vn_release(src.vn);
+    if (!host) {
+        errno = ENOTSUP;
+        goto out;
+    }
+    if (0 != vfs_create_path(to_abs, &m))
+        goto out;
+    ret = CALL_FUNC(copyfile, src.path, m.path, state, flags);
+out:
+    tvm_sig_leave();
+    return ret;
+}
+
+// fcopyfile(3) between the host descriptors behind both (ENOTSUP for a file
+// TVM serves itself: a cpio entry, a tty). Each is held as WITH_RFD holds
+// one, referenced but unlocked across the call, so both may be one file.
+static struct file *fcopyfile_hold(int nfd, int *rfd)
+{
+    struct file *file = file_for_task(current, nfd);
+    if (!file) {
+        errno = EBADF;
+        return NULL;
+    }
+    if (file->f_ops) {
+        file_unlock(file, 1);
+        errno = ENOTSUP;
+        return NULL;
+    }
+    *rfd = file->f_rfd;
+    file_unlock(file, 0);
+    return file;
+}
+
+static void fcopyfile_release(struct file *file)
+{
+    file_lock(file, 0);
+    file_unlock(file, 1);
+}
+
+FUNCTION_DEFINE4(int, fcopyfile, int, from_fd, int, to_fd, copyfile_state_t, state, copyfile_flags_t, flags) {
+    tvm_sig_enter();
+    int ret = -1, from_rfd, to_rfd;
+    struct file *from = fcopyfile_hold(from_fd, &from_rfd);
+    struct file *to = from ? fcopyfile_hold(to_fd, &to_rfd) : NULL;
+    if (from && to)
+        ret = CALL_FUNC(fcopyfile, from_rfd, to_rfd, state, flags);
+    int last_errno = errno;
+    if (to)
+        fcopyfile_release(to);
+    if (from)
+        fcopyfile_release(from);
+    tvm_sig_leave();
+    errno = last_errno;
+    return ret;
+}
+#endif
+
 static int tvm_unlink(const char *pathname_abs, int flags)
 {
     struct vfs_mut m;
@@ -17999,6 +19018,120 @@ FUNCTION_DEFINE3(int, bind, int, sockfd, const struct sockaddr *, addr, socklen_
 FUNCTION_DEFINE2(int, listen, int, sockfd, int,  backlog) {
     return CURRENT_RFD(sockfd, CALL_FUNC(listen, __rfd, backlog));
 }
+
+/*
+ * sendfile(2): both its descriptors are the program's. They went to the host
+ * as they were. libuv copies files with it (node's fs.copyFile) and falls
+ * back to read/write when the destination is no socket (ENOTSOCK on
+ * Darwin); the host found a socket of its own under that number instead and
+ * failed with ENOTSUP, which libuv does not fall back from.
+ */
+#if TARGET_OS_IPHONE
+/*
+ * iOS has no sendfile system call: the libSystem stub is there, the kernel
+ * answers it with ENOSYS and a SIGSYS, which killed the program (Claude
+ * Code's first screen, through node's libuv; libuv falls back to read/write
+ * on ENOTSOCK, not on ENOSYS). Done here as XNU does it: the headers, then
+ * the file from offset until *len bytes in all (headers counted) or its end
+ * (*len 0), then the trailers; *len comes back as the bytes sent, also when
+ * a non-blocking socket took only part of them (EAGAIN).
+ */
+static int sendfile_write(int s, const void *buf, size_t n, off_t *sent)
+{
+    const char *p = buf;
+    while (n) {
+        ssize_t w = CALL_FUNC(write, s, p, n);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        *sent += w;
+        p += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+static int sendfile_iov(int s, const struct iovec *iov, int cnt, off_t *sent)
+{
+    for (int i = 0; iov && i < cnt; i++)
+        if (sendfile_write(s, iov[i].iov_base, iov[i].iov_len, sent))
+            return -1;
+    return 0;
+}
+
+static int host_sendfile(int fd, int s, off_t offset, off_t *len, struct sf_hdtr *hdtr)
+{
+    off_t want = len ? *len : 0, sent = 0;
+    int r = -1;
+    char *buf = NULL;
+
+    if (offset < 0) {
+        errno = EINVAL;
+        goto out;
+    }
+    if (hdtr && sendfile_iov(s, hdtr->headers, hdtr->hdr_cnt, &sent))
+        goto out;
+
+    size_t bufsz = 64 * 1024;
+    if (!(buf = kalloc(bufsz))) {
+        errno = ENOMEM;
+        goto out;
+    }
+    for (off_t off = offset; !want || sent < want;) {
+        size_t n = bufsz;
+        if (want && (off_t)n > want - sent)
+            n = (size_t)(want - sent);
+        ssize_t got = CALL_FUNC(pread, fd, buf, n, off);
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            goto out;
+        }
+        if (got == 0)
+            break;
+        off_t before = sent;
+        if (sendfile_write(s, buf, (size_t)got, &sent))
+            goto out;
+        off += sent - before;
+    }
+
+    if (hdtr && sendfile_iov(s, hdtr->trailers, hdtr->trl_cnt, &sent))
+        goto out;
+    r = 0;
+out:
+    if (buf)
+        kfree(buf);
+    if (len)
+        *len = sent;
+    return r;
+}
+#endif
+
+#if defined(__APPLE__)
+FUNCTION_DEFINE6(int, sendfile, int, fd, int, s, off_t, offset, off_t *, len, struct sf_hdtr *, hdtr, int, flags) {
+#if TARGET_OS_IPHONE
+    (void)flags;
+    return CURRENT_RFD(fd, ({
+        int __in = __rfd;
+        CURRENT_RFD(s, host_sendfile(__in, __rfd, offset, len, hdtr));
+    }));
+#else
+    return CURRENT_RFD(fd, ({
+        int __in = __rfd;
+        CURRENT_RFD(s, CALL_FUNC(sendfile, __in, __rfd, offset, len, hdtr, flags));
+    }));
+#endif
+}
+#elif defined(__linux__)
+FUNCTION_DEFINE4(ssize_t, sendfile, int, out_fd, int, in_fd, off_t *, offset, size_t, count) {
+    return CURRENT_RFD(out_fd, ({
+        int __out = __rfd;
+        CURRENT_RFD(in_fd, CALL_FUNC(sendfile, __out, __rfd, offset, count));
+    }));
+}
+#endif
 
 FUNCTION_DEFINE3(int, connect, int, sockfd, const struct sockaddr *, addr, socklen_t, addrlen) {
     return CURRENT_RFD(sockfd, CALL_FUNC(connect, __rfd, addr, addrlen));
@@ -18431,9 +19564,8 @@ static void tvm_proc_entry_cont(struct fork_arg *arg)
     // exit() in the parent, and the child's exit() called the parent's
     // handler addresses -- unmapped by then -- and took the whole VM down
     // with a hardware fault in TVM's exit path.
-    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_exits, (void *)arg->parent->tsk_exits, sizeof(arg->tsk->tsk_exits), 1))
-        goto fail;
-    if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_exit_args, (void *)arg->parent->tsk_exit_args, sizeof(arg->tsk->tsk_exit_args), 1))
+    if (arg->tsk->tsk_nexits &&
+        0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_exits, (void *)arg->parent->tsk_exits, arg->tsk->tsk_nexits * sizeof(*arg->tsk->tsk_exits), 1))
         goto fail;
     // and the pthread key destructors (taskalloc_fork)
     if (0 != cow_fixup_ctx_add(&arg->fixup, (void *)arg->tsk->tsk_key_dtors, (void *)arg->parent->tsk_key_dtors, sizeof(arg->tsk->tsk_key_dtors), 1))
@@ -18816,6 +19948,17 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
 // a stack set with pthread_attr_setstack and report its bottom, the top less
 // the size they keep: with no stack set, NULL (no size set either) or minus
 // the size.
+/*
+ * TVM's own code runs on a guest thread's stack too: every interposed call,
+ * signal dispatch, and a thread's way out of its task (from TVM's signal
+ * handler, through pthread_exit and the thread's teardown). A thread created
+ * with a small stack had too little left for it: node's SignalInspector
+ * (64 KB), leaving its semaphore wait as node exited, ran into its guard
+ * page holding TVM's heap lock, and the whole VM hung. So a thread gets at
+ * least this much.
+ */
+#define TVM_MIN_THREAD_STACK ((size_t)512 << 10)
+
 static size_t attr_stack_size(const pthread_attr_t *attr)
 {
     pthread_attr_t def;
@@ -18830,7 +19973,9 @@ static size_t attr_stack_size(const pthread_attr_t *attr)
     pthread_attr_getstacksize(attr, &size);
     if (attr == &def)
         pthread_attr_destroy(&def);
-    return own ? 0 : size;
+    if (own)
+        return 0;
+    return size < TVM_MIN_THREAD_STACK ? TVM_MIN_THREAD_STACK : size;
 }
 
 // Create a thread within a locked task.  The new thread gets the full TVM lifecycle
@@ -19068,6 +20213,45 @@ static void task_keys_release(struct task *t)
 
 typedef void (*key_dtor_t)(void *);
 
+/*
+ * An exec's keys: the old program's are set aside before the new one loads
+ * and released once it has, as its mappings are. The new program's
+ * constructors make keys of their own (Bun's mimalloc keeps each thread's
+ * heap in one), and releasing every key the task held after the load let
+ * the host hand those out again: the next pthread_key_create() returned
+ * mimalloc's key, whose value it then overwrote, and the heap mimalloc
+ * found there was another allocation's memory.
+ */
+static void task_keys_stash(struct task *t, unsigned char *keys, key_dtor_t *dtors)
+{
+    task_lock(t);
+    memcpy(keys, t->tsk_keys, sizeof(t->tsk_keys));
+    memcpy(dtors, t->tsk_key_dtors, sizeof(t->tsk_key_dtors));
+    memset(t->tsk_keys, 0, sizeof(t->tsk_keys));
+    memset(t->tsk_key_dtors, 0, sizeof(t->tsk_key_dtors));
+    task_unlock(t);
+}
+
+// The exec failed: the keys the load made go, the old program's come back.
+static void task_keys_unstash(struct task *t, const unsigned char *keys, key_dtor_t const *dtors)
+{
+    task_keys_release(t);
+    task_lock(t);
+    memcpy(t->tsk_keys, keys, sizeof(t->tsk_keys));
+    memcpy(t->tsk_key_dtors, dtors, sizeof(t->tsk_key_dtors));
+    task_unlock(t);
+}
+
+// The exec succeeded: the old program's keys go.
+static void stashed_keys_release(const unsigned char *keys)
+{
+    pthread_mutex_lock(&keys_lock);
+    for (int k = 0; k < PTHREAD_KEYS_MAX; k++)
+        if (keys[k])
+            key_unref_locked(k);
+    pthread_mutex_unlock(&keys_lock);
+}
+
 FUNCTION_DEFINE2(int, pthread_key_create, pthread_key_t *, key, key_dtor_t, destructor) {
     if (caller_is_tvm())
         return CALL_FUNC(pthread_key_create, key, destructor);
@@ -19149,20 +20333,18 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
 
 FUNCTION_DEFINE_NORET1(exit, int, status) {
     tvm_sig_enter();
-    task_lock(current);
-    exit_t exits[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
-    void *exit_args[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
-    memcpy(&exits, current->tsk_exits, sizeof(exits));
-    memcpy(&exit_args, current->tsk_exit_args, sizeof(exit_args));
-    memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
-    memset(&current->tsk_exit_args, 0, sizeof(current->tsk_exit_args));
-    task_unlock(current);
-
-    for (int i = 0; i < sizeof(current->tsk_exits)/sizeof(*current->tsk_exits); i++) {
-        if (exits[i]) {
-            if (0 != emulator_call(NULL, (uint64_t)exits[i], (uint64_t)exit_args[i], 0, 0, 0, 0, 0))
-                abort();
+    // the handlers, last registered first; taken from the task, so that
+    // one registered by a handler runs too, and none twice
+    for (;;) {
+        task_lock(current);
+        if (!current->tsk_nexits) {
+            task_unlock(current);
+            break;
         }
+        struct task_exit te = current->tsk_exits[--current->tsk_nexits];
+        task_unlock(current);
+        if (0 != emulator_call(NULL, (uint64_t)te.te_fn, (uint64_t)te.te_arg, 0, 0, 0, 0, 0))
+            abort();
     }
 
     // Flush with signals deliverable: a broken pipe here is a fatal SIGPIPE
@@ -19249,6 +20431,118 @@ static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sec
     }
     return _dyld_find_unwind_sections(addr, info);
 }
+
+/*
+ * dyld's image list and the executable's segments, as the task's program
+ * sees them. dyld knows the host's images only: to a program TVM loaded,
+ * image 0 and _NSGetMachExecuteHeader() were tvm itself, and getsegbyname()
+ * looked in tvm's segments. A Bun program finds the JavaScript compiled into
+ * it as its executable's __BUN segment (getsegbyname, then
+ * _dyld_get_image_vmaddr_slide(0)); not found, the program ran as the bun
+ * command instead. The task's images come first, its executable at 0 (see
+ * ulinker_image), then the host's.
+ */
+static uint32_t guest_image_count(void)
+{
+    struct ulinker_image im;
+    uint32_t n = 0;
+    while (current && current->tsk_linker && ulinker_image(current->tsk_linker, n, &im))
+        n++;
+    return n;
+}
+
+static int guest_image(uint32_t index, struct ulinker_image *im)
+{
+    return current && current->tsk_linker && ulinker_image(current->tsk_linker, index, im);
+}
+
+static uint32_t tvm_dyld_image_count(void) {
+    return guest_image_count() + _dyld_image_count();
+}
+
+static const struct mach_header *tvm_dyld_get_image_header(uint32_t index) {
+    struct ulinker_image im;
+    if (guest_image(index, &im))
+        return im.mh;
+    uint32_t n = guest_image_count();
+    return index < n ? NULL : _dyld_get_image_header(index - n);
+}
+
+static intptr_t tvm_dyld_get_image_vmaddr_slide(uint32_t index) {
+    struct ulinker_image im;
+    if (guest_image(index, &im))
+        return im.slide;
+    uint32_t n = guest_image_count();
+    return index < n ? 0 : _dyld_get_image_vmaddr_slide(index - n);
+}
+
+static const char *tvm_dyld_get_image_name(uint32_t index) {
+    struct ulinker_image im;
+    if (guest_image(index, &im))
+        return im.path;
+    uint32_t n = guest_image_count();
+    return index < n ? NULL : _dyld_get_image_name(index - n);
+}
+
+// The executable's mach header: the task's, if TVM loaded one.
+static const struct mach_header_64 *guest_exec_header(void)
+{
+    struct ulinker_image im;
+    if (!guest_image(0, &im))
+        return NULL;
+    const struct mach_header_64 *mh = im.mh;
+    return mh->filetype == MH_EXECUTE ? mh : NULL;
+}
+
+static const struct mach_header *tvm_NSGetMachExecuteHeader(void) {
+    const struct mach_header_64 *mh = guest_exec_header();
+    return mh ? (const struct mach_header *)mh : (const struct mach_header *)_NSGetMachExecuteHeader();
+}
+
+// The executable's segment and section commands, link-time addresses (the
+// caller adds the slide), as libmacho's own, which read
+// _NSGetMachExecuteHeader(). Not the host's: it would be tvm's.
+static const struct segment_command_64 *exec_segment(const struct mach_header_64 *mh, const char *segname)
+{
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+        if (lc->cmd == LC_SEGMENT_64 && 0 == strncmp(sg->segname, segname, sizeof(sg->segname)))
+            return sg;
+    }
+    return NULL;
+}
+
+static const struct section_64 *exec_section(const struct mach_header_64 *mh, const char *segname, const char *sectname)
+{
+    const struct segment_command_64 *sg = exec_segment(mh, segname);
+    const struct section_64 *sp = sg ? (const struct section_64 *)(sg + 1) : NULL;
+    for (uint32_t i = 0; sg && i < sg->nsects; i++, sp++)
+        if (0 == strncmp(sp->sectname, sectname, sizeof(sp->sectname)))
+            return sp;
+    return NULL;
+}
+
+static const struct segment_command_64 *tvm_getsegbyname(const char *segname) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)tvm_NSGetMachExecuteHeader();
+    return exec_segment(mh, segname);
+}
+
+static const struct section_64 *tvm_getsectbyname(const char *segname, const char *sectname) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)tvm_NSGetMachExecuteHeader();
+    return exec_section(mh, segname, sectname);
+}
+
+static char *tvm_getsectdata(const char *segname, const char *sectname, unsigned long *size) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)tvm_NSGetMachExecuteHeader();
+    const struct section_64 *sp = exec_section(mh, segname, sectname);
+    if (!sp) {
+        *size = 0;
+        return NULL;
+    }
+    *size = sp->size;
+    return (char *)sp->addr;
+}
 #endif
 
 /*
@@ -19268,6 +20562,59 @@ static void main_program_handle_init(void)
     main_program_handle = dlopen(NULL, RTLD_LAZY);
 }
 
+/*
+ * sqlite3_config(3) for a task's program. The host's libsqlite3 is loaded
+ * once for the whole VM, and its configuration is global to it and fixed
+ * by the first sqlite3_initialize(): the options that hand sqlite code or
+ * memory of the program's -- an allocator (SQLITE_CONFIG_MALLOC), mutexes,
+ * a page cache, buffers, a log callback -- outlived the program, and every
+ * later program's sqlite ran on them. Bun installs its own allocator that
+ * way: once opencode had run, the next opencode's sqlite called the dead
+ * one's allocator on blocks the new heap had never seen -- a lookup that
+ * never ended on macOS, a crash at startup on iOS, every second run. Those
+ * options are accepted and ignored, sqlite keeping its own; the rest go
+ * through.
+ */
+#define TVM_SQLITE_CONFIG_SCRATCH    6
+#define TVM_SQLITE_CONFIG_PAGECACHE  7
+#define TVM_SQLITE_CONFIG_HEAP       8
+#define TVM_SQLITE_CONFIG_MALLOC     4
+#define TVM_SQLITE_CONFIG_MUTEX     10
+#define TVM_SQLITE_CONFIG_PCACHE    14
+#define TVM_SQLITE_CONFIG_LOG       16
+#define TVM_SQLITE_CONFIG_PCACHE2   18
+#define TVM_SQLITE_CONFIG_SQLLOG    21
+
+static int tvm_sqlite3_config(int op, ...)
+{
+    switch (op) {
+    case TVM_SQLITE_CONFIG_MALLOC:
+    case TVM_SQLITE_CONFIG_SCRATCH:
+    case TVM_SQLITE_CONFIG_PAGECACHE:
+    case TVM_SQLITE_CONFIG_HEAP:
+    case TVM_SQLITE_CONFIG_MUTEX:
+    case TVM_SQLITE_CONFIG_PCACHE:
+    case TVM_SQLITE_CONFIG_LOG:
+    case TVM_SQLITE_CONFIG_PCACHE2:
+    case TVM_SQLITE_CONFIG_SQLLOG:
+        return 0;   // SQLITE_OK
+    }
+
+    static int (*real)(int, ...);
+    if (!real)
+        real = (int (*)(int, ...))dlsym(RTLD_DEFAULT, "sqlite3_config");
+    if (!real)
+        return 21;  // SQLITE_MISUSE
+
+    // the option's arguments, at most three, each a pointer-sized variadic
+    // slot whatever its type: passed on as such, the callee reads its own
+    va_list ap;
+    va_start(ap, op);
+    void *a = va_arg(ap, void *), *b = va_arg(ap, void *), *c = va_arg(ap, void *);
+    va_end(ap);
+    return real(op, a, b, c);
+}
+
 static void *tvm_guest_dlsym(void *handle, const char *symbol)
 {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -19280,6 +20627,11 @@ static void *tvm_guest_dlsym(void *handle, const char *symbol)
 #if defined(RTLD_MAIN_ONLY)
     whole |= handle == RTLD_MAIN_ONLY;
 #endif
+    // a library the program opened itself: the host's, as it is, but for
+    // its process-global configuration (see tvm_sqlite3_config)
+    if (symbol && 0 == strcmp(symbol, "sqlite3_config"))
+        return dlsym(handle, symbol) ? (void *)&tvm_sqlite3_config : NULL;
+
     if (!whole || !symbol || !current || !current->tsk_linker)
         return dlsym(handle, symbol);
 
@@ -19313,21 +20665,23 @@ static int tvm_atexit(exit_t function, void *arg, void *lr) {
     }
 
     task_lock(current);
-    for (int i = (sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)) - 1; i >= 0; i--) {
-        if (!current->tsk_exits[i]) {
-            current->tsk_exits[i] = function;
-            current->tsk_exit_args[i] = arg;
+    if (current->tsk_nexits == current->tsk_exits_cap) {
+        size_t cap = current->tsk_exits_cap ? current->tsk_exits_cap * 2 : 32;
+        struct task_exit *n = krealloc(current->tsk_exits, cap * sizeof(*n));
+        if (!n) {
             task_unlock(current);
             tvm_sig_leave();
-            return 0;
+            errno = ENOMEM;
+            return -1;
         }
+        current->tsk_exits = n;
+        current->tsk_exits_cap = cap;
     }
+    current->tsk_exits[current->tsk_nexits++] = (struct task_exit){ function, arg };
     task_unlock(current);
 
     tvm_sig_leave();
-
-    errno = ENOMEM;
-    return -1;
+    return 0;
 }
 
 FUNCTION_DEFINE_NORET_VA2(errx, int, eval, const char *, fmt) {
@@ -19663,6 +21017,37 @@ FUNCTION_DEFINE2(int, _NSGetExecutablePath, char *, buf, uint32_t *, bufsize) {
     }
     memcpy(buf, current->tsk_exe, need);
     return 0;
+}
+
+/*
+ * The program's arguments, environment and name as crt_externs.h hands them
+ * out: the host's were tvm's own. Rust's std::env::args() reads them so (on
+ * Darwin it never sees main's arguments): ripgrep took tvm's argv[1], its
+ * own path, for the pattern. Before the task's first execve() (no program
+ * of its own yet) they are the host's.
+ */
+FUNCTION_DEFINE0(int *, _NSGetArgc) {
+    if (!current->tsk_data || !current->tsk_data->argv)
+        return CALL_FUNC(_NSGetArgc);
+    return &current->tsk_data->argc;
+}
+
+FUNCTION_DEFINE0(char ***, _NSGetArgv) {
+    if (!current->tsk_data || !current->tsk_data->argv)
+        return CALL_FUNC(_NSGetArgv);
+    return &current->tsk_data->argv;
+}
+
+FUNCTION_DEFINE0(char ***, _NSGetEnviron) {
+    if (!current->tsk_data || !current->tsk_relocs.__environ)
+        return CALL_FUNC(_NSGetEnviron);
+    return current->tsk_relocs.__environ;
+}
+
+FUNCTION_DEFINE0(char **, _NSGetProgname) {
+    if (!current->tsk_data || !current->tsk_data->progname)
+        return CALL_FUNC(_NSGetProgname);
+    return &current->tsk_data->progname;
 }
 
 FUNCTION_DEFINE_VOID1(setprogname, const char *, name) {
@@ -20840,19 +22225,37 @@ do_exec:
     // These copies stay in this frame, below thr_fork_fp, for the program's
     // whole life, so every fork it does copies and fixes them up: zero-pad
     // them (see tvm_alloca_zero).
+    //
+    // The strings are laid out as a kernel lays them out: one block, the
+    // arguments' in order, end to end, then the environment's. Programs rely
+    // on it: libuv's uv_setup_args takes the arguments to span argv[0] to the
+    // end of the last one, which it then overwrites with the process title
+    // (node's process.title). Each string had an alloca of its own, so they
+    // ran downwards: that span came out negative, and setting the title
+    // overwrote the stack above argv[0] -- the program's environment array
+    // among it (Claude Code on node died in getenv("TZ")).
+    size_t strings = 0;
+    for (int i = 0; i < argc; i++)
+        strings += strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++)
+        strings += strlen(envp[i]) + 1;
+    char *block = tvm_alloca_zero(strings ? strings : 1);
+
     char **new_argv = alloca(sizeof(char *) * (argc + 1));
     for (int i = 0; i < argc; i++) {
         size_t len = strlen(argv[i]) + 1;
-        new_argv[i] = tvm_alloca_zero(len);
-        memcpy(new_argv[i], argv[i], len);
+        new_argv[i] = block;
+        memcpy(block, argv[i], len);
+        block += len;
     }
     new_argv[argc] = NULL;
 
     char **new_envp = alloca(sizeof(char *) * (envc + 1));
     for (int i = 0; i < envc; i++) {
         size_t len = strlen(envp[i]) + 1;
-        new_envp[i] = tvm_alloca_zero(len);
-        memcpy(new_envp[i], envp[i], len);
+        new_envp[i] = block;
+        memcpy(block, envp[i], len);
+        block += len;
     }
     new_envp[envc] = NULL;
 
@@ -20887,8 +22290,8 @@ do_exec:
     // constructor's atexit(), is registered there, and clearing the handlers
     // after the load (as was done) dropped them, so no static destructor of
     // a program ever ran. Put back if the exec fails.
-    exit_t old_exits[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
-    void *old_exit_args[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
+    struct task_exit *old_exits;
+    size_t old_nexits, old_exits_cap;
     // and its mappings (see mmap): the new one's start with its constructors
     struct task_map *old_maps;
     size_t old_nmaps;
@@ -20897,11 +22300,16 @@ do_exec:
     old_nmaps = current->tsk_nmaps;
     current->tsk_maps = NULL;
     current->tsk_nmaps = 0;
-    memcpy(old_exits, current->tsk_exits, sizeof(old_exits));
-    memcpy(old_exit_args, current->tsk_exit_args, sizeof(old_exit_args));
-    memset(&current->tsk_exits, 0, sizeof(current->tsk_exits));
-    memset(&current->tsk_exit_args, 0, sizeof(current->tsk_exit_args));
+    old_exits = current->tsk_exits;
+    old_nexits = current->tsk_nexits;
+    old_exits_cap = current->tsk_exits_cap;
+    current->tsk_exits = NULL;
+    current->tsk_nexits = current->tsk_exits_cap = 0;
     task_unlock(current);
+    // and its pthread keys (see task_keys_stash)
+    unsigned char old_keys[PTHREAD_KEYS_MAX];
+    key_dtor_t old_key_dtors[PTHREAD_KEYS_MAX];
+    task_keys_stash(current, old_keys, old_key_dtors);
 
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
@@ -20910,14 +22318,17 @@ do_exec:
         void *handle = ulinker_dlopen(new_linker, pathname, dlflags);
         if (!handle) {
             task_lock(current);
-            memcpy(current->tsk_exits, old_exits, sizeof(old_exits));
-            memcpy(current->tsk_exit_args, old_exit_args, sizeof(old_exit_args));
+            kfree(current->tsk_exits);  /* the failed load's */
+            current->tsk_exits = old_exits;
+            current->tsk_nexits = old_nexits;
+            current->tsk_exits_cap = old_exits_cap;
             task_unlock(current);
             task_maps_unmap(current);
             task_lock(current);
             current->tsk_maps = old_maps;
             current->tsk_nmaps = old_nmaps;
             task_unlock(current);
+            task_keys_unstash(current, old_keys, old_key_dtors);
             current->tsk_linker = old_linker;
             current_thread->thr_emulator = old_emulator;
             emulator_context_destroy(new_emulator);
@@ -20931,14 +22342,17 @@ do_exec:
         if (!entry) {
             INFO("failed to load executable library \"%s\": symbol \"main\" not found", pathname);
             task_lock(current);
-            memcpy(current->tsk_exits, old_exits, sizeof(old_exits));
-            memcpy(current->tsk_exit_args, old_exit_args, sizeof(old_exit_args));
+            kfree(current->tsk_exits);  /* the failed load's */
+            current->tsk_exits = old_exits;
+            current->tsk_nexits = old_nexits;
+            current->tsk_exits_cap = old_exits_cap;
             task_unlock(current);
             task_maps_unmap(current);
             task_lock(current);
             current->tsk_maps = old_maps;
             current->tsk_nmaps = old_nmaps;
             task_unlock(current);
+            task_keys_unstash(current, old_keys, old_key_dtors);
             current->tsk_linker = old_linker;
             current_thread->thr_emulator = old_emulator;
             emulator_context_destroy(new_emulator);
@@ -20954,14 +22368,17 @@ do_exec:
     if (!main_func) {
         INFO("  failed(ENOENT)");
         task_lock(current);
-        memcpy(current->tsk_exits, old_exits, sizeof(old_exits));
-        memcpy(current->tsk_exit_args, old_exit_args, sizeof(old_exit_args));
+        kfree(current->tsk_exits);  /* the failed load's */
+        current->tsk_exits = old_exits;
+        current->tsk_nexits = old_nexits;
+        current->tsk_exits_cap = old_exits_cap;
         task_unlock(current);
         task_maps_unmap(current);
         task_lock(current);
         current->tsk_maps = old_maps;
         current->tsk_nmaps = old_nmaps;
         task_unlock(current);
+        task_keys_unstash(current, old_keys, old_key_dtors);
         current->tsk_linker = old_linker;
         current_thread->thr_emulator = old_emulator;
         emulator_context_destroy(new_emulator);
@@ -20978,10 +22395,11 @@ do_exec:
 
     // cleanup old emulator and linker
     emulator_context_destroy(old_emulator);
+    kfree(old_exits);   // the old program's exit handlers: its code is gone
     ulinker_destroy(old_linker);
 
     // the old program's pthread keys: their destructors were its code
-    task_keys_release(current);
+    stashed_keys_release(old_keys);
     // and its mappings
     for (size_t i = 0; i < old_nmaps; i++)
         CALL_FUNC(munmap, (void *)old_maps[i].start, old_maps[i].end - old_maps[i].start);
@@ -21078,6 +22496,9 @@ do_exec:
     // re-initialize tvm data section
     memset(current->tsk_data, 0, sizeof(*current->tsk_data));
     *current->tsk_relocs.__environ = new_envp;
+    current->tsk_data->argc = argc;
+    current->tsk_data->argv = argv;
+    current->tsk_data->progname = current->tsk_comm;
     *current->tsk_relocs.optind = 1;
     *current->tsk_relocs.opterr = 1;
     current->tsk_data->optreset = 0;
@@ -21461,7 +22882,27 @@ FUNCTION_DEFINE2(int, posix_spawn_file_actions_addinherit_np, posix_spawn_file_a
     return spawn_fa_add(fa, SFA_INHERIT, fd, 0, 0, 0, NULL);
 }
 
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE
+/*
+ * iOS's SDK has these as unavailable, so they are not interposed by name
+ * here; ulinker_external_dlsym binds them instead, for an import and for a
+ * dlsym() alike. libuv looks posix_spawn_file_actions_addchdir_np up at run
+ * time (node's child_process with a cwd): it got the host's, which took
+ * TVM's file actions for its own and wrote over them, and the next action
+ * added crashed the app.
+ */
+static int tvm_spawn_fa_addchdir(posix_spawn_file_actions_t *fa, const char *path) {
+    return spawn_fa_add(fa, SFA_CHDIR, 0, 0, 0, 0, path);
+}
+
+static int tvm_spawn_fa_addfchdir(posix_spawn_file_actions_t *fa, int fd) {
+    return spawn_fa_add(fa, SFA_FCHDIR, fd, 0, 0, 0, NULL);
+}
+
+static int tvm_spawnattr_noop(const posix_spawnattr_t *attr) {
+    return spawn_attr(attr) ? 0 : EINVAL;
+}
+#else
 FUNCTION_DEFINE2(int, posix_spawn_file_actions_addchdir_np, posix_spawn_file_actions_t *, fa, const char * __restrict, path) {
     return spawn_fa_add(fa, SFA_CHDIR, 0, 0, 0, 0, path);
 }
@@ -22280,8 +23721,15 @@ static void *tvm_calloc(size_t nmemb, size_t size) {
     void *p = rmem_arena_alloc(ar, total);
     if (NULL == p)
         return NULL;
-    
-    memset(p, 0, total);
+
+    // The arena hands out zeroed objects (fresh mappings, zeroed again when
+    // freed). Clearing a large one anyway made every page of it resident at
+    // once, written or not: V8 callocs its ArrayBuffers and node under TVM
+    // used several times its usual memory (see rmem_zero). Small objects are
+    // still cleared, which costs little and keeps a stray write to a freed
+    // one from reaching a later calloc.
+    if (total < (64 << 10))
+        memset(p, 0, total);
     return p;
 }
 
@@ -22332,6 +23780,34 @@ FUNCTION_DEFINE2(void *, aligned_alloc, size_t, alignment, size_t, size) {
     }
     return tvm_memalign(alignment, size);
 }
+
+/*
+ * The usable size of a block: malloc_size() on Darwin, malloc_usable_size()
+ * on Linux. The host's knows the host's blocks only and answered 0 for every
+ * block from the task's arena. V8 asks it for every buffer it allocates and
+ * uses all of it (zone segments, AllocateAtLeast): with 0, node's parser and
+ * compiler worked in corrupted memory and crashed on their first script. A
+ * block the arena does not own (the host's, a malloc zone's) is the host's to
+ * size, as before.
+ */
+static size_t tvm_usable_size(const void *ptr)
+{
+    struct rmem_arena *ar = current ? arena_for_task(current) : NULL;
+    size_t n = ar ? rmem_arena_usable_size(ar, ptr) : 0;
+    return n;
+}
+
+#if defined(__APPLE__)
+FUNCTION_DEFINE1(size_t, malloc_size, const void *, ptr) {
+    size_t n = tvm_usable_size(ptr);
+    return n ? n : CALL_FUNC(malloc_size, ptr);
+}
+#elif defined(__linux__)
+FUNCTION_DEFINE1(size_t, malloc_usable_size, void *, ptr) {
+    size_t n = tvm_usable_size(ptr);
+    return n ? n : CALL_FUNC(malloc_usable_size, ptr);
+}
+#endif
 
 FUNCTION_DEFINE1(void *, valloc, size_t, size) {
     return tvm_memalign((size_t)sysconf(_SC_PAGESIZE), size);
@@ -22584,6 +24060,33 @@ FUNCTION_DEFINE2(int, munmap, void *, addr, size_t, length) {
 
 static void *task_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset, int track);
 
+/*
+ * Whether [addr, addr + length) touches a thread stack of TVM's (its guard
+ * page included). A program may map over its own stack's guard: Rust's
+ * runtime puts its stack guard just below the main thread's stack
+ * (MAP_FIXED, then PROT_NONE). That page is the stack's, which TVM unmaps
+ * with the stack; recorded as the task's mapping as well, it was unmapped a
+ * second time when the task was reaped -- a hole by then, which the kernel
+ * punishes (EXC_GUARD, the whole process: ripgrep under Claude Code), or a
+ * page of the next thread's stack.
+ */
+static int range_on_tvm_stack(uintptr_t addr, size_t length)
+{
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    int on = 0;
+    struct tvm_stack *st;
+    pthread_mutex_lock(&stacks_lock);
+    list_for_each_entry(st, &stacks, st_list) {
+        uintptr_t lo = (uintptr_t)st->st_base - pg, hi = (uintptr_t)st->st_base + st->st_size;
+        if (addr < hi && lo < addr + length) {
+            on = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&stacks_lock);
+    return on;
+}
+
 FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, flags, int, fd, off_t, offset) {
     return task_mmap(addr, length, prot, flags, fd, offset, !caller_is_tvm());
 }
@@ -22593,7 +24096,11 @@ static void *task_mmap(void *addr, size_t length, int prot, int flags, int fd, o
     
     tvm_sig_enter();
 
-    if (fd >= 0) {
+    // An anonymous mapping's fd is no descriptor: -1, or on Darwin the
+    // mapping's VM tag (VM_MAKE_TAG, the tag in the top byte), which the
+    // host takes as given. JavaScriptCore tags its memory so (tag 53, a
+    // positive fd), and mapping it failed with EBADF.
+    if (fd >= 0 && !(flags & MAP_ANON)) {
         file = file_for_task(current, fd);
         if (!file) {
             tvm_sig_leave();
@@ -22606,7 +24113,7 @@ static void *task_mmap(void *addr, size_t length, int prot, int flags, int fd, o
     if (!file || !file->f_ops || !file->f_ops->f_mmap) {
         if (file)
             file_unlock(file, 0);
-        ret = CALL_FUNC(mmap, addr, length, prot, flags, (file ? file->f_rfd : -1), offset);
+        ret = CALL_FUNC(mmap, addr, length, prot, flags, (file ? file->f_rfd : ((flags & MAP_ANON) ? fd : -1)), offset);
 #ifdef TRACE_MMAP
         INFO("mmap %p-%p (mmap)", ret, (uintptr_t)ret + length);
 #endif
@@ -22619,7 +24126,7 @@ static void *task_mmap(void *addr, size_t length, int prot, int flags, int fd, o
     if (file)
         file_unlock(file, 1);
 
-    if (track && ret != MAP_FAILED)
+    if (track && ret != MAP_FAILED && !((flags & MAP_FIXED) && range_on_tvm_stack((uintptr_t)ret, length)))
         task_maps_add(current, ret, length, flags & MAP_FIXED);
 
     tvm_sig_leave();
@@ -23019,10 +24526,108 @@ static int qsort_compar_emulator(const void *a, const void *b)
     return (int)ret;
 }
 
+/*
+ * pthread_once(3): the host calls the init routine itself, natively, which
+ * for an emulated program is a jump into code mapped without execute
+ * permission (SIGBUS in its first constructor; seen with a node binary that
+ * Claude Code found on the host's PATH). The routine is called as the
+ * program's (emulator_call) from a trampoline; one routine may run another
+ * pthread_once, hence the save and restore.
+ */
+static void once_routine_emulator(void)
+{
+    if (0 != emulator_call(NULL, (uint64_t)once_routine, 0, 0, 0, 0, 0, 0))
+        err(1, "emulator_call(pthread_once routine)");
+}
+
+typedef void (*once_routine_t)(void);
+
+FUNCTION_DEFINE2(int, pthread_once, pthread_once_t *, once, once_routine_t, routine) {
+    void (*saved)(void) = once_routine;
+    once_routine = routine;
+    int r = CALL_FUNC(pthread_once, once, once_routine_emulator);
+    once_routine = saved;
+    return r;
+}
+
 FUNCTION_DEFINE_VOID4(qsort, void *, base, size_t, nel, size_t, width, compar_t, compar) {
     qsort_compar = compar;
     CALL_FUNC(qsort, base, nel, width, qsort_compar_emulator);
     qsort_compar = NULL;
+}
+
+/*
+ * scandir(3). The host's read the directory itself, by the program's path
+ * (the host's view, not the VM's), and returned entries from the host's
+ * malloc, which the program then gave to the interposed free(): an abort
+ * ("rmem_arena_free: invalid pointer"). libuv lists every directory so
+ * (uv_fs_scandir, node's fs.readdir). Read through the interposed
+ * opendir/readdir here, entries from the task's heap; select() and compar()
+ * are the program's, called as such (emulator_call, the qsort trampoline).
+ */
+typedef int (*scandir_sel_t)(const struct dirent *);
+typedef int (*scandir_cmp_t)(const struct dirent **, const struct dirent **);
+
+FUNCTION_DEFINE4(int, scandir, const char *, dirname, struct dirent ***, namelist,
+                 scandir_sel_t, select, scandir_cmp_t, compar) {
+    DIR *d = opendir(dirname);
+    if (!d)
+        return -1;
+    struct dirent **list = NULL;
+    size_t n = 0, cap = 0;
+    struct dirent *de;
+    int err = 0;
+    errno = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (select) {
+            uint64_t keep;
+            if (0 != emulator_call(&keep, (uint64_t)select, (uint64_t)de, 0, 0, 0, 0, 0))
+                abort();
+            if (!(int)keep)
+                continue;
+        }
+        size_t namelen = strlen(de->d_name);
+        size_t size = offsetof(struct dirent, d_name) + namelen + 1;
+        if (size < sizeof(struct dirent) - sizeof(de->d_name) + 1)
+            size = sizeof(struct dirent) - sizeof(de->d_name) + 1;
+        struct dirent *copy = malloc(size);
+        if (!copy) {
+            err = ENOMEM;
+            break;
+        }
+        memcpy(copy, de, offsetof(struct dirent, d_name));
+        memcpy(copy->d_name, de->d_name, namelen + 1);
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 32;
+            struct dirent **nl = realloc(list, ncap * sizeof(*nl));
+            if (!nl) {
+                free(copy);
+                err = ENOMEM;
+                break;
+            }
+            list = nl;
+            cap = ncap;
+        }
+        list[n++] = copy;
+    }
+    if (!err && errno)
+        err = errno;
+    closedir(d);
+    if (err) {
+        while (n)
+            free(list[--n]);
+        free(list);
+        errno = err;
+        return -1;
+    }
+    if (compar && n > 1) {
+        compar_t saved = qsort_compar;
+        qsort_compar = (compar_t)compar;
+        CALL_FUNC(qsort, list, n, sizeof(*list), qsort_compar_emulator);
+        qsort_compar = saved;
+    }
+    *namelist = list;
+    return (int)n;
 }
 
 static void *vtimer_thread_entry(void *_arg)
