@@ -665,27 +665,12 @@ if(APPLE)
 endif()
 
 ###############################################################################
-# Claude Code (macOS / iOS apps only)
-#
-# Anthropic's own build, not built here: the Bun program the native installer
-# puts at ~/.local/share/claude/versions/<version> (a macOS arm64
-# executable). Shipped only when TVM_CLAUDE_CODE names one, as
-# libclaude.framework (exe2lib.py keeps its LC_MAIN entry point: it exports
-# no main) and /tvm/bin/claude in the Flutter initrd.
-###############################################################################
-set(TVM_CLAUDE_CODE "" CACHE FILEPATH "Claude Code's macOS arm64 executable to ship in the apps (empty: none)")
-if(APPLE AND TVM_CLAUDE_CODE)
-    add_shared_lib(claude ${TVM_CLAUDE_CODE} ${TVM_CLAUDE_CODE})
-    add_launcher(claude)
-endif()
-
-###############################################################################
 # ripgrep (macOS / iOS apps only)
 #
 # The release build (BurntSushi/ripgrep's aarch64-apple-darwin archive), not
 # built here: TVM_RIPGREP names its rg. Shipped as librg.framework and
-# /tvm/bin/rg in the Flutter initrd, the rg that opencode and Claude Code
-# search with (init.flutter.rc). They bring or download their own otherwise,
+# /tvm/bin/rg in the Flutter initrd, the rg that Claude Code searches with
+# (init.flutter.rc). It brings or downloads its own otherwise,
 # a program the app can only emulate, and searching with it emulated many
 # threads at once, which took the app down (unicorn's TCI aborting on a
 # translation block it could not decode).
@@ -694,21 +679,6 @@ set(TVM_RIPGREP "" CACHE FILEPATH "ripgrep's macOS arm64 executable to ship in t
 if(APPLE AND TVM_RIPGREP)
     add_shared_lib(rg ${TVM_RIPGREP} ${TVM_RIPGREP})
     add_launcher(rg)
-endif()
-
-###############################################################################
-# opencode (macOS / iOS apps only)
-#
-# Its own release build, not built here: the Bun program of npm's
-# opencode-darwin-arm64 package (bin/opencode, a macOS arm64 executable).
-# Shipped only when TVM_OPENCODE names one, as libopencode.framework (exported
-# no main either, see Claude Code above) and /tvm/bin/opencode in the Flutter
-# initrd.
-###############################################################################
-set(TVM_OPENCODE "" CACHE FILEPATH "opencode's macOS arm64 executable to ship in the apps (empty: none)")
-if(APPLE AND TVM_OPENCODE)
-    add_shared_lib(opencode ${TVM_OPENCODE} ${TVM_OPENCODE})
-    add_launcher(opencode)
 endif()
 
 ###############################################################################
@@ -734,4 +704,23 @@ if(APPLE AND TVM_NODE)
         COMMENT "Staging node's npm and corepack"
     )
     set_target_properties(node_modules PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+###############################################################################
+# Bun (macOS / iOS apps only)
+#
+# The official build (oven-sh/bun's bun-darwin-aarch64 archive), not built
+# here: TVM_BUN names the bun executable. Shipped as libbun.framework and
+# /tvm/bin/bun in the Flutter initrd. A compiled Bun program (Claude Code,
+# which users install themselves with its installer) runs on it: execve runs
+# this signed runtime with the program's module graph mapped into it, in
+# memory (tvm.c, "Bun programs"); on iOS without its JIT (BUN_JSC_useJIT,
+# init.flutter.rc). Bun bundles JavaScriptCore, which is LGPL-2.1: the
+# framework carries its own copy, so the obligation is on libbun.framework
+# alone (source offer or accompany).
+###############################################################################
+set(TVM_BUN "" CACHE FILEPATH "The official Bun macOS arm64 executable to ship in the apps (empty: none)")
+if(APPLE AND TVM_BUN)
+    add_shared_lib(bun ${TVM_BUN} ${TVM_BUN})
+    add_launcher(bun)
 endif()

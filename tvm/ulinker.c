@@ -3,6 +3,8 @@
 #include <errno.h>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
 #endif
 #include <stdio.h>
 #include <unistd.h>
@@ -2059,6 +2061,15 @@ struct ulinker {
     // directory of the first image loaded, what @executable_path means to its
     // dependencies
     char ul_exec_dir[DLINFO_PATH_LEN];
+
+    // a Bun module graph for the next image with a __BUN,__bun section (see
+    // ulinker_set_bun_graph); ul_bun_graph_size 0: none
+    char     ul_bun_graph_path[DLINFO_PATH_LEN];
+    uint64_t ul_bun_graph_offset;
+    uint64_t ul_bun_graph_size;
+    // ...a fork child's: the parent's mapped graph, copied from there
+    // (ulinker_duplicate) rather than mapped from the file again
+    uintptr_t ul_bun_graph_src;
 };
 
 #define DLINFO_LOCK(_ul)   pthread_mutex_lock(&(_ul)->ul_dlinfo_mtx)
@@ -2315,12 +2326,25 @@ struct dlinfo_macho64 {
     int dlm64_slot_cacheable;   // native image with executable segments, all mapped
     int dlm64_slot_reused;      // executable segments came from a parked slot
 
+    // a Bun module graph mapped over the image's __BUN,__bun section (see
+    // ulinker_set_bun_graph): the file and the section's place in it, where
+    // it is mapped, and the shift of the segments after __BUN it displaced
+    char      dlm64_bun_graph_path[DLINFO_PATH_LEN];
+    uint64_t  dlm64_bun_graph_offset, dlm64_bun_graph_size;
+    uintptr_t dlm64_bun_graph_at;       // vmaddr of the section (unslid)
+    size_t    dlm64_bun_graph_len;      // bytes mapped there, whole pages
+    uintptr_t dlm64_bun_shift_from;     // vmaddr where __BUN ended in the file
+    uintptr_t dlm64_bun_shift;          // what segments from there on moved by
+
     // thread-local variables, see "Thread-local variables"
     int           dlm64_tlv_has_key;
     pthread_key_t dlm64_tlv_key;        // each thread's block of the image's TLVs
     uintptr_t     dlm64_tlv_template;   // their initial values, in the image
     size_t        dlm64_tlv_size;       // size of a block
 };
+
+// where a segment is, past a Bun module graph (see ulinker_set_bun_graph)
+static uintptr_t macho64_seg_vmaddr(const struct dlinfo_macho64 *dl, const struct segment_command_64 *sc);
 
 // thread-local variables, see "Thread-local variables"
 static int macho64_tlv_setup(struct dlinfo_macho64 *dl);
@@ -2817,11 +2841,13 @@ int create_macho64_jit_entry(struct dlinfo_macho64 *dl, const char *filename)
             if (sc->initprot == 0 && sc->maxprot == 0 && sc->vmaddr == 0)
                 continue;
 
-            sc->vmaddr += bias;
+            // past a Bun module graph, where the segment is (see macho64_seg_vmaddr)
+            uint64_t moved = macho64_seg_vmaddr(dl, sc) - sc->vmaddr;
+            sc->vmaddr += bias + moved;
 
             struct section_64 *sect = (struct section_64 *)((uintptr_t)sc + sizeof(struct segment_command_64));
             for (uint32_t j = 0; j < sc->nsects; ++j, ++sect) {
-                sect->addr += bias;
+                sect->addr += bias + moved;
 
                 if (0 == strncmp(sect->segname, "__DWARF", 16)) {
                     if (0 == strncmp(sect->sectname, "__debug_line", 16))
@@ -3689,6 +3715,16 @@ static void free_macho64_library(struct dlinfo_macho64 *dl)
     }
     if (DLBASE(dl)->dl_base) {
 #if defined(__APPLE__)
+        // A parked range keeps its mappings, but not a Bun module graph:
+        // anonymous memory, never touched, takes its place, which drops its
+        // pages and its hold on the program's file (an updated program's old
+        // version would stay on disk) and keeps the range reserved. The next
+        // load maps the graph afresh. This runs in the task that reaps the
+        // image's (waitpid), so not through uo_mmap, the image's task's own.
+        if (dl->dlm64_slot_cacheable && dl->dlm64_bun_graph_len) {
+            vm_address_t graph = (vm_address_t)(dl->dlm64_load_bias + dl->dlm64_bun_graph_at);
+            vm_allocate(mach_task_self(), &graph, dl->dlm64_bun_graph_len, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+        }
         if (!(dl->dlm64_slot_cacheable && image_slot_put(&dl->dlm64_slot_key, DLBASE(dl)->dl_base)))
 #endif
         uo.uo_munmap(DLPRIVATE(dl), DLBASE(dl)->dl_base, DLBASE(dl)->dl_size);
@@ -3696,6 +3732,13 @@ static void free_macho64_library(struct dlinfo_macho64 *dl)
         DLBASE(dl)->dl_size = 0;
     }
     uo.uo_free(DLPRIVATE(dl), dl);
+}
+
+// Where a segment is, unslid: its vmaddr, past a Bun module graph moved
+// (see ulinker_set_bun_graph)
+static uintptr_t macho64_seg_vmaddr(const struct dlinfo_macho64 *dl, const struct segment_command_64 *sc)
+{
+    return sc->vmaddr + (dl->dlm64_bun_shift && sc->vmaddr >= dl->dlm64_bun_shift_from ? dl->dlm64_bun_shift : 0);
 }
 
 static uintptr_t vaddr_macho64(struct dlinfo_macho64 *dl, uint32_t fileoff)
@@ -3716,9 +3759,67 @@ static uintptr_t vaddr_macho64(struct dlinfo_macho64 *dl, uint32_t fileoff)
         if (fileoff < curr_sc->fileoff || fileoff >= (curr_sc->fileoff + curr_sc->filesize))
             continue;
 
-        return dl->dlm64_load_bias + curr_sc->vmaddr + fileoff - curr_sc->fileoff;
+        return dl->dlm64_load_bias + macho64_seg_vmaddr(dl, curr_sc) + fileoff - curr_sc->fileoff;
     }
 
+    return 0;
+}
+
+/*
+ * A Bun module graph mapped over the image's __BUN,__bun section (see
+ * ulinker_set_bun_graph): the section of the program's file, private and
+ * writable (JavaScriptCore rewrites the bytecode in it in place), never
+ * executable. From the file when the section starts on a page there (bun
+ * build --compile aligns it to one), pages coming in as they are touched;
+ * read in otherwise.
+ */
+static int macho64_map_bun_graph(struct ulinker *ulinker, struct dlinfo_macho64 *dl, int fd, uintptr_t src)
+{
+    void *at = (void *)(dl->dlm64_load_bias + dl->dlm64_bun_graph_at);
+    size_t len = dl->dlm64_bun_graph_len;
+    off_t off = (off_t)dl->dlm64_bun_graph_offset;
+    void *m;
+#if defined(__APPLE__)
+    // A fork child's: a copy-on-write copy of the parent's, as the kernel's
+    // fork gives it, with what JavaScriptCore rewrote in it. Not from the
+    // file again: it may be gone by now (unlinked, or its path pointing at a
+    // newer version, as Claude Code's updater leaves ~/.local/bin/claude).
+    if (src) {
+        vm_address_t target = (vm_address_t)at;
+        vm_prot_t cur, max;
+        kern_return_t kr = vm_remap(mach_task_self(), &target, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                    mach_task_self(), (vm_address_t)src, TRUE, &cur, &max, VM_INHERIT_COPY);
+        if (kr != KERN_SUCCESS || target != (vm_address_t)at) {
+            ERROR("failed to copy the Bun module graph of \"%s\" (%zu bytes): %d", dl->dlm64_bun_graph_path, len, kr);
+            return 1;
+        }
+        return 0;
+    }
+#else
+    (void)src;
+#endif
+    if (0 == page_offset((uintptr_t)off)) {
+        m = uo.uo_mmap(ulinker->ul_private, at, len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, off);
+    } else {
+        m = uo.uo_mmap(ulinker->ul_private, at, len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        uint8_t *p = at;
+        for (uint64_t got = 0; m != MAP_FAILED && got < dl->dlm64_bun_graph_size;) {
+            if (lseek(fd, off + (off_t)got, SEEK_SET) < 0) {
+                m = MAP_FAILED;
+                break;
+            }
+            ssize_t n = uo.uo_read(ulinker->ul_private, fd, p + got, dl->dlm64_bun_graph_size - got);
+            if (n <= 0)
+                m = MAP_FAILED;
+            else
+                got += (uint64_t)n;
+        }
+    }
+    if (m == MAP_FAILED) {
+        ERROR("failed to map the Bun module graph of \"%s\" (%llu bytes): -%d (%s)", dl->dlm64_bun_graph_path,
+              (unsigned long long)dl->dlm64_bun_graph_size, errno, strerror(errno));
+        return 1;
+    }
     return 0;
 }
 
@@ -3728,6 +3829,8 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
     struct dlinfo_macho64 *dl = NULL;
     void* hdr_mmap = MAP_FAILED;
     size_t hdr_size = 0;
+    int bun_fd = -1;    // the Bun module graph's file (see ulinker_set_bun_graph)
+    uintptr_t bun_src = 0;  // ...or a fork parent's copy of it
 
     if (!(dl = uo.uo_malloc(ulinker->ul_private, sizeof(struct dlinfo_macho64)))) {
         ERROR("failed to open \"%s\": -%d (%s)", filename, ENOMEM, strerror(ENOMEM));
@@ -3828,6 +3931,65 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
     min_vaddr = page_start(min_vaddr);
     max_vaddr = page_end(max_vaddr);
 
+    // A Bun module graph for this image (see ulinker_set_bun_graph): mapped
+    // at its __BUN,__bun section, which grows to the graph's size; the
+    // segments after __BUN (__LINKEDIT) move up by as much, and the range
+    // with them.
+    if (ulinker->ul_bun_graph_size) {
+        const struct segment_command_64 *bun_sc = NULL;
+        const struct section_64 *bun_sect = NULL;
+        curr_lc = lc;
+        for (size_t i = 0; i < dl->dlm64_hdr.ncmds && !bun_sect; ++i, curr_lc = (const struct load_command *)((uintptr_t)curr_lc + curr_lc->cmdsize)) {
+            if (curr_lc->cmd != LC_SEGMENT_64)
+                continue;
+            const struct segment_command_64 *sc = (const struct segment_command_64 *)curr_lc;
+            if (strncmp(sc->segname, "__BUN", sizeof(sc->segname)))
+                continue;
+            const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+            for (uint32_t k = 0; k < sc->nsects; k++)
+                if (0 == strncmp(sect[k].sectname, "__bun", sizeof(sect[k].sectname))) {
+                    bun_sc = sc;
+                    bun_sect = &sect[k];
+                    break;
+                }
+        }
+        if (bun_sect) {
+            uint64_t graph_off = ulinker->ul_bun_graph_offset, graph_size = ulinker->ul_bun_graph_size;
+            snprintf(dl->dlm64_bun_graph_path, sizeof(dl->dlm64_bun_graph_path), "%s", ulinker->ul_bun_graph_path);
+            bun_src = ulinker->ul_bun_graph_src;
+            ulinker->ul_bun_graph_size = 0;     // this image's
+            ulinker->ul_bun_graph_src = 0;
+            // the section alone in its segment, at its start, a data one
+            // (as Bun's linker settings put BUN_COMPILED): what is mapped
+            // over it is all of the segment that is left
+            if (page_offset(bun_sect->addr) || bun_sc->nsects != 1 || bun_sect->addr != bun_sc->vmaddr ||
+                !(bun_sc->initprot & VM_PROT_WRITE) || (bun_sc->initprot & VM_PROT_EXECUTE)) {
+                ERROR("failed to load \"%s\" with the Bun module graph of \"%s\": unexpected __BUN layout", filename, dl->dlm64_bun_graph_path);
+                goto out;
+            }
+            if (!bun_src && -1 == (bun_fd = uo.uo_open(ulinker->ul_private, dl->dlm64_bun_graph_path))) {
+                ERROR("failed to open the Bun module graph \"%s\": -%d (%s)", dl->dlm64_bun_graph_path, errno, strerror(errno));
+                goto out;
+            }
+            uintptr_t graph_end = page_end(bun_sect->addr + graph_size);
+            uintptr_t seg_end = page_end(bun_sc->vmaddr + bun_sc->vmsize);
+            dl->dlm64_bun_graph_offset = graph_off;
+            dl->dlm64_bun_graph_size = graph_size;
+            dl->dlm64_bun_graph_at = bun_sect->addr;
+            dl->dlm64_bun_graph_len = graph_end - bun_sect->addr;
+            dl->dlm64_bun_shift_from = seg_end;
+            dl->dlm64_bun_shift = graph_end > seg_end ? graph_end - seg_end : 0;
+            max_vaddr += dl->dlm64_bun_shift;
+        } else {
+            // the program would run as this image, without its graph
+            ERROR("failed to load \"%s\" with the Bun module graph of \"%s\": not a Bun runtime (no __BUN,__bun)",
+                  filename, ulinker->ul_bun_graph_path);
+            ulinker->ul_bun_graph_size = 0;
+            ulinker->ul_bun_graph_src = 0;
+            goto out;
+        }
+    }
+
     size_t load_size = max_vaddr - min_vaddr;
 
     void *base = MAP_FAILED;
@@ -3903,8 +4065,15 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             continue;
         }
 
+        // a segment that takes no memory, though it has file content: Go's
+        // __DWARF, which shares its address with __LINKEDIT. dyld maps
+        // nothing for it; mapped, its file content went over the next
+        // segment's pages (EXC_GUARD, the whole process)
+        if (curr_sc->vmsize == 0)
+            continue;
+
         // Segment addresses in memory.
-        uintptr_t seg_start = curr_sc->vmaddr + dl->dlm64_load_bias;
+        uintptr_t seg_start = macho64_seg_vmaddr(dl, curr_sc) + dl->dlm64_load_bias;
         uintptr_t seg_end   = seg_start + curr_sc->vmsize;
 
         uintptr_t seg_page_start = page_start(seg_start);
@@ -3977,6 +4146,10 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             }
         }
 
+        // the Bun module graph, over the __BUN,__bun section it is in
+        if ((bun_fd != -1 || bun_src) && 0 == strncmp(curr_sc->segname, "__BUN", sizeof(curr_sc->segname)) &&
+            macho64_map_bun_graph(ulinker, dl, bun_fd, bun_src))
+            goto out;
     }
 
 #if defined(__APPLE__)
@@ -4084,6 +4257,8 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         gdb_jit_register(&dl->dlm64_jit_entry);
 
 out:
+    if (bun_fd != -1)
+        uo.uo_close(ulinker->ul_private, bun_fd);
     if (hdr_mmap != MAP_FAILED) {
         uo.uo_munmap(ulinker->ul_private, hdr_mmap, hdr_size);
         hdr_mmap = MAP_FAILED;
@@ -5088,9 +5263,19 @@ static void notify_loaded_segments(struct ulinker *ulinker, struct dlinfo *dl)
             // skip zeropage
             if (sc->initprot == 0 && sc->maxprot == 0 && sc->vmaddr == 0)
                 continue;
-            uintptr_t seg_start = sc->vmaddr + dlm->dlm64_load_bias;
+            if (sc->vmsize == 0)
+                continue;
+            uintptr_t seg_start = macho64_seg_vmaddr(dlm, sc) + dlm->dlm64_load_bias;
             uintptr_t seg_page_start = page_start(seg_start);
             uintptr_t seg_page_end = page_end(seg_start + sc->vmsize);
+            // A Bun module graph (see ulinker_set_bun_graph) is reported
+            // read-only: a fork child gets a copy-on-write copy of it
+            // (macho64_map_bun_graph), not its 100+ MB copied byte by byte.
+            if (dlm->dlm64_bun_graph_len && 0 == strncmp(sc->segname, "__BUN", sizeof(sc->segname))) {
+                ulinker->ul_cb_mmap(ulinker, dl->dl_base, dl->dl_size,
+                    (void *)(dlm->dlm64_load_bias + dlm->dlm64_bun_graph_at), dlm->dlm64_bun_graph_len, PROT_READ);
+                continue;
+            }
             ulinker->ul_cb_mmap(ulinker, dl->dl_base, dl->dl_size,
                 (void *)seg_page_start, seg_page_end - seg_page_start,
                 VMPROT_TO_PROT(sc->initprot) & ~(DLBASE(dl)->dl_emu ? PROT_EXEC : 0));  // strip away PROT_EXEC if run on emulator
@@ -5632,6 +5817,19 @@ void *ulinker_dlopen(struct ulinker *ulinker, const char *filename, int flags) {
     return (void *)load_library(ulinker, filename, flags);
 }
 
+int ulinker_set_bun_graph(struct ulinker *ulinker, const char *path, uint64_t offset, uint64_t size)
+{
+    if (!path || strlen(path) >= sizeof(ulinker->ul_bun_graph_path) || !size) {
+        errno = EINVAL;
+        return -1;
+    }
+    snprintf(ulinker->ul_bun_graph_path, sizeof(ulinker->ul_bun_graph_path), "%s", path);
+    ulinker->ul_bun_graph_offset = offset;
+    ulinker->ul_bun_graph_size = size;
+    ulinker->ul_bun_graph_src = 0;
+    return 0;
+}
+
 int ulinker_dlclose(void *handle)
 {
     struct dlinfo *dl = (struct dlinfo *)handle;
@@ -5858,6 +6056,12 @@ int ulinker_duplicate(struct ulinker *old, struct ulinker *new, void (*segment_c
         };
 
         new->ul_cb_arg = (void *)&dup_arg;
+        // the child's image gets the parent's Bun module graph too
+        if (dl->dl_type == DLT_MACHO64 && ((struct dlinfo_macho64 *)dl)->dlm64_bun_graph_len) {
+            const struct dlinfo_macho64 *dlm = (const struct dlinfo_macho64 *)dl;
+            ulinker_set_bun_graph(new, dlm->dlm64_bun_graph_path, dlm->dlm64_bun_graph_offset, dlm->dlm64_bun_graph_size);
+            new->ul_bun_graph_src = dlm->dlm64_load_bias + dlm->dlm64_bun_graph_at;
+        }
         if (!load_library(new, dl->dl_pathname, dl->dl_flags)) {
             uo.uo_free(new->ul_private, images);
             goto out;

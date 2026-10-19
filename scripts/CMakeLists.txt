@@ -178,6 +178,15 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/ssl\"\n")
     string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/cacert.pem' \"$ROOTFS/etc/ssl/cacert.pem\"\n\n")
 
+    # ── security ──
+    # The keychain tool, as an empty keychain (scripts/security.sh): the
+    # host's cannot run in TVM, and Claude Code saves its login only when the
+    # keychain answers like one
+    if(APPLE)
+        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/security.sh' \"$ROOTFS/bin/security\"\n")
+        string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/security\"\n\n")
+    endif()
+
     # ── python ──
     # bin/python3.X is the interpreter: a launcher stub for libpython in the
     # Flutter initrd, the real executable in the CLI one; python3 and python
@@ -234,20 +243,9 @@ function(mkinitrd_target NAME)
         string(APPEND SCRIPT "\n")
     endif()
 
-    # ── Claude Code ── (TVM_CLAUDE_CODE, third_party/CMakeLists.txt): a
-    # launcher stub for libclaude in the Flutter initrd
-    if(APPLE AND TVM_CLAUDE_CODE AND ARG_FLUTTER)
-        string(APPEND SCRIPT "cp '${BIN_OUT}/claude_launcher' \"$ROOTFS/bin/claude\"\n\n")
-    endif()
-
     # ── ripgrep ── (TVM_RIPGREP, third_party/CMakeLists.txt): likewise
     if(APPLE AND TVM_RIPGREP AND ARG_FLUTTER)
         string(APPEND SCRIPT "cp '${BIN_OUT}/rg_launcher' \"$ROOTFS/bin/rg\"\n\n")
-    endif()
-
-    # ── opencode ── (TVM_OPENCODE, third_party/CMakeLists.txt): likewise
-    if(APPLE AND TVM_OPENCODE AND ARG_FLUTTER)
-        string(APPEND SCRIPT "cp '${BIN_OUT}/opencode_launcher' \"$ROOTFS/bin/opencode\"\n\n")
     endif()
 
     # ── Node.js ── (TVM_NODE, third_party/CMakeLists.txt): a launcher stub
@@ -263,6 +261,19 @@ function(mkinitrd_target NAME)
             string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/${name}\"\n")
         endforeach()
         string(APPEND SCRIPT "\n")
+    endif()
+
+    # ── Bun ── (TVM_BUN, third_party/CMakeLists.txt): a launcher stub for
+    # libbun in the Flutter initrd, the signed runtime execve runs compiled
+    # Bun programs on (tvm.c, "Bun programs"), and what it preloads into
+    # them: tvm-sab.js (a SharedArrayBuffer for JavaScriptCore without its
+    # JIT) and tvm-cellseg.js (Bun.ant.CellSegmenter, which Claude Code's
+    # terminal UI paints through).
+    if(APPLE AND TVM_BUN AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/bun_launcher' \"$ROOTFS/bin/bun\"\n")
+        string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/bun\"\n")
+        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/bun/tvm-sab.js' \"$ROOTFS/share/bun/tvm-sab.js\"\n")
+        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/bun/tvm-cellseg.js' \"$ROOTFS/share/bun/tvm-cellseg.js\"\n\n")
     endif()
 
     # ── apple *_cmds ──
@@ -339,17 +350,14 @@ set(LLVM_FLUTTER_DEPS "")
 if(APPLE)
     set(LLVM_CLI_DEPS llvm_exe llvm_bundle)
     set(LLVM_FLUTTER_DEPS llvm_launcher)
-    if(TVM_CLAUDE_CODE)
-        list(APPEND LLVM_FLUTTER_DEPS claude_launcher)
-    endif()
     if(TVM_RIPGREP)
         list(APPEND LLVM_FLUTTER_DEPS rg_launcher)
     endif()
-    if(TVM_OPENCODE)
-        list(APPEND LLVM_FLUTTER_DEPS opencode_launcher)
-    endif()
     if(TVM_NODE)
         list(APPEND LLVM_FLUTTER_DEPS node_launcher)
+    endif()
+    if(TVM_BUN)
+        list(APPEND LLVM_FLUTTER_DEPS bun_launcher)
     endif()
 endif()
 foreach(module ${APPLE_CMDS_MODULES})

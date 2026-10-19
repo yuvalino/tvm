@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shlex
@@ -3148,3 +3149,213 @@ def test_clang_cxx_threads(sshi: spawn):
     out, rc = _sh(sshi, "$TMPDIR/thr", timeout=CLANG_TIMEOUT)
     assert rc == 0, out
     assert "caught 10 main tl 0" in _lines(out), out
+
+
+# ── Bun programs ──────────────────────────────────────────────────
+# A compiled Bun program (bun build --compile) runs on the Bun the app ships,
+# its module graph (its __BUN,__bun section) mapped into that runtime's image
+# (tvm.c, "Bun programs"). The CLI ships no Bun, so these bind one at
+# /tvm/bin/bun with an initrc of their own: TVM_BUN, from the environment or
+# the build's CMake cache. They compile their programs with it too.
+
+def _cmake_cache_value(name: str):
+    try:
+        with open(f"./output/{PLATFORM}/build/CMakeCache.txt") as f:
+            for line in f:
+                if line.startswith(name + ":"):
+                    return line.split("=", 1)[1].strip() or None
+    except OSError:
+        pass
+    return None
+
+BUN = os.environ.get("TVM_BUN") or _cmake_cache_value("TVM_BUN")
+
+pytestmark_bun = pytest.mark.skipif(
+    not PLATFORM.startswith("macos-") or not BUN or not os.path.exists(BUN),
+    reason="needs a Bun (TVM_BUN) on macOS")
+
+# An embedded text module, which the graph gives as a string (as a file on
+# disk, it would be {default: ...}). With BUN_BARRIER set, the program marks
+# itself started there and waits until BUN_BARRIER_N programs have: then they
+# all ran at once.
+def _bun_text_program(who):
+    return ('import data from "./WHO.txt" with { type: "text" };\n'
+            'import { writeFileSync, readdirSync } from "node:fs";\n'
+            'let met = null;\n'
+            'if (process.env.BUN_BARRIER) {\n'
+            '  writeFileSync(process.env.BUN_BARRIER + "/WHO-" + process.pid, "");\n'
+            '  const end = Date.now() + 60000;\n'
+            '  while (!(met = readdirSync(process.env.BUN_BARRIER).length >= +process.env.BUN_BARRIER_N) && Date.now() < end)\n'
+            '    await Bun.sleep(20);\n'
+            '}\n'
+            'console.log(JSON.stringify({ who: "WHO", argv: process.argv.slice(2), data: data.trim(),\n'
+            '  sab: typeof SharedArrayBuffer, met }));\n').replace("WHO", who)
+
+BUN_PROGRAMS = {
+    "a": (_bun_text_program("a"), {"a.txt": "payload of a\n"}),
+    # UTF-8 beyond latin-1
+    "b": (_bun_text_program("b"), {"b.txt": "payload of b é 中\n"}),
+    # its own path, a child process, and itself again through process.execPath
+    "c": ('import { spawnSync } from "node:child_process";\n'
+          'if (process.argv[2] === "--child") {\n'
+          '  console.log(JSON.stringify({ who: "c-child", execPath: process.execPath, argv: process.argv.slice(2) }));\n'
+          '  process.exit(7);\n'
+          '}\n'
+          'const sh = Bun.spawnSync(["/tvm/bin/bash", "-c", "echo from-bash"]);\n'
+          'const self = spawnSync(process.execPath, ["--child", "z"], { encoding: "utf8" });\n'
+          'console.log(JSON.stringify({ who: "c", execPath: process.execPath, bash: sh.stdout.toString().trim(),\n'
+          '  selfStatus: self.status, selfOut: self.stdout.trim() }));\n',
+          {}),
+    # Bun.ant.CellSegmenter, which Claude Code's terminal UI paints through
+    # (scripts/bun/tvm-cellseg.js): a line with an SGR run and a wide glyph
+    "d": ('const s = new Bun.ant.CellSegmenter({ ambiguousIsNarrow: true });\n'
+          'const cells = new Int32Array(32), runs = new Int32Array(32);\n'
+          'const n = s.segment("a\\x1b[31mb\\u4e2d", cells, runs, false);\n'
+          'console.log(JSON.stringify({ who: "d", n, w: [cells[1] & 255, cells[3] & 255, cells[5] & 255],\n'
+          '  run: [cells[3] >>> 10, cells[5] >>> 10], keys: s.sgrKeys, g: s.graphemes[cells[4]] }));\n',
+          {}),
+    # a graph of megabytes, more than the runtime's __BUN segment (16 KB):
+    # the segments after it move (ulinker_set_bun_graph); and a child of it,
+    # itself again, which gets a copy of the parent's mapped graph
+    "e": ('import big from "./big.txt" with { type: "text" };\n'
+          'import { spawnSync } from "node:child_process";\n'
+          'if (process.argv[2] === "--child") { console.log(JSON.stringify({ who: "e-child", len: big.length })); process.exit(3); }\n'
+          'const c = spawnSync(process.execPath, ["--child"], { encoding: "utf8" });\n'
+          'console.log(JSON.stringify({ who: "e", len: big.length, tail: big.slice(-6), child: c.status, childOut: c.stdout.trim() }));\n',
+          {"big.txt": "0123456789abcdef" * (512 * 1024) + "-tail-"}),
+    # a program whose file is gone while it runs (an updated program's old
+    # version): its children still start, and see its environment without
+    # TVM's preloads (BUN_OPTIONS of the user's own only)
+    "f": ('import { unlinkSync } from "node:fs";\n'
+          'unlinkSync(process.execPath);\n'
+          'const sh = Bun.spawnSync(["/tvm/bin/bash", "-c", "echo \\"opts=[$BUN_OPTIONS]\\""]);\n'
+          'console.log(JSON.stringify({ who: "f", sh: sh.exitCode, out: sh.stdout.toString().trim() }));\n',
+          {}),
+}
+
+@pytest.fixture(scope="module")
+def bun_programs(tmp_path_factory):
+    d = tmp_path_factory.mktemp("bun")
+    src = d / "src"
+    src.mkdir()
+    for name, (code, files) in BUN_PROGRAMS.items():
+        (src / f"{name}.js").write_text(code)
+        for fname, text in files.items():
+            (src / fname).write_text(text, encoding="utf-8")
+        subprocess.run([BUN, "build", "--compile", str(src / f"{name}.js"), "--outfile", str(d / name)],
+                       check=True, capture_output=True, cwd=src)
+    with open("init.rc") as f:
+        rc = [l for l in f.read().splitlines() if not l.startswith("echo TVM initialized")]
+    rc += [f"mount --bind {os.path.abspath(BUN)}:/tvm/bin/bun",
+           f"mount --bind {os.path.abspath('scripts/bun/tvm-sab.js')}:/tvm/share/bun/tvm-sab.js",
+           f"mount --bind {os.path.abspath('scripts/bun/tvm-cellseg.js')}:/tvm/share/bun/tvm-cellseg.js"]
+    (d / "init.rc").write_text("\n".join(rc) + "\n")
+    return d
+
+def _run_bun_programs(d, script: str, **env_extra):
+    env = dict(os.environ)
+    env["TVM_NOEMU"] = TVM_NOEMU_DEFAULT + ":/tvm/bin/bun"
+    env["PLATFORM"] = PLATFORM
+    env.pop("BUN_OPTIONS", None)
+    env.update(env_extra)
+    p = subprocess.run([TVM_BIN, "-i", str(d / "init.rc"), "/tvm/bin/bash", "-c", script],
+                       capture_output=True, text=True, timeout=120, env=env)
+    records = []
+    for line in p.stdout.splitlines():
+        if line.startswith("{"):
+            records.append(json.loads(line))
+    return p, records
+
+@pytestmark_bun
+def test_bun_programs_side_by_side(bun_programs):
+    """Two compiled Bun programs, and two instances of one, run at once, each
+    on its own module graph: their embedded text modules are theirs, as
+    strings, and each saw all three started before it went on."""
+    d = bun_programs
+    barrier = d / "barrier"
+    barrier.mkdir(exist_ok=True)
+    for f in barrier.iterdir():
+        f.unlink()
+    p, recs = _run_bun_programs(d, f"{d}/a x1 x2 & {d}/b y1 & {d}/a x3 & wait; echo done=$?",
+                                BUN_BARRIER=str(barrier), BUN_BARRIER_N="3")
+    assert "done=0" in p.stdout, p.stdout + p.stderr
+    assert p.returncode == 0, p.stdout + p.stderr
+    by = sorted(recs, key=lambda r: (r["who"], r["argv"]))
+    assert [(r["who"], r["argv"], r["data"], r["met"]) for r in by] == [
+        ("a", ["x1", "x2"], "payload of a", True),
+        ("a", ["x3"], "payload of a", True),
+        ("b", ["y1"], "payload of b é 中", True),
+    ], p.stdout + p.stderr
+
+@pytestmark_bun
+def test_bun_program_rerun(bun_programs):
+    """A program run again after one exits (its image parked, then reused)."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/a one; echo a1=$?; {d}/a two; echo a2=$?; {d}/b three; echo b=$?")
+    assert "a1=0" in p.stdout and "a2=0" in p.stdout and "b=0" in p.stdout, p.stdout + p.stderr
+    assert [(r["who"], r["argv"]) for r in recs] == [("a", ["one"]), ("a", ["two"]), ("b", ["three"])]
+
+@pytestmark_bun
+def test_bun_program_self_and_children(bun_programs):
+    """process.execPath is the program's own path, a child process runs, and
+    the program runs itself again through process.execPath (detected anew)."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/c")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert len(recs) == 1, p.stdout + p.stderr
+    r = recs[0]
+    assert r["execPath"] == os.path.realpath(d / "c"), r
+    assert r["bash"] == "from-bash", r
+    assert r["selfStatus"] == 7, r
+    child = json.loads(r["selfOut"])
+    assert child == {"who": "c-child", "execPath": os.path.realpath(d / "c"), "argv": ["--child", "z"]}, r
+
+@pytestmark_bun
+def test_bun_program_preload_jitless(bun_programs):
+    """Without its JIT (as on iOS), JavaScriptCore turns SharedArrayBuffer
+    off; the preload execve adds gives one back, also with BUN_OPTIONS of
+    the user's own."""
+    d = bun_programs
+    for extra in ({}, {"BUN_OPTIONS": "--smol"}):
+        p, recs = _run_bun_programs(d, f"{d}/a j", BUN_JSC_useJIT="0", **extra)
+        assert p.returncode == 0, p.stdout + p.stderr
+        assert [(r["who"], r["sab"]) for r in recs] == [("a", "function")], (extra, p.stdout + p.stderr)
+
+@pytestmark_bun
+def test_bun_program_cell_segmenter(bun_programs):
+    """A Bun program has Bun.ant.CellSegmenter, which only Anthropic's Bun
+    has natively and Claude Code's terminal UI cannot draw without: cells,
+    widths, SGR runs and interned graphemes as the native class gives them."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/d")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert recs == [{"who": "d", "n": 3, "w": [1, 1, 2], "run": [1, 1], "keys": ["", "\x1b[31m"], "g": "\u4e2d"}], p.stdout + p.stderr
+
+@pytestmark_bun
+def test_bun_program_big_graph(bun_programs):
+    """A graph of megabytes, past the runtime's own __BUN segment: the image's
+    later segments move, and its child (itself, through process.execPath)
+    runs on a copy of the parent's graph."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/e")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert len(recs) == 1, p.stdout + p.stderr
+    r = recs[0]
+    assert (r["len"], r["tail"], r["child"]) == (8 * 1024 * 1024 + 6, "-tail-", 3), r
+    assert json.loads(r["childOut"]) == {"who": "e-child", "len": 8 * 1024 * 1024 + 6}, r
+
+@pytestmark_bun
+def test_bun_program_file_gone(bun_programs):
+    """A program whose file is deleted while it runs still starts children (a
+    fork copies its graph, it does not open the file), and they do not
+    inherit TVM's preloads, only the user's own BUN_OPTIONS."""
+    import shutil
+    d = bun_programs
+    for opts in (None, "--smol"):
+        gone = d / "f-copy"
+        shutil.copy(d / "f", gone)
+        extra = {"BUN_OPTIONS": opts} if opts else {}
+        p, recs = _run_bun_programs(d, f"{gone}; echo rc=$?", **extra)
+        assert "rc=0" in p.stdout, p.stdout + p.stderr
+        assert recs == [{"who": "f", "sh": 0, "out": f"opts=[{opts or ''}]"}], p.stdout + p.stderr
+        assert not gone.exists()

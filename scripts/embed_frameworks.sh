@@ -17,7 +17,7 @@ DEST="${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}"
 SIGN_ID="${EXPANDED_CODE_SIGN_IDENTITY:--}"
 
 mkdir -p "$DEST"
-for name in libtvm libdropbear libsftpserver libbash libtoybox libvim libcurl libless libnano libsqlite libgit libgit-remote-http libgit-http-fetch libpython libllvm libclaude libopencode libnode librg; do
+for name in libtvm libdropbear libsftpserver libbash libtoybox libvim libcurl libless libnano libsqlite libgit libgit-remote-http libgit-http-fetch libpython libllvm libnode librg libbun; do
     SRC="$TVM_LIB/$name.framework"
     # the loose dylib an earlier build of this tree embedded
     rm -f "$DEST/$name.dylib"

@@ -3650,6 +3650,7 @@ char *normalize_path(const char *dirname, const char *file_name, char *out_path)
     }
 
     *out = '\0';
+
     return out_path;
 }
 
@@ -6109,16 +6110,18 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
     long remaining_ms = vtime * 100; // VTIME in 0.1s units → ms
 
     while (total_read < count) {
-        // Check if we have enough bytes for VMIN
-        if (!canon && vmin > 0 && total_read >= (size_t)vmin)
-            break;
-
-        // If VMIN == 0 and some bytes already read, return immediately
-        if (vmin == 0 && total_read > 0)
-            break;
+        // Once VMIN bytes are in (VMIN 0: any), the read takes what else is
+        // there, up to count, without waiting, as a kernel's does. Returning
+        // at VMIN split what came in one write: a key's escape sequence
+        // (ESC [ B) reached the program a byte per read, and Claude Code's
+        // input parser took the ESC for the Escape key and dropped the rest
+        // (its arrow keys did nothing).
+        int satisfied = !canon && (vmin > 0 ? total_read >= (size_t)vmin : total_read > 0);
 
         int poll_timeout;
-        if (nonblock) {
+        if (satisfied) {
+            poll_timeout = 0;  // what is there now, then return
+        } else if (nonblock) {
             poll_timeout = 0;  // what is there now, else EAGAIN (below)
         } else if (canon && total_read > 0) {
             poll_timeout = 0;  // the rest of the line, which is there
@@ -14033,9 +14036,13 @@ static const char *tvm_dyld_get_image_name(uint32_t index);
 static const struct mach_header *tvm_NSGetMachExecuteHeader(void);
 static const struct segment_command_64 *tvm_getsegbyname(const char *segname);
 static const struct section_64 *tvm_getsectbyname(const char *segname, const char *sectname);
+static int pc_in_go_image(const void *pc);
 static char *tvm_getsectdata(const char *segname, const char *sectname, unsigned long *size);
 #endif
 static void *tvm_guest_dlsym(void *handle, const char *symbol);
+#if defined(__APPLE__)
+static void *tvm_guest_dlopen(const char *path, int mode);
+#endif
 static int tvm_sqlite3_config(int op, ...);
 #if TARGET_OS_IPHONE
 static int tvm_spawn_fa_addchdir(posix_spawn_file_actions_t *fa, const char *path);
@@ -14103,6 +14110,9 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(base, "pthread_create")) return &emulator_pthread_create;
     if (0 == strcmp(base, "sqlite3_config")) return &tvm_sqlite3_config;
     if (0 == strcmp(base, "dlsym"))          return &tvm_guest_dlsym;
+#if defined(__APPLE__)
+    if (0 == strcmp(base, "dlopen"))         return &tvm_guest_dlopen;
+#endif
 
     if (0 == strcmp(base, "optarg"))   return &current->tsk_data->optarg;
     if (0 == strcmp(base, "optind"))   return &current->tsk_data->optind;
@@ -19680,9 +19690,19 @@ fail:
 //FUNCTION_DEFINE0(pid_t, fork) {
 FUNCTION_METADATA(fork, &fork);
 pid_t fork(void) {
-    if (!can_enter_tvm(__builtin_return_address(0)))
+    // the caller, from the frame record: fork's frame is large enough for
+    // its prologue to call the stack probe (__chkstk_darwin), which takes the
+    // link register __builtin_return_address(0) would read (fork itself)
+    void *caller = ((void **)__builtin_frame_address(0))[1];
+    if (!can_enter_tvm(caller))
         return CALL_FUNC(fork);
-    
+#if defined(__APPLE__)
+    if (pc_in_go_image(caller)) {
+        errno = ENOSYS;
+        return -1;
+    }
+#endif
+
     struct task *tsk = NULL;
     struct thread *thr = NULL;
     struct fork_arg *arg = NULL;
@@ -20523,6 +20543,27 @@ static const struct section_64 *exec_section(const struct mach_header_64 *mh, co
     return NULL;
 }
 
+/*
+ * Go programs' fork. TVM's fork gives the child a copy of the forking
+ * thread's stack and of the task's TVM heap; memory a program maps for
+ * itself stays one, the parent's and the child's. Go's heap and goroutine
+ * stacks are such memory, and the child of Go's syscall.forkExec runs Go
+ * code on its parent's goroutine stack until it execs: it corrupted the
+ * parent (a stack-protector abort in fork on macOS; free(0x3), the whole
+ * app, on iOS, opencode's terminal UI running git). Until TVM has a
+ * vfork-like fork, which such a child needs, a Go program's fork fails
+ * (ENOSYS) and its os/exec reports the error.
+ */
+static int pc_in_go_image(const void *pc)
+{
+    struct ulinker_dladdr_info info;
+    if (!current || !current->tsk_linker ||
+        !ulinker_dladdr(current->tsk_linker, pc, &info, DLA_NOSYM) || !info.udli_fbase)
+        return 0;
+    const struct mach_header_64 *mh = info.udli_fbase;
+    return mh->magic == MH_MAGIC_64 && exec_section(mh, "__DATA", "__go_buildinfo") != NULL;
+}
+
 static const struct segment_command_64 *tvm_getsegbyname(const char *segname) {
     const struct mach_header_64 *mh = (const struct mach_header_64 *)tvm_NSGetMachExecuteHeader();
     return exec_segment(mh, segname);
@@ -20638,6 +20679,33 @@ static void *tvm_guest_dlsym(void *handle, const char *symbol)
     void *a = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, symbol, 0);
     return a ? a : ulinker_external_dlsym(NULL, symbol, 0);
 }
+
+#if defined(__APPLE__)
+/*
+ * dlopen(3) as a task's program calls it: the host's, but for a system
+ * framework a macOS program names by its versioned path
+ * (X.framework/Versions/A/X), which iOS does not have: its frameworks are
+ * shallow bundles (X.framework/X), the same library. Bun loads CoreFoundation
+ * and CoreServices that way for fs.watch() (FSEvents), and panicked ("Cannot
+ * Load CoreFoundation") when Claude Code watched a directory. A program's own
+ * dependencies get the same treatment from the linker (ulinker.c,
+ * load_dependency).
+ */
+static void *tvm_guest_dlopen(const char *path, int mode)
+{
+    void *handle = dlopen(path, mode);
+    if (handle || !path || 0 != strncmp(path, "/System/Library/", 16))
+        return handle;
+    const char *v = strstr(path, ".framework/Versions/");
+    const char *bin = v ? strchr(v + 20, '/') : NULL;
+    if (!bin)
+        return NULL;
+    char shallow[PATH_MAX];
+    snprintf(shallow, sizeof(shallow), "%.*s.framework%s", (int)(v - path), path, bin);
+    handle = dlopen(shallow, mode);
+    return handle ? handle : dlopen(path, mode);   // the original's dlerror()
+}
+#endif
 
 //FUNCTION_DEFINE1(int, atexit, exit_t, function) {
 int atexit(exit_t function) {
@@ -22062,10 +22130,236 @@ FUNCTION_DEFINE_VOID0(endusershell) {
     current->tsk_data->usershell_idx = 0;
 }
 
+/*
+ * Bun programs. A compiled Bun program (bun build --compile: Claude Code's
+ * releases, for one) is a copy of the Bun runtime with the program's
+ * modules in its __BUN,__bun section. That runtime is unsigned, and on iOS
+ * the app may map no code but its signed frameworks'; so the app ships one
+ * Bun of its own (libbun.framework, /tvm/bin/bun; TVM_BUN in
+ * third_party/CMakeLists.txt), and execve runs such a program on it.
+ *
+ * Bun finds the program it is through a variable the linker placed at the
+ * start of its own __BUN,__bun section (BUN_COMPILED: the length, then the
+ * module graph), which it reads at startup; /$bunfs/root, where the modules
+ * import each other from, is that graph, with each module's own loader (a
+ * text module is a string, an embedded file is its bytes). The app's Bun
+ * has the section empty. So execve runs it on the program's own arguments
+ * with the program's section mapped over its empty one, in memory, by the
+ * linker (ulinker_set_bun_graph): neither file changes, every code page is
+ * the signed runtime's, and that Bun is the compiled program. Each task
+ * maps its own, so Bun programs run side by side.
+ *
+ * The section holds [u64 size][payload]; the payload ends with 32 bytes of
+ * Offsets (u64 byte_count; the module table's offset and length; u32
+ * entry_point_id; the compile_exec_argv string; u32 flags), then the
+ * trailer "\n---- Bun! ----\n". The module table has 52-byte records: six
+ * {u32 offset, u32 length} strings (name, contents, sourcemap, bytecode,
+ * module_info, bytecode_origin_path), then u8 encoding, loader,
+ * module_format and side (Bun's StandaloneModuleGraph). A runtime of
+ * another version reads them as long as their layout is its own (checked
+ * at the program's start: Claude Code 2.1.302, built by Bun 1.4.4, runs on
+ * the official 1.4.3).
+ */
+
+#if defined(__APPLE__)
+
+static const char bunfs_trailer[] = "\n---- Bun! ----\n";
+#define BUNFS_TRAILER_LEN (sizeof(bunfs_trailer) - 1)
+#define BUNFS_OFFSETS_LEN 32
+#define BUNFS_MODULE_RECORD_LEN 52
+#define BUNFS_RUNTIME "/tvm/bin/bun"
+#define BUNFS_PRELOAD "--preload /tvm/share/bun/tvm-sab.js --preload /tvm/share/bun/tvm-cellseg.js"
+
+struct bunfs_offsets {
+    uint64_t byte_count;
+    uint32_t modules_off;
+    uint32_t modules_len;
+    uint32_t entry_point_id;
+    uint32_t argv_off;
+    uint32_t argv_len;
+    uint32_t flags;
+};
+_Static_assert(sizeof(struct bunfs_offsets) == BUNFS_OFFSETS_LEN, "bunfs_offsets layout");
+
+struct bunfs_module {
+    uint32_t name_off, name_len;
+    uint32_t contents_off, contents_len;
+    uint32_t sourcemap_off, sourcemap_len;
+    uint32_t bytecode_off, bytecode_len;
+    uint32_t module_info_off, module_info_len;
+    uint32_t origin_off, origin_len;
+    uint8_t encoding;   // 0 binary, 1 latin1, 2 utf-16le
+    uint8_t loader;     // Bun's Loader: 5 file, 10 napi (assets, kept as they are)
+    uint8_t module_format;
+    uint8_t side;
+};
+_Static_assert(sizeof(struct bunfs_module) == BUNFS_MODULE_RECORD_LEN, "bunfs_module layout");
+
+// A compiled Bun program, as bunfs_probe reads it
+struct bunfs_program {
+    uint64_t payload_off;   // in the file: the payload's first byte
+    uint64_t payload_size;
+    struct bunfs_offsets offsets;
+    char entry[PATH_MAX];   // the entry point's module name (/$bunfs/root/...)
+};
+
+static int bunfs_pread_all(int fd, void *buf, size_t len, off_t off)
+{
+    uint8_t *p = buf;
+    while (len) {
+        ssize_t n = pread(fd, p, len, off);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += n;
+        len -= (size_t)n;
+        off += n;
+    }
+    return 0;
+}
+
+// The __BUN,__bun section of the Mach-O image open at fd
+static int bunfs_find_section(int fd, uint64_t *sec_offset, uint64_t *sec_size)
+{
+    struct mach_header_64 mh;
+    if (bunfs_pread_all(fd, &mh, sizeof(mh), 0) || mh.magic != MH_MAGIC_64 ||
+        mh.sizeofcmds > 4 * 1024 * 1024)
+        return -1;
+    uint8_t *cmds = kalloc(mh.sizeofcmds);
+    if (!cmds)
+        return -1;
+    int found = -1;
+    if (0 == bunfs_pread_all(fd, cmds, mh.sizeofcmds, sizeof(mh))) {
+        uint32_t off = 0;
+        for (uint32_t i = 0; i < mh.ncmds && found && off + sizeof(struct load_command) <= mh.sizeofcmds; i++) {
+            const struct load_command *lc = (const struct load_command *)(cmds + off);
+            if (lc->cmdsize < sizeof(*lc) || off + lc->cmdsize > mh.sizeofcmds)
+                break;
+            if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+                const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+                const struct section_64 *sect = (const struct section_64 *)(sg + 1);
+                if (0 == strncmp(sg->segname, "__BUN", sizeof(sg->segname)) &&
+                    sizeof(*sg) + sg->nsects * sizeof(*sect) <= lc->cmdsize)
+                    for (uint32_t k = 0; k < sg->nsects; k++)
+                        if (0 == strncmp(sect[k].sectname, "__bun", sizeof(sect[k].sectname))) {
+                            *sec_offset = sect[k].offset;
+                            *sec_size = sect[k].size;
+                            found = 0;
+                            break;
+                        }
+            }
+            off += lc->cmdsize;
+        }
+    }
+    kfree(cmds);
+    return found;
+}
+
+// Whether `path` is a compiled Bun program, and if so its layout. The
+// shipped runtime itself has the section, empty (size 0).
+static int bunfs_probe(const char *path, struct bunfs_program *prog)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    int r = -1;
+    uint64_t sec_off, sec_size, size;
+    uint8_t tail[BUNFS_OFFSETS_LEN + BUNFS_TRAILER_LEN];
+    if (bunfs_find_section(fd, &sec_off, &sec_size) || sec_size < sizeof(size) ||
+        bunfs_pread_all(fd, &size, sizeof(size), sec_off) ||
+        size < sizeof(tail) || size > sec_size - sizeof(size) ||
+        bunfs_pread_all(fd, tail, sizeof(tail), sec_off + sizeof(size) + size - sizeof(tail)) ||
+        memcmp(tail + BUNFS_OFFSETS_LEN, bunfs_trailer, BUNFS_TRAILER_LEN))
+        goto out;
+
+    prog->payload_off = sec_off + sizeof(size);
+    prog->payload_size = size;
+    memcpy(&prog->offsets, tail, BUNFS_OFFSETS_LEN);
+
+    // the entry point's name: the first string of its module record
+    const struct bunfs_offsets *o = &prog->offsets;
+    uint32_t name[2];
+    uint64_t rec = (uint64_t)o->modules_off + (uint64_t)o->entry_point_id * BUNFS_MODULE_RECORD_LEN;
+    if ((uint64_t)o->modules_off + o->modules_len > size ||
+        (uint64_t)o->entry_point_id >= o->modules_len / BUNFS_MODULE_RECORD_LEN ||
+        bunfs_pread_all(fd, name, sizeof(name), prog->payload_off + rec) ||
+        !name[1] || name[1] >= sizeof(prog->entry) || (uint64_t)name[0] + name[1] > size ||
+        bunfs_pread_all(fd, prog->entry, name[1], prog->payload_off + name[0]))
+        goto out;
+    prog->entry[name[1]] = 0;
+    r = 0;
+out:
+    close(fd);
+    return r;
+}
+
+// The app's Frameworks directory, libtvm's (libtvm.framework/libtvm in it),
+// or NULL: the CLI, where /tvm/bin/bun is the runtime itself
+static char bunfs_frameworks[PATH_MAX];
+static void bunfs_frameworks_init(void)
+{
+    Dl_info di;
+    const char *m;
+    if (dladdr((void *)&bunfs_frameworks_init, &di) && di.dli_fname &&
+        (m = strstr(di.dli_fname, "/libtvm.framework/")))
+        snprintf(bunfs_frameworks, sizeof(bunfs_frameworks), "%.*s", (int)(m - di.dli_fname), di.dli_fname);
+}
+
+static const char *bunfs_frameworks_dir(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, bunfs_frameworks_init);
+    return bunfs_frameworks[0] ? bunfs_frameworks : NULL;
+}
+
+// The environment without TVM's preloads, which are a compiled Bun
+// program's (see "Bun programs"): its children inherit BUN_OPTIONS, and
+// with them bun's own commands went wrong (`bun install` was taken for a
+// script named install). `out` has room for as many entries as `envp`.
+static char **bunfs_env_without_preload(char *const *envp, char **out, char *buf, size_t bufsz)
+{
+    static const char key[] = "BUN_OPTIONS=";
+    int k = 0;
+    for (char *const *e = envp; e && *e; e++) {
+        const char *at;
+        if (strncmp(*e, key, sizeof(key) - 1) || !(at = strstr(*e, BUNFS_PRELOAD))) {
+            out[k++] = *e;
+            continue;
+        }
+        // BUNFS_PRELOAD and the space after it, or before it at the end
+        const char *rest = at + sizeof(BUNFS_PRELOAD) - 1;
+        if (*rest == ' ')
+            rest++;
+        else if (at > *e + sizeof(key) - 1 && at[-1] == ' ')
+            at--;
+        size_t head = (size_t)(at - *e), need = head + strlen(rest) + 1;
+        if (need > bufsz) {
+            out[k++] = *e;
+            continue;
+        }
+        memcpy(buf, *e, head);
+        strcpy(buf + head, rest);
+        if (buf[sizeof(key) - 1])      // anything left of the user's own
+            out[k++] = buf;
+        buf += need;
+        bufsz -= need;
+    }
+    out[k] = NULL;
+    return out;
+}
+#endif // __APPLE__
+
 FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char * const *, envp) {
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
+    // the path the program is known by, when not the image loaded (a
+    // compiled Bun program on the app's Bun), and the section of it that
+    // image gets (see "Bun programs")
+    const char *self_path = NULL;
+    char bun_self[PATH_MAX];
+    uint64_t bun_graph_off = 0, bun_graph_size = 0;
     pathname = pathname_abs;
 
     int is_script = 0;
@@ -22150,6 +22444,69 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         return -1;
     }
 
+#if defined(__APPLE__)
+    // A compiled Bun program runs on the app's Bun (see "Bun programs"),
+    // its section mapped into it, on its own arguments and as itself (its
+    // path is the program's: process.execPath, a re-exec of itself, comes
+    // back here). Without an app Bun (the CLI ships none) it runs as it is.
+    struct stat bun_st;
+    struct bunfs_program *bprog = alloca(sizeof(*bprog));
+    static const uint32_t macho_magic = MH_MAGIC_64;
+    if (n >= 4 && 0 == memcmp(hdr, &macho_magic, sizeof(macho_magic)) &&
+        0 == stat(BUNFS_RUNTIME, &bun_st) && 0 == bunfs_probe(pathname, bprog)) {
+        snprintf(bun_self, sizeof(bun_self), "%s", pathname);
+        self_path = bun_self;
+        bun_graph_off = bprog->payload_off - sizeof(uint64_t);
+        bun_graph_size = bprog->payload_size + sizeof(uint64_t);
+        INFO("  %s: Bun program (entry %s, %llu bytes of modules, flags %#x)", pathname, bprog->entry,
+             (unsigned long long)bprog->payload_size, bprog->offsets.flags);
+
+        // TVM's preloads, ahead of the program's own options: tvm-sab.js, a
+        // SharedArrayBuffer for JavaScriptCore without its JIT, and
+        // tvm-cellseg.js, the Bun.ant.CellSegmenter of Anthropic's Bun, which
+        // Claude Code paints its terminal UI through (scripts/bun)
+        int envc = 0;
+        for (char *const *e = envp; e && *e; e++)
+            envc++;
+        char **benvp = alloca(sizeof(char *) * (envc + 2));
+        int bi = 0, has_options = 0;
+        for (int i = 0; i < envc; i++) {
+            if (0 == strncmp(envp[i], "BUN_OPTIONS=", 12)) {
+                has_options = 1;
+                if (!strstr(envp[i], BUNFS_PRELOAD)) {
+                    size_t sz = sizeof("BUN_OPTIONS=" BUNFS_PRELOAD " ") + strlen(envp[i] + 12);
+                    char *opt = alloca(sz);
+                    snprintf(opt, sz, "BUN_OPTIONS=" BUNFS_PRELOAD " %s", envp[i] + 12);
+                    benvp[bi++] = opt;
+                    continue;
+                }
+            }
+            benvp[bi++] = envp[i];
+        }
+        if (!has_options)
+            benvp[bi++] = "BUN_OPTIONS=" BUNFS_PRELOAD;
+        benvp[bi] = NULL;
+        envp = benvp;
+
+        // the runtime itself: in the apps /tvm/bin/bun is a launcher that
+        // execs libbun.framework's binary (scripts/launcher.c), and the
+        // section is for the image this exec loads, so go there directly.
+        // The Frameworks directory is libtvm's own, not the program's
+        // TVM_FRAMEWORKS: `env -i claude` would have run the launcher, which
+        // the linker refuses a module graph to.
+        const char *frameworks = bunfs_frameworks_dir();
+        char runtime[PATH_MAX];
+        if (!frameworks ||
+            snprintf(runtime, sizeof(runtime), "%s/libbun.framework/libbun", frameworks) >= (int)sizeof(runtime) ||
+            0 != stat(runtime, &bun_st))
+            snprintf(runtime, sizeof(runtime), "%s", BUNFS_RUNTIME);
+        if (!normalize_path(NULL, runtime, pathname_abs))
+            return -1;
+        pathname = pathname_abs;
+        goto do_exec;
+    }
+#endif
+
     if (has_shebang) {
         hdr[n] = '\0';
         char *eol = strchr(hdr + 2, '\n');
@@ -22221,6 +22578,19 @@ do_exec:
     if (envp)
         for (char * const *e = envp; *e; e++)
             envc++;
+#if defined(__APPLE__)
+    if (!self_path && envc) {
+        size_t bufsz = 0;
+        for (int i = 0; i < envc; i++)
+            if (0 == strncmp(envp[i], "BUN_OPTIONS=", 12))
+                bufsz += strlen(envp[i]) + 1;
+        if (bufsz) {
+            envp = bunfs_env_without_preload(envp, alloca(sizeof(char *) * (envc + 1)), alloca(bufsz), bufsz);
+            for (envc = 0; envp[envc]; envc++)
+                ;
+        }
+    }
+#endif
 
     // These copies stay in this frame, below thr_fork_fp, for the program's
     // whole life, so every fork it does copies and fixes them up: zero-pad
@@ -22234,14 +22604,23 @@ do_exec:
     // ran downwards: that span came out negative, and setting the title
     // overwrote the stack above argv[0] -- the program's environment array
     // among it (Claude Code on node died in getenv("TZ")).
-    size_t strings = 0;
+    static const char exec_path_key[] = "executable_path=";
+    const char *exec_path = self_path ? self_path : pathname;
+    size_t strings = sizeof(exec_path_key) + strlen(exec_path);
     for (int i = 0; i < argc; i++)
         strings += strlen(argv[i]) + 1;
     for (int i = 0; i < envc; i++)
         strings += strlen(envp[i]) + 1;
-    char *block = tvm_alloca_zero(strings ? strings : 1);
+    char *block = tvm_alloca_zero(strings);
 
-    char **new_argv = alloca(sizeof(char *) * (argc + 1));
+    // The arrays too are one, as the kernel hands them to dyld: argv, NULL,
+    // envp, NULL, then the "apple" strings (executable_path=), NULL. Go's
+    // runtime takes argc and argv alone and finds the environment and the
+    // apple strings past argv's NULL (rt0_darwin_arm64.s): with an array of
+    // their own each, it read what followed argv and crashed in its first
+    // instructions (opencode's TUI).
+    char **vec = alloca(sizeof(char *) * (argc + 1 + envc + 1 + 2));
+    char **new_argv = vec;
     for (int i = 0; i < argc; i++) {
         size_t len = strlen(argv[i]) + 1;
         new_argv[i] = block;
@@ -22250,7 +22629,7 @@ do_exec:
     }
     new_argv[argc] = NULL;
 
-    char **new_envp = alloca(sizeof(char *) * (envc + 1));
+    char **new_envp = vec + argc + 1;
     for (int i = 0; i < envc; i++) {
         size_t len = strlen(envp[i]) + 1;
         new_envp[i] = block;
@@ -22258,6 +22637,11 @@ do_exec:
         block += len;
     }
     new_envp[envc] = NULL;
+
+    char **apple = new_envp + envc + 1;
+    apple[0] = block;
+    block = stpcpy(stpcpy(block, exec_path_key), exec_path) + 1;
+    apple[1] = NULL;
 
     argv = new_argv;
     envp = new_envp;
@@ -22315,6 +22699,8 @@ do_exec:
     if (!main_func) {
 
         int dlflags = RTLD_NOW | RTLD_NEEDMAIN | (is_noemu_binary(pathname) ? RTLD_NOEMU : 0);
+        if (bun_graph_size)
+            ulinker_set_bun_graph(new_linker, self_path, bun_graph_off, bun_graph_size);
         void *handle = ulinker_dlopen(new_linker, pathname, dlflags);
         if (!handle) {
             task_lock(current);
@@ -22419,15 +22805,15 @@ do_exec:
     if (current->tsk_threads_cnt != 1)
         panic("_exit tsk_threads_cnt");
 
-    const char *basename = (const char *)strrchr(pathname, '/');
+    const char *basename = (const char *)strrchr(exec_path, '/');
     if (!basename)
-        basename = pathname;
+        basename = exec_path;
     else
         basename++;
     task_lock(current);
     memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
     strncpy(current->tsk_comm, basename, sizeof(current->tsk_comm) - 1);
-    snprintf(current->tsk_exe, sizeof(current->tsk_exe), "%s", pathname);
+    snprintf(current->tsk_exe, sizeof(current->tsk_exe), "%s", exec_path);
     task_unlock(current);
 
     // close all file-descriptors marked as CLOEXEC
@@ -22507,7 +22893,8 @@ do_exec:
                   (uint64_t)argc,
                   (uint64_t)argv,
                   (uint64_t)envp,
-                0, 0, 0);
+                  (uint64_t)apple,
+                0, 0);
     if (callerr)
         printf("execve emulator_call failed!\n");
 

@@ -70,6 +70,12 @@ struct ulinker *ulinker_create(void *private);
 void ulinker_destroy(struct ulinker *ulinker);
 
 void *ulinker_dlopen(struct ulinker *ulinker, const char *filename, int flags);
+// The next Mach-O image the linker loads with a __BUN,__bun section (a Bun
+// runtime) gets `size` bytes of the file `path` from `offset` mapped over
+// that section, growing it: a compiled Bun program's section, its module
+// graph, which the runtime then runs as that program (tvm.c, "Bun
+// programs"). Kept by fork. Returns -1 (EINVAL) for a bad request.
+int   ulinker_set_bun_graph(struct ulinker *ulinker, const char *path, uint64_t offset, uint64_t size);
 int   ulinker_dlclose(void *handle);
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all);
 char *ulinker_dlerror(void);
