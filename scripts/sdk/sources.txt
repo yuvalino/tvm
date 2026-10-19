@@ -1,0 +1,50 @@
+# The Apple open-source projects scripts/sdk/build_sdk.sh makes the SDK's
+# headers of: each one's release in macOS 26.2, as Apple's manifest of that
+# release lists it (github.com/apple-oss-distributions/distribution-macOS,
+# tag macos-262), fetched as GitHub's archive of the project's tag
+# (https://github.com/apple-oss-distributions/<project>/archive/refs/tags/<tag>.tar.gz)
+# and checked against its SHA-256. A fourth column is the archive's URL for a
+# project of somebody else's (the archive is then <tag>.tar.gz all the same).
+#
+# <project>             <tag>                       <sha256>                                                            [<url>]
+AvailabilityVersions    AvailabilityVersions-155    4116d620072474fdf58046393c55e534bb15e6c66719c430c387652fde4db6c5
+xnu                     xnu-12377.61.12             ac38b434b4397cfc2c0618c7444f74ee5ebb10b82d5b31d738b69dcc48a51257
+Libc                    Libc-1725.40.4              d86b9e23c26ee8feab26df3cc87a586961afb9edbfadc895f4653d6893f23d76
+libpthread              libpthread-539              a9786dd16427812da39bcb330b786f5e9d95a40e55d9540df14fffe200b724b7
+libmalloc               libmalloc-792.60.6          b4a65a41f6dd9113710003ca018aabe922acc687d8adbef271f9c167ead11971
+Libinfo                 Libinfo-600                 ea37be1f7876e8ca20761ab03f484f1cb0fa1ac15c437bb5615167c88529563b
+dyld                    dyld-1335                   9663a77232adf2740945bb45c47cbd3b5dc8eb9e40ac69121ea1c69089029650
+objc4                   objc4-951.1                 b95fe2e788c13a4748e9cd0038dc016450965909ceeed2aeea8dc11ccc1868e3
+libdispatch             libdispatch-1542.0.4        e33dc6ebc77d543afb989dd6f0f318f9bf2bbc17f58704cba9b7a147a5c50bc2
+libplatform             libplatform-359.60.3        7dcbd08d337f860cbe7d460c7f90c429075de0fe2c186bc06a6f69205390da06
+libclosure              libclosure-96               03b8da2acde57a757f9cb9a585965eec94e7c7bc0a5ed18223f58b8908701198
+Libnotify               Libnotify-344.0.1           6e9b10d87d30c584038c8402ef0552e8b23d02d429dea21f810abc8d5a8c4c06
+removefile              removefile-84               d46ecb6af445dc6faba262fab39dc6550eaf89dff601225e56ea6d47a8fd0ae9
+copyfile                copyfile-230.0.1.0.1        8a8e07899674300769ea70c41890b6fa36d60fb2158fb9cb480ff036899ccaf7
+libresolv               libresolv-93                10841d9b6f1c60935f9ad2882ab27faa2bc26a4a01cc30318c05c592daf5f83e
+architecture            architecture-282            e639a0993f7fe55cfe8f4565f805b64eb8ebe919ba419e26fcb48ed6daa6890f
+zlib                    zlib-100                    09d7e425eff5ab2d2a286a82c7fee7648b18b869dac5315ac3334e0a35a87d03
+libiconv                libiconv-113                455053e227806f24877548525193f469060c12a3e552b4598ef7d40abc068178
+libffi                  libffi-40                   92a07516242177db37b5a058827552fc704d8cc214e4f19449e97f6a37739ad7
+bzip2                   bzip2-47                    650323fa85aeb0b00c458580a352e1290bd477e112893eae77b56024cfd007e7
+libedit                 libedit-65                  f02b05ed8df11cff3e3e90c21d8ed1131ee395e9748b20b28c89fd7771956ebe
+CommonCrypto            CommonCrypto-600035         245cd31f412b342fa00210d10d99b151aaa38796a07e3c105f8b770e893022aa
+# Single headers: mach-o/ from cctools (not in the manifest: its latest
+# release, whose mach-o headers are the 26.2 SDK's), asl.h from syslog and
+# dns_sd.h from mDNSResponder (the manifest's releases), MacTypes.h & co.
+# from CarbonHeaders (not in the manifest: its latest release, of 2008,
+# whose types are the SDK's)
+cctools                 cctools-1035.1.102          1867fa0204c139f8073689b0d0785454b152b367762ff07ec9f316c97da1969b
+syslog                  syslog-406                  03ba22e5b89f2dcae1872a705b8b17302676fd8773001b69f1eb2a63ff637e9e
+mDNSResponder           mDNSResponder-2881.60.4     192b74fa5f4fdd985d6347bc2b39fed9b194c633f7cf7392f0a4c4d8b64c96a7
+CarbonHeaders           CarbonHeaders-18.1          50d687bf1cd8cc4067618ba830ba96515a6b65ae96aa7ff75e57a8482728d39d
+# The headers of the other libraries the system has (curses, expat, libxml2,
+# libpcap, libcurl): the manifest's releases
+ncurses                 ncurses-79                  5a7bfa041c4b5f7da6ae8b45c8fd7df5595968168199237b52a5fa27f690a4d6
+expat                   expat-43                    06b2a7ef94174e833fe35dbeac72e31065536ac2023f173cdf1c8df9c48c853d
+libxml2                 libxml2-39.8                8e8f1e3015509f2c67fa838538a38e0987e0936076ea55e1a2546a12f22d2a1e
+libpcap                 libpcap-144                 1ce77bc42d72443a7beab66e477fee23758b545493a231280c6025767213ca55
+curl                    curl-162                    42a63f0b6ee73154035ea28fe7130d943abdc074185d073465b6830e0ed48f94
+# sqlite3.h: not in Apple's releases; SQLite's own (public domain), the
+# version the system's libsqlite3 is (sqlite3 --version: 3.51.0)
+sqlite                  sqlite-autoconf-3510000     42e26dfdd96aa2e6b1b1be5c88b0887f9959093f650d693cb02eb9c36d146ca5    https://www.sqlite.org/2025/sqlite-autoconf-3510000.tar.gz

@@ -35,10 +35,12 @@
 #                      memory whole):
 #     lib/clang/<N>/   clang's resource directory: its own headers, and the
 #                      compiler-rt builtins (lib/darwin/libclang_rt.<os>.a)
-#     sdk/             the SDK, trimmed to what C and C++ need: usr/include,
-#                      the usr/lib stubs and the SDK settings, with libc++
-#                      (headers and libc++.1.dylib) built here in place of
-#                      the SDK's
+#     sdk/             the SDK: TVM's own (scripts/sdk/build_sdk.sh), the C
+#                      headers of Apple's open-source releases and stubs of
+#                      the system's libraries, nothing of Xcode's SDK, which
+#                      may not be redistributed; with libunwind's headers
+#                      (LLVM's) and libc++ (headers and libc++.1.dylib) built
+#                      here
 #
 # The guest's clang finds the bundle through the configuration files in
 # /tvm/etc/clang (CLANG_CONFIG_FILE_SYSTEM_DIR; third_party/configs/clang.cfg):
@@ -272,17 +274,21 @@ mkdir -p "$RESOURCE/lib/darwin" "$BUNDLE/sdk/usr/lib"
 cp -R "$BUILDDIR/target/lib/clang/$LLVM_MAJOR/include" "$RESOURCE/"
 cp "$BUILDDIR/builtins/$BUILTINS" "$RESOURCE/lib/darwin/"
 
-# The SDK: its settings (the driver reads the SDK's version and platform from
-# SDKSettings.json), the C headers, and the library stubs -- not the
-# frameworks, nor Swift. libc++ is this build's, headers and library, in
-# place of the SDK's.
-cp "$SDK/SDKSettings.json" "$SDK/SDKSettings.plist" "$BUNDLE/sdk/"
-mkdir -p "$BUNDLE/sdk/usr/include"
-(cd "$SDK/usr/include" && tar cf - --exclude ./c++ .) | (cd "$BUNDLE/sdk/usr/include" && tar xf -)
-(cd "$SDK/usr/lib" && tar cf - --exclude ./swift --exclude './libc++*' --exclude './libstdc++*' .) | \
-    (cd "$BUNDLE/sdk/usr/lib" && tar xf -)
-# Links into the frameworks left out (Tcl, Kerberos, vecLib's headers ...)
-find "$BUNDLE/sdk" -type l ! -exec test -e {} \; -exec rm {} +
+# The SDK the guest's clang compiles and links against: TVM's own, made of
+# Apple's open-source releases (scripts/sdk/build_sdk.sh; its sources are
+# fetched once into sdk-work). Nothing of Xcode's SDK, which the build above
+# compiles against, is in the bundle: its license allows no redistribution of
+# any part of it (Xcode and Apple SDKs Agreement, 2.7). Added to it:
+# libunwind's public headers (libunwind.h, mach-o/compact_unwind_encoding.h),
+# which are LLVM's, and libc++, this build's, headers and library.
+case "$OS" in
+    ios) SDK_PLATFORM=iphoneos ;;
+    *)   SDK_PLATFORM=macosx ;;
+esac
+sh "$(cd "$(dirname "$0")" && pwd)/sdk/build_sdk.sh" "$SDK_PLATFORM" "$BUILDDIR/sdk-work" "$BUNDLE/sdk"
+cp "$SRCDIR/libunwind/include/libunwind.h" "$SRCDIR/libunwind/include/__libunwind_config.h" \
+    "$BUNDLE/sdk/usr/include/"
+cp "$SRCDIR/libunwind/include/mach-o/compact_unwind_encoding.h" "$BUNDLE/sdk/usr/include/mach-o/"
 cp -R "$BUILDDIR/runtimes/install/include/c++" "$BUNDLE/sdk/usr/include/"
 cp "$BUILDDIR/runtimes/install/lib/libc++.1.dylib" "$BUNDLE/sdk/usr/lib/"
 ln -s libc++.1.dylib "$BUNDLE/sdk/usr/lib/libc++.dylib"

@@ -646,7 +646,9 @@ if(APPLE)
         INSTALL_COMMAND ""
         EXCLUDE_FROM_ALL TRUE
     )
-    tvm_ext_inputs(llvm_ext ${SCRIPTS_DIR}/build_llvm.sh SUBMODULE:third_party/llvm-project)
+    # ...and the SDK in its bundle (scripts/sdk/build_sdk.sh)
+    file(GLOB LLVM_SDK_INPUTS ${SCRIPTS_DIR}/sdk/*)
+    tvm_ext_inputs(llvm_ext ${SCRIPTS_DIR}/build_llvm.sh ${LLVM_SDK_INPUTS} SUBMODULE:third_party/llvm-project)
     add_custom_target(llvm_exe DEPENDS llvm_ext)
     set_target_properties(llvm_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
