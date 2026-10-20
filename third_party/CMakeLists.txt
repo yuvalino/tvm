@@ -540,3 +540,187 @@ add_shared_lib(git-remote-http git_exe ${GIT_BUILD}/src/git-remote-http)
 add_launcher(git-remote-http)
 add_shared_lib(git-http-fetch git_exe ${GIT_BUILD}/src/git-http-fetch)
 add_launcher(git-http-fetch)
+
+###############################################################################
+# libffi (static libffi.a for Python's ctypes; macOS / iOS only)
+#
+# Unpatched upstream, autoreconf'd and configured in a shadow tree by
+# scripts/build_libffi.sh. Installed into ${TVM_LIBFFI_PREFIX}.
+###############################################################################
+if(APPLE)
+    set(LIBFFI_BUILD ${THIRDPARTY_BUILD}/libffi)
+    set(TVM_LIBFFI_PREFIX ${LIBFFI_BUILD}/prefix)
+
+    ExternalProject_Add(libffi_ext
+        SOURCE_DIR ${THIRDPARTY_SRC}/libffi
+        BINARY_DIR ${LIBFFI_BUILD}
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_libffi.sh ${THIRDPARTY_SRC}/libffi ${LIBFFI_BUILD}
+        INSTALL_COMMAND ""
+        EXCLUDE_FROM_ALL TRUE
+    )
+    tvm_ext_inputs(libffi_ext ${SCRIPTS_DIR}/build_libffi.sh SUBMODULE:third_party/libffi)
+endif()
+
+###############################################################################
+# python (macOS / iOS only)
+#
+# Unpatched CPython, out-of-tree autotools build by scripts/build_python.sh:
+# every extension module built into the interpreter (no dlopen in a TVM
+# image), pip unpacked into site-packages. Installed (DESTDIR) into
+# ${PYTHON_BUILD}/stage/tvm: bin/python3.X is the exe, converted for the
+# Flutter apps by add_shared_lib; lib/python3.X is the standard library,
+# which the CLI initrd carries and the apps ship as a bundle resource
+# (python_stdlib, scripts/embed_frameworks.sh).
+###############################################################################
+if(APPLE)
+    file(STRINGS ${THIRDPARTY_SRC}/python/Include/patchlevel.h _py_major REGEX "^#define PY_MAJOR_VERSION")
+    file(STRINGS ${THIRDPARTY_SRC}/python/Include/patchlevel.h _py_minor REGEX "^#define PY_MINOR_VERSION")
+    string(REGEX MATCH "[0-9]+$" _py_major "${_py_major}")
+    string(REGEX MATCH "[0-9]+$" _py_minor "${_py_minor}")
+    set(TVM_PYTHON_VERSION ${_py_major}.${_py_minor} PARENT_SCOPE)
+    set(TVM_PYTHON_VERSION ${_py_major}.${_py_minor})
+    set(PYTHON_BUILD ${THIRDPARTY_BUILD}/python)
+
+    ExternalProject_Add(python_ext
+        SOURCE_DIR ${THIRDPARTY_SRC}/python
+        BINARY_DIR ${PYTHON_BUILD}
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} -E env "CC=${TVM_CC}" ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_python.sh
+            ${THIRDPARTY_SRC}/python ${PYTHON_BUILD} ${TVM_LIBFFI_PREFIX} ${TVM_OPENSSL_PREFIX} ${TVM_NCURSES_PREFIX}
+        INSTALL_COMMAND ""
+        DEPENDS libffi_ext openssl_ext ncurses_ext
+        EXCLUDE_FROM_ALL TRUE
+    )
+    tvm_ext_inputs(python_ext ${SCRIPTS_DIR}/build_python.sh SUBMODULE:third_party/python
+        ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_ios_libc.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/include-shim/tvm_stdio_unlocked.h)
+    add_custom_target(python_exe DEPENDS python_ext)
+    set_target_properties(python_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    add_shared_lib(python python_exe ${PYTHON_BUILD}/stage/tvm/bin/python${TVM_PYTHON_VERSION})
+    add_launcher(python)
+
+    # The standard library for the Flutter apps, at ${LIB_OUT}/python/lib
+    # (the prefix layout), where scripts/embed_frameworks.sh copies it into
+    # the app bundle's resources.
+    add_custom_target(python_stdlib
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIB_OUT}/python
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${LIB_OUT}/python
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${PYTHON_BUILD}/stage/tvm/lib ${LIB_OUT}/python/lib
+        DEPENDS python_exe
+        COMMENT "Staging the Python standard library"
+    )
+    set_target_properties(python_stdlib PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+###############################################################################
+# llvm: clang and lld (macOS / iOS only)
+#
+# Unpatched upstream, built by scripts/build_llvm.sh: one multicall program,
+# ${LLVM_BUILD}/target/bin/llvm (clang, clang++, ld64.lld & co. are its names),
+# converted for the Flutter apps by add_shared_lib; and the bundle a guest
+# compiles against, ${LLVM_BUILD}/bundle (clang's resource directory and the
+# SDK), staged at ${LIB_OUT}/llvm by llvm_bundle, where the CLI's init.rc
+# binds it at /tvm/llvm and scripts/embed_frameworks.sh copies it into the
+# app bundle's resources. The iOS build runs the macOS build's programs (see
+# the script), which `python3 build.py -a macos-arm64 -t llvm_exe` makes.
+###############################################################################
+if(APPLE)
+    file(STRINGS ${THIRDPARTY_SRC}/llvm-project/cmake/Modules/LLVMVersion.cmake _llvm_major
+        REGEX "set\\(LLVM_VERSION_MAJOR [0-9]+\\)")
+    string(REGEX MATCH "[0-9]+" _llvm_major "${_llvm_major}")
+    set(TVM_LLVM_MAJOR ${_llvm_major} PARENT_SCOPE)
+    set(LLVM_BUILD ${THIRDPARTY_BUILD}/llvm)
+    set(LLVM_HOST_BIN "")
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(LLVM_HOST_BIN ${CMAKE_BINARY_DIR}/../../macos-arm64/build/third_party/llvm/llvm/bin)
+    endif()
+
+    ExternalProject_Add(llvm_ext
+        SOURCE_DIR ${THIRDPARTY_SRC}/llvm-project
+        BINARY_DIR ${LLVM_BUILD}
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} -E env ${TVM_CROSS_ENV} sh ${SCRIPTS_DIR}/build_llvm.sh
+            ${THIRDPARTY_SRC}/llvm-project ${LLVM_BUILD} ${LLVM_HOST_BIN}
+        INSTALL_COMMAND ""
+        EXCLUDE_FROM_ALL TRUE
+    )
+    # ...and the SDK in its bundle (scripts/sdk/build_sdk.sh)
+    file(GLOB LLVM_SDK_INPUTS ${SCRIPTS_DIR}/sdk/*)
+    tvm_ext_inputs(llvm_ext ${SCRIPTS_DIR}/build_llvm.sh ${LLVM_SDK_INPUTS} SUBMODULE:third_party/llvm-project)
+    add_custom_target(llvm_exe DEPENDS llvm_ext)
+    set_target_properties(llvm_exe PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    add_shared_lib(llvm llvm_exe ${LLVM_BUILD}/target/bin/llvm)
+    add_launcher(llvm)
+
+    add_custom_target(llvm_bundle
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIB_OUT}/llvm
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${LLVM_BUILD}/bundle ${LIB_OUT}/llvm
+        DEPENDS llvm_exe
+        COMMENT "Staging the clang toolchain bundle"
+    )
+    set_target_properties(llvm_bundle PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+###############################################################################
+# ripgrep (macOS / iOS apps only)
+#
+# The release build (BurntSushi/ripgrep's aarch64-apple-darwin archive), not
+# built here: TVM_RIPGREP names its rg. Shipped as librg.framework and
+# /tvm/bin/rg in the Flutter initrd, the rg that Claude Code searches with
+# (init.flutter.rc). It brings or downloads its own otherwise,
+# a program the app can only emulate, and searching with it emulated many
+# threads at once, which took the app down (unicorn's TCI aborting on a
+# translation block it could not decode).
+###############################################################################
+set(TVM_RIPGREP "" CACHE FILEPATH "ripgrep's macOS arm64 executable to ship in the apps (empty: none)")
+if(APPLE AND TVM_RIPGREP)
+    add_shared_lib(rg ${TVM_RIPGREP} ${TVM_RIPGREP})
+    add_launcher(rg)
+endif()
+
+###############################################################################
+# Node.js (macOS / iOS apps only)
+#
+# The official build (nodejs.org's node-vX-darwin-arm64, unpacked), not built
+# here: TVM_NODE names its directory. Shipped as libnode.framework (bin/node,
+# a macOS executable, which TVM loads on iOS as well) and /tvm/bin/node in
+# the Flutter initrd, its lib/node_modules (npm, corepack) as a bundle
+# resource that init.flutter.rc binds at /tvm/node. The app runs it jitless
+# (NODE_OPTIONS, init.flutter.rc): an app cannot map executable memory. With
+# them, scripts/node/tvm-fetch.cjs, the fetch() NODE_OPTIONS preloads.
+###############################################################################
+set(TVM_NODE "" CACHE PATH "An official Node.js darwin-arm64 distribution to ship in the apps (empty: none)")
+if(APPLE AND TVM_NODE)
+    add_shared_lib(node ${TVM_NODE}/bin/node ${TVM_NODE}/bin/node)
+    add_launcher(node)
+    add_custom_target(node_modules
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${LIB_OUT}/node
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${TVM_NODE}/lib/node_modules ${LIB_OUT}/node
+        COMMAND ${CMAKE_COMMAND} -E copy ${SCRIPTS_DIR}/node/tvm-fetch.cjs ${LIB_OUT}/node/tvm-fetch.cjs
+        DEPENDS ${SCRIPTS_DIR}/node/tvm-fetch.cjs
+        COMMENT "Staging node's npm and corepack"
+    )
+    set_target_properties(node_modules PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+###############################################################################
+# Bun (macOS / iOS apps only)
+#
+# The official build (oven-sh/bun's bun-darwin-aarch64 archive), not built
+# here: TVM_BUN names the bun executable. Shipped as libbun.framework and
+# /tvm/bin/bun in the Flutter initrd. A compiled Bun program (Claude Code,
+# which users install themselves with its installer) runs on it: execve runs
+# this signed runtime with the program's module graph mapped into it, in
+# memory (tvm.c, "Bun programs"); on iOS without its JIT (BUN_JSC_useJIT,
+# init.flutter.rc). Bun bundles JavaScriptCore, which is LGPL-2.1: the
+# framework carries its own copy, so the obligation is on libbun.framework
+# alone (source offer or accompany).
+###############################################################################
+set(TVM_BUN "" CACHE FILEPATH "The official Bun macOS arm64 executable to ship in the apps (empty: none)")
+if(APPLE AND TVM_BUN)
+    add_shared_lib(bun ${TVM_BUN} ${TVM_BUN})
+    add_launcher(bun)
+endif()

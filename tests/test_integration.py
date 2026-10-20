@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shlex
@@ -16,7 +17,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch:/tvm/bin/python3.15:/tvm/bin/llvm"
 # where build.py -t flutter leaves the built app
 FLUTTER_APP = "./flutter/build/macos/Build/Products/Release/tvm.app"
 IOS_APP = "./output/ios-arm64/bin/tvm.ipa"
@@ -747,6 +748,44 @@ def test_concurrent_interactive(forkless: Forkless):
             s2.expect(r"\$ ")
         s1.expect(r"\$ ")
 
+def test_tty_canonical_input(sshi: spawn):
+    """The pty's line discipline in cooked mode (ICANON|ECHO, what a program
+    that does not set the terminal up reads with): typing is echoed, the
+    line is edited with VERASE, VWERASE and VKILL before the program gets
+    it, and VEOF on an empty line is an end of file."""
+    def read_line(keys: str) -> str:
+        # READY is printed once bash has put the terminal back in cooked
+        # mode for the command; keys typed earlier would go in raw
+        sshi.sendline('echo READY; read -r v; echo "got=[$v]"')
+        sshi.expect("READY\r\n")
+        sshi.send(keys)
+        sshi.expect(r"got=\[(.*?)\]\r\n")
+        line = sshi.match.group(1).decode()
+        sshi.expect(r"\$ ")
+        return line
+
+    sshi.sendline('echo READY; read -r v; echo "got=[$v]"')
+    sshi.expect("READY\r\n")
+    sshi.send("abc")
+    sshi.expect("abc")                  # echoed as typed
+    sshi.send("\x7f")
+    sshi.expect("\b \b")                # rubbed out
+    sshi.send("d\r")
+    sshi.expect("d\r\n")                # the newline is echoed (ICRNL, ONLCR)
+    sshi.expect(r"got=\[abd\]")
+    sshi.expect(r"\$ ")
+
+    assert read_line("one two\x17three\r") == "one three"   # ^W
+    assert read_line("junk\x15ok\r") == "ok"                # ^U
+
+    sshi.sendline("echo READY; cat; echo cat_rc=$?")
+    sshi.expect("READY\r\n")
+    sshi.send("line\r")
+    sshi.expect("line\r\nline\r\n")     # the echo, then cat's copy
+    sshi.send("\x04")                   # ^D
+    sshi.expect("cat_rc=0")
+    sshi.expect(r"\$ ")
+
 # ── SCP extended ──────────────────────────────────────────────
 
 def test_scp_large_file(forkless: Forkless, device):
@@ -886,6 +925,12 @@ def _sh(sshi: spawn, cmd: str, timeout: float = CURL_TIMEOUT) -> tuple[str, int]
 
 def _lines(out: str) -> list[str]:
     return [l.strip() for l in out.splitlines() if l.strip()]
+
+def _write(sshi: spawn, path: str, content: str):
+    """Write content to path in the guest, through a quoted here-document."""
+    assert "TVMEOF" not in content
+    sshi.sendline(f"cat > {path} <<'TVMEOF'\n{content}TVMEOF")
+    sshi.expect(r"\$ ")
 
 # curl's exit codes that say the request never got an answer: name resolution,
 # connection, and the -m 20 deadline. Everything else, rc=60 (verification)
@@ -2184,8 +2229,10 @@ def test_ls_root_shows_tvm(sshi: spawn):
 def test_vfs_readonly(sshi: spawn):
     """A cpio mount is read-only: creating in it is "Read-only file system"
     (the host used to answer for a path it has not got, ENOENT), and the
-    mount point itself is busy."""
-    out, rc = _sh(sshi, "mkdir /tvm/x 2>&1; touch /tvm/etc/x 2>&1; rm /tvm/etc/profile 2>&1; rmdir /tvm 2>&1; true")
+    mount point itself is busy. (rm's stdin is not the terminal: access(W_OK)
+    says EROFS, as a read-only file system does, and toybox's rm would ask
+    "rm ro ...?" on a tty before trying.)"""
+    out, rc = _sh(sshi, "mkdir /tvm/x 2>&1; touch /tvm/etc/x 2>&1; rm /tvm/etc/profile </dev/null 2>&1; rmdir /tvm 2>&1; true")
     assert out.count("Read-only file system") == 3, out
     assert "busy" in out.lower(), out
 
@@ -2228,7 +2275,8 @@ def test_bind_mounts(sshi: spawn):
                         "printf '#!/bin/sh\\necho SH_OK\\n' > $d/s && printf '#!/usr/bin/env bash\\necho ENV_OK\\n' > $d/e && "
                         "chmod +x $d/b $d/s $d/e && $d/b && $d/s && $d/e; rm -rf $d")
     assert rc == 0 and "ARR=y" in out and "SH_OK" in out and "ENV_OK" in out, out
-    out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh 2>&1; [ -f /bin/sh ] && echo still_there")
+    # rm's stdin not the tty: it would ask "rm ro /bin/sh?" (see test_vfs_readonly)
+    out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh </dev/null 2>&1; [ -f /bin/sh ] && echo still_there")
     assert out.lower().count("busy") == 2 and "still_there" in out, out
 
 def test_bind_dir_listing(sshi: spawn):
@@ -2583,3 +2631,731 @@ def test_shell_survives_child_crash(sshi: spawn):
     sshi.sendline("echo still_ok")
     sshi.expect("still_ok")
     sshi.expect(r"\$ ")
+
+# ── python ──────────────────────────────────────────────────────
+#
+# CPython (third_party/python, scripts/build_python.sh): every extension module
+# built into the interpreter, the standard library at /tvm/lib/python3.X, pip
+# in its site-packages. Only built for the Darwin targets.
+
+PYTHON_VERSION = "3.15"
+
+pytestmark_python = pytest.mark.skipif(
+    not PLATFORM.startswith(("macos-", "ios-")),
+    reason="python is only built for the Darwin targets")
+
+@pytestmark_python
+def test_python_version(sshi: spawn):
+    """python3, python and python3.X are the same interpreter."""
+    for name in ("python3", "python", f"python{PYTHON_VERSION}"):
+        out, rc = _sh(sshi, f"{name} --version")
+        assert rc == 0, out
+        assert any(re.fullmatch(rf"Python {re.escape(PYTHON_VERSION)}\.\d+", l) for l in _lines(out)), out
+
+@pytestmark_python
+def test_python_paths(sshi: spawn):
+    """The prefix is /tvm, found from the executable, and sys.executable is
+    the guest's interpreter, not the host process (TVM's
+    _NSGetExecutablePath)."""
+    out, rc = _sh(sshi, "python3 -c 'import sys; print(\"prefix=\" + sys.prefix); print(\"exe=\" + sys.executable)'")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "prefix=/tvm" in lines, out
+    # /tvm/bin/python3 as invoked (found on PATH); never the host's tvm
+    exe = next(l[len("exe="):] for l in lines if l.startswith("exe="))
+    assert exe.startswith("/tvm/bin/python") or exe.endswith("/libpython"), out
+    out, rc = _sh(sshi, "python3 -c 'import subprocess, sys; "
+                        "r = subprocess.run([sys.executable, \"-c\", \"print(6*7)\"], capture_output=True, text=True); "
+                        "print(\"inner\", r.returncode, repr(r.stdout), repr(r.stderr))'")
+    assert rc == 0, out
+    assert "inner 0 '42\\n' ''" in _lines(out), out
+
+@pytestmark_python
+def test_python_subprocess_argv_reused_blocks(sshi: spawn):
+    """A forked child's argv survives fork's pointer relocation when the
+    argv copies land in reused pymalloc blocks: 16-byte object()s (a type
+    pointer at offset 8) are freed right before each subprocess.run, and
+    "print(6*7)" ends in the word that held that pointer. pymalloc reusing
+    blocks without zeroing them made every run fail ("print(6*7)~e\\x01");
+    see scripts/build_python.sh."""
+    out, rc = _sh(sshi, "python3 -c 'import subprocess, sys\n"
+                        "bad = 0\n"
+                        "for i in range(10):\n"
+                        "    objs = [object() for _ in range(5000)]; del objs\n"
+                        "    r = subprocess.run([sys.executable, \"-c\", \"print(6*7)\"], capture_output=True, text=True)\n"
+                        "    bad += (r.returncode, r.stdout) != (0, \"42\\n\")\n"
+                        "print(\"bad\", bad)'", timeout=120)
+    assert rc == 0, out
+    assert "bad 0" in _lines(out), out
+
+@pytestmark_python
+def test_posix_spawn(sshi: spawn):
+    """posix_spawn and posix_spawnp, which TVM implements (with their file
+    actions): the child runs in the VM, its stdout a pipe or a file the
+    actions set up; a program that cannot be run is posix_spawn's error, not
+    the child's exit status."""
+    _write(sshi, "$TMPDIR/spawn.py",
+           "import os\n"
+           "r, w = os.pipe()\n"
+           "pid = os.posix_spawnp('echo', ['echo', 'spawned'], os.environ,\n"
+           "                      file_actions=[(os.POSIX_SPAWN_DUP2, w, 1), (os.POSIX_SPAWN_CLOSE, r)])\n"
+           "os.close(w)\n"
+           "print('pipe', os.read(r, 100).decode().strip())\n"
+           "print('status', os.waitpid(pid, 0)[1])\n"
+           "out = os.environ['TMPDIR'] + '/spawn.out'\n"
+           "pid = os.posix_spawn('/tvm/bin/sh', ['sh', '-c', 'echo to-file; exit 3'], os.environ,\n"
+           "                     file_actions=[(os.POSIX_SPAWN_OPEN, 1, out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)])\n"
+           "print('exit', os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))\n"
+           "print('file', open(out).read().strip())\n"
+           "try:\n"
+           "    os.posix_spawn('/nonexistent/prog', ['prog'], os.environ)\n"
+           "except FileNotFoundError:\n"
+           "    print('enoent')\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/spawn.py")
+    assert rc == 0, out
+    lines = _lines(out)
+    for want in ("pipe spawned", "status 0", "exit 3", "file to-file", "enoent"):
+        assert want in lines, out
+
+@pytestmark_python
+def test_python_builtin_modules(sshi: spawn):
+    """The extension modules are built in (no lib-dynload), with their
+    dependencies: OpenSSL, libffi, sqlite3, zlib, bz2, expat, ncurses."""
+    mods = ["_ssl", "_hashlib", "_ctypes", "_sqlite3", "zlib", "_bz2", "pyexpat",
+            "_decimal", "_curses", "_socket", "select", "termios", "_json"]
+    names = ",".join(f'"{m}"' for m in mods)
+    out, rc = _sh(sshi, "python3 -c 'import sys; "
+                        f"missing = [m for m in [{names}] if m not in sys.builtin_module_names]; "
+                        "print(\"missing=\" + \",\".join(missing))'")
+    assert rc == 0, out
+    assert "missing=" in _lines(out), out
+    out, rc = _sh(sshi, f"ls /tvm/lib/python{PYTHON_VERSION}/lib-dynload 2>/dev/null | grep -c '\\.so$'")
+    assert "0" in _lines(out), out
+    out, rc = _sh(sshi, "python3 -c 'import ssl, sqlite3, hashlib, zlib, bz2, json, decimal; "
+                        "print(ssl.OPENSSL_VERSION.split()[0]); print(hashlib.sha256(b\"tvm\").hexdigest()[:8]); "
+                        "print(zlib.decompress(zlib.compress(b\"zz\")).decode()); "
+                        "print(sqlite3.connect(\":memory:\").execute(\"select 6*7\").fetchone()[0]); "
+                        "print(decimal.Decimal(\"0.1\") + decimal.Decimal(\"0.2\"))'")
+    assert rc == 0, out
+    lines = _lines(out)
+    for want in ("OpenSSL", "3973a32c", "zz", "42", "0.3"):
+        assert want in lines, f"{want}: {out}"
+
+@pytestmark_python
+def test_python_ctypes(sshi: spawn):
+    """ctypes calls a host function, and a Python callback through a libffi
+    closure (the trampoline table on arm64 Apple targets)."""
+    out, rc = _sh(sshi, "python3 -c 'import ctypes; libc = ctypes.CDLL(None); "
+                        "print(\"strlen=%d\" % libc.strlen(b\"hello\")); "
+                        "a = (ctypes.c_int * 5)(5, 1, 4, 2, 3); "
+                        "CMP = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)); "
+                        "libc.qsort(a, 5, ctypes.sizeof(ctypes.c_int), CMP(lambda x, y: x[0] - y[0])); "
+                        "print(\"sorted=\" + \",\".join(map(str, a)))'")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "strlen=5" in lines and "sorted=1,2,3,4,5" in lines, out
+
+@pytestmark_python
+def test_python_subprocess_fork(sshi: spawn):
+    """subprocess (fork/exec through TVM) and os.fork with a pipe."""
+    out, rc = _sh(sshi, "python3 -c 'import subprocess; "
+                        "print(subprocess.run([\"echo\", \"from-child\"], capture_output=True, text=True).stdout.strip()); "
+                        "print(subprocess.check_output(\"echo $((2+3))\", shell=True, text=True).strip())'")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "from-child" in lines and "5" in lines, out
+    out, rc = _sh(sshi, "python3 -c 'import os; r, w = os.pipe(); pid = os.fork()\n"
+                        "if pid == 0:\n    os.write(w, b\"forked\"); os._exit(7)\n"
+                        "_, st = os.waitpid(pid, 0); print(os.read(r, 16).decode(), os.waitstatus_to_exitcode(st))'")
+    assert rc == 0, out
+    assert "forked 7" in _lines(out), out
+
+@pytestmark_python
+def test_python_repl(sshi: spawn):
+    """The interactive interpreter (_pyrepl, terminfo from /tvm/share/terminfo)."""
+    sshi.sendline("python3")
+    sshi.expect(">>> ")
+    # it falls back to the basic console (and says so) without select.poll
+    assert b"can't use pyrepl" not in sshi.before, sshi.before
+    sshi.sendline("6 * 7")
+    sshi.expect("42")
+    sshi.expect(">>> ")
+    sshi.sendline("exit()")
+    sshi.sendline("echo repl_done=$?")
+    sshi.expect("repl_done=0")
+    sshi.expect(r"\$ ")
+
+@pytestmark_python
+def test_python_basic_repl_echo(sshi: spawn):
+    """The basic console reads lines from the terminal in cooked mode, so
+    the pty echoes what is typed, the newline included."""
+    sshi.sendline("PYTHON_BASIC_REPL=1 python3 -q")
+    sshi.expect(">>> ")
+    sshi.send("6*7")
+    sshi.expect(r"6\*7")
+    sshi.send("\r")
+    sshi.expect("\r\n42\r\n")
+    sshi.expect(">>> ")
+    sshi.send("\x04")                   # ^D: end of file, the console exits
+    sshi.sendline("echo repl_done=$?")
+    sshi.expect("repl_done=0")
+    sshi.expect(r"\$ ")
+
+@pytestmark_python
+def test_python_http_server_ctrl_c(sshi: spawn):
+    """http.server exits on ^C while connections are open, as a browser
+    leaves them: their handler threads are daemon threads, which CPython
+    parks in pause() for good once the interpreter is finalizing, and the
+    exit must not wait for them."""
+    port = 18000 + os.getpid() % 2000
+    _write(sshi, "$TMPDIR/idle_clients.py",
+           "import socket, sys, time\n"
+           "port = int(sys.argv[1])\n"
+           "for _ in range(100):\n"
+           "    try:\n"
+           "        socket.create_connection(('127.0.0.1', port)).close()\n"
+           "        break\n"
+           "    except OSError:\n"
+           "        time.sleep(0.2)\n"
+           "conns = [socket.create_connection(('127.0.0.1', port)) for _ in range(3)]\n"
+           "conns[0].sendall(b'GET / HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n')\n"
+           "conns[0].recv(65536)\n"
+           "conns[1].sendall(b'GET /fav')\n"
+           "print('IDLE_READY', flush=True)\n"
+           "time.sleep(300)\n")
+    sshi.sendline(f"python3 $TMPDIR/idle_clients.py {port} & "
+                  f"python3 -m http.server {port} --bind 127.0.0.1 -d $TMPDIR")
+    sshi.expect("IDLE_READY", timeout=60)
+    sshi.send("\x03")
+    sshi.expect("Keyboard interrupt received, exiting")
+    sshi.expect(r"\$ ", timeout=15)
+    sshi.sendline("kill %1; wait; echo cleaned")
+    sshi.expect("cleaned")
+    sshi.expect(r"\$ ")
+
+@pytestmark_python
+def test_pip_version(sshi: spawn):
+    """pip, pip3 and python3 -m pip are the pip in /tvm's site-packages."""
+    for cmd in ("pip --version", "pip3 --version", "python3 -m pip --version"):
+        out, rc = _sh(sshi, cmd)
+        assert rc == 0, out
+        assert re.search(rf"pip \d+\.\d+(\.\d+)? from /tvm/lib/python{re.escape(PYTHON_VERSION)}/site-packages/pip "
+                         rf"\(python {re.escape(PYTHON_VERSION)}\)", out), out
+
+@pytestmark_python
+def test_pip_install_local_wheel(sshi: spawn):
+    """pip installs a wheel into the user scheme (~/.local: the system
+    site-packages is read-only), with a console script, and uninstalls it."""
+    make_wheel = (
+        "import zipfile, base64, hashlib\n"
+        "files = {'tvmdemo/__init__.py': 'def hello():\\n    return \"hello from tvmdemo\"\\n'\n"
+        "      'def main():\\n    print(hello())\\n',\n"
+        "  'tvmdemo-1.0.dist-info/METADATA': 'Metadata-Version: 2.1\\nName: tvmdemo\\nVersion: 1.0\\n',\n"
+        "  'tvmdemo-1.0.dist-info/WHEEL': 'Wheel-Version: 1.0\\nGenerator: tvm\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n',\n"
+        "  'tvmdemo-1.0.dist-info/entry_points.txt': '[console_scripts]\\ntvmdemo = tvmdemo:main\\n'}\n"
+        "rec = []\n"
+        "with zipfile.ZipFile('/tmp/tvmdemo-1.0-py3-none-any.whl'.replace('/tmp', __import__('os').environ['TMPDIR']), 'w') as z:\n"
+        "    for n, c in files.items():\n"
+        "        d = base64.urlsafe_b64encode(hashlib.sha256(c.encode()).digest()).rstrip(b'=').decode()\n"
+        "        z.writestr(n, c); rec.append(f'{n},sha256={d},{len(c)}')\n"
+        "    rec.append('tvmdemo-1.0.dist-info/RECORD,,')\n"
+        "    z.writestr('tvmdemo-1.0.dist-info/RECORD', '\\n'.join(rec) + '\\n')\n"
+    )
+    sshi.sendline("cat > $TMPDIR/mkwheel.py <<'PYEOF'\n" + make_wheel + "PYEOF")
+    sshi.expect(r"\$ ")
+    out, rc = _sh(sshi, "python3 $TMPDIR/mkwheel.py")
+    assert rc == 0, out
+    # a run that failed half way may have left it installed
+    _sh(sshi, "pip uninstall -y -q --disable-pip-version-check tvmdemo")
+    out, rc = _sh(sshi, "pip install --no-index --disable-pip-version-check $TMPDIR/tvmdemo-1.0-py3-none-any.whl")
+    assert rc == 0, out
+    assert "Successfully installed tvmdemo-1.0" in out, out
+    out, rc = _sh(sshi, "python3 -c 'import tvmdemo; print(tvmdemo.hello())'")
+    assert rc == 0, out
+    assert "hello from tvmdemo" in _lines(out), out
+    out, rc = _sh(sshi, "$HOME/.local/bin/tvmdemo")
+    assert rc == 0, out
+    assert "hello from tvmdemo" in _lines(out), out
+    out, rc = _sh(sshi, "pip uninstall -y --disable-pip-version-check tvmdemo")
+    assert rc == 0, out
+    assert "Successfully uninstalled tvmdemo-1.0" in out, out
+
+@pytestmark_python
+@network_required
+def test_pip_install_from_pypi(sshi: spawn):
+    """pip downloads and installs a pure-Python package from PyPI over HTTPS
+    (OpenSSL with pip's certificate handling)."""
+    _sh(sshi, "pip uninstall -y -q --disable-pip-version-check six")
+    out, rc = _sh(sshi, "pip install --no-cache-dir --disable-pip-version-check six", timeout=120)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "python3 -c 'import six; print(\"six\", six.__version__)'")
+    assert rc == 0, out
+    assert any(l.startswith("six ") for l in _lines(out)), out
+    out, rc = _sh(sshi, "pip uninstall -y --disable-pip-version-check six")
+    assert rc == 0, out
+
+@pytestmark_python
+@network_required
+def test_python_https_verifies(sshi: spawn):
+    """Python's ssl verifies servers with the CA bundle SSL_CERT_FILE names
+    (/tvm/etc/ssl/cacert.pem): OpenSSL's compiled-in default is the build
+    tree's prefix, so it had no CA at all. A bad certificate still fails."""
+    _write(sshi, "$TMPDIR/https.py",
+           "import urllib.request\n"
+           "print('status', urllib.request.urlopen('https://pypi.org/simple/six/', timeout=30).status)\n"
+           "try:\n"
+           "    urllib.request.urlopen('https://expired.badssl.com/', timeout=30)\n"
+           "except Exception as e:\n"
+           "    print('expired', 'CERTIFICATE_VERIFY_FAILED' in str(e))\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/https.py", timeout=120)
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "status 200" in lines and "expired True" in lines, out
+
+@pytestmark_python
+def test_python_ctypes_pythonapi(sshi: spawn):
+    """ctypes.pythonapi finds the interpreter's C API: a guest's dlsym() of
+    the whole program searches the images TVM loaded, which dyld does not
+    know."""
+    out, rc = _sh(sshi, "python3 -c 'import ctypes; print(\"init\", ctypes.pythonapi.Py_IsInitialized())'")
+    assert rc == 0, out
+    assert "init 1" in _lines(out), out
+
+@pytestmark_python
+def test_python_venv(sshi: spawn):
+    """A venv (symlinks, as on macOS by default): its bin/python3 is a link
+    of the host's file system to /tvm/bin/python3, which TVM follows into
+    its own tree; the host found nothing there."""
+    out, rc = _sh(sshi, "rm -rf $TMPDIR/venv && python3 -m venv --without-pip $TMPDIR/venv && "
+                        "$TMPDIR/venv/bin/python -c 'import sys; print(\"venv\", sys.prefix != sys.base_prefix)'",
+                  timeout=60)
+    assert rc == 0, out
+    assert "venv True" in _lines(out), out
+
+def test_symlink_into_tvm(sshi: spawn):
+    """A link of the host's file system into TVM's tree is followed by
+    exec, open and directory lookups (the host knows no /tvm)."""
+    out, rc = _sh(sshi, "rm -rf $TMPDIR/lnk && mkdir $TMPDIR/lnk && cd $TMPDIR/lnk && "
+                        "ln -s /tvm/bin/bash sh2 && ln -s /tvm/etc/profile prof && ln -s /tvm/bin bindir && "
+                        "./sh2 -c 'echo exec ok' && head -c 1 prof && echo && ls bindir/bash; cd - >/dev/null")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "exec ok" in lines and "#" in lines and "bindir/bash" in lines, out
+
+def test_kill_9_child(sshi: spawn):
+    """kill -9 of a child kills that child: SIGKILL sent as it was to a host
+    thread killed the host process, every session with it."""
+    out, rc = _sh(sshi, "sleep 30 & kill -9 $!; wait $!; echo status=$?")
+    assert rc == 0, out
+    assert "status=137" in _lines(out), out
+
+@pytestmark_python
+def test_python_alarm_and_waitid(sshi: spawn):
+    """signal.alarm() is the task's (the host's armed the host process's
+    timer, whose SIGALRM ended every task), and os.waitid waits for the
+    task's children (it reaped the host's)."""
+    _write(sshi, "$TMPDIR/alarm.py",
+           "import os, signal, subprocess, sys, time\n"
+           "r = subprocess.run([sys.executable, '-c', 'import signal, time; signal.alarm(1); time.sleep(5)'])\n"
+           "print('child', r.returncode)\n"
+           "got = []\n"
+           "signal.signal(signal.SIGALRM, lambda s, f: got.append(s))\n"
+           "signal.alarm(1); time.sleep(2); print('alarm', got)\n"
+           "p = subprocess.Popen(['sh', '-c', 'exit 5']); time.sleep(0.3)\n"
+           "w = os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)\n"
+           "print('waitid', w.si_pid == p.pid, w.si_status, p.wait())\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/alarm.py", timeout=60)
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "child -14" in lines and "alarm [14]" in lines and "waitid True 5 5" in lines, out
+
+@pytestmark_python
+def test_python_pty_getpass(sshi: spawn):
+    """A program on a pty (Python as pexpect drives one): getpass turns the
+    echo off (tcsetattr with TCSASOFT was EINVAL, and it echoed the
+    password), input() reads a line, and once the child is gone the master
+    reads an end of file (TVM held the slave's end open: readers waited)."""
+    _write(sshi, "$TMPDIR/ptyrun.py",
+           "import os, select, subprocess, sys\n"
+           "m, s = os.openpty()\n"
+           "child = ('import fcntl, termios, getpass; fcntl.ioctl(0, termios.TIOCSCTTY, 0); '\n"
+           "         'p = getpass.getpass(\"PW: \"); print(\"got\", p); print(\"line\", input(\"name? \"))')\n"
+           "p = subprocess.Popen([sys.executable, '-c', child], stdin=s, stdout=s, stderr=s, start_new_session=True)\n"
+           "os.close(s)\n"
+           "buf = b''; sent = 0\n"
+           "while True:\n"
+           "    r, _, _ = select.select([m], [], [], 20)\n"
+           "    if not r: print('STALLED'); break\n"
+           "    d = os.read(m, 100)\n"
+           "    if not d: print('EOF'); break\n"
+           "    buf += d\n"
+           "    if sent == 0 and b'PW: ' in buf: os.write(m, b'secret\\r'); sent = 1\n"
+           "    if sent == 1 and b'name? ' in buf: os.write(m, b'bob\\r'); sent = 2\n"
+           "print(repr(buf)); print('rc', p.wait())\n")
+    out, rc = _sh(sshi, "python3 $TMPDIR/ptyrun.py", timeout=60)
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "EOF" in lines and "rc 0" in lines, out
+    assert "got secret" in out and "line bob" in out, out
+    assert "PW: secret" not in out and "Warning" not in out, out
+
+# ── clang ──────────────────────────────────────────────────────
+
+pytestmark_clang = pytest.mark.skipif(
+    not PLATFORM.startswith(("macos-", "ios-")),
+    reason="clang is only built for the Darwin targets")
+
+# Compiling is native (clang is a TVM_NOEMU program), the compiled program is
+# not: it is emulated, as anything built on the device is unsigned.
+CLANG_TIMEOUT = 180
+
+@pytestmark_clang
+def test_clang_c_hello(sshi: spawn):
+    """cc compiles and links a C program (clang, lld, the SDK in /tvm/llvm),
+    which runs, with arguments, stdio and libm."""
+    _write(sshi, "$TMPDIR/hello.c",
+           '#include <stdio.h>\n'
+           '#include <math.h>\n'
+           '#include <stdlib.h>\n'
+           'int main(int argc, char **argv) {\n'
+           '    printf("hello %s %.3f\\n", argc > 1 ? argv[1] : "?", sqrt(atof(argv[2])));\n'
+           '    return 7;\n'
+           '}\n')
+    out, rc = _sh(sshi, "cc -O2 -Wall -o $TMPDIR/hello $TMPDIR/hello.c -lm", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/hello clang 2", timeout=CLANG_TIMEOUT)
+    assert rc == 7, out
+    assert "hello clang 1.414" in _lines(out), out
+
+@pytestmark_clang
+def test_clang_cxx(sshi: spawn):
+    """c++ compiles a C++ program against libc++ (static, from the SDK in
+    /tvm/llvm): iostream, containers and algorithms, virtual dispatch and
+    RTTI, static constructors and destructors, and exceptions, which the
+    program's own libunwind unwinds through its emulated frames."""
+    _write(sshi, "$TMPDIR/prog.cpp",
+           '#include <algorithm>\n'
+           '#include <iostream>\n'
+           '#include <map>\n'
+           '#include <memory>\n'
+           '#include <stdexcept>\n'
+           '#include <string>\n'
+           '#include <vector>\n'
+           'struct Global {\n'
+           '    Global() { std::cout << "ctor" << std::endl; }\n'
+           '    ~Global() { std::cout << "dtor" << std::endl; }\n'
+           '} global;\n'
+           'struct Shape { virtual ~Shape() = default; virtual int area() const = 0; };\n'
+           'struct Square : Shape { int s; explicit Square(int s) : s(s) {} int area() const override { return s * s; } };\n'
+           'static int depth(int n) {\n'
+           '    if (n == 0) throw std::runtime_error("bottom");\n'
+           '    return depth(n - 1) + 1;\n'
+           '}\n'
+           'int main() {\n'
+           '    std::vector<int> v{5, 3, 9, 1};\n'
+           '    std::sort(v.begin(), v.end());\n'
+           '    std::map<std::string, int> m{{"b", 2}, {"a", 1}};\n'
+           '    std::cout << "sorted " << v[0] << v[1] << v[2] << v[3]\n'
+           '              << " first " << m.begin()->first << std::endl;\n'
+           '    std::unique_ptr<Shape> sh = std::make_unique<Square>(4);\n'
+           '    std::cout << "area " << sh->area()\n'
+           '              << " square " << (dynamic_cast<Square *>(sh.get()) != nullptr) << std::endl;\n'
+           '    try {\n'
+           '        depth(10);\n'
+           '    } catch (const std::exception &e) {\n'
+           '        std::cout << "caught " << e.what() << std::endl;\n'
+           '    }\n'
+           '    try {\n'
+           '        throw 42;\n'
+           '    } catch (int i) {\n'
+           '        std::cout << "caught int " << i << std::endl;\n'
+           '    }\n'
+           '    return 0;\n'
+           '}\n')
+    out, rc = _sh(sshi, "c++ -std=c++20 -O1 -o $TMPDIR/prog $TMPDIR/prog.cpp", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/prog", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    lines = _lines(out)
+    for want in ("ctor", "sorted 1359 first a", "area 16 square 1",
+                 "caught bottom", "caught int 42", "dtor"):
+        assert want in lines, out
+    assert lines.index("ctor") < lines.index("caught int 42") < lines.index("dtor"), out
+
+@pytestmark_clang
+def test_clang_objects_and_archive(sshi: spawn):
+    """Separate compilation: objects, a static library made with ar, and a
+    link of both (clang driving ld64.lld)."""
+    _write(sshi, "$TMPDIR/add.c", "int add(int a, int b) { return a + b; }\n")
+    _write(sshi, "$TMPDIR/mul.c", "int mul(int a, int b) { return a * b; }\n")
+    _write(sshi, "$TMPDIR/calc.c",
+           '#include <stdio.h>\n'
+           'int add(int, int);\n'
+           'int mul(int, int);\n'
+           'int main(void) { printf("calc %d\\n", add(mul(6, 7), 1)); return 0; }\n')
+    out, rc = _sh(sshi, "cd $TMPDIR && cc -c add.c mul.c calc.c && ar rcs libcalc.a add.o mul.o"
+                        " && cc -o calc calc.o -L. -lcalc; rc2=$?; cd - >/dev/null; (exit $rc2)",
+                  timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/calc", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    assert "calc 43" in _lines(out), out
+    out, rc = _sh(sshi, "nm $TMPDIR/libcalc.a")
+    assert rc == 0, out
+    assert any(l.endswith(" T _add") for l in _lines(out)), out
+
+@pytestmark_clang
+def test_clang_preprocessor_and_errors(sshi: spawn):
+    """cpp preprocesses; a compile error is reported with its location, and
+    cc fails."""
+    out, rc = _sh(sshi, "printf '#define X 6*7\\nvalue X\\n' | cpp -P -")
+    assert rc == 0, out
+    assert "value 6*7" in _lines(out), out
+    _write(sshi, "$TMPDIR/bad.c", "int main(void) { return undefined_name; }\n")
+    out, rc = _sh(sshi, "cc -o $TMPDIR/bad $TMPDIR/bad.c", timeout=CLANG_TIMEOUT)
+    assert rc != 0, out
+    assert "bad.c:1:" in out and "undefined_name" in out, out
+
+@pytestmark_clang
+def test_clang_cxx_threads(sshi: spawn):
+    """A compiled C++ program's threads: std::thread, a mutex, thread_local
+    variables, and an exception thrown and caught in each thread (libc++abi's
+    per-thread state, whose pthread key destructor TVM runs as the thread
+    exits)."""
+    _write(sshi, "$TMPDIR/thr.cpp",
+           '#include <atomic>\n'
+           '#include <iostream>\n'
+           '#include <mutex>\n'
+           '#include <stdexcept>\n'
+           '#include <string>\n'
+           '#include <thread>\n'
+           '#include <vector>\n'
+           'thread_local int tl = 0;\n'
+           'int main() {\n'
+           '    std::atomic<int> caught{0};\n'
+           '    std::mutex m;\n'
+           '    std::vector<std::thread> ts;\n'
+           '    for (int i = 0; i < 4; i++)\n'
+           '        ts.emplace_back([&, i] {\n'
+           '            tl = i + 1;\n'
+           '            try { throw std::runtime_error("t" + std::to_string(i)); }\n'
+           '            catch (const std::exception &) { std::lock_guard<std::mutex> g(m); caught += tl; }\n'
+           '        });\n'
+           '    for (auto &t : ts) t.join();\n'
+           '    std::cout << "caught " << caught << " main tl " << tl << std::endl;\n'
+           '}\n')
+    out, rc = _sh(sshi, "c++ -std=c++20 -O1 -o $TMPDIR/thr $TMPDIR/thr.cpp", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    out, rc = _sh(sshi, "$TMPDIR/thr", timeout=CLANG_TIMEOUT)
+    assert rc == 0, out
+    assert "caught 10 main tl 0" in _lines(out), out
+
+
+# ── Bun programs ──────────────────────────────────────────────────
+# A compiled Bun program (bun build --compile) runs on the Bun the app ships,
+# its module graph (its __BUN,__bun section) mapped into that runtime's image
+# (tvm.c, "Bun programs"). The CLI ships no Bun, so these bind one at
+# /tvm/bin/bun with an initrc of their own: TVM_BUN, from the environment or
+# the build's CMake cache. They compile their programs with it too.
+
+def _cmake_cache_value(name: str):
+    try:
+        with open(f"./output/{PLATFORM}/build/CMakeCache.txt") as f:
+            for line in f:
+                if line.startswith(name + ":"):
+                    return line.split("=", 1)[1].strip() or None
+    except OSError:
+        pass
+    return None
+
+BUN = os.environ.get("TVM_BUN") or _cmake_cache_value("TVM_BUN")
+
+pytestmark_bun = pytest.mark.skipif(
+    not PLATFORM.startswith("macos-") or not BUN or not os.path.exists(BUN),
+    reason="needs a Bun (TVM_BUN) on macOS")
+
+# An embedded text module, which the graph gives as a string (as a file on
+# disk, it would be {default: ...}). With BUN_BARRIER set, the program marks
+# itself started there and waits until BUN_BARRIER_N programs have: then they
+# all ran at once.
+def _bun_text_program(who):
+    return ('import data from "./WHO.txt" with { type: "text" };\n'
+            'import { writeFileSync, readdirSync } from "node:fs";\n'
+            'let met = null;\n'
+            'if (process.env.BUN_BARRIER) {\n'
+            '  writeFileSync(process.env.BUN_BARRIER + "/WHO-" + process.pid, "");\n'
+            '  const end = Date.now() + 60000;\n'
+            '  while (!(met = readdirSync(process.env.BUN_BARRIER).length >= +process.env.BUN_BARRIER_N) && Date.now() < end)\n'
+            '    await Bun.sleep(20);\n'
+            '}\n'
+            'console.log(JSON.stringify({ who: "WHO", argv: process.argv.slice(2), data: data.trim(),\n'
+            '  sab: typeof SharedArrayBuffer, met }));\n').replace("WHO", who)
+
+BUN_PROGRAMS = {
+    "a": (_bun_text_program("a"), {"a.txt": "payload of a\n"}),
+    # UTF-8 beyond latin-1
+    "b": (_bun_text_program("b"), {"b.txt": "payload of b é 中\n"}),
+    # its own path, a child process, and itself again through process.execPath
+    "c": ('import { spawnSync } from "node:child_process";\n'
+          'if (process.argv[2] === "--child") {\n'
+          '  console.log(JSON.stringify({ who: "c-child", execPath: process.execPath, argv: process.argv.slice(2) }));\n'
+          '  process.exit(7);\n'
+          '}\n'
+          'const sh = Bun.spawnSync(["/tvm/bin/bash", "-c", "echo from-bash"]);\n'
+          'const self = spawnSync(process.execPath, ["--child", "z"], { encoding: "utf8" });\n'
+          'console.log(JSON.stringify({ who: "c", execPath: process.execPath, bash: sh.stdout.toString().trim(),\n'
+          '  selfStatus: self.status, selfOut: self.stdout.trim() }));\n',
+          {}),
+    # Bun.ant.CellSegmenter, which Claude Code's terminal UI paints through
+    # (scripts/bun/tvm-cellseg.js): a line with an SGR run and a wide glyph
+    "d": ('const s = new Bun.ant.CellSegmenter({ ambiguousIsNarrow: true });\n'
+          'const cells = new Int32Array(32), runs = new Int32Array(32);\n'
+          'const n = s.segment("a\\x1b[31mb\\u4e2d", cells, runs, false);\n'
+          'console.log(JSON.stringify({ who: "d", n, w: [cells[1] & 255, cells[3] & 255, cells[5] & 255],\n'
+          '  run: [cells[3] >>> 10, cells[5] >>> 10], keys: s.sgrKeys, g: s.graphemes[cells[4]] }));\n',
+          {}),
+    # a graph of megabytes, more than the runtime's __BUN segment (16 KB):
+    # the segments after it move (ulinker_set_bun_graph); and a child of it,
+    # itself again, which gets a copy of the parent's mapped graph
+    "e": ('import big from "./big.txt" with { type: "text" };\n'
+          'import { spawnSync } from "node:child_process";\n'
+          'if (process.argv[2] === "--child") { console.log(JSON.stringify({ who: "e-child", len: big.length })); process.exit(3); }\n'
+          'const c = spawnSync(process.execPath, ["--child"], { encoding: "utf8" });\n'
+          'console.log(JSON.stringify({ who: "e", len: big.length, tail: big.slice(-6), child: c.status, childOut: c.stdout.trim() }));\n',
+          {"big.txt": "0123456789abcdef" * (512 * 1024) + "-tail-"}),
+    # a program whose file is gone while it runs (an updated program's old
+    # version): its children still start, and see its environment without
+    # TVM's preloads (BUN_OPTIONS of the user's own only)
+    "f": ('import { unlinkSync } from "node:fs";\n'
+          'unlinkSync(process.execPath);\n'
+          'const sh = Bun.spawnSync(["/tvm/bin/bash", "-c", "echo \\"opts=[$BUN_OPTIONS]\\""]);\n'
+          'console.log(JSON.stringify({ who: "f", sh: sh.exitCode, out: sh.stdout.toString().trim() }));\n',
+          {}),
+}
+
+@pytest.fixture(scope="module")
+def bun_programs(tmp_path_factory):
+    d = tmp_path_factory.mktemp("bun")
+    src = d / "src"
+    src.mkdir()
+    for name, (code, files) in BUN_PROGRAMS.items():
+        (src / f"{name}.js").write_text(code)
+        for fname, text in files.items():
+            (src / fname).write_text(text, encoding="utf-8")
+        subprocess.run([BUN, "build", "--compile", str(src / f"{name}.js"), "--outfile", str(d / name)],
+                       check=True, capture_output=True, cwd=src)
+    with open("init.rc") as f:
+        rc = [l for l in f.read().splitlines() if not l.startswith("echo TVM initialized")]
+    rc += [f"mount --bind {os.path.abspath(BUN)}:/tvm/bin/bun",
+           f"mount --bind {os.path.abspath('scripts/bun/tvm-sab.js')}:/tvm/share/bun/tvm-sab.js",
+           f"mount --bind {os.path.abspath('scripts/bun/tvm-cellseg.js')}:/tvm/share/bun/tvm-cellseg.js"]
+    (d / "init.rc").write_text("\n".join(rc) + "\n")
+    return d
+
+def _run_bun_programs(d, script: str, **env_extra):
+    env = dict(os.environ)
+    env["TVM_NOEMU"] = TVM_NOEMU_DEFAULT + ":/tvm/bin/bun"
+    env["PLATFORM"] = PLATFORM
+    env.pop("BUN_OPTIONS", None)
+    env.update(env_extra)
+    p = subprocess.run([TVM_BIN, "-i", str(d / "init.rc"), "/tvm/bin/bash", "-c", script],
+                       capture_output=True, text=True, timeout=120, env=env)
+    records = []
+    for line in p.stdout.splitlines():
+        if line.startswith("{"):
+            records.append(json.loads(line))
+    return p, records
+
+@pytestmark_bun
+def test_bun_programs_side_by_side(bun_programs):
+    """Two compiled Bun programs, and two instances of one, run at once, each
+    on its own module graph: their embedded text modules are theirs, as
+    strings, and each saw all three started before it went on."""
+    d = bun_programs
+    barrier = d / "barrier"
+    barrier.mkdir(exist_ok=True)
+    for f in barrier.iterdir():
+        f.unlink()
+    p, recs = _run_bun_programs(d, f"{d}/a x1 x2 & {d}/b y1 & {d}/a x3 & wait; echo done=$?",
+                                BUN_BARRIER=str(barrier), BUN_BARRIER_N="3")
+    assert "done=0" in p.stdout, p.stdout + p.stderr
+    assert p.returncode == 0, p.stdout + p.stderr
+    by = sorted(recs, key=lambda r: (r["who"], r["argv"]))
+    assert [(r["who"], r["argv"], r["data"], r["met"]) for r in by] == [
+        ("a", ["x1", "x2"], "payload of a", True),
+        ("a", ["x3"], "payload of a", True),
+        ("b", ["y1"], "payload of b é 中", True),
+    ], p.stdout + p.stderr
+
+@pytestmark_bun
+def test_bun_program_rerun(bun_programs):
+    """A program run again after one exits (its image parked, then reused)."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/a one; echo a1=$?; {d}/a two; echo a2=$?; {d}/b three; echo b=$?")
+    assert "a1=0" in p.stdout and "a2=0" in p.stdout and "b=0" in p.stdout, p.stdout + p.stderr
+    assert [(r["who"], r["argv"]) for r in recs] == [("a", ["one"]), ("a", ["two"]), ("b", ["three"])]
+
+@pytestmark_bun
+def test_bun_program_self_and_children(bun_programs):
+    """process.execPath is the program's own path, a child process runs, and
+    the program runs itself again through process.execPath (detected anew)."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/c")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert len(recs) == 1, p.stdout + p.stderr
+    r = recs[0]
+    assert r["execPath"] == os.path.realpath(d / "c"), r
+    assert r["bash"] == "from-bash", r
+    assert r["selfStatus"] == 7, r
+    child = json.loads(r["selfOut"])
+    assert child == {"who": "c-child", "execPath": os.path.realpath(d / "c"), "argv": ["--child", "z"]}, r
+
+@pytestmark_bun
+def test_bun_program_preload_jitless(bun_programs):
+    """Without its JIT (as on iOS), JavaScriptCore turns SharedArrayBuffer
+    off; the preload execve adds gives one back, also with BUN_OPTIONS of
+    the user's own."""
+    d = bun_programs
+    for extra in ({}, {"BUN_OPTIONS": "--smol"}):
+        p, recs = _run_bun_programs(d, f"{d}/a j", BUN_JSC_useJIT="0", **extra)
+        assert p.returncode == 0, p.stdout + p.stderr
+        assert [(r["who"], r["sab"]) for r in recs] == [("a", "function")], (extra, p.stdout + p.stderr)
+
+@pytestmark_bun
+def test_bun_program_cell_segmenter(bun_programs):
+    """A Bun program has Bun.ant.CellSegmenter, which only Anthropic's Bun
+    has natively and Claude Code's terminal UI cannot draw without: cells,
+    widths, SGR runs and interned graphemes as the native class gives them."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/d")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert recs == [{"who": "d", "n": 3, "w": [1, 1, 2], "run": [1, 1], "keys": ["", "\x1b[31m"], "g": "\u4e2d"}], p.stdout + p.stderr
+
+@pytestmark_bun
+def test_bun_program_big_graph(bun_programs):
+    """A graph of megabytes, past the runtime's own __BUN segment: the image's
+    later segments move, and its child (itself, through process.execPath)
+    runs on a copy of the parent's graph."""
+    d = bun_programs
+    p, recs = _run_bun_programs(d, f"{d}/e")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert len(recs) == 1, p.stdout + p.stderr
+    r = recs[0]
+    assert (r["len"], r["tail"], r["child"]) == (8 * 1024 * 1024 + 6, "-tail-", 3), r
+    assert json.loads(r["childOut"]) == {"who": "e-child", "len": 8 * 1024 * 1024 + 6}, r
+
+@pytestmark_bun
+def test_bun_program_file_gone(bun_programs):
+    """A program whose file is deleted while it runs still starts children (a
+    fork copies its graph, it does not open the file), and they do not
+    inherit TVM's preloads, only the user's own BUN_OPTIONS."""
+    import shutil
+    d = bun_programs
+    for opts in (None, "--smol"):
+        gone = d / "f-copy"
+        shutil.copy(d / "f", gone)
+        extra = {"BUN_OPTIONS": opts} if opts else {}
+        p, recs = _run_bun_programs(d, f"{gone}; echo rc=$?", **extra)
+        assert "rc=0" in p.stdout, p.stdout + p.stderr
+        assert recs == [{"who": "f", "sh": 0, "out": f"opts=[{opts or ''}]"}], p.stdout + p.stderr
+        assert not gone.exists()

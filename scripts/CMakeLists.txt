@@ -15,6 +15,18 @@ else()
     set(FLUTTER_ARCH linux-x64)
 endif()
 
+# clang's configuration (third_party/configs/clang.cfg): the deployment target
+# is the one scripts/build_llvm.sh builds the runtimes for
+if(APPLE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(TVM_CLANG_MIN_VERSION_FLAG -mios-version-min=15.0)
+    else()
+        set(TVM_CLANG_MIN_VERSION_FLAG -mmacosx-version-min=13.0)
+    endif()
+    set(CLANG_CFG ${CMAKE_CURRENT_BINARY_DIR}/clang.cfg)
+    configure_file(${ROOTDIR}/third_party/configs/clang.cfg ${CLANG_CFG} @ONLY)
+endif()
+
 # ── Toybox applets ──────────────────────────────────────────────
 set(TOYBOX_APPLETS
     ascii awk base32 base64 basename bzcat cal cat chgrp chmod chown
@@ -157,12 +169,111 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/git/mergetools/'* \"$ROOTFS/libexec/git-core/mergetools/\"\n")
     string(APPEND SCRIPT "cp -R '${GIT_BUILD}/src/templates/blt' \"$ROOTFS/share/git-core/templates\"\n\n")
 
-    # ── CA bundle (Linux only) ──
-    # curl verifies through the OS trust store on macOS/iOS (USE_APPLE_SECTRUST);
-    # Linux gets Mozilla's bundle, curl's compile-time CURL_CA_BUNDLE default.
-    if(NOT APPLE)
-        string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/ssl\"\n")
-        string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/cacert.pem' \"$ROOTFS/etc/ssl/cacert.pem\"\n\n")
+    # ── CA bundle ──
+    # Mozilla's bundle: curl's compile-time CURL_CA_BUNDLE default on Linux
+    # (on macOS/iOS curl verifies through the OS trust store,
+    # USE_APPLE_SECTRUST), and SSL_CERT_FILE (init.rc, init.flutter.rc) for
+    # programs on OpenSSL's own verification, Python's ssl among them: its
+    # compiled-in default is the build tree's OpenSSL prefix.
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/ssl\"\n")
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/cacert.pem' \"$ROOTFS/etc/ssl/cacert.pem\"\n\n")
+
+    # ── security ──
+    # The keychain tool, as an empty keychain (scripts/security.sh): the
+    # host's cannot run in TVM, and Claude Code saves its login only when the
+    # keychain answers like one
+    if(APPLE)
+        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/security.sh' \"$ROOTFS/bin/security\"\n")
+        string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/security\"\n\n")
+    endif()
+
+    # ── python ──
+    # bin/python3.X is the interpreter: a launcher stub for libpython in the
+    # Flutter initrd, the real executable in the CLI one; python3 and python
+    # link to it (TVM_NOEMU resolves the links to /tvm/bin/python3.X), and
+    # pip, pip3 and pip3.X are pip's console script. The standard library is
+    # /tvm/lib/python3.X, the interpreter's compiled-in prefix: carried by
+    # the CLI initrd; the apps ship it in the bundle and bind it there
+    # (init.flutter.rc), since an initrd is read into memory whole.
+    if(APPLE)
+        set(PYV ${TVM_PYTHON_VERSION})
+        set(PYTHON_STAGE ${THIRDPARTY_BUILD}/python/stage/tvm)
+        if(ARG_FLUTTER)
+            string(APPEND SCRIPT "cp '${BIN_OUT}/python_launcher' \"$ROOTFS/bin/python${PYV}\"\n")
+        else()
+            string(APPEND SCRIPT "cp '${PYTHON_STAGE}/bin/python${PYV}' \"$ROOTFS/bin/python${PYV}\"\n")
+            string(APPEND SCRIPT "mkdir -p \"$ROOTFS/lib\"\n")
+            string(APPEND SCRIPT "cp -R '${PYTHON_STAGE}/lib/python${PYV}' \"$ROOTFS/lib/\"\n")
+        endif()
+        string(APPEND SCRIPT "ln -sf python${PYV} \"$ROOTFS/bin/python3\"\n")
+        string(APPEND SCRIPT "ln -sf python3 \"$ROOTFS/bin/python\"\n")
+        foreach(pip pip pip3 pip${PYV})
+            string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/pip' \"$ROOTFS/bin/${pip}\"\n")
+            string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/${pip}\"\n")
+        endforeach()
+        string(APPEND SCRIPT "\n")
+    endif()
+
+    # ── clang ──
+    # bin/llvm is the toolchain (scripts/build_llvm.sh): a launcher stub for
+    # libllvm in the Flutter initrd; in the CLI one, init.rc binds the
+    # executable from the build tree there, as an initrd is read into memory
+    # whole. The tools are names of it, which it tells apart by argv[0]
+    # (links, which TVM_NOEMU resolves to /tvm/bin/llvm); cc, c++ and cpp,
+    # names it does not know, are scripts. The configuration in /tvm/etc/clang
+    # points clang at the bundle init.rc binds at /tvm/llvm.
+    if(APPLE)
+        if(ARG_FLUTTER)
+            string(APPEND SCRIPT "cp '${BIN_OUT}/llvm_launcher' \"$ROOTFS/bin/llvm\"\n")
+        endif()
+        foreach(tool clang clang++ clang-cpp ld64.lld ld ar ranlib nm objdump otool strip size c++filt addr2line)
+            string(APPEND SCRIPT "ln -sf llvm \"$ROOTFS/bin/${tool}\"\n")
+        endforeach()
+        foreach(pair cc:clang c++:clang++ cpp:clang-cpp)
+            string(REPLACE ":" ";" pair "${pair}")
+            list(GET pair 0 name)
+            list(GET pair 1 tool)
+            string(APPEND SCRIPT "printf '#!/tvm/bin/sh\\nexec ${tool} \"$@\"\\n' > \"$ROOTFS/bin/${name}\"\n")
+            string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/${name}\"\n")
+        endforeach()
+        string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/clang\"\n")
+        foreach(cfg clang clang++ clang-cpp)
+            string(APPEND SCRIPT "cp '${CLANG_CFG}' \"$ROOTFS/etc/clang/${cfg}.cfg\"\n")
+        endforeach()
+        string(APPEND SCRIPT "\n")
+    endif()
+
+    # ── ripgrep ── (TVM_RIPGREP, third_party/CMakeLists.txt): likewise
+    if(APPLE AND TVM_RIPGREP AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/rg_launcher' \"$ROOTFS/bin/rg\"\n\n")
+    endif()
+
+    # ── Node.js ── (TVM_NODE, third_party/CMakeLists.txt): a launcher stub
+    # for libnode, and npm and npx run from the modules init.flutter.rc binds
+    # at /tvm/node
+    if(APPLE AND TVM_NODE AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/node_launcher' \"$ROOTFS/bin/node\"\n")
+        foreach(pair npm:npm-cli npx:npx-cli)
+            string(REPLACE ":" ";" pair "${pair}")
+            list(GET pair 0 name)
+            list(GET pair 1 cli)
+            string(APPEND SCRIPT "printf '#!/tvm/bin/sh\\nexec /tvm/bin/node /tvm/node/npm/bin/${cli}.js \"$@\"\\n' > \"$ROOTFS/bin/${name}\"\n")
+            string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/${name}\"\n")
+        endforeach()
+        string(APPEND SCRIPT "\n")
+    endif()
+
+    # ── Bun ── (TVM_BUN, third_party/CMakeLists.txt): a launcher stub for
+    # libbun in the Flutter initrd, the signed runtime execve runs compiled
+    # Bun programs on (tvm.c, "Bun programs"), and what it preloads into
+    # them: tvm-sab.js (a SharedArrayBuffer for JavaScriptCore without its
+    # JIT) and tvm-cellseg.js (Bun.ant.CellSegmenter, which Claude Code's
+    # terminal UI paints through).
+    if(APPLE AND TVM_BUN AND ARG_FLUTTER)
+        string(APPEND SCRIPT "cp '${BIN_OUT}/bun_launcher' \"$ROOTFS/bin/bun\"\n")
+        string(APPEND SCRIPT "mkdir -p \"$ROOTFS/share/bun\"\n")
+        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/bun/tvm-sab.js' \"$ROOTFS/share/bun/tvm-sab.js\"\n")
+        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/bun/tvm-cellseg.js' \"$ROOTFS/share/bun/tvm-cellseg.js\"\n\n")
     endif()
 
     # ── apple *_cmds ──
@@ -225,17 +336,41 @@ endfunction()
 # The apple *_cmds modules go into both initrds as real executables, so both
 # targets depend on them. Empty on Linux, where the subdirectory is not added.
 set(APPLE_CMDS_DEPS "")
+# python: macOS / iOS only (third_party/CMakeLists.txt)
+set(PYTHON_CLI_DEPS "")
+set(PYTHON_FLUTTER_DEPS "")
+if(APPLE)
+    set(PYTHON_CLI_DEPS python_exe)
+    set(PYTHON_FLUTTER_DEPS python_launcher)
+endif()
+# clang: macOS / iOS only (third_party/CMakeLists.txt). The CLI's init.rc
+# binds the program and the bundle from the build output.
+set(LLVM_CLI_DEPS "")
+set(LLVM_FLUTTER_DEPS "")
+if(APPLE)
+    set(LLVM_CLI_DEPS llvm_exe llvm_bundle)
+    set(LLVM_FLUTTER_DEPS llvm_launcher)
+    if(TVM_RIPGREP)
+        list(APPEND LLVM_FLUTTER_DEPS rg_launcher)
+    endif()
+    if(TVM_NODE)
+        list(APPEND LLVM_FLUTTER_DEPS node_launcher)
+    endif()
+    if(TVM_BUN)
+        list(APPEND LLVM_FLUTTER_DEPS bun_launcher)
+    endif()
+endif()
 foreach(module ${APPLE_CMDS_MODULES})
     list(APPEND APPLE_CMDS_DEPS ${module}_exe)
 endforeach()
 
 # CLI initrd (real binaries)
 mkinitrd_target(initrd_cli
-    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_exe sftpserver_ext bash_exe toybox_exe vim_exe curl_exe less_exe nano_exe sqlite_exe git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_CLI_DEPS} ${LLVM_CLI_DEPS}
 )
 
 # Flutter initrd (launcher stubs for the dylib-backed tools, real binaries for
 # the apple *_cmds modules)
 mkinitrd_target(initrd_flutter FLUTTER
-    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git-remote-http_launcher git-http-fetch_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS}
+    DEPENDS dropbear_launcher sftpserver_launcher bash_launcher toybox_launcher vim_launcher curl_launcher less_launcher nano_launcher sqlite_launcher git_launcher git-remote-http_launcher git-http-fetch_launcher git_exe toybox_host_ext ncurses_host_ext ${APPLE_CMDS_DEPS} ${PYTHON_FLUTTER_DEPS} ${LLVM_FLUTTER_DEPS}
 )

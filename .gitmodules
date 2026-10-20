@@ -52,3 +52,15 @@
 [submodule "third_party/git"]
 	path = third_party/git
 	url = https://github.com/git/git.git
+[submodule "third_party/python"]
+	path = third_party/python
+	url = https://github.com/python/cpython.git
+	shallow = true
+[submodule "third_party/libffi"]
+	path = third_party/libffi
+	url = https://github.com/libffi/libffi.git
+	shallow = true
+[submodule "third_party/llvm-project"]
+	path = third_party/llvm-project
+	url = https://github.com/llvm/llvm-project.git
+	shallow = true

@@ -31,11 +31,35 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         COMMAND ${CMAKE_COMMAND} -E chdir ${IPA_STAGE}
             zip -qry ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/tvm.ipa Payload)
 endif()
+# python (macOS / iOS only): its framework, and the standard library that
+# scripts/embed_frameworks.sh copies into the bundle
+set(FLUTTER_PYTHON_DEPS "")
+if(APPLE)
+    set(FLUTTER_PYTHON_DEPS python_shared python_stdlib)
+endif()
+# clang (macOS / iOS only): its framework, and the toolchain bundle that
+# scripts/embed_frameworks.sh copies into the bundle
+set(FLUTTER_LLVM_DEPS "")
+if(APPLE)
+    set(FLUTTER_LLVM_DEPS llvm_shared llvm_bundle)
+endif()
+# ripgrep, when TVM_RIPGREP names its binary (third_party/CMakeLists.txt)
+if(APPLE AND TVM_RIPGREP)
+    list(APPEND FLUTTER_LLVM_DEPS rg_shared)
+endif()
+# Node.js, when TVM_NODE names a distribution (third_party/CMakeLists.txt)
+if(APPLE AND TVM_NODE)
+    list(APPEND FLUTTER_LLVM_DEPS node_shared node_modules)
+endif()
+# Bun, when TVM_BUN names its binary (third_party/CMakeLists.txt)
+if(APPLE AND TVM_BUN)
+    list(APPEND FLUTTER_LLVM_DEPS bun_shared)
+endif()
 add_custom_target(flutter
     COMMAND ${FLUTTER_ENV} sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_flutter.sh
         ${CMAKE_CURRENT_SOURCE_DIR}/flutter
     ${FLUTTER_IPA}
-    DEPENDS tvm_shared dropbear_shared sftpserver_shared bash_shared toybox_shared vim_shared curl_shared less_shared nano_shared sqlite_shared git_shared git-remote-http_shared git-http-fetch_shared initrd_flutter
+    DEPENDS tvm_shared dropbear_shared sftpserver_shared bash_shared toybox_shared vim_shared curl_shared less_shared nano_shared sqlite_shared git_shared git-remote-http_shared git-http-fetch_shared ${FLUTTER_PYTHON_DEPS} ${FLUTTER_LLVM_DEPS} initrd_flutter
     COMMENT "Building Flutter app"
 )
 set_target_properties(flutter PROPERTIES EXCLUDE_FROM_ALL TRUE)

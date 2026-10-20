@@ -9,12 +9,23 @@ mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 mount --bind /tvm/bin/sh:/bin/sh
 mount --bind /tvm/bin/bash:/bin/bash
 mount --bind /tvm/bin/env:/usr/bin/env
+# The macOS keychain tool, which TVM cannot run either (an arm64e system
+# binary): exec'ing it failed with ENOEXEC, which node throws, and Claude Code
+# (run on node) died at startup looking for its login there. Bound to the
+# VM's own, a keychain with no entries (scripts/security.sh)
+mount --bind /tvm/bin/security:/usr/bin/security
+
+# clang (macOS; scripts/build_llvm.sh): the toolchain bundle and the program
+# whose names /tvm/bin/clang & co. are, bound from the build output rather
+# than carried in the initrd, which is read into memory whole
+mount --bind output/$PLATFORM/lib/llvm:/tvm/llvm
+mount --bind output/$PLATFORM/build/third_party/llvm/target/bin/llvm:/tvm/bin/llvm
 
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/bash
 setenv SHELL=/tvm/bin/bash
 setenv PATH=/tvm/bin:$PATH
-setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch
+setenv? TVM_NOEMU=/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch:/tvm/bin/python3.15:/tvm/bin/llvm
 # Terminfo database of the static ncursesw bash, vim, less and nano link
 # (scripts/build_ncurses.sh); also its compiled-in default, exported so a
 # host TERMINFO in the environment cannot redirect it
@@ -23,6 +34,9 @@ setenv TERMINFO=/tvm/share/terminfo
 setenv? PAGER=less
 setenv? LESS=-R
 setenv? EDITOR=nano
+# CA certificates for OpenSSL's own verification (Python's ssl); see
+# scripts/CMakeLists.txt
+setenv? SSL_CERT_FILE=/tvm/etc/ssl/cacert.pem
 umask 022
 mkdir $HOME/.dropbear
 

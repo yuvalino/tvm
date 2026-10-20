@@ -1,0 +1,6 @@
+#!/tvm/bin/python3
+# /tvm/bin/pip (and pip3, pip3.X): pip's console script, as pip's own
+# entry point (pip/_internal/cli/main.py) defines it.
+import sys
+from pip._internal.cli.main import main
+sys.exit(main())
