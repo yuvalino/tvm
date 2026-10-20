@@ -1,5 +1,8 @@
 import 'package:flutter/cupertino.dart';
 
+import '../theme/tvm_colors.dart';
+import 'editor_page.dart';
+
 class PasswordEditorScreen extends StatefulWidget {
   const PasswordEditorScreen({
     super.key,
@@ -36,47 +39,35 @@ class _PasswordEditorScreenState extends State<PasswordEditorScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return CupertinoPageScaffold(
-      backgroundColor: CupertinoColors.black,
-      navigationBar: CupertinoNavigationBar(
-        middle: Text(widget.title),
-        previousPageTitle: 'Settings',
-      ),
-      child: SafeArea(
-        child: ListView(
-          children: [
-            CupertinoFormSection.insetGrouped(
-              footer: widget.footer != null ? Text(widget.footer!) : null,
-              children: [
-                CupertinoTextField.borderless(
-                  controller: _controller,
-                  placeholder: widget.title,
-                  obscureText: !_showPassword,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  onChanged: widget.onChanged,
-                  autofocus: true,
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 16, vertical: 12),
-                  suffix: Padding(
-                    padding: const EdgeInsets.only(right: 12),
-                    child: GestureDetector(
-                      onTap: () =>
-                          setState(() => _showPassword = !_showPassword),
-                      child: Icon(
-                        _showPassword
-                            ? CupertinoIcons.eye_slash_fill
-                            : CupertinoIcons.eye_fill,
-                        size: 22,
-                        color: CupertinoColors.secondaryLabel.resolveFrom(
-                            context),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+    return EditorPage(
+      title: widget.title,
+      footer: widget.footer,
+      field: CupertinoTextField.borderless(
+        controller: _controller,
+        placeholder: widget.title,
+        obscureText: !_showPassword,
+        autocorrect: false,
+        enableSuggestions: false,
+        onChanged: widget.onChanged,
+        autofocus: true,
+        style: EditorPage.valueStyle,
+        placeholderStyle: EditorPage.placeholderStyle,
+        cursorColor: TvmColors.green,
+        keyboardAppearance: Brightness.dark,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        suffix: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => setState(() => _showPassword = !_showPassword),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Icon(
+              _showPassword
+                  ? CupertinoIcons.eye_slash_fill
+                  : CupertinoIcons.eye_fill,
+              size: 20,
+              color: TvmColors.dim,
             ),
-          ],
+          ),
         ),
       ),
     );
