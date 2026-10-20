@@ -15,6 +15,9 @@ dependencies:
   ffi: ^2.1.0
   shared_preferences: ^2.3.4
   package_info_plus: ^8.0.0
+  xterm: ^4.0.0
+  dartssh2: ^4.1.0
+  flutter_svg: ^2.3.0
 
 dev_dependencies:
   flutter_test:
@@ -24,8 +27,19 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  # The app's own UI is set in JetBrains Mono, the font of tvm.yuvalino.com
+  # (assets/fonts/OFL.txt). The terminal keeps xterm's default.
+  fonts:
+    - family: JetBrains Mono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+        - asset: assets/fonts/JetBrainsMono-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/JetBrainsMono-Bold.ttf
+          weight: 700
   assets:
     - assets/init.flutter.rc
+    - assets/logo.png
     - path: assets/initrd.flutter.ios-arm64.cpio
       platforms:
         - ios
