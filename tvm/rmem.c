@@ -9,6 +9,12 @@
 #include <pthread.h>
 
 #include "rmem.h"
+// its mutexes are TVM's, counted (see the header); plain where rmem is
+// linked without TVM (test_rmem)
+#include "tvm_mutex.h"
+
+__attribute__((weak)) int tvm_mutex_lock(pthread_mutex_t *m) { return (pthread_mutex_lock)(m); }
+__attribute__((weak)) int tvm_mutex_unlock(pthread_mutex_t *m) { return (pthread_mutex_unlock)(m); }
 
 
 

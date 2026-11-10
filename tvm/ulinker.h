@@ -104,6 +104,9 @@ int ulinker_image(struct ulinker *ulinker, size_t index, struct ulinker_image *o
 size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max);
 void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
                          void *(*translate)(void *arg, void *p), void *arg);
+// A thread of the linker's task is exiting (the task lives on): its TLV
+// blocks go back to the task's memory.
+void ulinker_tlv_thread_exit(struct ulinker *ulinker);
 
 enum {
     ULARCH_NONE = 0,

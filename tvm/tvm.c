@@ -125,6 +125,9 @@ int sigtimedwait(const sigset_t *restrict, siginfo_t *restrict, const struct tim
 #include "unicorn/x86.h"
 #include "unicorn/arm64.h"
 
+// TVM's own mutexes are counted per thread (tls_locks_held, see the header)
+#include "tvm_mutex.h"
+
 /**
  * Instructions unclear, ended up implementing a kernel.
  *    (all I wanted was to have ssh server in iOS)
@@ -315,6 +318,12 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
 	for (pos = list_first_entry(head, typeof(*pos), member);	\
 	     !list_entry_is_head(pos, head, member);			\
 	     pos = list_next_entry(pos, member))
+
+#define list_for_each_entry_safe(pos, n, head, member)			\
+	for (pos = list_first_entry(head, typeof(*pos), member),	\
+	     n = list_next_entry(pos, member);				\
+	     !list_entry_is_head(pos, head, member);			\
+	     pos = n, n = list_next_entry(n, member))
 
 /////////////
 // MARK: Functions
@@ -2130,6 +2139,7 @@ struct tvm_tls {
     int tls_tvm_emu_call_depth; // >0 while inside emulated execution in emulator_call_ex; signals defer and drain only at the emulator_step safe point
     int tls_sigshutup;
     int tls_tasks_lock_held; // set during task teardown when tasks_lock is held
+    int tls_locks_held;      // TVM mutexes held or being waited for (tvm_mutex_lock)
 
     struct tvm_call *tls_call;
 
@@ -2179,6 +2189,28 @@ static void tvm_thread_destructor(void *arg) {
 // tvm_tls(). Everything else calls tvm_tls(), which treats a missing TLS as a
 // fatal bug (a code path that slipped past every chokepoint).
 #define TVM_TLS_PEEK() (tls_initialized ? (struct tvm_tls *)pthread_getspecific(tls_key) : NULL)
+
+int tvm_mutex_lock(pthread_mutex_t *m)
+{
+    // counted before the wait: one waiting in it is in TVM's locking too
+    struct tvm_tls *t = TVM_TLS_PEEK();
+    if (t)
+        t->tls_locks_held++;
+    int r = (pthread_mutex_lock)(m);
+    if (r && t)
+        t->tls_locks_held--;
+    return r;
+}
+
+int tvm_mutex_unlock(pthread_mutex_t *m)
+{
+    int r = (pthread_mutex_unlock)(m);
+    // a thread whose TLS came after the lock did not count it
+    struct tvm_tls *t = TVM_TLS_PEEK();
+    if (!r && t && t->tls_locks_held > 0)
+        t->tls_locks_held--;
+    return r;
+}
 
 static inline struct tvm_tls *tvm_tls(void) {
     struct tvm_tls *t = TVM_TLS_PEEK();
@@ -4926,7 +4958,8 @@ static inline void tvm_sig_leave(void)
  * Whether the interrupted thread was blocked in one of the host's waiting
  * system calls: its pc right after the svc of one of these stubs, where the
  * kernel resumes it (Darwin arm64; elsewhere never). A thread there is in a
- * wait and holds no lock of the host's libraries.
+ * wait and holds no lock of the host's libraries; the caller checks it holds
+ * none of TVM's either (tls_locks_held).
  */
 #if defined(__APPLE__) && defined(__aarch64__)
 static uintptr_t kernel_wait_stubs[10];
@@ -5018,7 +5051,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     // CPython (3.14+) parks a daemon thread that outlives the interpreter in
     // pause() for good (PyThread_hang_thread), as http.server's handlers of
     // a browser's idle connections do, and exit() after Ctrl+C hung on them.
-    if (signum == SIGCONT && thread_in_kernel_wait(ucontext)) {
+    if (signum == SIGCONT && tls->tls_locks_held == 0 && thread_in_kernel_wait(ucontext)) {
         struct thread *exiting = __atomic_load_n(&tls->tls_current->tsk_exiting_thread, __ATOMIC_ACQUIRE);
         if (exiting && exiting != current_thread) {
             pthread_mutex_lock(&tasks_lock);
@@ -5865,11 +5898,17 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
                 tt->t_canlen = 0;
                 tt->t_lnext = 0;
             } else if (was_canon && !(tt->t_lflag & ICANON) && tt->t_canlen) {
-                // the line typed so far is input as it is
+                // the line typed so far is input as it is. O_NONBLOCK is
+                // the open file's, which every master descriptor shares
+                // (a dup of t_mfd), so it is put back as it was: left set,
+                // a program's blocking read of the master got EAGAIN
                 int mfd = CALL_FUNC(dup, tt->t_mfd);
                 if (-1 != mfd) {
-                    if (-1 != CALL_FUNC(fcntl, mfd, F_SETFL, O_NONBLOCK))
+                    int fl = CALL_FUNC(fcntl, mfd, F_GETFL);
+                    if (-1 != fl && -1 != CALL_FUNC(fcntl, mfd, F_SETFL, fl | O_NONBLOCK)) {
                         (void)tty_canon_flush_locked(tt, mfd);
+                        CALL_FUNC(fcntl, mfd, F_SETFL, fl);
+                    }
                     CALL_FUNC(close, mfd);
                 }
                 tt->t_canlen = 0;
@@ -11805,6 +11844,41 @@ _Static_assert(offsetof(struct host_call_frame, rx) == 304, "host_call_frame lay
 _Static_assert(offsetof(struct host_call_frame, rv) == 320, "host_call_frame layout");
 
 void tvm_host_call_arm64(struct host_call_frame *f);
+#endif
+
+/*
+ * An emulated program's call of a native function, by plain C call (the
+ * fast path below covers Darwin arm64 calls with the full register state).
+ * In a section of its own, so that the interposed function it calls can
+ * tell the program's call from TVM's own (caller_is_tvm): the return
+ * address is in this section, TVM's text though it is. Not a tail call: the
+ * return address would be the caller's.
+ */
+#if defined(__APPLE__)
+# define TVM_UPCALL_TEXT __attribute__((noinline, section("__TEXT,__tvm_upcall,regular,pure_instructions")))
+extern const char tvm_upcall_text_start[] __asm("section$start$__TEXT$__tvm_upcall");
+extern const char tvm_upcall_text_end[] __asm("section$end$__TEXT$__tvm_upcall");
+#else
+# define TVM_UPCALL_TEXT __attribute__((noinline, section("tvm_upcall")))
+extern const char __start_tvm_upcall[], __stop_tvm_upcall[];
+# define tvm_upcall_text_start __start_tvm_upcall
+# define tvm_upcall_text_end   __stop_tvm_upcall
+#endif
+
+TVM_UPCALL_TEXT
+static uint64_t tvm_host_call_plain(uint64_t pc, const uint64_t *a)
+{
+    uint64_t ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))pc)(
+        a[ 0], a[ 1], a[ 2], a[ 3], a[ 4], a[ 5], a[ 6], a[ 7], a[ 8], a[ 9],
+        a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19]);
+    __asm__ volatile("" ::: "memory");
+    return ret;
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
 // where a host function called from emulated code returns to (see caller_is_tvm)
 extern const char tvm_host_call_arm64_ret[];
 __asm__(
@@ -11906,15 +11980,7 @@ static int emulator_call_ex_res(struct ulinker_dladdr_info *pcinfo, struct emula
 #endif
     if (!pcinfo->udli_femu) {
         TVM_ON;
-        uint64_t ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t))params->pc)(
-            params->arg[ 0], params->arg[ 1], params->arg[ 2], params->arg[ 3], params->arg[ 4],
-            params->arg[ 5], params->arg[ 6], params->arg[ 7], params->arg[ 8], params->arg[ 9],
-            params->arg[10], params->arg[11], params->arg[12], params->arg[13], params->arg[14],
-            params->arg[15], params->arg[16], params->arg[17], params->arg[18], params->arg[19]
-        );
+        uint64_t ret = tvm_host_call_plain(params->pc, params->arg);
         if (out_ret)
             *out_ret = ret;
         if (out_res) {
@@ -12421,6 +12487,10 @@ static int caller_is_tvm(void)
     if (lr == (uintptr_t)tvm_host_call_arm64_ret)
         return 0;
 #endif
+    // ...or through tvm_host_call_plain (every other build, and calls
+    // without the full register state): returning into its section
+    if (lr >= (uintptr_t)tvm_upcall_text_start && lr < (uintptr_t)tvm_upcall_text_end)
+        return 0;
     get_text(&text_start, &text_end);
     return lr >= text_start && lr < text_end;
 }
@@ -17177,6 +17247,7 @@ struct kq_proc_watch {
     uint64_t w_kqgen;   // the kqueue's: its file's f_gencnt
     int      w_kq;      // a host descriptor of it: the program may close its own
     pid_t    w_pid;
+    pid_t    w_owner;   // the task that asked: its watches go when it exits
     uint64_t w_ident;   // the EVFILT_USER event standing for it
     uint32_t w_fflags;  // what the program asked for (NOTE_EXIT, NOTE_EXITSTATUS)
     uint64_t w_udata;   // its udata: every change to an event replaces the event's
@@ -17206,14 +17277,23 @@ static void kq_proc_free_locked(struct kq_proc_watch *w)
 }
 
 // A task exited (terminate_current_locked, with tasks_lock held): the
-// events watching it fire.
+// events watching it fire, and the watches it made itself go, with the
+// host descriptor each holds. A program that exits (or is killed) with
+// children unreaped never deletes them, nor receives their events, which
+// is when the others are freed; its kqueue is gone with it. (A fork child
+// has a dup of the kqueue here, where Darwin gives it none that works, and
+// a watch it adds for a pid its parent watches is the parent's, which goes
+// with the parent: programs do not use a kqueue across fork.)
 static void kq_proc_exited(pid_t pid, int status)
 {
-    struct kq_proc_watch *w;
+    struct kq_proc_watch *w, *tmp;
     pthread_mutex_lock(&kq_proc_lock);
-    list_for_each_entry(w, &kq_proc_watches, w_list)
-        if (w->w_pid == pid && !w->w_fired)
+    list_for_each_entry_safe(w, tmp, &kq_proc_watches, w_list) {
+        if (w->w_owner == pid)
+            kq_proc_free_locked(w);
+        else if (w->w_pid == pid && !w->w_fired)
             kq_proc_fire_locked(w, status);
+    }
     pthread_mutex_unlock(&kq_proc_lock);
 }
 
@@ -17264,6 +17344,7 @@ static int kq_proc_change(int rkq, uint64_t gen, const struct kevent64_s *ch)
                 else {
                     w->w_kqgen = gen;
                     w->w_pid = (pid_t)ch->ident;
+                    w->w_owner = current->tsk_pid;
                     w->w_ident = KQ_PROC_IDENT_BASE | ++kq_proc_seq;
                     list_add(&w->w_list, &kq_proc_watches);
                 }
@@ -19812,6 +19893,16 @@ pid_t fork(void) {
 
     // failure no longer allowed on parent
 
+    // The program's mappings are the child's too now (fork shares them),
+    // and either may outlive the other or unmap one: they are no longer
+    // the parent's alone to unmap when it goes (see task_maps_add). Only
+    // now that there is a child: a fork that failed shares nothing.
+    task_lock(current);
+    kfree(current->tsk_maps);
+    current->tsk_maps = NULL;
+    current->tsk_nmaps = 0;
+    task_unlock(current);
+
     pthread_mutex_lock(&arg->mtx);
     while (arg->pid == 0) {
         pthread_cond_wait(&arg->cond, &arg->mtx);
@@ -20319,6 +20410,9 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
 
     // while the thread is still the task's (see pthread_key_create)
     run_key_destructors();
+    // ...and its blocks of thread-local variables (after the destructors,
+    // which may use them)
+    ulinker_tlv_thread_exit(current->tsk_linker);
 
     task_lock(current);
     if (current->tsk_threads_cnt == 1) {
@@ -24043,8 +24137,13 @@ retry:
  * space growing without end in a long-lived VM. The task records what its
  * program maps (not TVM's own mappings: ulinker unmaps its images itself)
  * and munmap() takes it out; what is left goes with the task, or with the
- * program at exec. A fork child starts with none: fork does not copy them
- * (they stay the parent's).
+ * program at exec. Not after a fork, though: the child shares every
+ * mapping its parent had (fork copies only the TVM heap and the stack), and
+ * an unmap by either, at its exit or exec, went under the other (a Python
+ * worker outliving its parent, its arenas mmap'd); worse, a range one of
+ * them unmapped and something else then mapped again was unmapped by the
+ * other later. So a fork leaves both without those mappings recorded, as
+ * before, and each records what it maps afterwards.
  */
 static void task_maps_remove_locked(struct task *t, uintptr_t start, uintptr_t end)
 {
