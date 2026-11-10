@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 
 #include "ulinker.h"
+// its mutexes are TVM's, counted (see the header)
+#include "tvm_mutex.h"
 
 
 static void (*print_cb)(char *, int) = NULL;
@@ -4463,7 +4465,10 @@ static int opcode_bind(struct dlinfo_macho64 *dl, const uint8_t *p, uint32_t siz
             return 1;
         }
         // a weak definition of the image's own needs no binding of its
-        // stream; only the binds of others' (weak) definitions are applied
+        // stream; only the binds of others' (weak) definitions are applied.
+        // The address still moves past what the op covers: all `times` of
+        // a DO_BIND_ULEB_TIMES_SKIPPING_ULEB, not one
+        uint64_t times = count;
         if (weak && (flags & BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION))
             count = 0;
         uintptr_t sym = 0;
@@ -4487,8 +4492,8 @@ static int opcode_bind(struct dlinfo_macho64 *dl, const uint8_t *p, uint32_t siz
                 *(uintptr_t *)addr = sym ? sym + addend : 0;
             off += sizeof(uintptr_t) + skip;
         }
-        if (!count && op != BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB)
-            off += sizeof(uintptr_t) + skip;
+        if (!count)
+            off += times * (sizeof(uintptr_t) + skip);
     }
     return 0;
 }
@@ -5024,6 +5029,26 @@ void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t co
     DLINFO_UNLOCK(ulinker);
 }
 
+// Each thread's blocks were freed only when their image was, and then only
+// the unloading thread's: a task that starts and ends threads (a thread
+// pool per job, a server's thread per connection) kept every ended
+// thread's blocks until it exited.
+void ulinker_tlv_thread_exit(struct ulinker *ulinker)
+{
+    DLINFO_LOCK(ulinker);
+    for (struct dlinfo *dl = ulinker->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL; dl = dl->dl_next) {
+        struct dlinfo_macho64 *dlm = (struct dlinfo_macho64 *)dl;
+        if (dl->dl_type != DLT_MACHO64 || !dlm->dlm64_tlv_has_key)
+            continue;
+        void *block = pthread_getspecific(dlm->dlm64_tlv_key);
+        if (block) {
+            pthread_setspecific(dlm->dlm64_tlv_key, NULL);
+            uo.uo_free(dl->dl_linker->ul_private, block);
+        }
+    }
+    DLINFO_UNLOCK(ulinker);
+}
+
 #else
 
 static int macho64_tlv_setup(struct dlinfo_macho64 *dl) { (void)dl; return 0; }
@@ -5032,6 +5057,7 @@ size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max) 
 void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
                          void *(*translate)(void *arg, void *p), void *arg)
 { (void)ulinker; (void)blocks; (void)count; (void)translate; (void)arg; }
+void ulinker_tlv_thread_exit(struct ulinker *ulinker) { (void)ulinker; }
 
 #endif
 
