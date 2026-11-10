@@ -191,7 +191,7 @@ class _ConnectCard extends StatelessWidget {
 
   Widget _build(String? host) {
     final w = WorkerController.instance;
-    final cmd = 'ssh -p ${w.sshPort} ${w.username}@${host ?? 'localhost'}';
+    final cmd = 'ssh -p ${w.serverPort} ${w.username}@${host ?? 'localhost'}';
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.fromLTRB(12, 10, 4, 4),

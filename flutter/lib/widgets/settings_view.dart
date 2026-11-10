@@ -23,7 +23,7 @@ class _SettingsViewState extends State<SettingsView> {
     super.initState();
     PackageInfo.fromPlatform().then((info) {
       if (mounted) setState(() => _packageInfo = info);
-    });
+    }, onError: (_) {});
   }
 
   @override
