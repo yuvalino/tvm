@@ -47,6 +47,7 @@ class TabsController extends ChangeNotifier {
     for (var j = 0; j < shells.length; j++) {
       shells[j].active = j == _index - 1;
     }
+    activeShell?.unseen = false;
     notifyListeners();
   }
 

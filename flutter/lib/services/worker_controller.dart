@@ -44,6 +44,14 @@ class WorkerController {
   String get sshPass => _prefs.getString('sshPass') ?? 'alpine';
   set sshPass(String value) => _prefs.setString('sshPass', value);
 
+  /// The port and password the server was started with. The settings above
+  /// apply on next launch; until then the shell tabs and the shown ssh
+  /// command go by these.
+  int get serverPort => _serverPort ?? sshPort;
+  String get serverPass => _serverPass ?? sshPass;
+  int? _serverPort;
+  String? _serverPass;
+
 
   double get terminalFontSize => _prefs.getDouble('terminalFontSize') ?? 13.0;
   set terminalFontSize(double value) {
@@ -88,13 +96,15 @@ class WorkerController {
   void start() {
     if (_started) return;
     _started = true;
+    _serverPort = sshPort;
+    _serverPass = sshPass;
 
     _log('device: ${_NativeInfo.device()}');
     _log('pid: $pid');
     _log('uid: ${_NativeInfo.uid()}');
     _log('username: ${_NativeInfo.username()}');
     _log('hostname: ${Platform.localHostname}');
-    _log('ssh port: $sshPort');
+    _log('ssh port: $serverPort');
     _log('cwd: ${Directory.current.path}');
     _log('home: ${_NativeInfo.home()}');
     _lookUpNetwork();
@@ -116,8 +126,8 @@ class WorkerController {
     _log('[INFO] Starting tvm');
     final result = TvmBindings.instance.start(
       libtvmPath: libtvmPath,
-      port: sshPort,
-      password: sshPass,
+      port: serverPort,
+      password: serverPass,
       initrcPath: '$assets/assets/init.flutter.rc',
       initrdPath: '$assets/assets/initrd.flutter.$arch.cpio',
     );

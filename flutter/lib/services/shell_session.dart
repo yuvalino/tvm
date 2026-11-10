@@ -71,41 +71,55 @@ class ShellSession extends ChangeNotifier {
   bool ctrl = false;
   bool alt = false;
 
-  late final _filter = _PrivateSgrFilter(onLate: terminal.write);
+  late final _filter = _PrivateSgrFilter(onLate: _write);
   SSHClient? _client;
   SSHSession? _session;
   final _subs = <StreamSubscription>[];
   bool _disposed = false;
 
+  // Counts connect() calls. A reconnect starts a new one while the old may
+  // still be waiting; the old one finds the count moved on and leaves the
+  // new connection alone.
+  int _generation = 0;
+
   Future<void> connect() async {
     final worker = WorkerController.instance;
+    final generation = ++_generation;
+    bool stale() => _disposed || generation != _generation;
     _setState(ShellState.connecting);
     endReason = null;
     try {
       final socket = await SSHSocket.connect(
         '127.0.0.1',
-        worker.sshPort,
+        worker.serverPort,
         timeout: const Duration(seconds: 5),
       );
+      if (stale()) {
+        socket.destroy();
+        return;
+      }
       // The host key is our own server's, over loopback: nothing to verify.
       final client = SSHClient(
         socket,
         username: worker.username,
-        onPasswordRequest: () => worker.sshPass,
+        onPasswordRequest: () => worker.serverPass,
       );
       _client = client;
+      final width = terminal.viewWidth, height = terminal.viewHeight;
       final session = await client.shell(
-        pty: SSHPtyConfig(
-          type: 'xterm-256color',
-          width: terminal.viewWidth,
-          height: terminal.viewHeight,
-        ),
+        pty: SSHPtyConfig(type: 'xterm-256color', width: width, height: height),
       );
-      if (_disposed) {
+      if (stale()) {
         client.close();
         return;
       }
       _session = session;
+      // A resize while the shell was being opened found no session to
+      // tell: catch up on it, unless one is still on its way.
+      if (_resizeTimer?.isActive != true &&
+          (terminal.viewWidth != width || terminal.viewHeight != height)) {
+        session.resizeTerminal(terminal.viewWidth, terminal.viewHeight);
+      }
       _setState(ShellState.connected);
       _subs.add(
         session.stdout
@@ -120,6 +134,7 @@ class ShellSession extends ChangeNotifier {
             .listen(_onData),
       );
       await session.done;
+      if (stale()) return;
       final code = session.exitCode;
       final signal = session.exitSignal?.signalName;
       _end(
@@ -130,7 +145,7 @@ class ShellSession extends ChangeNotifier {
             : 'connection closed',
       );
     } catch (e) {
-      _end(e.toString());
+      if (!stale()) _end(e.toString());
     }
   }
 
@@ -145,7 +160,7 @@ class ShellSession extends ChangeNotifier {
   void _onData(String data) {
     data = _filter.filter(data);
     if (data.isEmpty) return;
-    terminal.write(data);
+    _write(data);
     if (!active && !unseen) {
       unseen = true;
       notifyListeners();
@@ -159,6 +174,19 @@ class ShellSession extends ChangeNotifier {
     _setState(ShellState.ended);
   }
 
+  // Output from the shell. The terminal answers some of it (device
+  // attributes, cursor position, size reports) through [_send] while it is
+  // being written; those answers are not typed and leave the latch alone.
+  bool _writing = false;
+  void _write(String data) {
+    _writing = true;
+    try {
+      terminal.write(data);
+    } finally {
+      _writing = false;
+    }
+  }
+
   void _setState(ShellState s) {
     if (_disposed) return;
     _state = s;
@@ -167,7 +195,8 @@ class ShellSession extends ChangeNotifier {
 
   // Everything typed reaches the shell through here: the software keyboard
   // (via the TerminalView), the key bar and pastes alike, so a latched
-  // modifier applies to whichever key comes next.
+  // modifier applies to whichever key comes next. The terminal's own
+  // answers come this way too, and go as they are.
   void _send(String data) {
     // The iOS keyboard's return key arrives as typed text, "\n", but a
     // terminal's Return is CR. Programs that read the tty raw (Claude Code)
@@ -175,7 +204,7 @@ class ShellSession extends ChangeNotifier {
     // Pastes go the same way, as a terminal sends them. A Ctrl+J from the
     // key bar is made below, after this, and stays LF.
     data = data.replaceAll('\n', '\r');
-    if (ctrl || alt) {
+    if ((ctrl || alt) && !_writing) {
       if (data.length == 1) {
         if (ctrl) data = _ctrlChar(data);
         if (alt) data = '\x1b$data';
@@ -203,6 +232,8 @@ class ShellSession extends ChangeNotifier {
       case '6':
         return '\x1e';
       case '7':
+      case '/':
+      case '-':
         return '\x1f';
       case '8':
       case '?':
