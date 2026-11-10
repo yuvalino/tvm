@@ -747,6 +747,44 @@ def test_concurrent_interactive(forkless: Forkless):
             s2.expect(r"\$ ")
         s1.expect(r"\$ ")
 
+def test_tty_canonical_input(sshi: spawn):
+    """The pty's line discipline in cooked mode (ICANON|ECHO, what a program
+    that does not set the terminal up reads with): typing is echoed, the
+    line is edited with VERASE, VWERASE and VKILL before the program gets
+    it, and VEOF on an empty line is an end of file."""
+    def read_line(keys: str) -> str:
+        # READY is printed once bash has put the terminal back in cooked
+        # mode for the command; keys typed earlier would go in raw
+        sshi.sendline('echo READY; read -r v; echo "got=[$v]"')
+        sshi.expect("READY\r\n")
+        sshi.send(keys)
+        sshi.expect(r"got=\[(.*?)\]\r\n")
+        line = sshi.match.group(1).decode()
+        sshi.expect(r"\$ ")
+        return line
+
+    sshi.sendline('echo READY; read -r v; echo "got=[$v]"')
+    sshi.expect("READY\r\n")
+    sshi.send("abc")
+    sshi.expect("abc")                  # echoed as typed
+    sshi.send("\x7f")
+    sshi.expect("\b \b")                # rubbed out
+    sshi.send("d\r")
+    sshi.expect("d\r\n")                # the newline is echoed (ICRNL, ONLCR)
+    sshi.expect(r"got=\[abd\]")
+    sshi.expect(r"\$ ")
+
+    assert read_line("one two\x17three\r") == "one three"   # ^W
+    assert read_line("junk\x15ok\r") == "ok"                # ^U
+
+    sshi.sendline("echo READY; cat; echo cat_rc=$?")
+    sshi.expect("READY\r\n")
+    sshi.send("line\r")
+    sshi.expect("line\r\nline\r\n")     # the echo, then cat's copy
+    sshi.send("\x04")                   # ^D
+    sshi.expect("cat_rc=0")
+    sshi.expect(r"\$ ")
+
 # ── SCP extended ──────────────────────────────────────────────
 
 def test_scp_large_file(forkless: Forkless, device):
@@ -2184,8 +2222,10 @@ def test_ls_root_shows_tvm(sshi: spawn):
 def test_vfs_readonly(sshi: spawn):
     """A cpio mount is read-only: creating in it is "Read-only file system"
     (the host used to answer for a path it has not got, ENOENT), and the
-    mount point itself is busy."""
-    out, rc = _sh(sshi, "mkdir /tvm/x 2>&1; touch /tvm/etc/x 2>&1; rm /tvm/etc/profile 2>&1; rmdir /tvm 2>&1; true")
+    mount point itself is busy. (rm's stdin is not the terminal: access(W_OK)
+    says EROFS, as a read-only file system does, and toybox's rm would ask
+    "rm ro ...?" on a tty before trying.)"""
+    out, rc = _sh(sshi, "mkdir /tvm/x 2>&1; touch /tvm/etc/x 2>&1; rm /tvm/etc/profile </dev/null 2>&1; rmdir /tvm 2>&1; true")
     assert out.count("Read-only file system") == 3, out
     assert "busy" in out.lower(), out
 
@@ -2228,7 +2268,8 @@ def test_bind_mounts(sshi: spawn):
                         "printf '#!/bin/sh\\necho SH_OK\\n' > $d/s && printf '#!/usr/bin/env bash\\necho ENV_OK\\n' > $d/e && "
                         "chmod +x $d/b $d/s $d/e && $d/b && $d/s && $d/e; rm -rf $d")
     assert rc == 0 and "ARR=y" in out and "SH_OK" in out and "ENV_OK" in out, out
-    out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh 2>&1; [ -f /bin/sh ] && echo still_there")
+    # rm's stdin not the tty: it would ask "rm ro /bin/sh?" (see test_vfs_readonly)
+    out, rc = _sh(sshi, "mv /bin/sh $TMPDIR/sh_moved 2>&1; rm /bin/sh </dev/null 2>&1; [ -f /bin/sh ] && echo still_there")
     assert out.lower().count("busy") == 2 and "still_there" in out, out
 
 def test_bind_dir_listing(sshi: spawn):
@@ -2583,3 +2624,20 @@ def test_shell_survives_child_crash(sshi: spawn):
     sshi.sendline("echo still_ok")
     sshi.expect("still_ok")
     sshi.expect(r"\$ ")
+
+def test_symlink_into_tvm(sshi: spawn):
+    """A link of the host's file system into TVM's tree is followed by
+    exec, open and directory lookups (the host knows no /tvm)."""
+    out, rc = _sh(sshi, "rm -rf $TMPDIR/lnk && mkdir $TMPDIR/lnk && cd $TMPDIR/lnk && "
+                        "ln -s /tvm/bin/bash sh2 && ln -s /tvm/etc/profile prof && ln -s /tvm/bin bindir && "
+                        "./sh2 -c 'echo exec ok' && head -c 1 prof && echo && ls bindir/bash; cd - >/dev/null")
+    assert rc == 0, out
+    lines = _lines(out)
+    assert "exec ok" in lines and "#" in lines and "bindir/bash" in lines, out
+
+def test_kill_9_child(sshi: spawn):
+    """kill -9 of a child kills that child: SIGKILL sent as it was to a host
+    thread killed the host process, every session with it."""
+    out, rc = _sh(sshi, "sleep 30 & kill -9 $!; wait $!; echo status=$?")
+    assert rc == 0, out
+    assert "status=137" in _lines(out), out

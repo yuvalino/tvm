@@ -157,12 +157,22 @@ function(mkinitrd_target NAME)
     string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/git/mergetools/'* \"$ROOTFS/libexec/git-core/mergetools/\"\n")
     string(APPEND SCRIPT "cp -R '${GIT_BUILD}/src/templates/blt' \"$ROOTFS/share/git-core/templates\"\n\n")
 
-    # ── CA bundle (Linux only) ──
-    # curl verifies through the OS trust store on macOS/iOS (USE_APPLE_SECTRUST);
-    # Linux gets Mozilla's bundle, curl's compile-time CURL_CA_BUNDLE default.
-    if(NOT APPLE)
-        string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/ssl\"\n")
-        string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/cacert.pem' \"$ROOTFS/etc/ssl/cacert.pem\"\n\n")
+    # ── CA bundle ──
+    # Mozilla's bundle: curl's compile-time CURL_CA_BUNDLE default on Linux
+    # (on macOS/iOS curl verifies through the OS trust store,
+    # USE_APPLE_SECTRUST), and SSL_CERT_FILE (init.rc, init.flutter.rc) for
+    # programs on OpenSSL's own verification, whose compiled-in default is
+    # the build tree's OpenSSL prefix.
+    string(APPEND SCRIPT "mkdir -p \"$ROOTFS/etc/ssl\"\n")
+    string(APPEND SCRIPT "cp '${ROOTDIR}/third_party/configs/cacert.pem' \"$ROOTFS/etc/ssl/cacert.pem\"\n\n")
+
+    # ── security ──
+    # The keychain tool, as an empty keychain (scripts/security.sh): the
+    # host's cannot run in TVM, and programs that keep secrets there save
+    # them only when the keychain answers like one
+    if(APPLE)
+        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/security.sh' \"$ROOTFS/bin/security\"\n")
+        string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/security\"\n\n")
     endif()
 
     # ── apple *_cmds ──

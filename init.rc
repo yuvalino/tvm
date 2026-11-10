@@ -9,6 +9,10 @@ mount output/$PLATFORM/lib/initrd.cli.cpio:/tvm
 mount --bind /tvm/bin/sh:/bin/sh
 mount --bind /tvm/bin/bash:/bin/bash
 mount --bind /tvm/bin/env:/usr/bin/env
+# The macOS keychain tool, which TVM cannot run either (an arm64e system
+# binary): exec'ing it failed with ENOEXEC. Bound to the VM's own, a
+# keychain with no entries (scripts/security.sh)
+mount --bind /tvm/bin/security:/usr/bin/security
 
 # Environment setup
 setenv TVM_SHELL=/tvm/bin/bash
@@ -23,6 +27,8 @@ setenv TERMINFO=/tvm/share/terminfo
 setenv? PAGER=less
 setenv? LESS=-R
 setenv? EDITOR=nano
+# CA certificates for OpenSSL's own verification; see scripts/CMakeLists.txt
+setenv? SSL_CERT_FILE=/tvm/etc/ssl/cacert.pem
 umask 022
 mkdir $HOME/.dropbear
 

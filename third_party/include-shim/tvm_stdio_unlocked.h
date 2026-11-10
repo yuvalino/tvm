@@ -26,6 +26,10 @@
 #ifndef TVM_STDIO_UNLOCKED_H
 #define TVM_STDIO_UNLOCKED_H
 
+/* -include reaches assembler sources too (a project whose CFLAGS also
+ * build its .S files): C only. */
+#ifndef __ASSEMBLER__
+
 /*
  * glibc: the same holds there (getc_unlocked() & co. are extern inlines
  * over the glibc FILE's _IO_read_ptr/_IO_write_ptr at -O2), but the
@@ -79,5 +83,7 @@
 #define ferror_unlocked(fp) ferror(fp)
 #define clearerr_unlocked(fp) clearerr(fp)
 #define fileno_unlocked(fp) fileno(fp)
+
+#endif /* __ASSEMBLER__ */
 
 #endif

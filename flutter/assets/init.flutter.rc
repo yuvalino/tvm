@@ -4,11 +4,16 @@ umask 022
 mount --bind /tvm/bin/sh:/bin/sh
 mount --bind /tvm/bin/bash:/bin/bash
 mount --bind /tvm/bin/env:/usr/bin/env
+# The macOS keychain tool (arm64e, not loadable in TVM): a failing exec is
+# not the same as "not found" to the programs that ask it
+mount --bind /tvm/bin/security:/usr/bin/security
 setenv TVM_SHELL=/tvm/bin/bash
 setenv? TVM_NOEMU=libdropbear:libbash:libtoybox:libvim:libsftpserver:libcurl:libless:libnano:libsqlite:libgit:libgit-remote-http:libgit-http-fetch
 setenv TERMINFO=/tvm/share/terminfo
 setenv? PAGER=less
 setenv? LESS=-R
 setenv? EDITOR=nano
+# CA certificates for OpenSSL's own verification; see scripts/CMakeLists.txt
+setenv? SSL_CERT_FILE=/tvm/etc/ssl/cacert.pem
 mkdir $HOME/.dropbear
 echo TVM initialized

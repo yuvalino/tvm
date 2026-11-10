@@ -1028,6 +1028,12 @@ struct load_command {
 #define LC_DYLD_ENVIRONMENT 0x27 /* string for dyld to treat
 				    like environment variable */
 #define LC_MAIN (0x28|LC_REQ_DYLD) /* replacement for LC_UNIXTHREAD */
+struct entry_point_command {
+    uint32_t  cmd;	/* LC_MAIN only used in MH_EXECUTE filetypes */
+    uint32_t  cmdsize;	/* 24 */
+    uint64_t  entryoff;	/* file (__TEXT) offset of main() */
+    uint64_t  stacksize;/* if not zero, initial stack size */
+};
 #define LC_DATA_IN_CODE 0x29 /* table of non-instructions in __text */
 #define LC_SOURCE_VERSION 0x2A /* source version used to build binary */
 #define LC_DYLIB_CODE_SIGN_DRS 0x2B /* Code signing DRs copied from linked dylibs */
@@ -1624,6 +1630,25 @@ struct linkedit_data_command {
     uint32_t	datasize;	/* file size of data in __LINKEDIT segment  */
 };
 
+/*
+ * The dyld_info_command contains the file offsets and sizes of the opcode
+ * streams dyld uses to rebase and bind an image that predates chained fixups.
+ */
+struct dyld_info_command {
+    uint32_t   cmd;		/* LC_DYLD_INFO or LC_DYLD_INFO_ONLY */
+    uint32_t   cmdsize;		/* sizeof(struct dyld_info_command) */
+    uint32_t   rebase_off;	/* file offset to rebase info  */
+    uint32_t   rebase_size;	/* size of rebase info   */
+    uint32_t   bind_off;	/* file offset to binding info   */
+    uint32_t   bind_size;	/* size of binding info  */
+    uint32_t   weak_bind_off;	/* file offset to weak binding info   */
+    uint32_t   weak_bind_size;  /* size of weak binding info  */
+    uint32_t   lazy_bind_off;	/* file offset to lazy binding info */
+    uint32_t   lazy_bind_size;  /* size of lazy binding infs */
+    uint32_t   export_off;	/* file offset to lazy binding info */
+    uint32_t   export_size;	/* size of lazy binding infs */
+};
+
 // header of the LC_DYLD_CHAINED_FIXUPS payload
 struct dyld_chained_fixups_header
 {
@@ -1971,11 +1996,12 @@ pthread_mutex_t __jit_debug_descriptor_mtx = PTHREAD_MUTEX_INITIALIZER;
 /*
  * Whether loaded images are registered with gdb's JIT interface. Building an
  * entry reads the whole image file and rewrites its DWARF to the load
- * address: cheap for Mach-O (debug info stays in the .dSYM), but a Linux
- * guest carries its DWARF inline (git: 58 MB), and every exec and every fork
- * (ulinker_duplicate reloads the images) paid for it -- seconds per git
- * command, which timed out git's commit loops in CI. TVM turns it off on
- * Linux unless a debugger is attached (ULINKER_GDB_JIT).
+ * address, and every exec and every fork (ulinker_duplicate reloads the
+ * images) pays for it: a Linux guest carries its DWARF inline (git: 58 MB),
+ * seconds per git command, which timed out git's commit loops in CI; a
+ * Mach-O image keeps its DWARF in the .dSYM, but the copy is still the whole
+ * file (node: 122 MB per node task). TVM turns it off unless a debugger is
+ * attached (ULINKER_GDB_JIT).
  */
 static int gdb_jit = 1;
 
@@ -2268,6 +2294,8 @@ struct dlinfo_macho64 {
 
     size_t dlm64_dysymtab_iextdefsym;
     size_t dlm64_dysymtab_nextdefsym;
+    int dlm64_extdef_sorted;    // the exported symbols are sorted by name (see macho64_check_extdef_sorted)
+    uintptr_t dlm64_entry;      // the LC_MAIN entry point, or 0
 
     const struct dyld_chained_starts_in_image *dlm64_chainedfixups_starts;
 
@@ -2276,13 +2304,27 @@ struct dlinfo_macho64 {
     size_t      dlm64_chainedfixups_imports_count;
     void       *dlm64_chainedfixups_imports;
 
+    // rebase and bind opcodes (LC_DYLD_INFO), in the mapped __LINKEDIT
+    const uint8_t *dlm64_rebase, *dlm64_bind, *dlm64_weak_bind, *dlm64_lazy_bind;
+    uint32_t dlm64_rebase_size, dlm64_bind_size, dlm64_weak_bind_size, dlm64_lazy_bind_size;
+
     struct jit_code_entry dlm64_jit_entry;
 
     // parked image slot reuse (native images, Apple), see image_slot_take()
     struct image_slot_key dlm64_slot_key;
     int dlm64_slot_cacheable;   // native image with executable segments, all mapped
     int dlm64_slot_reused;      // executable segments came from a parked slot
+
+    // thread-local variables, see "Thread-local variables"
+    int           dlm64_tlv_has_key;
+    pthread_key_t dlm64_tlv_key;        // each thread's block of the image's TLVs
+    uintptr_t     dlm64_tlv_template;   // their initial values, in the image
+    size_t        dlm64_tlv_size;       // size of a block
 };
+
+// thread-local variables, see "Thread-local variables"
+static int macho64_tlv_setup(struct dlinfo_macho64 *dl);
+static void macho64_tlv_release(struct dlinfo_macho64 *dl);
 
 struct dlinfo_external {
     struct dlinfo dlext_base;
@@ -2987,10 +3029,73 @@ static void *lookup_symbol_elf64(struct dlinfo_elf64 *dl, const char *s, int all
     return lookup_symbol_elf64_all(dl, s);
 }
 
+// The name an exported symbol is looked up by: without the leading underscore
+static const char *macho64_extdef_name(struct dlinfo_macho64 *dl, size_t i)
+{
+    struct nlist_64 *n = &dl->dlm64_symtab[i];
+    if (!n->n_un.n_strx || n->n_un.n_strx >= dl->dlm64_strtabsize)
+        return NULL;
+    return &dl->dlm64_strtab[n->n_un.n_strx] + 1;
+}
+
+/*
+ * Static linkers write the exported symbols (LC_DYSYMTAB's extdef range)
+ * sorted by name, which is what let dyld binary-search them. A linear scan
+ * per lookup made loading a large image quadratic: clang (~10^5 exports)
+ * looked up every one of its imports in itself first, and took 6 s to
+ * start. The order is checked once, and an image not in it is scanned.
+ */
+static void macho64_check_extdef_sorted(struct dlinfo_macho64 *dl)
+{
+    dl->dlm64_extdef_sorted = 0;
+    if (!dl->dlm64_symtab || !dl->dlm64_strtab)
+        return;
+    size_t first = dl->dlm64_dysymtab_iextdefsym, end = first + dl->dlm64_dysymtab_nextdefsym;
+    if (end > dl->dlm64_symtabsize)
+        return;
+    const char *prev = NULL;
+    for (size_t i = first; i < end; i++) {
+        const char *name = macho64_extdef_name(dl, i);
+        if (!name || (prev && strcmp(prev, name) > 0))
+            return;
+        prev = name;
+    }
+    dl->dlm64_extdef_sorted = 1;
+}
+
+static void *lookup_symbol_macho64_exported(struct dlinfo_macho64 *dl, const char *s);
+
+// An executable's "main" is its LC_MAIN entry point (main()'s signature,
+// called as dyld calls it) unless it exports one: a stripped executable,
+// such as a Bun standalone program, exports nothing else. Also a dylib's:
+// scripts/exe2lib.py keeps LC_MAIN in the framework it makes of one.
 static void *lookup_symbol_macho64(struct dlinfo_macho64 *dl, const char *s)
+{
+    void *sym = lookup_symbol_macho64_exported(dl, s);
+    if (!sym && dl->dlm64_entry && 0 == strcmp(s, "main"))
+        sym = (void *)dl->dlm64_entry;
+    return sym;
+}
+
+static void *lookup_symbol_macho64_exported(struct dlinfo_macho64 *dl, const char *s)
 {
     if (!dl->dlm64_symtab)
         return NULL;
+
+    if (dl->dlm64_extdef_sorted) {
+        size_t lo = dl->dlm64_dysymtab_iextdefsym, hi = lo + dl->dlm64_dysymtab_nextdefsym;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int c = strcmp(s, macho64_extdef_name(dl, mid));
+            if (c == 0)
+                return (void *)(dl->dlm64_load_bias + dl->dlm64_symtab[mid].n_value);
+            if (c < 0)
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        return NULL;
+    }
 
     for (size_t i = dl->dlm64_dysymtab_iextdefsym; i < (dl->dlm64_dysymtab_iextdefsym + dl->dlm64_dysymtab_nextdefsym) && i < dl->dlm64_symtabsize; i++) {
         struct nlist_64 *n = &dl->dlm64_symtab[i];
@@ -3798,6 +3903,13 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             continue;
         }
 
+        // a segment that takes no memory, though it has file content: Go's
+        // __DWARF, which shares its address with __LINKEDIT. dyld maps
+        // nothing for it; mapped, its file content went over the next
+        // segment's pages (EXC_GUARD, the whole process)
+        if (curr_sc->vmsize == 0)
+            continue;
+
         // Segment addresses in memory.
         uintptr_t seg_start = curr_sc->vmaddr + dl->dlm64_load_bias;
         uintptr_t seg_end   = seg_start + curr_sc->vmsize;
@@ -3928,6 +4040,11 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             dl->dlm64_strtabsize = symc->strsize;
         }
 
+        if (curr_lc->cmd == LC_MAIN) {
+            const struct entry_point_command *epc = (const struct entry_point_command *)curr_lc;
+            dl->dlm64_entry = vaddr_macho64(dl, (uint32_t)epc->entryoff);
+        }
+
         if (curr_lc->cmd == LC_DYSYMTAB) {
             const struct dysymtab_command *dysymc = (const struct dysymtab_command *)curr_lc;
             dl->dlm64_dysymtab_iextdefsym = dysymc->iextdefsym;
@@ -3943,7 +4060,32 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
             dl->dlm64_chainedfixups_imports_count = dcfhdr->imports_count;
             dl->dlm64_chainedfixups_imports_format = dcfhdr->imports_format;
         }
+
+        // Rebase and bind opcodes: what static linkers emit for targets
+        // older than macOS 12 / iOS 15, or with -no_fixup_chains (prebuilt
+        // tools: the ripgrep Claude Code ships). Applied in
+        // link_library_macho64_opcodes.
+        if (curr_lc->cmd == LC_DYLD_INFO || curr_lc->cmd == LC_DYLD_INFO_ONLY) {
+            const struct dyld_info_command *dic = (const struct dyld_info_command *)curr_lc;
+#define DYLD_INFO_STREAM(_name)                                                         \
+            if (dic->_name##_size) {                                                    \
+                dl->dlm64_##_name = (const uint8_t *)vaddr_macho64(dl, dic->_name##_off); \
+                dl->dlm64_##_name##_size = dic->_name##_size;                           \
+                if (!dl->dlm64_##_name) {                                               \
+                    ERROR("failed to load Mach-O \"%s\": " #_name " info outside the file's segments", filename); \
+                    ret = NULL;                                                         \
+                    goto out;                                                           \
+                }                                                                       \
+            }
+            DYLD_INFO_STREAM(rebase)
+            DYLD_INFO_STREAM(bind)
+            DYLD_INFO_STREAM(weak_bind)
+            DYLD_INFO_STREAM(lazy_bind)
+#undef DYLD_INFO_STREAM
+        }
     }
+
+    macho64_check_extdef_sorted(dl);
 
     if (gdb_jit && 0 == create_macho64_jit_entry(dl, filename))
         gdb_jit_register(&dl->dlm64_jit_entry);
@@ -3975,8 +4117,10 @@ static void free_library(struct dlinfo *dl)
 
     if (dl->dl_type == DLT_ELF64)
         free_elf64_library((struct dlinfo_elf64 *)dl);
-    else if (dl->dl_type == DLT_MACHO64)
+    else if (dl->dl_type == DLT_MACHO64) {
+        macho64_tlv_release((struct dlinfo_macho64 *)dl);
         free_macho64_library((struct dlinfo_macho64 *)dl);
+    }
     else {
         // TODO abort
         abort();
@@ -4095,17 +4239,294 @@ static int link_library_elf64(struct dlinfo_elf64 *dl)
     return 0;
 }
 
+/* -------------------- Rebase and bind opcodes -------------------- */
+
+#define REBASE_TYPE_POINTER                                     1
+#define REBASE_OPCODE_MASK                                      0xF0
+#define REBASE_IMMEDIATE_MASK                                   0x0F
+#define REBASE_OPCODE_DONE                                      0x00
+#define REBASE_OPCODE_SET_TYPE_IMM                              0x10
+#define REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB               0x20
+#define REBASE_OPCODE_ADD_ADDR_ULEB                             0x30
+#define REBASE_OPCODE_ADD_ADDR_IMM_SCALED                       0x40
+#define REBASE_OPCODE_DO_REBASE_IMM_TIMES                       0x50
+#define REBASE_OPCODE_DO_REBASE_ULEB_TIMES                      0x60
+#define REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB                   0x70
+#define REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB        0x80
+
+#define BIND_TYPE_POINTER                                       1
+#define BIND_SYMBOL_FLAGS_WEAK_IMPORT                           0x1
+#define BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION                   0x8
+#define BIND_OPCODE_MASK                                        0xF0
+#define BIND_IMMEDIATE_MASK                                     0x0F
+#define BIND_OPCODE_DONE                                        0x00
+#define BIND_OPCODE_SET_DYLIB_ORDINAL_IMM                       0x10
+#define BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB                      0x20
+#define BIND_OPCODE_SET_DYLIB_SPECIAL_IMM                       0x30
+#define BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM               0x40
+#define BIND_OPCODE_SET_TYPE_IMM                                0x50
+#define BIND_OPCODE_SET_ADDEND_SLEB                             0x60
+#define BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB                 0x70
+#define BIND_OPCODE_ADD_ADDR_ULEB                               0x80
+#define BIND_OPCODE_DO_BIND                                     0x90
+#define BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB                       0xA0
+#define BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED                 0xB0
+#define BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB            0xC0
+
+static uint64_t opcode_uleb(const uint8_t **p, const uint8_t *end)
+{
+    uint64_t v = 0;
+    unsigned shift = 0;
+    while (*p < end) {
+        uint8_t b = *(*p)++;
+        if (shift < 64)
+            v |= (uint64_t)(b & 0x7f) << shift;
+        shift += 7;
+        if (!(b & 0x80))
+            break;
+    }
+    return v;
+}
+
+static int64_t opcode_sleb(const uint8_t **p, const uint8_t *end)
+{
+    int64_t v = 0;
+    unsigned shift = 0;
+    uint8_t b = 0;
+    while (*p < end) {
+        b = *(*p)++;
+        if (shift < 64)
+            v |= (int64_t)(b & 0x7f) << shift;
+        shift += 7;
+        if (!(b & 0x80))
+            break;
+    }
+    if (shift < 64 && (b & 0x40))
+        v |= -((int64_t)1 << shift);
+    return v;
+}
+
+// The loaded address of offset `off` in segment number `seg` (the load
+// commands' order, __PAGEZERO counting), or 0 if out of the segment.
+static uintptr_t opcode_address(struct dlinfo_macho64 *dl, uint64_t seg, uint64_t off)
+{
+    uint64_t n = 0;
+    const struct load_command *lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        if (n++ != seg)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        if (off + sizeof(uintptr_t) > sc->vmsize)
+            return 0;
+        return dl->dlm64_load_bias + sc->vmaddr + off;
+    }
+    return 0;
+}
+
+static int opcode_rebase(struct dlinfo_macho64 *dl)
+{
+    const uint8_t *p = dl->dlm64_rebase, *end = p + dl->dlm64_rebase_size;
+    uint64_t seg = 0, off = 0;
+    int type = 0;
+    while (p < end) {
+        uint8_t op = *p & REBASE_OPCODE_MASK, imm = *p & REBASE_IMMEDIATE_MASK;
+        p++;
+        uint64_t count = 0, skip = 0;
+        switch (op) {
+            case REBASE_OPCODE_DONE:
+                return 0;
+            case REBASE_OPCODE_SET_TYPE_IMM:
+                type = imm;
+                continue;
+            case REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+                seg = imm;
+                off = opcode_uleb(&p, end);
+                continue;
+            case REBASE_OPCODE_ADD_ADDR_ULEB:
+                off += opcode_uleb(&p, end);
+                continue;
+            case REBASE_OPCODE_ADD_ADDR_IMM_SCALED:
+                off += (uint64_t)imm * sizeof(uintptr_t);
+                continue;
+            case REBASE_OPCODE_DO_REBASE_IMM_TIMES:
+                count = imm;
+                break;
+            case REBASE_OPCODE_DO_REBASE_ULEB_TIMES:
+                count = opcode_uleb(&p, end);
+                break;
+            case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB:
+                count = 1;
+                skip = opcode_uleb(&p, end);
+                break;
+            case REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB:
+                count = opcode_uleb(&p, end);
+                skip = opcode_uleb(&p, end);
+                break;
+            default:
+                ERROR("failed to link Mach-O \"%s\": unknown rebase opcode 0x%x", DLBASE(dl)->dl_name, op);
+                return 1;
+        }
+        if (type != REBASE_TYPE_POINTER) {
+            ERROR("failed to link Mach-O \"%s\": unsupported rebase type %d", DLBASE(dl)->dl_name, type);
+            return 1;
+        }
+        for (uint64_t i = 0; i < count; i++) {
+            uintptr_t addr = opcode_address(dl, seg, off);
+            if (!addr) {
+                ERROR("failed to link Mach-O \"%s\": rebase outside segment %llu", DLBASE(dl)->dl_name, (unsigned long long)seg);
+                return 1;
+            }
+            *(uintptr_t *)addr += dl->dlm64_load_bias;
+            off += sizeof(uintptr_t) + skip;
+        }
+    }
+    return 0;
+}
+
+// dyld's lazy binder, which an image linked with opcodes binds (its stub
+// helper's first jump) and which macOS's libdyld no longer has. Every lazy
+// pointer is bound at load here, so the helper is never reached.
+static void opcode_stub_binder(void)
+{
+    ERROR("dyld_stub_binder reached: a lazy pointer was not bound");
+    abort();
+}
+
+// One bind stream. `lazy`: the lazy stream, whose entries each end with a
+// DONE; `weak`: the weak stream, whose definitions are coalesced (here:
+// bound to the first one found) and whose missing symbols are no error.
+static int opcode_bind(struct dlinfo_macho64 *dl, const uint8_t *p, uint32_t size, int lazy, int weak)
+{
+    const uint8_t *end = p + size;
+    uint64_t seg = 0, off = 0;
+    int64_t addend = 0;
+    int type = BIND_TYPE_POINTER, flags = 0;
+    const char *name = NULL;
+    while (p < end) {
+        uint8_t op = *p & BIND_OPCODE_MASK, imm = *p & BIND_IMMEDIATE_MASK;
+        p++;
+        uint64_t count = 0, skip = 0;
+        switch (op) {
+            case BIND_OPCODE_DONE:
+                if (lazy)
+                    continue;
+                return 0;
+            case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
+            case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+                continue;   // a flat lookup, as for chained fixups
+            case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
+                (void)opcode_uleb(&p, end);
+                continue;
+            case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+                name = (const char *)p;
+                flags = imm;
+                while (p < end && *p)
+                    p++;
+                p++;
+                continue;
+            case BIND_OPCODE_SET_TYPE_IMM:
+                type = imm;
+                continue;
+            case BIND_OPCODE_SET_ADDEND_SLEB:
+                addend = opcode_sleb(&p, end);
+                continue;
+            case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+                seg = imm;
+                off = opcode_uleb(&p, end);
+                continue;
+            case BIND_OPCODE_ADD_ADDR_ULEB:
+                off += opcode_uleb(&p, end);
+                continue;
+            case BIND_OPCODE_DO_BIND:
+                count = 1;
+                break;
+            case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
+                count = 1;
+                skip = opcode_uleb(&p, end);
+                break;
+            case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
+                count = 1;
+                skip = (uint64_t)imm * sizeof(uintptr_t);
+                break;
+            case BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB:
+                count = opcode_uleb(&p, end);
+                skip = opcode_uleb(&p, end);
+                break;
+            default:
+                ERROR("failed to link Mach-O \"%s\": unknown bind opcode 0x%x", DLBASE(dl)->dl_name, op);
+                return 1;
+        }
+        if (type != BIND_TYPE_POINTER || !name) {
+            ERROR("failed to link Mach-O \"%s\": unsupported bind (type %d)", DLBASE(dl)->dl_name, type);
+            return 1;
+        }
+        // a weak definition of the image's own needs no binding of its
+        // stream; only the binds of others' (weak) definitions are applied
+        if (weak && (flags & BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION))
+            count = 0;
+        uintptr_t sym = 0;
+        if (count) {
+            // skip the leading underscore
+            sym = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, name[0] == '_' ? name + 1 : name, NULL, 1, 0, DLBASE(dl));
+            if (!sym && 0 == strcmp(name, "dyld_stub_binder"))
+                sym = (uintptr_t)&opcode_stub_binder;
+            if (!sym && !weak && !(flags & BIND_SYMBOL_FLAGS_WEAK_IMPORT)) {
+                ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, name);
+                return 1;
+            }
+        }
+        for (uint64_t i = 0; i < count; i++) {
+            uintptr_t addr = opcode_address(dl, seg, off);
+            if (!addr) {
+                ERROR("failed to link Mach-O \"%s\": bind outside segment %llu", DLBASE(dl)->dl_name, (unsigned long long)seg);
+                return 1;
+            }
+            if (sym || !weak)   // a missing weak import is 0, as dyld leaves it
+                *(uintptr_t *)addr = sym ? sym + addend : 0;
+            off += sizeof(uintptr_t) + skip;
+        }
+        if (!count && op != BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB)
+            off += sizeof(uintptr_t) + skip;
+    }
+    return 0;
+}
+
+// An image linked with rebase and bind opcodes: its rebases, its binds and
+// its lazy binds, all applied now (no lazy binding here), then weak binds.
+static int link_library_macho64_opcodes(struct dlinfo_macho64 *dl)
+{
+    if (dl->dlm64_rebase && opcode_rebase(dl))
+        return 1;
+    if (dl->dlm64_bind && opcode_bind(dl, dl->dlm64_bind, dl->dlm64_bind_size, 0, 0))
+        return 1;
+    if (dl->dlm64_lazy_bind && opcode_bind(dl, dl->dlm64_lazy_bind, dl->dlm64_lazy_bind_size, 1, 0))
+        return 1;
+    if (dl->dlm64_weak_bind && opcode_bind(dl, dl->dlm64_weak_bind, dl->dlm64_weak_bind_size, 0, 1))
+        return 1;
+    DLBASE(dl)->dl_linked = 1;
+    return 0;
+}
+
 static int link_library_macho64(struct dlinfo_macho64 *dl)
 {
+    if (dl->dlm64_rebase || dl->dlm64_bind || dl->dlm64_lazy_bind || dl->dlm64_weak_bind)
+        return link_library_macho64_opcodes(dl);
+
     if (!dl->dlm64_chainedfixups_imports)
         return 0;
 
-    if (dl->dlm64_chainedfixups_imports_format != DYLD_CHAINED_IMPORT) {
-        ERROR("failed to link Mach-O \"%s\": unknown chained fixups imports format %d", DLBASE(dl)->dl_name, dl->dlm64_chainedfixups_imports_format);
+    // All three import formats: the plain one, and those carrying an addend
+    // per import (a reference into another image's data at an offset, C++
+    // typeinfo/vtable references among them, which a static linker emits as
+    // DYLD_CHAINED_IMPORT_ADDEND once any import needs one).
+    int imports_format = dl->dlm64_chainedfixups_imports_format;
+    if (imports_format != DYLD_CHAINED_IMPORT && imports_format != DYLD_CHAINED_IMPORT_ADDEND &&
+        imports_format != DYLD_CHAINED_IMPORT_ADDEND64) {
+        ERROR("failed to link Mach-O \"%s\": unknown chained fixups imports format %d", DLBASE(dl)->dl_name, imports_format);
         return 1;
     }
-
-    struct dyld_chained_import *imports = dl->dlm64_chainedfixups_imports;
 
     uintptr_t starts_base = (uintptr_t)dl->dlm64_chainedfixups_starts;
     for (uint32_t sg = 0; sg < dl->dlm64_chainedfixups_starts->seg_count; sg++) {
@@ -4148,23 +4569,45 @@ static int link_library_macho64(struct dlinfo_macho64 *dl)
                     case DYLD_CHAINED_PTR_64_OFFSET:
                         if (p.ptr_64_rebase->bind) {
                             next = p.ptr_64_bind->next * 4;
-                            struct dyld_chained_import *import = &imports[p.ptr_64_bind->ordinal];
+                            uint32_t ordinal = p.ptr_64_bind->ordinal;
+                            uint32_t name_offset;
+                            int weak_import;
+                            int64_t addend = p.ptr_64_bind->addend;   // inline, 0..255
+                            if (imports_format == DYLD_CHAINED_IMPORT) {
+                                const struct dyld_chained_import *imp = &((const struct dyld_chained_import *)dl->dlm64_chainedfixups_imports)[ordinal];
+                                name_offset = imp->name_offset;
+                                weak_import = imp->weak_import;
+                            }
+                            else if (imports_format == DYLD_CHAINED_IMPORT_ADDEND) {
+                                const struct dyld_chained_import_addend *imp = &((const struct dyld_chained_import_addend *)dl->dlm64_chainedfixups_imports)[ordinal];
+                                name_offset = imp->name_offset;
+                                weak_import = imp->weak_import;
+                                addend += imp->addend;
+                            }
+                            else {
+                                const struct dyld_chained_import_addend64 *imp = &((const struct dyld_chained_import_addend64 *)dl->dlm64_chainedfixups_imports)[ordinal];
+                                name_offset = (uint32_t)imp->name_offset;
+                                weak_import = imp->weak_import;
+                                addend += (int64_t)imp->addend;
+                            }
                             // skip the leading underscore
-                            const char *s = dl->dlm64_chainedfixups_strtab + import->name_offset + 1;
+                            const char *s = dl->dlm64_chainedfixups_strtab + name_offset + 1;
                             uintptr_t sym_addr = (uintptr_t)dlsym_internal(DLBASE(dl)->dl_linker, RTLD_DEFAULT, s, NULL, 1, 0, DLBASE(dl));
-                            if (!sym_addr && !import->weak_import) {
+                            if (!sym_addr && !weak_import) {
                                 ERROR("failed to link Mach-O \"%s\": symbol \"%s\" not found", DLBASE(dl)->dl_name, s);
                                 return 1;
                             }
-                            *p.ptr8 = sym_addr;
+                            // a missing weak import stays 0, addend or not, as dyld leaves it
+                            *p.ptr8 = sym_addr ? sym_addr + addend : 0;
                         }
                         else {
                             next = p.ptr_64_rebase->next * 4;
                             // DYLD_CHAINED_PTR_64 targets are vmaddrs,
                             // DYLD_CHAINED_PTR_64_OFFSET ones offsets from
-                            // the mach header
-                            *p.ptr8 = (uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target +
-                                (seg_starts->pointer_format == DYLD_CHAINED_PTR_64_OFFSET ? dl->dlm64_hdr_vmaddr : 0);
+                            // the mach header; high8 is the top byte (a tag)
+                            *p.ptr8 = ((uintptr_t)dl->dlm64_load_bias + p.ptr_64_rebase->target +
+                                (seg_starts->pointer_format == DYLD_CHAINED_PTR_64_OFFSET ? dl->dlm64_hdr_vmaddr : 0)) |
+                                ((uintptr_t)p.ptr_64_rebase->high8 << 56);
                         }
                         break;
                 }
@@ -4305,6 +4748,17 @@ static void call_macho64_constructors(struct dlinfo_macho64 *dl) {
         const struct section_64 *curr_sect = (const struct section_64 *)((uintptr_t)curr_sc + sizeof(struct segment_command_64));
         for (size_t j = 0; j < curr_sc->nsects; ++j, curr_sect++) {
             
+            // __mod_init_func: pointers, already fixed up (what static linkers
+            // emitted before __init_offsets, and still do for some targets)
+            if ( (curr_sect->flags & SECTION_TYPE) == S_MOD_INIT_FUNC_POINTERS ) {
+                const uintptr_t *funcs = (const uintptr_t *)(dl->dlm64_load_bias + curr_sect->addr);
+                const uintptr_t *funcs_end = (const uintptr_t *)((uintptr_t)funcs + curr_sect->size);
+                for (const uintptr_t *f = funcs; f < funcs_end; ++f)
+                    if (*f)
+                        call_function(DLBASE(dl)->dl_linker, (struct dlinfo *)dl, (void *)*f);
+                continue;
+            }
+
             if ( (curr_sect->flags & SECTION_TYPE) != S_INIT_FUNC_OFFSETS )
                 continue;
             
@@ -4321,6 +4775,265 @@ static void call_macho64_constructors(struct dlinfo_macho64 *dl) {
         }
     }
 }
+
+/* -------------------- Thread-local variables -------------------- */
+
+/*
+ * Mach-O thread-local variables (C11 _Thread_local, C++ thread_local, the
+ * one CPython keeps its current thread state in) are dyld's to set up, and
+ * dyld does not know the images loaded here. An access loads a descriptor
+ * from S_THREAD_LOCAL_VARIABLES ({thunk, key, offset}) and calls its thunk
+ * with the descriptor in x0, which returns the variable's address in x0. The
+ * static linker binds every thunk to dyld's _tlv_bootstrap, which for an
+ * image dyld did not load ends in _tlv_bootstrap_error: abort().
+ *
+ * As dyld does: each image with TLVs gets a pthread key, each thread a block
+ * holding all of the image's variables, initialized from the image's
+ * template (its S_THREAD_LOCAL_REGULAR and S_THREAD_LOCAL_ZEROFILL sections,
+ * contiguous, the zerofill part never written), and every descriptor the key
+ * and our thunk. The thunk is called like dyld's: it may clobber only x0,
+ * x16 and x17, so the fast path is assembly reading the thread's pthread
+ * slot directly (Darwin's thread-specific data array, at TPIDRRO_EL0) and
+ * the first access of a thread goes to C with every other caller-saved
+ * register saved around the call. Emulated images use the same thunk: the
+ * call leaves the emulator, which passes x0 in and takes x0 back only.
+ *
+ * Blocks are allocated from the image's task (uo_malloc), so a fork copies
+ * them with the rest of the task's memory. The child's thread is a new one,
+ * though, with nothing in its slots: the parent's blocks are recorded before
+ * the fork (ulinker_tlv_snapshot, on the forking thread) and the child points
+ * its own keys at the copies (ulinker_tlv_restore).
+ */
+#if defined(__APPLE__) && defined(__aarch64__)
+
+struct tlv_descriptor {
+    void *(*thunk)(struct tlv_descriptor *);
+    unsigned long key;
+    unsigned long offset;
+};
+
+// The image a key belongs to, for a thread's first access.
+#define TLV_KEYS_MAX 1024
+static pthread_mutex_t tlv_mtx = PTHREAD_MUTEX_INITIALIZER;
+static struct dlinfo_macho64 *tlv_images[TLV_KEYS_MAX];
+
+void *ulinker_tlv_get_addr(struct tlv_descriptor *d);
+void *ulinker_tlv_allocate(struct tlv_descriptor *d) __attribute__((visibility("hidden")));
+
+// A thread's first access to one of an image's TLVs: allocate its block.
+void *ulinker_tlv_allocate(struct tlv_descriptor *d)
+{
+    pthread_key_t key = (pthread_key_t)d->key;
+    char *block = pthread_getspecific(key);
+    if (!block) {
+        pthread_mutex_lock(&tlv_mtx);
+        struct dlinfo_macho64 *dl = key < TLV_KEYS_MAX ? tlv_images[key] : NULL;
+        pthread_mutex_unlock(&tlv_mtx);
+        if (!dl) {
+            ERROR("thread-local variable with unknown key %lu", (unsigned long)key);
+            abort();
+        }
+        block = uo.uo_malloc(DLBASE(dl)->dl_linker->ul_private, dl->dlm64_tlv_size);
+        if (!block) {
+            ERROR("out of memory for the thread-local variables of \"%s\"", DLBASE(dl)->dl_name);
+            abort();
+        }
+        memcpy(block, (const void *)dl->dlm64_tlv_template, dl->dlm64_tlv_size);
+        pthread_setspecific(key, block);
+    }
+    return block + d->offset;
+}
+
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".private_extern _ulinker_tlv_get_addr\n"
+    "_ulinker_tlv_get_addr:\n"
+    "    ldr  x16, [x0, #8]\n"              // key
+    "    mrs  x17, TPIDRRO_EL0\n"
+    "    and  x17, x17, #-8\n"              // the thread's pthread slots
+    "    ldr  x17, [x17, x16, lsl #3]\n"    // its block
+    "    cbz  x17, 1f\n"
+    "    ldr  x16, [x0, #16]\n"             // offset
+    "    add  x0, x17, x16\n"
+    "    ret\n"
+    "1:\n"
+    "    stp  x29, x30, [sp, #-16]!\n"
+    "    mov  x29, sp\n"
+    "    stp  x1, x2, [sp, #-16]!\n"
+    "    stp  x3, x4, [sp, #-16]!\n"
+    "    stp  x5, x6, [sp, #-16]!\n"
+    "    stp  x7, x8, [sp, #-16]!\n"
+    "    stp  x9, x10, [sp, #-16]!\n"
+    "    stp  x11, x12, [sp, #-16]!\n"
+    "    stp  x13, x14, [sp, #-16]!\n"
+    "    stp  x15, xzr, [sp, #-16]!\n"
+    "    stp  q0, q1, [sp, #-32]!\n"
+    "    stp  q2, q3, [sp, #-32]!\n"
+    "    stp  q4, q5, [sp, #-32]!\n"
+    "    stp  q6, q7, [sp, #-32]!\n"
+    "    stp  q16, q17, [sp, #-32]!\n"
+    "    stp  q18, q19, [sp, #-32]!\n"
+    "    stp  q20, q21, [sp, #-32]!\n"
+    "    stp  q22, q23, [sp, #-32]!\n"
+    "    stp  q24, q25, [sp, #-32]!\n"
+    "    stp  q26, q27, [sp, #-32]!\n"
+    "    stp  q28, q29, [sp, #-32]!\n"
+    "    stp  q30, q31, [sp, #-32]!\n"
+    "    bl   _ulinker_tlv_allocate\n"
+    "    ldp  q30, q31, [sp], #32\n"
+    "    ldp  q28, q29, [sp], #32\n"
+    "    ldp  q26, q27, [sp], #32\n"
+    "    ldp  q24, q25, [sp], #32\n"
+    "    ldp  q22, q23, [sp], #32\n"
+    "    ldp  q20, q21, [sp], #32\n"
+    "    ldp  q18, q19, [sp], #32\n"
+    "    ldp  q16, q17, [sp], #32\n"
+    "    ldp  q6, q7, [sp], #32\n"
+    "    ldp  q4, q5, [sp], #32\n"
+    "    ldp  q2, q3, [sp], #32\n"
+    "    ldp  q0, q1, [sp], #32\n"
+    "    ldp  x15, xzr, [sp], #16\n"
+    "    ldp  x13, x14, [sp], #16\n"
+    "    ldp  x11, x12, [sp], #16\n"
+    "    ldp  x9, x10, [sp], #16\n"
+    "    ldp  x7, x8, [sp], #16\n"
+    "    ldp  x5, x6, [sp], #16\n"
+    "    ldp  x3, x4, [sp], #16\n"
+    "    ldp  x1, x2, [sp], #16\n"
+    "    ldp  x29, x30, [sp], #16\n"
+    "    ret\n"
+);
+
+// Give the image a key (the first time) and point its descriptors at it and
+// at the thunk. Again for a fork child once its writable segments hold the
+// parent's descriptors, which name the parent's key.
+static int macho64_tlv_setup(struct dlinfo_macho64 *dl)
+{
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    int has_vars = 0;
+    const struct load_command *lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+        for (size_t j = 0; j < sc->nsects; j++, sect++) {
+            uint32_t type = sect->flags & SECTION_TYPE;
+            if (type == S_THREAD_LOCAL_REGULAR || type == S_THREAD_LOCAL_ZEROFILL) {
+                uintptr_t start = dl->dlm64_load_bias + sect->addr;
+                if (start < lo)
+                    lo = start;
+                if (start + sect->size > hi)
+                    hi = start + sect->size;
+            }
+            else if (type == S_THREAD_LOCAL_VARIABLES)
+                has_vars = 1;
+        }
+    }
+    if (!has_vars)
+        return 0;
+
+    if (!dl->dlm64_tlv_has_key) {
+        pthread_key_t key;
+        if (pthread_key_create(&key, NULL)) {
+            ERROR("failed to set up the thread-local variables of \"%s\": no pthread key", DLBASE(dl)->dl_name);
+            return 1;
+        }
+        if (key >= TLV_KEYS_MAX) {
+            pthread_key_delete(key);
+            ERROR("failed to set up the thread-local variables of \"%s\": pthread key %lu out of range", DLBASE(dl)->dl_name, (unsigned long)key);
+            return 1;
+        }
+        dl->dlm64_tlv_key = key;
+        dl->dlm64_tlv_has_key = 1;
+        dl->dlm64_tlv_template = lo == UINTPTR_MAX ? 0 : lo;
+        dl->dlm64_tlv_size = lo == UINTPTR_MAX ? 0 : hi - lo;
+        // a key reused from an image unloaded on this thread starts empty
+        pthread_setspecific(key, NULL);
+        pthread_mutex_lock(&tlv_mtx);
+        tlv_images[key] = dl;
+        pthread_mutex_unlock(&tlv_mtx);
+    }
+
+    lc = dl->dlm64_lc;
+    for (size_t i = 0; i < dl->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+        for (size_t j = 0; j < sc->nsects; j++, sect++) {
+            if ((sect->flags & SECTION_TYPE) != S_THREAD_LOCAL_VARIABLES)
+                continue;
+            struct tlv_descriptor *d = (struct tlv_descriptor *)(dl->dlm64_load_bias + sect->addr);
+            struct tlv_descriptor *end = (struct tlv_descriptor *)((uintptr_t)d + sect->size);
+            for (; d < end; d++) {
+                d->thunk = ulinker_tlv_get_addr;
+                d->key = dl->dlm64_tlv_key;
+            }
+        }
+    }
+    return 0;
+}
+
+// Unloading: this thread's block goes back (exec unloads on its only thread),
+// and the key, so that a key reused later starts empty here.
+static void macho64_tlv_release(struct dlinfo_macho64 *dl)
+{
+    if (!dl->dlm64_tlv_has_key)
+        return;
+    void *block = pthread_getspecific(dl->dlm64_tlv_key);
+    if (block) {
+        pthread_setspecific(dl->dlm64_tlv_key, NULL);
+        uo.uo_free(DLBASE(dl)->dl_linker->ul_private, block);
+    }
+    pthread_mutex_lock(&tlv_mtx);
+    tlv_images[dl->dlm64_tlv_key] = NULL;
+    pthread_mutex_unlock(&tlv_mtx);
+    pthread_key_delete(dl->dlm64_tlv_key);
+    dl->dlm64_tlv_has_key = 0;
+}
+
+size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max)
+{
+    size_t n = 0;
+    DLINFO_LOCK(ulinker);
+    for (struct dlinfo *dl = ulinker->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL; dl = dl->dl_next) {
+        if (dl->dl_type != DLT_MACHO64 || !((struct dlinfo_macho64 *)dl)->dlm64_tlv_has_key)
+            continue;
+        if (n < max)
+            blocks[n] = pthread_getspecific(((struct dlinfo_macho64 *)dl)->dlm64_tlv_key);
+        n++;
+    }
+    DLINFO_UNLOCK(ulinker);
+    return n;
+}
+
+void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
+                         void *(*translate)(void *arg, void *p), void *arg)
+{
+    size_t n = 0;
+    DLINFO_LOCK(ulinker);
+    for (struct dlinfo *dl = ulinker->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL && n < count; dl = dl->dl_next) {
+        if (dl->dl_type != DLT_MACHO64 || !((struct dlinfo_macho64 *)dl)->dlm64_tlv_has_key)
+            continue;
+        if (blocks[n])
+            pthread_setspecific(((struct dlinfo_macho64 *)dl)->dlm64_tlv_key, translate(arg, blocks[n]));
+        n++;
+    }
+    DLINFO_UNLOCK(ulinker);
+}
+
+#else
+
+static int macho64_tlv_setup(struct dlinfo_macho64 *dl) { (void)dl; return 0; }
+static void macho64_tlv_release(struct dlinfo_macho64 *dl) { (void)dl; }
+size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max) { (void)ulinker; (void)blocks; (void)max; return 0; }
+void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
+                         void *(*translate)(void *arg, void *p), void *arg)
+{ (void)ulinker; (void)blocks; (void)count; (void)translate; (void)arg; }
+
+#endif
 
 static void call_elf64_constructors(struct dlinfo_elf64 *dl)
 {
@@ -4381,6 +5094,8 @@ static void notify_loaded_segments(struct ulinker *ulinker, struct dlinfo *dl)
             const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
             // skip zeropage
             if (sc->initprot == 0 && sc->maxprot == 0 && sc->vmaddr == 0)
+                continue;
+            if (sc->vmsize == 0)
                 continue;
             uintptr_t seg_start = sc->vmaddr + dlm->dlm64_load_bias;
             uintptr_t seg_page_start = page_start(seg_start);
@@ -4611,6 +5326,18 @@ static int load_dependency(struct ulinker *ulinker, struct dlinfo *dl, const cha
 
     // the host's
     void *handle = uo.uo_dlopen ? uo.uo_dlopen(ulinker->ul_private, name) : NULL;
+    // A macOS program names a system framework by its versioned path
+    // (X.framework/Versions/A/X); on iOS a framework is a shallow bundle
+    // (X.framework/X), where the program (node) finds the same library.
+    if (!handle && uo.uo_dlopen) {
+        const char *v = strstr(name, ".framework/Versions/");
+        const char *bin = v ? strchr(v + 20, '/') : NULL;
+        if (bin) {
+            char shallow[DLINFO_PATH_LEN];
+            snprintf(shallow, sizeof(shallow), "%.*s.framework%s", (int)(v - name), name, bin);
+            handle = uo.uo_dlopen(ulinker->ul_private, shallow);
+        }
+    }
     if (!handle) {
         if (weak)
             return 0;
@@ -4769,12 +5496,21 @@ static struct dlinfo *load_library(struct ulinker *ulinker, const char *filename
     else if (link_library(dl))
         goto out;
 
+    // thread-local variables, before any of the image's code runs
+    if (dl->dl_type == DLT_MACHO64 && macho64_tlv_setup((struct dlinfo_macho64 *)dl))
+        goto out;
+
     if (!ulinker->ul_duplicating)
         call_constructors(dl);
 
     // calls mmap_cb, load event is reported right at mmap time.
     // this is purely for post-processing memory after initialization is done.
     notify_loaded_segments(ulinker, dl);
+
+    // a fork child's writable segments now hold the parent's descriptors,
+    // naming the parent's key: give them the child's
+    if (ulinker->ul_duplicating && dl->dl_type == DLT_MACHO64 && macho64_tlv_setup((struct dlinfo_macho64 *)dl))
+        goto out;
 
     ret = dl;
 
@@ -4962,6 +5698,43 @@ char *ulinker_dlerror(void) {
 }
 
 /*
+ * An image's unwind tables, for the unwinder of a program whose images TVM
+ * loaded: a guest's own libunwind (statically linked into C++ programs, so
+ * that exceptions unwind its emulated frames) asks dyld for them with
+ * _dyld_find_unwind_sections(), and dyld does not know these images.
+ */
+int ulinker_find_unwind_sections(struct ulinker *ulinker, const void *addr, struct ulinker_unwind_sections *out)
+{
+    memset(out, 0, sizeof(*out));
+    DLINFO_LOCK(ulinker);
+    struct dlinfo *dl = library_for_address_locked(ulinker, addr);
+    DLINFO_UNLOCK(ulinker);
+    if (!dl || dl->dl_type != DLT_MACHO64)
+        return 0;
+
+    struct dlinfo_macho64 *dlm = (struct dlinfo_macho64 *)dl;
+    out->mh = (const void *)(dlm->dlm64_load_bias + dlm->dlm64_hdr_vmaddr);
+    const struct load_command *lc = dlm->dlm64_lc;
+    for (size_t i = 0; i < dlm->dlm64_hdr.ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64)
+            continue;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+        for (size_t j = 0; j < sc->nsects; j++, sect++) {
+            if (0 == strncmp(sect->sectname, "__eh_frame", sizeof(sect->sectname))) {
+                out->dwarf_section = (const void *)(dlm->dlm64_load_bias + sect->addr);
+                out->dwarf_section_length = sect->size;
+            }
+            else if (0 == strncmp(sect->sectname, "__unwind_info", sizeof(sect->sectname))) {
+                out->compact_unwind_section = (const void *)(dlm->dlm64_load_bias + sect->addr);
+                out->compact_unwind_section_length = sect->size;
+            }
+        }
+    }
+    return 1;
+}
+
+/*
  * DLA_NOSYM skips the nearest-symbol search: udli_sname and udli_saddr come
  * back NULL. That search walks the image's symbol table and is only wanted
  * for diagnostics; the emulator asks "which image, which arch, emulated or
@@ -4969,6 +5742,53 @@ char *ulinker_dlerror(void) {
  * when host qsort() calls an emulated comparator, and the symbol walk was
  * the single hottest function in a neofetch run.
  */
+static int macho64_is_executable(const struct dlinfo *dl)
+{
+    return dl->dl_type == DLT_MACHO64 && (dl->dl_flags & RTLD_NEEDMAIN);
+}
+
+int ulinker_image(struct ulinker *ulinker, size_t index, struct ulinker_image *out)
+{
+    int found = 0;
+    DLINFO_LOCK(ulinker);
+    // The list is newest first, ending at the host's (DLT_EXTERNAL) entries:
+    // index 0 is the executable, i of the others counts from the oldest.
+    size_t count = 0;
+    struct dlinfo *exe = NULL;
+    for (struct dlinfo *dl = ulinker->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL; dl = dl->dl_next) {
+        if (macho64_is_executable(dl))
+            exe = dl;
+        else if (dl->dl_type == DLT_MACHO64)
+            count++;
+    }
+    struct dlinfo *pick = NULL;
+    if (exe && index == 0)
+        pick = exe;
+    else {
+        size_t want = exe ? index - 1 : index;  // from the oldest
+        if (want < count) {
+            size_t i = count;
+            for (struct dlinfo *dl = ulinker->ul_dlinfo; dl && dl->dl_type != DLT_EXTERNAL; dl = dl->dl_next) {
+                if (dl->dl_type != DLT_MACHO64 || macho64_is_executable(dl))
+                    continue;
+                if (--i == want) {
+                    pick = dl;
+                    break;
+                }
+            }
+        }
+    }
+    if (pick) {
+        struct dlinfo_macho64 *m = (struct dlinfo_macho64 *)pick;
+        out->mh = (const void *)(m->dlm64_load_bias + m->dlm64_hdr_vmaddr);
+        out->slide = (intptr_t)m->dlm64_load_bias;
+        out->path = pick->dl_pathname;
+        found = 1;
+    }
+    DLINFO_UNLOCK(ulinker);
+    return found;
+}
+
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int flags) {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = library_for_address_locked(ulinker, addr);
