@@ -125,7 +125,7 @@ class _HomeScreenState extends State<HomeScreen> {
       Clipboard.getData(Clipboard.kTextPlain).then((data) {
         final text = data?.text;
         if (text != null && text.isNotEmpty) shell.terminal.paste(text);
-      });
+      }, onError: (_) {});
       return KeyEventResult.handled;
     }
     return shell.handleKeyEvent(event);
@@ -224,37 +224,61 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _rename(ShellSession shell) async {
-    final controller = TextEditingController(text: shell.title);
     final name = await showCupertinoDialog<String>(
       context: context,
       barrierDismissible: true,
-      builder: (context) => CupertinoAlertDialog(
-        title: const Text('Rename tab'),
-        content: Padding(
-          padding: const EdgeInsets.only(top: 12),
-          child: CupertinoTextField(
-            controller: controller,
-            autofocus: true,
-            autocorrect: false,
-            style: const TextStyle(fontFamily: TvmColors.mono),
-            onSubmitted: (v) => Navigator.pop(context, v),
-          ),
-        ),
-        actions: [
-          CupertinoDialogAction(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          CupertinoDialogAction(
-            isDefaultAction: true,
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: const Text('Rename'),
-          ),
-        ],
-      ),
+      builder: (context) => _RenameDialog(title: shell.title),
     );
-    controller.dispose();
     if (name != null && name.trim().isNotEmpty) shell.title = name.trim();
+  }
+}
+
+/// Owns its text controller, so the controller lives until the dialog has
+/// faded out, not just until it is popped.
+class _RenameDialog extends StatefulWidget {
+  const _RenameDialog({required this.title});
+
+  final String title;
+
+  @override
+  State<_RenameDialog> createState() => _RenameDialogState();
+}
+
+class _RenameDialogState extends State<_RenameDialog> {
+  late final _controller = TextEditingController(text: widget.title);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoAlertDialog(
+      title: const Text('Rename tab'),
+      content: Padding(
+        padding: const EdgeInsets.only(top: 12),
+        child: CupertinoTextField(
+          controller: _controller,
+          autofocus: true,
+          autocorrect: false,
+          style: const TextStyle(fontFamily: TvmColors.mono),
+          onSubmitted: (v) => Navigator.pop(context, v),
+        ),
+      ),
+      actions: [
+        CupertinoDialogAction(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        CupertinoDialogAction(
+          isDefaultAction: true,
+          onPressed: () => Navigator.pop(context, _controller.text),
+          child: const Text('Rename'),
+        ),
+      ],
+    );
   }
 }
 

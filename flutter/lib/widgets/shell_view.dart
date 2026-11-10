@@ -74,25 +74,33 @@ class _ShellViewState extends State<ShellView>
                     shell,
                     WorkerController.instance.terminalFontSizeNotifier,
                   ]),
-                  builder: (context, _) => TerminalView(
-                    shell.terminal,
-                    // Only the tab in front follows the screen's size; one
-                    // coming to the front catches up on its first layout.
-                    autoResize: shell.active,
-                    focusNode: shell.viewFocus,
-                    scrollController: shell.scroll,
-                    hardwareKeyboardOnly: true,
-                    readOnly: true,
-                    theme: tvmTerminalTheme,
-                    textStyle: TerminalStyle(
-                      fontSize: WorkerController
-                          .instance
-                          .terminalFontSizeNotifier
-                          .value,
-                    ),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 4,
+                  // TerminalView insets its rows by the MediaQuery padding.
+                  // The home indicator's bottom inset is the bottom bar's,
+                  // below this; left in, the terminal would lose rows to it
+                  // with the keyboard down and get them back with it up.
+                  builder: (context, _) => MediaQuery.removePadding(
+                    context: context,
+                    removeBottom: true,
+                    child: TerminalView(
+                      shell.terminal,
+                      // Only the tab in front follows the screen's size; one
+                      // coming to the front catches up on its first layout.
+                      autoResize: shell.active,
+                      focusNode: shell.viewFocus,
+                      scrollController: shell.scroll,
+                      hardwareKeyboardOnly: true,
+                      readOnly: true,
+                      theme: tvmTerminalTheme,
+                      textStyle: TerminalStyle(
+                        fontSize: WorkerController
+                            .instance
+                            .terminalFontSizeNotifier
+                            .value,
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 4,
+                      ),
                     ),
                   ),
                 ),
