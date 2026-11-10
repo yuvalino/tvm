@@ -54,7 +54,7 @@ class _BottomBarState extends State<BottomBar> {
   }
 
   // The TVM tab stays pinned at the left; once the strip is scrolled off its
-  // start it drops the label and keeps only the apple.
+  // start it drops the label and keeps only the logo.
   void _onStripScroll() {
     final collapsed = _strip.hasClients && _strip.offset > 2;
     final atEnd =
@@ -207,7 +207,7 @@ class _BottomBarState extends State<BottomBar> {
   }
 
   // The TVM tab's width with its label out, and the room it takes folded
-  // (the apple, the divider and the gap after it).
+  // (the logo, the divider and the gap after it).
   static const _gap = 6.0;
   static final double _tvmWidth = () {
     final label = TextPainter(
@@ -221,7 +221,7 @@ class _BottomBarState extends State<BottomBar> {
       ),
       textDirection: TextDirection.ltr,
     )..layout();
-    // border + padding + apple + gap + label + padding + border
+    // border + padding + logo + gap + label + padding + border
     return 1 + 9 + 24 + 6 + label.width.ceilToDouble() + 9 + 1;
   }();
   static const _tvmFoldedWidth = 1 + 9 + 24 + 9 + 1 + _gap + 1 + _gap;
@@ -236,7 +236,7 @@ class _BottomBarState extends State<BottomBar> {
               _Chip(
                 selected: tabs.index == 0,
                 onTap: () => widget.onSelect(0),
-                icon: const AppleIcon(size: 24),
+                icon: const TvmLogo(size: 24),
                 label: 'tvm',
                 labelShown: !_collapsed,
                 bold: true,
