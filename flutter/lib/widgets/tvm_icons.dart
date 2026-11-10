@@ -6,40 +6,20 @@ import '../theme/tvm_colors.dart';
 String _hex(Color c) =>
     '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
 
-/// The site's neofetch apple: a steel shackle hanging open off the left
-/// (its left leg free beside the apple, its right one going into the top)
-/// and the body striped green, yellow, red, magenta, blue. Marks the TVM tab.
-class AppleIcon extends StatelessWidget {
-  const AppleIcon({super.key, this.size = 24});
+/// The site's favicon (tvm.yuvalino.com/favicon-32.png): the yellow pixel-art
+/// hard hat, stored at 4x with each pixel kept square. Marks the TVM tab.
+class TvmLogo extends StatelessWidget {
+  const TvmLogo({super.key, this.size = 24});
 
   final double size;
 
-  static final String _svg = () {
-    String stop(double at, Color c) =>
-        '<stop offset="$at" stop-color="${_hex(c)}"/>';
-    final stripes = [
-      (0.0, 0.22, TvmColors.green),
-      (0.22, 0.40, TvmColors.yellow),
-      (0.40, 0.62, TvmColors.red),
-      (0.62, 0.80, TvmColors.magenta),
-      (0.80, 1.0, TvmColors.blue),
-    ].map((s) => stop(s.$1, s.$3) + stop(s.$2, s.$3)).join();
-    // The shackle is drawn first so the body covers the end of its right leg.
-    // It rises 5/13 of the body's height above it, as on the site (5 rows of
-    // shackle to 13 of apple), and the whole is shifted up to sit centred.
-    return '''
-<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-<defs><linearGradient id="a" x1="0" y1="0" x2="0" y2="1">$stripes</linearGradient></defs>
-<g transform="translate(0 -0.9)">
-<path d="M2.4 7.8V6.6a2.9 2.9 0 0 1 5.8 0V9.6" fill="none" stroke="${_hex(TvmColors.steel)}" stroke-width="2" stroke-linecap="round"/>
-<path fill="url(#a)" d="M17.2 14.1c0-2.5 2-3.7 2.1-3.8-1.2-1.7-3-1.9-3.6-1.9-1.5-.2-3 .9-3.8.9-.8 0-2-.9-3.3-.8-1.7 0-3.2 1-4.1 2.5-1.8 3.1-.5 7.6 1.3 10.1.8 1.2 1.8 2.6 3.1 2.5 1.2 0 1.7-.8 3.2-.8s1.9.8 3.2.8c1.3 0 2.2-1.2 3-2.5.9-1.4 1.3-2.8 1.3-2.9 0 0-2.4-1-2.4-4.1z"/>
-</g>
-</svg>''';
-  }();
-
   @override
-  Widget build(BuildContext context) =>
-      SvgPicture.string(_svg, width: size, height: size);
+  Widget build(BuildContext context) => Image.asset(
+    'assets/favicon.png',
+    width: size,
+    height: size,
+    filterQuality: FilterQuality.medium,
+  );
 }
 
 /// A stroked 24x24 icon (paths in SVG syntax) drawn in the ambient icon

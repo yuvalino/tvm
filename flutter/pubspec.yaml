@@ -40,6 +40,7 @@ flutter:
   assets:
     - assets/init.flutter.rc
     - assets/logo.png
+    - assets/favicon.png
     - path: assets/initrd.flutter.ios-arm64.cpio
       platforms:
         - ios
