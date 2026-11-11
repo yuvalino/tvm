@@ -211,8 +211,9 @@ class _BottomBarState extends State<BottomBar> {
   // The TVM tab's width with its label out, and the room it takes folded
   // (the logo, the divider and the gap after it).
   static const _gap = 6.0;
-  static final double _tvmWidth = () {
+  double get _tvmWidth {
     final label = TextPainter(
+      textScaler: MediaQuery.textScalerOf(context),
       text: const TextSpan(
         text: 'tvm',
         style: TextStyle(
@@ -223,9 +224,11 @@ class _BottomBarState extends State<BottomBar> {
       ),
       textDirection: TextDirection.ltr,
     )..layout();
+    final width = label.width.ceilToDouble();
+    label.dispose();
     // border + padding + logo + gap + label + padding + border
-    return 1 + 9 + 24 + 6 + label.width.ceilToDouble() + 9 + 1;
-  }();
+    return 1 + 9 + 24 + 6 + width + 9 + 1;
+  }
   static const _tvmFoldedWidth = 1 + 9 + 24 + 9 + 1 + _gap + 1 + _gap;
 
   Widget _buildTvmTab(TabsController tabs) {
@@ -311,24 +314,20 @@ class _BottomBarState extends State<BottomBar> {
     // the tab by its shell's id.
     return KeyedSubtree(
       key: ValueKey('tab-${s.id}'),
-      child: _tabChipFor(tabs, i, s, key),
-    );
-  }
-
-  Widget _tabChipFor(TabsController tabs, int i, ShellSession s, GlobalKey key) {
-    return _Chip(
-      key: key,
-      selected: tabs.index == i + 1,
-      onTap: () => widget.onSelect(i + 1),
-      onLongPress: () {
-        final box = key.currentContext?.findRenderObject() as RenderBox?;
-        if (box == null) return;
-        widget.onTabMenu(s, box.localToGlobal(Offset.zero) & box.size);
-      },
-      icon: const StrokeIcon(StrokeIcon.shell, size: 18),
-      label: s.title,
-      dot: s.unseen,
-      dotKey: ValueKey('tab-dot-${s.id}'),
+      child: _Chip(
+        key: key,
+        selected: tabs.index == i + 1,
+        onTap: () => widget.onSelect(i + 1),
+        onLongPress: () {
+          final box = key.currentContext?.findRenderObject() as RenderBox?;
+          if (box == null) return;
+          widget.onTabMenu(s, box.localToGlobal(Offset.zero) & box.size);
+        },
+        icon: const StrokeIcon(StrokeIcon.shell, size: 18),
+        label: s.title,
+        dot: s.unseen,
+        dotKey: ValueKey('tab-dot-${s.id}'),
+      ),
     );
   }
 }
@@ -643,6 +642,9 @@ class _KeyState extends State<_Key> {
             }
           : null,
       onLongPressEnd: widget.repeat ? (_) => _stop() : null,
+      // A touch the system takes away (a call, a swipe to another app)
+      // ends with a cancel, not an end.
+      onLongPressCancel: widget.repeat ? _stop : null,
       child: Container(
         constraints: const BoxConstraints(minWidth: 40),
         padding: const EdgeInsets.symmetric(horizontal: 9),

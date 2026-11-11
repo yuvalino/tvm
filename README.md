@@ -60,7 +60,7 @@ ssh -p 2222 mobile@localhost
 
 **3. Change the password**
 
-Anyone on your network can log in with the default password. Change it in the app (gear icon → *SSH Pass*), then quit and reopen tvm for it to take effect.
+Anyone on your network can log in with the default password. Change it in the app (the *tvm* tab → *settings* → *Password*), then quit and reopen tvm for it to take effect.
 
 That's bash, running on a stock iPhone. Knock yourself out.
 

@@ -15,12 +15,9 @@ class LogView extends StatefulWidget {
   State<LogView> createState() => _LogViewState();
 }
 
-class _LogViewState extends State<LogView> with AutomaticKeepAliveClientMixin {
+class _LogViewState extends State<LogView> {
   final _scroll = ScrollController();
   final _worker = WorkerController.instance;
-
-  @override
-  bool get wantKeepAlive => true;
 
   @override
   void initState() {
@@ -46,9 +43,11 @@ class _LogViewState extends State<LogView> with AutomaticKeepAliveClientMixin {
   void _onScroll() {
     if (!_scroll.hasClients) return;
     final p = _scroll.position;
-    if (p.userScrollDirection == ScrollDirection.forward &&
-        p.pixels < p.maxScrollExtent - 20) {
+    final atEnd = p.pixels >= p.maxScrollExtent - 20;
+    if (p.userScrollDirection == ScrollDirection.forward && !atEnd) {
       _worker.autoScroll.value = false;
+    } else if (p.userScrollDirection == ScrollDirection.reverse && atEnd) {
+      _worker.autoScroll.value = true;
     }
   }
 
@@ -65,7 +64,6 @@ class _LogViewState extends State<LogView> with AutomaticKeepAliveClientMixin {
 
   @override
   Widget build(BuildContext context) {
-    super.build(context);
     return Stack(
       children: [
         ValueListenableBuilder<List<String>>(

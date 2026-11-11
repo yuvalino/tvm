@@ -210,7 +210,7 @@ class ShellSession extends ChangeNotifier {
     // take LF as Ctrl+J, a newline in the line being edited, not Enter.
     // Pastes go the same way, as a terminal sends them. A Ctrl+J from the
     // key bar is made below, after this, and stays LF.
-    data = data.replaceAll('\n', '\r');
+    data = data.replaceAll('\r\n', '\r').replaceAll('\n', '\r');
     if ((ctrl || alt) && !_writing) {
       if (data.length == 1) {
         if (ctrl) data = _ctrlChar(data);
@@ -260,7 +260,10 @@ class ShellSession extends ChangeNotifier {
     _scrollToEnd();
   }
 
-  void sendText(String text) => terminal.textInput(text);
+  void sendText(String text) {
+    terminal.textInput(text);
+    _scrollToEnd();
+  }
 
   /// Text from the software keyboard, handled as xterm's TerminalView
   /// handles its own: a single character a key stands for goes as that key
