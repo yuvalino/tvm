@@ -200,8 +200,11 @@ def _settings(app: App, values: dict[str, str]):
 # The user's settings as they were before a run changed them, until a run
 # puts them back: a run that died anyhow (SIGKILL, a closed terminal) left
 # them for the next to restore, which would otherwise take the test's port
-# for the user's own.
-SAVED_SETTINGS = os.path.join(tempfile.gettempdir(), "tvm_flutter_ui_settings.json")
+# for the user's own. (Settings changed by hand in between are put back to
+# these too.) One file per app: the Mac's, or a device's.
+def _saved_settings(device: str | None) -> str:
+    return os.path.join(tempfile.gettempdir(),
+                        f"tvm_flutter_ui_settings_{device or 'macos'}.json")
 
 
 @pytest.fixture(scope="module")
@@ -211,15 +214,17 @@ def app(device):
     an app launched for that, whatever state the run left the last in.
     Settings need no SSH server: those launches don't wait for one (the
     user's port may be taken)."""
+    saved = _saved_settings(device)
     first = _launch(device, ssh=False)
     try:
         try:
-            with open(SAVED_SETTINGS) as f:
+            with open(saved) as f:
                 original = json.load(f)
-        except FileNotFoundError:
+        # none, or one cut short (nothing was changed yet then)
+        except (FileNotFoundError, ValueError):
             original = {row: first.text(f"setting-{row}-value")
                         for row in ("port", "font-size")}
-            with open(SAVED_SETTINGS, "w") as f:
+            with open(saved, "w") as f:
                 json.dump(original, f)
     except BaseException:
         first.stop()
@@ -244,7 +249,7 @@ def app(device):
             _settings(last, original)
         finally:
             last.stop()
-        os.unlink(SAVED_SETTINGS)
+        os.unlink(saved)
 
 
 _tokens = itertools.count(1)
