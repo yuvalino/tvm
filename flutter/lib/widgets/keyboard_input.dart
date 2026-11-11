@@ -126,6 +126,7 @@ class _KeyboardInputState extends State<KeyboardInput> with TextInputClient {
   @override
   void connectionClosed() {
     // The system took the keyboard away; give up focus to match.
+    _connection?.connectionClosedReceived();
     _connection = null;
     widget.focusNode.unfocus();
   }
