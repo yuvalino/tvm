@@ -16142,7 +16142,7 @@ retry:
     int i = 0;
     char c = 0;
     struct file_stream *ufs = file_stream_fp(stream);
-    if (ufs->fs_ungetc) {
+    if (ufs->fs_ungetc && size > 1) {   // size 1: room for the NUL alone
         c = (char)(ufs->fs_ungetc - 1);
         ufs->fs_ungetc = 0;
         s[i++] = c;
@@ -18005,6 +18005,28 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         file_unlock(file, 1);
         tvm_sig_leave();
         return ret;
+    }
+#endif
+
+#ifdef F_GETPATH
+    // A directory the host does not let the program read (host_open) has
+    // "/" for its host descriptor: its path is the one it was opened by.
+    if (cmd == F_GETPATH) {
+        tvm_sig_enter();
+        struct file *file = file_for_task(current, fd);
+        if (!file) {
+            tvm_sig_leave();
+            errno = EBADF;
+            return -1;
+        }
+        if (file->f_ops == &searchdir_fops) {
+            strlcpy((char *)arg, (const char *)file->f_data, MAXPATHLEN);
+            file_unlock(file, 1);
+            tvm_sig_leave();
+            return 0;
+        }
+        file_unlock(file, 1);
+        tvm_sig_leave();
     }
 #endif
 
@@ -24441,16 +24463,21 @@ static void task_maps_unmap(struct task *t)
 }
 
 FUNCTION_DEFINE2(int, munmap, void *, addr, size_t, length) {
+    // Signals deferred from before the unmap: a handler takes the task's
+    // lock too, and a teardown between the unmap and its record's removal
+    // would unmap the range again at reaping, by then maybe another's.
+    tvm_sig_enter();
     int r = CALL_FUNC(munmap, addr, length);
     if (r == 0) {
         size_t pagesz = (size_t)getpagesize();
         uintptr_t start = (uintptr_t)addr, end = (start + length + pagesz - 1) & ~(uintptr_t)(pagesz - 1);
-        tvm_sig_enter();    // a handler takes the task's lock too
         task_lock(current);
         task_maps_remove_locked(current, start, end);
         task_unlock(current);
-        tvm_sig_leave();
     }
+    int err = errno;
+    tvm_sig_leave();    // a handler it runs may set errno
+    errno = err;
     return r;
 }
 
