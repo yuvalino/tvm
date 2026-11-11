@@ -14039,9 +14039,40 @@ struct rmem_ops rmem_ops = {
 
 // NOTE: we want to support destroying a linker from a different task, but we can safely assume no task wil dlopen for another so `VERIFY(arg == current);` is legit
 
-static void *ulinker_malloc(void *arg, size_t size)             { return rmem_arena_alloc(ULINKER_ARENA(arg), size); }
-static void  ulinker_free(void *arg, void *ptr)                 { rmem_arena_free(ULINKER_ARENA(arg), ptr); }
-static void *ulinker_realloc(void *arg, void *ptr, size_t size) { return rmem_arena_realloc(ULINKER_ARENA(arg), ptr, size); }
+// Signals deferred around the arena's lock (see tvm_calloc) on a thread TVM
+// knows: the linker allocates from a program's own code too, on a thread's
+// first touch of a thread-local variable (ulinker_tlv_allocate).
+static void *ulinker_malloc(void *arg, size_t size)
+{
+    int t = TVM_TLS_PEEK() != NULL;
+    if (t)
+        tvm_sig_enter();
+    void *p = rmem_arena_alloc(ULINKER_ARENA(arg), size);
+    if (t)
+        tvm_sig_leave();
+    return p;
+}
+
+static void ulinker_free(void *arg, void *ptr)
+{
+    int t = TVM_TLS_PEEK() != NULL;
+    if (t)
+        tvm_sig_enter();
+    rmem_arena_free(ULINKER_ARENA(arg), ptr);
+    if (t)
+        tvm_sig_leave();
+}
+
+static void *ulinker_realloc(void *arg, void *ptr, size_t size)
+{
+    int t = TVM_TLS_PEEK() != NULL;
+    if (t)
+        tvm_sig_enter();
+    void *p = rmem_arena_realloc(ULINKER_ARENA(arg), ptr, size);
+    if (t)
+        tvm_sig_leave();
+    return p;
+}
 
 static int     ulinker_open(void *arg, const char *name)                { VERIFY(arg == current); return open(name, O_RDONLY); }
 static int     ulinker_close(void *arg, int fd)                         { VERIFY(arg == current); return close(fd); }
@@ -19790,7 +19821,10 @@ pid_t fork(void) {
     if (!can_enter_tvm(caller))
         return CALL_FUNC(fork);
 #if defined(__APPLE__)
-    if (pc_in_go_image(caller)) {
+    tvm_sig_enter();    // the linker's lock (see guest_image)
+    int go = pc_in_go_image(caller);
+    tvm_sig_leave();
+    if (go) {
         errno = ENOSYS;
         return -1;
     }
@@ -20673,7 +20707,13 @@ static bool host_find_unwind_sections(void *addr, struct tvm_dyld_unwind_section
 // (libSystem's private API: libunwind declares it itself, AddressSpace.hpp.)
 static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sections *info) {
     struct ulinker_unwind_sections u;
-    if (current && current->tsk_linker && ulinker_find_unwind_sections(current->tsk_linker, addr, &u)) {
+    int found = 0;
+    if (current && current->tsk_linker) {
+        tvm_sig_enter();    // the linker's lock (see guest_image)
+        found = ulinker_find_unwind_sections(current->tsk_linker, addr, &u);
+        tvm_sig_leave();
+    }
+    if (found) {
         info->mh = u.mh;
         info->dwarf_section = u.dwarf_section;
         info->dwarf_section_length = u.dwarf_section_length;
@@ -20694,18 +20734,27 @@ static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sec
  * command instead. The task's images come first, its executable at 0 (see
  * ulinker_image), then the host's.
  */
+static int guest_image(uint32_t index, struct ulinker_image *im);
+
 static uint32_t guest_image_count(void)
 {
     struct ulinker_image im;
     uint32_t n = 0;
-    while (current && current->tsk_linker && ulinker_image(current->tsk_linker, n, &im))
+    while (guest_image(n, &im))
         n++;
     return n;
 }
 
+// Signals deferred while the linker's lock is held: a handler's dispatch
+// takes it too (emulator_find_dl, for an emulated handler).
 static int guest_image(uint32_t index, struct ulinker_image *im)
 {
-    return current && current->tsk_linker && ulinker_image(current->tsk_linker, index, im);
+    if (!current || !current->tsk_linker)
+        return 0;
+    tvm_sig_enter();
+    int r = ulinker_image(current->tsk_linker, index, im);
+    tvm_sig_leave();
+    return r;
 }
 
 static uint32_t tvm_dyld_image_count(void) {
@@ -20908,7 +20957,9 @@ static void *tvm_guest_dlsym(void *handle, const char *symbol)
     if (!whole || !symbol || !current || !current->tsk_linker)
         return dlsym(handle, symbol);
 
+    tvm_sig_enter();    // the linker's lock (see guest_image)
     void *a = ulinker_dlsym(current->tsk_linker, RTLD_DEFAULT, symbol, 0);
+    tvm_sig_leave();
     return a ? a : ulinker_external_dlsym(NULL, symbol, 0);
 }
 
@@ -23504,9 +23555,11 @@ static int tvm_spawn(pid_t *pidp, const char *path, const posix_spawn_file_actio
     }
 
     int rc = ENOMEM;
+    tvm_sig_enter();    // the arena's lock (see tvm_calloc)
     char *kpath = kstrdup(path);
     char **kargv = spawn_copy_vector(argv);
     char **kenvp = spawn_copy_vector(envp);
+    tvm_sig_leave();
     int p[2] = { -1, -1 };
     if (!kpath || !kargv || !kenvp)
         goto out;
@@ -23565,9 +23618,11 @@ out:
         close(p[0]);
     if (p[1] != -1)
         close(p[1]);
+    tvm_sig_enter();
     kfree(kpath);
     kfree(kargv);
     kfree(kenvp);
+    tvm_sig_leave();
     return rc;
 }
 
@@ -24897,8 +24952,14 @@ FUNCTION_DEFINE4(int, scandir, const char *, dirname, struct dirent ***, namelis
     size_t n = 0, cap = 0;
     struct dirent *de;
     int err = 0;
-    errno = 0;
-    while ((de = readdir(d)) != NULL) {
+    for (;;) {
+        // readdir's own errno: the program's select (or a handler) may
+        // leave one behind for an entry it took
+        errno = 0;
+        if (!(de = readdir(d))) {
+            err = errno;
+            break;
+        }
         if (select) {
             uint64_t keep;
             if (0 != emulator_call(&keep, (uint64_t)select, (uint64_t)de, 0, 0, 0, 0, 0))
@@ -24930,8 +24991,6 @@ FUNCTION_DEFINE4(int, scandir, const char *, dirname, struct dirent ***, namelis
         }
         list[n++] = copy;
     }
-    if (!err && errno)
-        err = errno;
     closedir(d);
     if (err) {
         while (n)
