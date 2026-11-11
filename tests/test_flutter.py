@@ -146,7 +146,18 @@ def _set_number(app: App, row: str, value: str):
     _open_settings(app)
     app.tap("key", f"setting-{row}")
     app.wait_for("key", "editor-field")
-    app.enter_text("key", "editor-field", value, settle=EDITOR_SETTLE)
+    # The editor page slides in: until it is in place, a tap on the field
+    # lands on the page below (409 not_hittable). Entering text replaces
+    # the field's text, so it is tried again until it lands.
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            app.enter_text("key", "editor-field", value, settle=EDITOR_SETTLE)
+            break
+        except FrtError as e:
+            if e.error != "not_hittable" or time.monotonic() > deadline:
+                raise
+            time.sleep(0.1)
     _back(app)
 
 
