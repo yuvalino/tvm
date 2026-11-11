@@ -18,10 +18,16 @@ enum ShellState { connecting, connected, ended }
 /// rendered by an xterm [Terminal]. The shell is exactly what an outside
 /// ssh client gets. Tabs live only in memory.
 class ShellSession extends ChangeNotifier {
-  ShellSession(this._title) {
+  ShellSession(this._title) : id = ++_lastId {
     terminal.onOutput = _send;
     terminal.onResize = _onResize;
   }
+
+  static int _lastId = 0;
+
+  /// A number for this tab that never changes or repeats, unlike its title.
+  /// Its widgets' keys carry it (`terminal-<id>`, `tab-<id>`), for tests.
+  final int id;
 
   final terminal = Terminal(maxLines: 10000);
 

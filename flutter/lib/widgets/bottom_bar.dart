@@ -152,6 +152,7 @@ class _BottomBarState extends State<BottomBar> {
         if (!open) ...[
           const SizedBox(width: 6),
           _SquareButton(
+            key: const ValueKey('keyboard-up'),
             onTap: () => widget.onKeyboard(true),
             child: const StrokeIcon(
               StrokeIcon.keyboardUp,
@@ -188,6 +189,7 @@ class _BottomBarState extends State<BottomBar> {
                       Expanded(child: _KeyBar(shell: shell)),
                       const SizedBox(width: 6),
                       _SquareButton(
+                        key: const ValueKey('keyboard-down'),
                         onTap: () => widget.onKeyboard(false),
                         child: const StrokeIcon(
                           StrokeIcon.keyboardDown,
@@ -234,6 +236,7 @@ class _BottomBarState extends State<BottomBar> {
           child: Row(
             children: [
               _Chip(
+                key: const ValueKey('tab-tvm'),
                 selected: tabs.index == 0,
                 onTap: () => widget.onSelect(0),
                 icon: const TvmLogo(size: 24),
@@ -304,6 +307,15 @@ class _BottomBarState extends State<BottomBar> {
 
   Widget _tabChip(TabsController tabs, int i, ShellSession s) {
     final key = _tabKeys.putIfAbsent(s, GlobalKey.new);
+    // The chip's own key is the GlobalKey its menu is placed by; tests find
+    // the tab by its shell's id.
+    return KeyedSubtree(
+      key: ValueKey('tab-${s.id}'),
+      child: _tabChipFor(tabs, i, s, key),
+    );
+  }
+
+  Widget _tabChipFor(TabsController tabs, int i, ShellSession s, GlobalKey key) {
     return _Chip(
       key: key,
       selected: tabs.index == i + 1,
@@ -316,6 +328,7 @@ class _BottomBarState extends State<BottomBar> {
       icon: const StrokeIcon(StrokeIcon.shell, size: 18),
       label: s.title,
       dot: s.unseen,
+      dotKey: ValueKey('tab-dot-${s.id}'),
     );
   }
 }
@@ -332,6 +345,7 @@ class _Chip extends StatelessWidget {
     this.label,
     this.labelShown = true,
     this.dot = false,
+    this.dotKey,
     this.bold = false,
   });
 
@@ -344,6 +358,9 @@ class _Chip extends StatelessWidget {
   /// Whether [label] is out; it folds away and back with a transition.
   final bool labelShown;
   final bool dot;
+
+  /// The dot's key, so tests can see it.
+  final Key? dotKey;
   final bool bold;
 
   @override
@@ -407,6 +424,7 @@ class _Chip extends StatelessWidget {
               if (dot) ...[
                 const SizedBox(width: 6),
                 Container(
+                  key: dotKey,
                   width: 6,
                   height: 6,
                   decoration: const BoxDecoration(
@@ -495,33 +513,45 @@ class _KeyBar extends StatelessWidget {
       listenable: shell ?? Listenable.merge(const []),
       builder: (context, _) {
         final keys = <Widget>[
-          _Key(label: 'esc', onTap: () => shell?.sendKey(TerminalKey.escape)),
           _Key(
+              key: const ValueKey('key-esc'),
+              label: 'esc',
+              onTap: () => shell?.sendKey(TerminalKey.escape)),
+          _Key(
+            key: const ValueKey('key-ctrl'),
             label: 'ctrl',
             modifier: true,
             latched: shell?.ctrl ?? false,
             onTap: () => shell?.toggleCtrl(),
           ),
           _Key(
+            key: const ValueKey('key-alt'),
             label: 'alt',
             modifier: true,
             latched: shell?.alt ?? false,
             onTap: () => shell?.toggleAlt(),
           ),
-          _Key(label: 'tab', onTap: () => shell?.sendKey(TerminalKey.tab)),
-          for (final (icon, key) in [
-            (StrokeIcon.left, TerminalKey.arrowLeft),
-            (StrokeIcon.up, TerminalKey.arrowUp),
-            (StrokeIcon.down, TerminalKey.arrowDown),
-            (StrokeIcon.right, TerminalKey.arrowRight),
+          _Key(
+              key: const ValueKey('key-tab'),
+              label: 'tab',
+              onTap: () => shell?.sendKey(TerminalKey.tab)),
+          for (final (name, icon, key) in [
+            ('left', StrokeIcon.left, TerminalKey.arrowLeft),
+            ('up', StrokeIcon.up, TerminalKey.arrowUp),
+            ('down', StrokeIcon.down, TerminalKey.arrowDown),
+            ('right', StrokeIcon.right, TerminalKey.arrowRight),
           ])
             _Key(
+              key: ValueKey('key-$name'),
               icon: StrokeIcon(icon, size: 15, strokeWidth: 2.2),
               repeat: true,
               onTap: () => shell?.sendKey(key),
             ),
           for (final c in ['|', '~', '/', '-'])
-            _Key(label: c, onTap: () => shell?.sendText(c)),
+            _Key(
+                key: ValueKey('key-$c'),
+                label: c,
+                onTap: () => shell?.sendText(c)),
         ];
         return IgnorePointer(
           ignoring: shell == null,
@@ -554,6 +584,7 @@ class _KeyBar extends StatelessWidget {
 
 class _Key extends StatefulWidget {
   const _Key({
+    super.key,
     required this.onTap,
     this.label,
     this.icon,

@@ -221,6 +221,19 @@ pytest tests/test_integration.py
 pytest tests/test_integration.py --device <device-name> --backend flutter
 ```
 
+UI tests of the Flutter app drive it over HTTP with
+[frt](https://github.com/yuvalino/frt), which the app starts only when
+launched with `FRT_PORT` set: tabs, settings, the log, and typing into the
+shell tabs and reading their screens. They run against the macOS app, and
+move its SSH server to a free port for the run (through its settings) and
+back after:
+
+```sh
+pip install pytest aiohttp
+python3 build.py -a macos-arm64 -t flutter
+pytest tests/test_flutter.py
+```
+
 Test runner flags: `-l` list tests, `-k=TEST` filter, `-v` verbose, `-g` debug with gdb.
 
 Small example programs live in `examples/`: `fork`, `snake`, `stopit`,

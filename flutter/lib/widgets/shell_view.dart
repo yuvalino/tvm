@@ -115,6 +115,7 @@ class _ShellViewState extends State<ShellView>
                       key: ValueKey(_generationFor(shell)),
                       child: TerminalView(
                         shell.terminal,
+                        key: ValueKey('terminal-${shell.id}'),
                         // Only the tab in front follows the screen's size; one
                         // coming to the front catches up on its first layout.
                         autoResize: shell.active,
@@ -147,6 +148,7 @@ class _ShellViewState extends State<ShellView>
                       right: 12,
                       bottom: 12,
                       child: _EndedBanner(
+                        key: ValueKey('session-ended-${shell.id}'),
                         reason: shell.endReason ?? '',
                         onReconnect: shell.reconnect,
                         onClose: widget.onClose,
@@ -163,6 +165,7 @@ class _ShellViewState extends State<ShellView>
 
 class _EndedBanner extends StatelessWidget {
   const _EndedBanner({
+    super.key,
     required this.reason,
     required this.onReconnect,
     required this.onClose,
@@ -211,6 +214,7 @@ class _EndedBanner extends StatelessWidget {
             ),
           ),
           CupertinoButton(
+            key: const ValueKey('session-close'),
             padding: const EdgeInsets.symmetric(horizontal: 12),
             minimumSize: const Size(0, 36),
             onPressed: onClose,
@@ -220,6 +224,7 @@ class _EndedBanner extends StatelessWidget {
             ),
           ),
           CupertinoButton(
+            key: const ValueKey('session-reconnect'),
             padding: const EdgeInsets.symmetric(horizontal: 14),
             minimumSize: const Size(0, 36),
             color: TvmColors.green,

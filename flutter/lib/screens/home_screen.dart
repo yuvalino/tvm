@@ -139,6 +139,7 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: TvmColors.bg,
         resizeToAvoidBottomInset: true,
         body: KeyboardInput(
+          key: const ValueKey('keyboard-input'),
           focusNode: _keyboard,
           onInsert: (text) => _tabs.activeShell?.typeText(text),
           onDelete: () => _tabs.activeShell?.sendKey(TerminalKey.backspace),
@@ -260,6 +261,7 @@ class _RenameDialogState extends State<_RenameDialog> {
       content: Padding(
         padding: const EdgeInsets.only(top: 12),
         child: CupertinoTextField(
+          key: const ValueKey('rename-field'),
           controller: _controller,
           autofocus: true,
           autocorrect: false,
@@ -269,10 +271,12 @@ class _RenameDialogState extends State<_RenameDialog> {
       ),
       actions: [
         CupertinoDialogAction(
+          key: const ValueKey('rename-cancel'),
           onPressed: () => Navigator.pop(context),
           child: const Text('Cancel'),
         ),
         CupertinoDialogAction(
+          key: const ValueKey('rename-ok'),
           isDefaultAction: true,
           onPressed: () => Navigator.pop(context, _controller.text),
           child: const Text('Rename'),
@@ -301,6 +305,7 @@ class _TabMenu extends StatelessWidget {
             {bool destructive = false}) {
       final color = destructive ? TvmColors.red : TvmColors.bright;
       return GestureDetector(
+        key: ValueKey('menu-${a.name}'),
         behavior: HitTestBehavior.opaque,
         onTap: () => Navigator.pop(context, a),
         child: Container(

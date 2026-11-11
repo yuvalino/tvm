@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:frt/frt.dart';
 
 import 'screens/home_screen.dart';
 import 'services/worker_controller.dart';
@@ -7,6 +10,16 @@ import 'theme/tvm_colors.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Tests launch the app with FRT_PORT (and FRT_HOST to be reached from
+  // another machine) to drive it over HTTP; launched normally, no socket is
+  // opened. See tests/test_flutter.py.
+  if (Platform.environment.containsKey('FRT_PORT')) {
+    try {
+      await initFrt();
+    } catch (e) {
+      stderr.writeln('[ERROR] frt: $e');
+    }
+  }
   await WorkerController.instance.init();
   runApp(const DevtoolApp());
 }
