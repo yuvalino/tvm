@@ -3374,6 +3374,21 @@ static void task_record_rusage(struct task *t)
 static void kq_proc_exited(pid_t pid, int status);
 #endif
 
+// What a child's wait status says, as SIGCHLD's siginfo and waitid() say it.
+static void chld_siginfo(siginfo_t *i, pid_t pid, int status)
+{
+    i->si_signo = SIGCHLD;
+    i->si_pid = pid;
+    i->si_uid = getuid();
+    if (WIFSIGNALED(status)) {
+        i->si_code = WCOREDUMP(status) ? CLD_DUMPED : CLD_KILLED;
+        i->si_status = WTERMSIG(status);
+    } else {
+        i->si_code = CLD_EXITED;
+        i->si_status = WEXITSTATUS(status);
+    }
+}
+
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
@@ -3523,19 +3538,8 @@ static void terminate_current_locked(int result)
         // the signal, said nothing of it: si_code and si_status 0, which
         // toybox's timeout reads as a child killed by signal 0, so every
         // `timeout N cmd` exited 128 whatever cmd did.
-        siginfo_t *ci = &parent->tsk_chld_info;
-        memset(ci, 0, sizeof(*ci));
-        ci->si_signo = SIGCHLD;
-        ci->si_pid = exiting_pid;
-        ci->si_uid = getuid();
-        if (WIFSIGNALED(result)) {
-            ci->si_code = WCOREDUMP(result) ? CLD_DUMPED : CLD_KILLED;
-            ci->si_status = WTERMSIG(result);
-        }
-        else {
-            ci->si_code = CLD_EXITED;
-            ci->si_status = WEXITSTATUS(result);
-        }
+        memset(&parent->tsk_chld_info, 0, sizeof(parent->tsk_chld_info));
+        chld_siginfo(&parent->tsk_chld_info, exiting_pid, result);
         parent->tsk_chld_valid = 1;
         task_kill_locked(parent, SIGCHLD);  // best-effort; parent may have already exited
     }
@@ -6347,6 +6351,10 @@ struct tty_obuf {
 // goes out blocking with the lock dropped, as tty_putc_locked did.
 static int tty_obuf_flush(struct tty_obuf *o)
 {
+    if (o->fd == -1) {  // echo with nowhere to go (tty_echo_open_locked)
+        o->n = 0;
+        return 0;
+    }
     size_t off = 0;
     while (off < o->n) {
         ssize_t w = CALL_FUNC(write, o->fd, o->b + off, o->n - off);
@@ -6465,32 +6473,32 @@ static ssize_t tty_output_buffer_locked(struct tty *tt, struct file *file, const
 }
 
 // Echo goes back to the master through the slave's end of the socket, as
-// the slave's own output does (OPOST).
-static int tty_echo_open_locked(struct tty *tt, struct tty_obuf *o)
+// the slave's own output does (OPOST). It goes nowhere (fd -1) when there
+// is nothing to echo, or no slave to echo for: a write to the shut down end
+// would raise the host's SIGPIPE. The input is taken either way.
+static void tty_echo_open_locked(struct tty *tt, struct tty_obuf *o)
 {
-    // no slave to echo for, and a write to the shut down end would raise
-    // the host's SIGPIPE
-    if (tt->t_hup)
-        return -1;
+    o->tt = tt;
+    o->fd = -1;
+    o->n = 0;
+    if (tt->t_hup || ISSET(tt->t_lflag, EXTPROC) ||
+        (!ISSET(tt->t_lflag, ECHO | ECHONL) && !ISSET(tt->t_iflag, IMAXBEL)))
+        return;
     int slave = CALL_FUNC(dup, tt->t_sfd);
     if (-1 == slave)
-        return -1;
-
+        return;
     if (-1 == CALL_FUNC(fcntl, slave, F_SETFL, O_NONBLOCK)) {
         CALL_FUNC(close, slave);
-        return -1;
+        return;
     }
-
-    o->tt = tt;
     o->fd = slave;
-    o->n = 0;
-    return 0;
 }
 
 static void tty_echo_close_locked(struct tty_obuf *o)
 {
     (void)tty_obuf_flush(o);
-    CALL_FUNC(close, o->fd);
+    if (o->fd != -1)
+        CALL_FUNC(close, o->fd);
 }
 
 // c as the user sees it typed: a control character as ^X with ECHOCTL.
@@ -6520,8 +6528,7 @@ static void tty_echo_char_locked(struct tty *tt, struct tty_obuf *o, int c)
 static void tty_echo_locked(struct tty *tt, int c)
 {
     struct tty_obuf o;
-    if (0 != tty_echo_open_locked(tt, &o))
-        return;
+    tty_echo_open_locked(tt, &o);
     tty_echo_char_locked(tt, &o, c);
     tty_echo_close_locked(&o);
 }
@@ -6621,8 +6628,7 @@ static int tty_is_blank(uint8_t c)
 static int tty_canon_locked(struct tty *tt, int fd, int c)
 {
     struct tty_obuf o;
-    if (0 != tty_echo_open_locked(tt, &o))
-        return -1;
+    tty_echo_open_locked(tt, &o);
 
     int ret = 0;
     int literal = tt->t_lnext;
@@ -14120,6 +14126,7 @@ static char *tvm_getsectdata(const char *segname, const char *sectname, unsigned
 static void *tvm_guest_dlsym(void *handle, const char *symbol);
 #if defined(__APPLE__)
 static void *tvm_guest_dlopen(const char *path, int mode);
+static int tvm_guest_dlclose(void *handle);
 #endif
 static int tvm_sqlite3_config(int op, ...);
 #if TARGET_OS_IPHONE
@@ -14181,6 +14188,7 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(base, "dlsym"))          return &tvm_guest_dlsym;
 #if defined(__APPLE__)
     if (0 == strcmp(base, "dlopen"))         return &tvm_guest_dlopen;
+    if (0 == strcmp(base, "dlclose"))        return &tvm_guest_dlclose;
 #endif
 
     if (0 == strcmp(base, "optarg"))   return &current->tsk_data->optarg;
@@ -14196,12 +14204,6 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
         if (0 == strcmp(fm->fm_name, base))
             return fm->fm_ptr;
     }
-    void *p = dlsym(RTLD_DEFAULT, s);
-    // A variant suffix the host does not export: macOS's $DARWIN_EXTSN
-    // variants (syslog, realpath, ...) are no symbols of iOS's libSystem,
-    // whose plain one is the same function (a macOS program run on iOS).
-    if (!p && s[base_len] == '$')
-        p = dlsym(RTLD_DEFAULT, base);
 #if TARGET_OS_IPHONE
     if (0 == strcmp(base, "posix_spawn_file_actions_addchdir_np") ||
         0 == strcmp(base, "posix_spawn_file_actions_addchdir"))           return &tvm_spawn_fa_addchdir;
@@ -14210,6 +14212,12 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
     if (0 == strcmp(base, "posix_spawnattr_setnosmt_np") ||
         0 == strcmp(base, "posix_spawnattr_set_csm_np"))                  return &tvm_spawnattr_noop;
 #endif
+    void *p = dlsym(RTLD_DEFAULT, s);
+    // A variant suffix the host does not export: macOS's $DARWIN_EXTSN
+    // variants (syslog, realpath, ...) are no symbols of iOS's libSystem,
+    // whose plain one is the same function (a macOS program run on iOS).
+    if (!p && s[base_len] == '$')
+        p = dlsym(RTLD_DEFAULT, base);
     return p;
 }
 
@@ -15008,6 +15016,13 @@ FUNCTION_DEFINE4(ssize_t, __getdirentries64, int, fd, void *, buf, size_t, bufsi
     if (!file) {
         tvm_sig_leave();
         errno = EBADF;
+        return -1;
+    }
+    if (file->f_ops == &searchdir_fops) {
+        // a directory the host does not let the program read, as fdopendir
+        file_unlock(file, 1);
+        tvm_sig_leave();
+        errno = EPERM;
         return -1;
     }
     if (!file->f_ops || !file->f_ops->f_readdir) {
@@ -20361,26 +20376,27 @@ FUNCTION_DEFINE2(int, pthread_key_create, pthread_key_t *, key, key_dtor_t, dest
         CALL_FUNC(pthread_key_delete, *key);
         return CALL_FUNC(pthread_key_create, key, destructor);
     }
+    // the task's lock first, as taskalloc() takes them
+    task_lock(current);
     pthread_mutex_lock(&keys_lock);
     key_refs[*key] = 1;
-    task_lock(current);
     current->tsk_keys[*key] = 1;
     current->tsk_key_dtors[*key] = destructor;
-    task_unlock(current);
     pthread_mutex_unlock(&keys_lock);
+    task_unlock(current);
     return 0;
 }
 
 FUNCTION_DEFINE1(int, pthread_key_delete, pthread_key_t, key) {
     if (caller_is_tvm() || key >= PTHREAD_KEYS_MAX || !current->tsk_keys[key])
         return CALL_FUNC(pthread_key_delete, key);
-    pthread_mutex_lock(&keys_lock);
     task_lock(current);
+    pthread_mutex_lock(&keys_lock);
     current->tsk_keys[key] = 0;
     current->tsk_key_dtors[key] = NULL;
-    task_unlock(current);
     key_unref_locked((int)key);
     pthread_mutex_unlock(&keys_lock);
+    task_unlock(current);
     return 0;
 }
 
@@ -20623,10 +20639,9 @@ static void host_images_init(void)
 static bool host_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sections *info)
 {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, host_images_init);
-
     bool found = false;
     tvm_sig_enter();
+    pthread_once(&once, host_images_init);  // takes host_images_lock too
     pthread_mutex_lock(&host_images_lock);
     size_t i = host_image_index_locked((uintptr_t)addr);
     if (i < host_images_count && host_images[i].hi_start <= (uintptr_t)addr) {
@@ -20891,21 +20906,30 @@ static void *tvm_guest_dlsym(void *handle, const char *symbol)
  * and CoreServices that way for fs.watch() (FSEvents), and panicked ("Cannot
  * Load CoreFoundation") when Claude Code watched a directory. A program's own
  * dependencies get the same treatment from the linker (ulinker.c,
- * load_dependency).
+ * load_dependency). Signals deferred, as for the linker's own
+ * (ulinker_dlopen_host).
  */
 static void *tvm_guest_dlopen(const char *path, int mode)
 {
+    tvm_sig_enter();
     void *handle = dlopen(path, mode);
-    if (handle || !path || 0 != strncmp(path, "/System/Library/", 16))
-        return handle;
-    const char *v = strstr(path, ".framework/Versions/");
+    const char *v = !handle && path && 0 == strncmp(path, "/System/Library/", 16)
+        ? strstr(path, ".framework/Versions/") : NULL;
     const char *bin = v ? strchr(v + 20, '/') : NULL;
-    if (!bin)
-        return NULL;
-    char shallow[PATH_MAX];
-    snprintf(shallow, sizeof(shallow), "%.*s.framework%s", (int)(v - path), path, bin);
-    handle = dlopen(shallow, mode);
-    return handle ? handle : dlopen(path, mode);   // the original's dlerror()
+    if (bin) {
+        char shallow[PATH_MAX];
+        snprintf(shallow, sizeof(shallow), "%.*s.framework%s", (int)(v - path), path, bin);
+        handle = dlopen(shallow, mode);
+        if (!handle)
+            handle = dlopen(path, mode);    // the original's dlerror()
+    }
+    tvm_sig_leave();
+    return handle;
+}
+
+static int tvm_guest_dlclose(void *handle)
+{
+    return ulinker_dlclose_host(NULL, handle);
 }
 #endif
 
@@ -21508,16 +21532,7 @@ FUNCTION_DEFINE4(int, waitid, idtype_t, idtype, id_t, id, siginfo_t *, infop, in
     pid_t r = tvm_wait_ex(pid, &status, options & WNOHANG, NULL, (options & WNOWAIT) != 0);
     if (r <= 0)
         return r;   // -1 (ECHILD, EINTR), or 0: WNOHANG with none, infop zeroed
-    infop->si_signo = SIGCHLD;
-    infop->si_pid = r;
-    infop->si_uid = getuid();
-    if (WIFSIGNALED(status)) {
-        infop->si_code = WCOREDUMP(status) ? CLD_DUMPED : CLD_KILLED;
-        infop->si_status = WTERMSIG(status);
-    } else {
-        infop->si_code = CLD_EXITED;
-        infop->si_status = WEXITSTATUS(status);
-    }
+    chld_siginfo(infop, r, status);
     return 0;
 }
 
@@ -22539,7 +22554,7 @@ do_exec:
 
     char **apple = new_envp + envc + 1;
     apple[0] = block;
-    block = stpcpy(stpcpy(block, exec_path_key), pathname) + 1;
+    strcpy(stpcpy(block, exec_path_key), pathname);
     apple[1] = NULL;
 
     argv = new_argv;
@@ -22596,34 +22611,18 @@ do_exec:
 
     main_func_t main_func = find_program(pathname);
     if (!main_func) {
-
+        int err = 0;
         int dlflags = RTLD_NOW | RTLD_NEEDMAIN | (is_noemu_binary(pathname) ? RTLD_NOEMU : 0);
         void *handle = ulinker_dlopen(new_linker, pathname, dlflags);
+        void *entry = handle ? ulinker_dlsym(new_linker, handle, "main", 1) : NULL;
         if (!handle) {
-            task_lock(current);
-            kfree(current->tsk_exits);  /* the failed load's */
-            current->tsk_exits = old_exits;
-            current->tsk_nexits = old_nexits;
-            current->tsk_exits_cap = old_exits_cap;
-            task_unlock(current);
-            task_maps_unmap(current);
-            task_lock(current);
-            current->tsk_maps = old_maps;
-            current->tsk_nmaps = old_nmaps;
-            task_unlock(current);
-            task_keys_unstash(current, old_keys, old_key_dtors);
-            current->tsk_linker = old_linker;
-            current_thread->thr_emulator = old_emulator;
-            emulator_context_destroy(new_emulator);
-            ulinker_destroy(new_linker);
-            tvm_sig_leave();
-            errno = is_script ? ENOENT : ENOEXEC;
-            return -1;
-        }
-
-        void *entry = ulinker_dlsym(new_linker, handle, "main", 1);
-        if (!entry) {
+            err = is_script ? ENOENT : ENOEXEC;
+        } else if (!entry) {
             INFO("failed to load executable library \"%s\": symbol \"main\" not found", pathname);
+            err = EINVAL;
+        }
+        if (err) {
+            // the old program back as it was
             task_lock(current);
             kfree(current->tsk_exits);  /* the failed load's */
             current->tsk_exits = old_exits;
@@ -22640,35 +22639,11 @@ do_exec:
             current_thread->thr_emulator = old_emulator;
             emulator_context_destroy(new_emulator);
             ulinker_destroy(new_linker);
-            errno = EINVAL;
             tvm_sig_leave();
+            errno = err;
             return -1;
         }
-
         main_func = (main_func_t)entry;
-    }
-
-    if (!main_func) {
-        INFO("  failed(ENOENT)");
-        task_lock(current);
-        kfree(current->tsk_exits);  /* the failed load's */
-        current->tsk_exits = old_exits;
-        current->tsk_nexits = old_nexits;
-        current->tsk_exits_cap = old_exits_cap;
-        task_unlock(current);
-        task_maps_unmap(current);
-        task_lock(current);
-        current->tsk_maps = old_maps;
-        current->tsk_nmaps = old_nmaps;
-        task_unlock(current);
-        task_keys_unstash(current, old_keys, old_key_dtors);
-        current->tsk_linker = old_linker;
-        current_thread->thr_emulator = old_emulator;
-        emulator_context_destroy(new_emulator);
-        ulinker_destroy(new_linker);
-        errno = ENOENT;
-        tvm_sig_leave();
-        return -1;
     }
 
     // No failing from here!
@@ -23839,8 +23814,8 @@ FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct te
     if (!islocaltty(fd))
         return CURRENT_RFD(fd, CALL_FUNC(tcsetattr, __rfd, optional_actions, termios_p));
 
-    struct termios t;
 #ifdef TCSASOFT
+    struct termios t;
     // BSD's TCSASOFT (CIGNORE): the hardware settings are left as they are.
     // CPython's getpass passes it, and EINVAL had it echo the password
     // ("Can not control echo on the terminal").
@@ -23856,7 +23831,6 @@ FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct te
         optional_actions &= ~TCSASOFT;
     }
 #endif
-    (void)t;
 
     int request;
     switch (optional_actions) {
@@ -24077,8 +24051,7 @@ FUNCTION_DEFINE2(void *, aligned_alloc, size_t, alignment, size_t, size) {
 static size_t tvm_usable_size(const void *ptr)
 {
     struct rmem_arena *ar = current ? arena_for_task(current) : NULL;
-    size_t n = ar ? rmem_arena_usable_size(ar, ptr) : 0;
-    return n;
+    return ar ? rmem_arena_usable_size(ar, ptr) : 0;
 }
 
 #if defined(__APPLE__)

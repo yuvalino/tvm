@@ -5760,14 +5760,6 @@ int ulinker_find_unwind_sections(struct ulinker *ulinker, const void *addr, stru
     return 1;
 }
 
-/*
- * DLA_NOSYM skips the nearest-symbol search: udli_sname and udli_saddr come
- * back NULL. That search walks the image's symbol table and is only wanted
- * for diagnostics; the emulator asks "which image, which arch, emulated or
- * not" on every emulated call (emulator_find_dl), e.g. once per comparison
- * when host qsort() calls an emulated comparator, and the symbol walk was
- * the single hottest function in a neofetch run.
- */
 static int macho64_is_executable(const struct dlinfo *dl)
 {
     return dl->dl_type == DLT_MACHO64 && (dl->dl_flags & RTLD_NEEDMAIN);
@@ -5815,6 +5807,14 @@ int ulinker_image(struct ulinker *ulinker, size_t index, struct ulinker_image *o
     return found;
 }
 
+/*
+ * DLA_NOSYM skips the nearest-symbol search: udli_sname and udli_saddr come
+ * back NULL. That search walks the image's symbol table and is only wanted
+ * for diagnostics; the emulator asks "which image, which arch, emulated or
+ * not" on every emulated call (emulator_find_dl), e.g. once per comparison
+ * when host qsort() calls an emulated comparator, and the symbol walk was
+ * the single hottest function in a neofetch run.
+ */
 int ulinker_dladdr(struct ulinker *ulinker, const void *addr, struct ulinker_dladdr_info *info, int flags) {
     DLINFO_LOCK(ulinker);
     struct dlinfo *dl = library_for_address_locked(ulinker, addr);
