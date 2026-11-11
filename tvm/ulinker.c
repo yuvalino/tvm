@@ -4838,10 +4838,18 @@ void *ulinker_tlv_allocate(struct tlv_descriptor *d)
             ERROR("thread-local variable with unknown key %lu", (unsigned long)key);
             abort();
         }
-        block = uo.uo_malloc(DLBASE(dl)->dl_linker->ul_private, dl->dlm64_tlv_size);
+        void *priv = DLBASE(dl)->dl_linker->ul_private;
+        block = uo.uo_malloc(priv, dl->dlm64_tlv_size);
         if (!block) {
             ERROR("out of memory for the thread-local variables of \"%s\"", DLBASE(dl)->dl_name);
             abort();
+        }
+        // a signal handler run as the allocation returned (its deferred
+        // signals) may have touched them first: its block stands
+        char *had = pthread_getspecific(key);
+        if (had) {
+            uo.uo_free(priv, block);
+            return had + d->offset;
         }
         memcpy(block, (const void *)dl->dlm64_tlv_template, dl->dlm64_tlv_size);
         pthread_setspecific(key, block);

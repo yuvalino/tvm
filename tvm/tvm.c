@@ -18012,6 +18012,10 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     // (Python duplicates every descriptor this way). Passed to the host it
     // returned a host descriptor number, not one of the task's.
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+        if ((long)arg < 0 || (long)arg >= MAX_FILES) {
+            errno = EINVAL;     // as POSIX has it (task_assign_file_locked panics)
+            return -1;
+        }
         tvm_sig_enter();
 
         task_lock(current);
@@ -20479,6 +20483,7 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
     task_lock(current);
     if (current->tsk_threads_cnt == 1) {
         task_unlock(current);
+        tvm_sig_leave();    // exit's own work takes its signals (verr)
         exit((int) ((long) retval));
     }
     task_unlock(current);
@@ -20492,6 +20497,7 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
     task_lock(current);
     if (current->tsk_threads_cnt == 1) {
         task_unlock(current);
+        tvm_sig_leave();    // exit's own work takes its signals (verr)
         exit((int) ((long) retval));
     }
     detach_current_thread_and_exit(retval);
@@ -20645,6 +20651,11 @@ static void host_image_added(const struct mach_header *mh, intptr_t slide)
     if (im.hi_start == im.hi_end)
         return;
 
+    // signals deferred on a task's thread: a handler unwinds through this
+    // lock, and a teardown frees into the arena krealloc takes
+    int t = TVM_TLS_PEEK() != NULL;
+    if (t)
+        tvm_sig_enter();
     pthread_mutex_lock(&host_images_lock);
     if (host_images_count == host_images_size) {
         size_t size = host_images_size ? host_images_size * 2 : 256;
@@ -20652,6 +20663,8 @@ static void host_image_added(const struct mach_header *mh, intptr_t slide)
         if (!images) {
             // the image goes unknown: no unwinding through its frames
             pthread_mutex_unlock(&host_images_lock);
+            if (t)
+                tvm_sig_leave();
             return;
         }
         host_images = images;
@@ -20662,12 +20675,17 @@ static void host_image_added(const struct mach_header *mh, intptr_t slide)
     host_images[i] = im;
     host_images_count++;
     pthread_mutex_unlock(&host_images_lock);
+    if (t)
+        tvm_sig_leave();
 }
 
 // dlclose() of a host image: called before dyld unmaps it
 static void host_image_removed(const struct mach_header *mh, intptr_t slide)
 {
     (void)slide;
+    int t = TVM_TLS_PEEK() != NULL;     // see host_image_added
+    if (t)
+        tvm_sig_enter();
     pthread_mutex_lock(&host_images_lock);
     size_t i = host_image_index_locked((uintptr_t)mh);  // the header is in __TEXT
     if (i < host_images_count && host_images[i].hi_sections.mh == mh) {
@@ -20675,6 +20693,8 @@ static void host_image_removed(const struct mach_header *mh, intptr_t slide)
         memmove(&host_images[i], &host_images[i + 1], (host_images_count - i) * sizeof(*host_images));
     }
     pthread_mutex_unlock(&host_images_lock);
+    if (t)
+        tvm_sig_leave();
 }
 
 // Registering calls host_image_added() for every image loaded so far, on
