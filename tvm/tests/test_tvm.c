@@ -3099,6 +3099,45 @@ TEST(DirVfsFork) {
     ASSERT_EQ(0, closedir(d));
 }
 
+#if defined(__APPLE__)
+#include <mach-o/loader.h>
+#include <stdbool.h>
+
+// libunwind's dyld_unwind_sections (AddressSpace.hpp); the function is
+// libSystem's, resolved by TVM to its own, which knows the images it loaded.
+struct test_unwind_sections {
+    const struct mach_header_64 *mh;
+    const void *dwarf_section;
+    uintptr_t   dwarf_section_length;
+    const void *compact_unwind_section;
+    uintptr_t   compact_unwind_section_length;
+};
+extern bool _dyld_find_unwind_sections(void *, struct test_unwind_sections *);
+
+TEST(DyldFindUnwindSections) {
+    struct test_unwind_sections u;
+    // This program's own code: an image TVM loaded.
+    memset(&u, 0, sizeof(u));
+    ASSERT_EQ(true, _dyld_find_unwind_sections((void *)&_test_DyldFindUnwindSections, &u));
+    ASSERT_EQ(MH_MAGIC_64, u.mh->magic);
+    ASSERT_NEQ(NULL, u.compact_unwind_section);
+    const struct mach_header_64 *self = u.mh;
+    // A host library's code (libsystem_c), another image, found without
+    // dyld's private lookup: what a guest's unwinder asks about a host frame.
+    memset(&u, 0, sizeof(u));
+    ASSERT_EQ(true, _dyld_find_unwind_sections((void *)&qsort, &u));
+    ASSERT_NEQ(NULL, u.mh);
+    ASSERT_NEQ(self, u.mh);
+    ASSERT_EQ(MH_MAGIC_64, u.mh->magic);
+    ASSERT_NEQ(NULL, u.compact_unwind_section);
+    ASSERT_NEQ(0, u.compact_unwind_section_length);
+    // In no image: the stack, and the emulator's end of the frame chain.
+    int local = 0;
+    ASSERT_EQ(false, _dyld_find_unwind_sections(&local, &u));
+    ASSERT_EQ(false, _dyld_find_unwind_sections((void *)0xDEADBEEF4141, &u));
+}
+#endif
+
 TEST(VfsStatfs) {
     struct statfs sf;
     ASSERT_EQ(0, statfs("/tvm/bin", &sf));

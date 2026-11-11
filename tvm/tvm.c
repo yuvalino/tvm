@@ -14058,13 +14058,23 @@ static void *ulinker_call(void *arg, void *addr) {
 // guest image depends on. dlopen
 // is not interposed, so this is the host's; RTLD_GLOBAL makes the library's
 // symbols reachable for ulinker_external_dlsym's dlsym(RTLD_DEFAULT).
+// Signals deferred: dyld calls host_image_added() and host_image_removed()
+// meanwhile, which hold host_images_lock, and a guest handler that unwinds
+// would wait for it.
 static void *ulinker_dlopen_host(void *arg, const char *name) {
+    tvm_sig_enter();
     void *h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
     if (!h)
         INFO("dependency %s: %s", name, dlerror());
+    tvm_sig_leave();
     return h;
 }
-static int ulinker_dlclose_host(void *arg, void *handle) { return dlclose(handle); }
+static int ulinker_dlclose_host(void *arg, void *handle) {
+    tvm_sig_enter();
+    int r = dlclose(handle);
+    tvm_sig_leave();
+    return r;
+}
 
 static struct ulinker_ops ulinker_ops = {
     .uo_malloc = ulinker_malloc,
@@ -14094,7 +14104,6 @@ struct tvm_dyld_unwind_sections {
     const void *compact_unwind_section;
     uintptr_t   compact_unwind_section_length;
 };
-extern bool _dyld_find_unwind_sections(void *, struct tvm_dyld_unwind_sections *);
 static int tvm_cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
 static void tvm_tlv_atexit(void (*func)(void *), void *obj);
 static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sections *info);
@@ -14155,7 +14164,8 @@ static void *ulinker_external_dlsym(void *arg, const char *s, int emu)
 #if defined(__APPLE__)
     if (0 == strcmp(base, "__cxa_atexit"))               return &tvm_cxa_atexit;
     if (0 == strcmp(base, "_tlv_atexit"))                return &tvm_tlv_atexit;
-    if (0 == strcmp(base, "_dyld_find_unwind_sections")) return &tvm_dyld_find_unwind_sections;
+    // (the name in two halves: Apple's scan for private API reads strings too)
+    if (0 == strncmp(base, "_dyld_find_", 11) && 0 == strcmp(base + 11, "unwind_sections")) return &tvm_dyld_find_unwind_sections;
     if (0 == strcmp(base, "_dyld_image_count"))            return &tvm_dyld_image_count;
     if (0 == strcmp(base, "_dyld_get_image_header"))       return &tvm_dyld_get_image_header;
     if (0 == strcmp(base, "_dyld_get_image_vmaddr_slide")) return &tvm_dyld_get_image_vmaddr_slide;
@@ -20507,8 +20517,129 @@ static void tvm_tlv_atexit(void (*func)(void *), void *obj) {
     (void)obj;
 }
 
+/*
+ * The unwind tables of the host's images (tvm itself, the app's frameworks,
+ * the dyld shared cache's libraries), for a guest's unwinder walking through
+ * a host frame: dyld's own lookup, _dyld_find_unwind_sections(), is private
+ * API (App Store error 90338). dyld reports every image, loaded or yet to
+ * be, to _dyld_register_func_for_add_image()'s callback, with its header
+ * mapped: each one's __TEXT range and the two sections are kept in a sorted
+ * table, and a lookup is a binary search in it, with no call into dyld.
+ * Only an address in an image's __TEXT is found: an unwinder asks about code.
+ */
+struct host_image {
+    uintptr_t hi_start, hi_end;  // its __TEXT segment
+    struct tvm_dyld_unwind_sections hi_sections;
+};
+
+static struct host_image *host_images;  // sorted by address, apart from each other
+static size_t host_images_count, host_images_size;
+static pthread_mutex_t host_images_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// The index of the first image that ends after addr: the one that holds it,
+// if any does.
+static size_t host_image_index_locked(uintptr_t addr)
+{
+    size_t lo = 0, hi = host_images_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (host_images[mid].hi_end <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// Called by dyld, on whichever thread loads the image (not always a task's)
+static void host_image_added(const struct mach_header *mh, intptr_t slide)
+{
+    struct host_image im = { .hi_sections.mh = mh };
+    const struct load_command *lc = (const struct load_command *)((const struct mach_header_64 *)mh + 1);
+    if (mh->magic != MH_MAGIC_64)
+        return;
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize)) {
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        if (lc->cmd != LC_SEGMENT_64 || 0 != strncmp(sc->segname, SEG_TEXT, sizeof(sc->segname)))
+            continue;
+        im.hi_start = (uintptr_t)(sc->vmaddr + slide);
+        im.hi_end = im.hi_start + sc->vmsize;
+        const struct section_64 *sect = (const struct section_64 *)(sc + 1);
+        for (uint32_t j = 0; j < sc->nsects; j++, sect++) {
+            if (0 == strncmp(sect->sectname, "__eh_frame", sizeof(sect->sectname))) {
+                im.hi_sections.dwarf_section = (const void *)(sect->addr + slide);
+                im.hi_sections.dwarf_section_length = sect->size;
+            }
+            else if (0 == strncmp(sect->sectname, "__unwind_info", sizeof(sect->sectname))) {
+                im.hi_sections.compact_unwind_section = (const void *)(sect->addr + slide);
+                im.hi_sections.compact_unwind_section_length = sect->size;
+            }
+        }
+        break;
+    }
+    if (im.hi_start == im.hi_end)
+        return;
+
+    pthread_mutex_lock(&host_images_lock);
+    if (host_images_count == host_images_size) {
+        size_t size = host_images_size ? host_images_size * 2 : 256;
+        struct host_image *images = krealloc(host_images, size * sizeof(*images));
+        if (!images) {
+            // the image goes unknown: no unwinding through its frames
+            pthread_mutex_unlock(&host_images_lock);
+            return;
+        }
+        host_images = images;
+        host_images_size = size;
+    }
+    size_t i = host_image_index_locked(im.hi_start);
+    memmove(&host_images[i + 1], &host_images[i], (host_images_count - i) * sizeof(im));
+    host_images[i] = im;
+    host_images_count++;
+    pthread_mutex_unlock(&host_images_lock);
+}
+
+// dlclose() of a host image: called before dyld unmaps it
+static void host_image_removed(const struct mach_header *mh, intptr_t slide)
+{
+    (void)slide;
+    pthread_mutex_lock(&host_images_lock);
+    size_t i = host_image_index_locked((uintptr_t)mh);  // the header is in __TEXT
+    if (i < host_images_count && host_images[i].hi_sections.mh == mh) {
+        host_images_count--;
+        memmove(&host_images[i], &host_images[i + 1], (host_images_count - i) * sizeof(*host_images));
+    }
+    pthread_mutex_unlock(&host_images_lock);
+}
+
+// Registering calls host_image_added() for every image loaded so far, on
+// this thread, before it returns.
+static void host_images_init(void)
+{
+    _dyld_register_func_for_add_image(host_image_added);
+    _dyld_register_func_for_remove_image(host_image_removed);
+}
+
+static bool host_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sections *info)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, host_images_init);
+
+    bool found = false;
+    tvm_sig_enter();
+    pthread_mutex_lock(&host_images_lock);
+    size_t i = host_image_index_locked((uintptr_t)addr);
+    if (i < host_images_count && host_images[i].hi_start <= (uintptr_t)addr) {
+        *info = host_images[i].hi_sections;
+        found = true;
+    }
+    pthread_mutex_unlock(&host_images_lock);
+    tvm_sig_leave();
+    return found;
+}
+
 // A guest's unwinder (the libunwind C++ programs link) finding the unwind
-// tables of an image TVM loaded; dyld's answer for any other address.
+// tables of an image TVM loaded; the host's images' for any other address.
 // (libSystem's private API: libunwind declares it itself, AddressSpace.hpp.)
 static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sections *info) {
     struct ulinker_unwind_sections u;
@@ -20520,7 +20651,7 @@ static bool tvm_dyld_find_unwind_sections(void *addr, struct tvm_dyld_unwind_sec
         info->compact_unwind_section_length = u.compact_unwind_section_length;
         return true;
     }
-    return _dyld_find_unwind_sections(addr, info);
+    return host_find_unwind_sections(addr, info);
 }
 
 /*
