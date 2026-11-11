@@ -107,7 +107,12 @@ class _KeyboardInputState extends State<KeyboardInput> with TextInputClient {
     } else if (value.text.length > _initial.text.length) {
       widget.onInsert(value.text.substring(_initial.text.length));
     }
-    if (value.text != _initial.text) {
+    // Put back after every edit, and after the caret is moved (the space
+    // bar's trackpad), or the next character would land among the spaces.
+    final caret = value.selection;
+    if (value.text != _initial.text ||
+        caret.baseOffset != caret.extentOffset ||
+        caret.extentOffset != _initial.text.length) {
       _current = _initial;
       _connection?.setEditingState(_initial);
     }
