@@ -205,12 +205,6 @@ class ShellSession extends ChangeNotifier {
   // modifier applies to whichever key comes next. The terminal's own
   // answers come this way too, and go as they are.
   void _send(String data) {
-    // The iOS keyboard's return key arrives as typed text, "\n", but a
-    // terminal's Return is CR. Programs that read the tty raw (Claude Code)
-    // take LF as Ctrl+J, a newline in the line being edited, not Enter.
-    // Pastes go the same way, as a terminal sends them. A Ctrl+J from the
-    // key bar is made below, after this, and stays LF.
-    data = data.replaceAll('\r\n', '\r').replaceAll('\n', '\r');
     if ((ctrl || alt) && !_writing) {
       if (data.length == 1) {
         if (ctrl) data = _ctrlChar(data);
@@ -265,10 +259,23 @@ class ShellSession extends ChangeNotifier {
     _scrollToEnd();
   }
 
+  // The iOS keyboard's return key arrives as typed text, "\n", but a
+  // terminal's Return is CR. Programs that read the tty raw (Claude Code)
+  // take LF as Ctrl+J, a newline in the line being edited, not Enter.
+  // Pastes go the same way, as a terminal sends them. A Ctrl+J (the key
+  // bar's, a hardware keyboard's) is a key, not text, and stays LF.
+  static String _returns(String text) =>
+      text.replaceAll('\r\n', '\r').replaceAll('\n', '\r');
+
+  /// Pasted text, as the terminal pastes it (bracketed when the program
+  /// asked), each line ended by a Return.
+  void paste(String text) => terminal.paste(_returns(text));
+
   /// Text from the software keyboard, handled as xterm's TerminalView
   /// handles its own: a single character a key stands for goes as that key
   /// (so the program's key modes apply), anything else as text.
   void typeText(String text) {
+    text = _returns(text);
     final key = charToTerminalKey(text.trim());
     if (key == null || !terminal.keyInput(key)) terminal.textInput(text);
     _scrollToEnd();

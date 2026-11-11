@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart' show Scaffold;
 import 'package:flutter/services.dart';
@@ -63,13 +65,17 @@ class _HomeScreenState extends State<HomeScreen> {
   // keyboard is raised on purpose (_focusTarget). Focus only parked
   // elsewhere (a dialog's route; the root scope while the app is inactive,
   // which macOS gives back on resume) keeps the views focusable for its
-  // return.
+  // return. After the focus manager's notifications: changing nodes while
+  // it notifies them throws (ConcurrentModificationError).
   void _onKeyboardFocus() {
     if (!_keyboard.hasFocus &&
         FocusManager.instance.primaryFocus == _keyboard.enclosingScope) {
-      for (final s in _tabs.shells) {
-        s.viewFocus.canRequestFocus = false;
-      }
+      scheduleMicrotask(() {
+        if (_keyboard.hasFocus) return;
+        for (final s in _tabs.shells) {
+          s.viewFocus.canRequestFocus = false;
+        }
+      });
     }
     _rebuild();
   }
@@ -128,6 +134,13 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_keyboardOpen) FocusManager.instance.primaryFocus?.unfocus();
   }
 
+  Widget _shellPage(ShellSession shell) => ShellView(
+        key: ObjectKey(shell),
+        shell: shell,
+        onClose: () => _close([shell]),
+        onTap: () => _setKeyboard(true),
+      );
+
   // Cmd+V (a hardware keyboard, the Mac) pastes; other keys go to the shell
   // in front. On the TVM tab there is nothing to type into.
   KeyEventResult _onKeyEvent(KeyEvent event) {
@@ -138,7 +151,7 @@ class _HomeScreenState extends State<HomeScreen> {
         HardwareKeyboard.instance.isMetaPressed) {
       Clipboard.getData(Clipboard.kTextPlain).then((data) {
         final text = data?.text;
-        if (text != null && text.isNotEmpty) shell.terminal.paste(text);
+        if (text != null && text.isNotEmpty) shell.paste(text);
       }, onError: (_) {});
       return KeyEventResult.handled;
     }
@@ -173,12 +186,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             key: ValueKey('tvm'),
                             child: TvmTab(),
                           )
-                        : ShellView(
-                            key: ObjectKey(_tabs.shells[i - 1]),
-                            shell: _tabs.shells[i - 1],
-                            onClose: () => _close([_tabs.shells[i - 1]]),
-                            onTap: () => _setKeyboard(true),
-                          ),
+                        : _shellPage(_tabs.shells[i - 1]),
                     childCount: _tabs.pageCount,
                     // Pages are found again by key after a tab closes, so the
                     // others keep their state.
