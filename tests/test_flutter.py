@@ -27,6 +27,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import unicodedata
 
 import pytest
 
@@ -194,9 +195,43 @@ class Shell:
     def send(self, text: str):
         self.app.terminal_input(text, self.key)
 
-    def wait(self, text=None, *, pattern=None, start=0, timeout=10000) -> dict:
-        return self.app.terminal_wait(text, self.key, pattern=pattern,
-                                      start=start, timeout=timeout)
+    def wait(self, text=None, *, pattern=None, start=0, timeout=10000,
+             screen=False) -> dict:
+        """terminal_wait; on a timeout, the failure shows the screen."""
+        try:
+            return self.app.terminal_wait(text, self.key, pattern=pattern,
+                                          start=start, timeout=timeout,
+                                          screen=screen)
+        except FrtError as e:
+            if e.status != 408:
+                raise
+            shown = "\n".join(f"|{row}|" for row in self.buffer(screen=True)["lines"])
+            raise AssertionError(f"{e}\nThe screen:\n{shown}") from None
+
+    def wait_alt(self, on: bool, timeout: float = 10):
+        """Wait for a full-screen program to switch to (on) or back from the
+        alternate screen."""
+        deadline = time.monotonic() + timeout
+        while self.buffer()["altBuffer"] != on:
+            assert time.monotonic() < deadline, f"altBuffer never became {on}"
+            time.sleep(0.1)
+
+    def wait_size(self, timeout: float = 5) -> tuple[int, int]:
+        """Wait until the shell is told the terminal's size (resizes reach it
+        a moment late: they are debounced); return (rows, columns)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            buf = self.buffer()
+            want = f"{buf['height']} {buf['width']}"
+            out, rc = self.run("stty size")
+            if (out, rc) == (want, 0):
+                return buf["height"], buf["width"]
+            assert time.monotonic() < deadline, f"stty size {out!r}, screen {want}"
+            time.sleep(0.2)
+
+    def scratch_dir(self):
+        """cd into a new empty directory."""
+        assert self.run('cd "$(mktemp -d)"')[1] == 0
 
     def run(self, cmd: str, timeout: int = 10000) -> tuple[str, int]:
         """Run cmd; return its output (the rows after the command line, soft
@@ -286,13 +321,23 @@ def keyboard_up(app: App):
 # --- The TVM tab ---
 
 
+def _network_line(app: App, timeout: float = 10) -> str:
+    """The network line, once the app's lookup at start has filled it in."""
+    deadline = time.monotonic() + timeout
+    while True:
+        line = app.text("network-line")
+        if line or time.monotonic() >= deadline:
+            return line
+        time.sleep(0.1)
+
+
 def test_network_line(app: App):
-    line = app.text("network-line")
+    line = _network_line(app)
     assert re.match(r"\d{1,3}(\.\d{1,3}){3}( · \S+)?$", line), line
 
 
 def test_connect_command(app: App):
-    line = app.text("network-line")
+    line = _network_line(app)
     host = line.split(" · ")[-1]
     user = re.search(r"^username: (.*)$", app.log(), re.M).group(1)
     app.tap("key", "tab-tvm")
@@ -334,15 +379,7 @@ def test_font_size_resizes_terminal(app: App, shell: Shell):
         app.tap("key", f"tab-{shell.id}")
         new = shell.buffer()["width"]
         assert new < width
-        # The shell is told the new size (a moment later: resizes are
-        # debounced).
-        deadline = time.monotonic() + 5
-        while True:
-            out, rc = shell.run("stty size")
-            if out == f"{shell.buffer()['height']} {new}" or time.monotonic() > deadline:
-                break
-            time.sleep(0.2)
-        assert rc == 0 and out == f"{shell.buffer()['height']} {new}"
+        assert shell.wait_size()[1] == new
     finally:
         _set_number(app, "font-size", "13")
     assert app.text("setting-font-size-value") == "13"
@@ -453,6 +490,22 @@ def test_wide_characters(shell: Shell):
     assert shell.run("echo 漢字x") == ("漢字x", 0)
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "xterm 4.0.0 Buffer.writeChar wraps only once the cursor is past the "
+    "last column, so a wide character in the last column is cut in two: "
+    "its first half ends the row, the empty second half starts the next"))
+def test_wide_character_at_the_edge(shell: Shell):
+    """A wide character with one column left starts the next row."""
+    width = shell.buffer()["width"]
+    at = shell.cursor_line()
+    out, rc = shell.run(f"printf -v s '%*s' {width - 1} ''; echo \"${{s// /x}}漢字\"")
+    assert rc == 0
+    buf = shell.buffer(start=at)
+    i = buf["lines"].index("x" * (width - 1))
+    assert buf["lines"][i + 1] == "漢字" and buf["wrapped"][i + 1]
+    assert out == "x" * (width - 1) + "漢字"
+
+
 def test_stty_size_matches_screen(shell: Shell):
     buf = shell.buffer()
     assert shell.run("stty size") == (f"{buf['height']} {buf['width']}", 0)
@@ -485,6 +538,232 @@ def test_alt_screen(shell: Shell):
         assert time.monotonic() < deadline, "less did not switch back"
         time.sleep(0.1)
     assert shell.run("echo after") == ("after", 0)
+
+
+def test_leaving_alt_screen_shows_prompt(shell: Shell):
+    # Scrollback first: the main screen has more lines than the alternate.
+    assert shell.run("seq 1 200")[1] == 0
+    # Into the alternate screen: it is in place at once, not sliding in.
+    at = shell.cursor_line()
+    shell.send("printf '\\e[?1049h'; sleep 0.5; printf '\\e[?1049l'; echo out\r")
+    shell.wait_alt(True)
+    buf = shell.buffer()
+    assert buf["view"] == {"first": 0, "last": buf["lineCount"] - 1}, buf["view"]
+    # And out of it while the spring would still run, as a program that
+    # quits at once does.
+    shell.wait_alt(False)
+    shell.wait(pattern=r"^out$", start=at)
+    assert shell.run("echo after") == ("after", 0)
+    # The view is back at the end, the prompt on its last row.
+    buf = shell.buffer()
+    assert buf["view"]["last"] == buf["cursor"]["line"] == buf["lineCount"] - 1, buf["view"]
+
+
+def test_tab_completion(shell: Shell):
+    shell.scratch_dir()
+    assert shell.run("touch alpha_one alpha_two beta_file") == ("", 0)
+    # One match: Tab completes it, and a space after.
+    at = shell.cursor_line()
+    shell.send("echo bet\t")
+    shell.wait(pattern=r"^\$ echo beta_file $", start=at)
+    assert shell.run("") == ("beta_file", 0)  # runs the completed line
+    # A command name.
+    at = shell.cursor_line()
+    shell.send("ech\t")
+    shell.wait(pattern=r"^\$ echo $", start=at)
+    shell.send("\x15")  # Ctrl-U: the line is dropped
+    # Two matches: Tab Tab lists them, then the line is back as it was.
+    at = shell.cursor_line()
+    shell.send("echo alpha_\t\t")
+    # (readline pads the list with spaces)
+    shell.wait(pattern=r"^alpha_one +alpha_two *\n\$ echo alpha_$", start=at)
+    shell.send("t\t")
+    shell.wait(pattern=r"^\$ echo alpha_two $", start=at)
+    assert shell.run("") == ("alpha_two", 0)
+
+
+def test_vim_cut_and_paste_lines(shell: Shell):
+    shell.scratch_dir()
+    assert shell.run(r"printf 'one\ntwo\nthree\nfour\nfive\n' > f") == ("", 0)
+    shell.send("vim f\r")
+    shell.wait(pattern=r"^one\ntwo\nthree\nfour\nfive\n~", screen=True)
+    assert shell.buffer()["altBuffer"]
+    # Line 2; Shift-V selects it, j takes line 3 too.
+    shell.send("jVj")
+    shell.wait(pattern=r"-- VISUAL LINE --", screen=True)
+    shell.send("d")  # cut both
+    shell.wait(pattern=r"^one\nfour\nfive\n~", screen=True)
+    shell.send("p")  # paste them after the line the cursor is on, "four"
+    shell.wait(pattern=r"^one\nfour\ntwo\nthree\nfive\n~", screen=True)
+    shell.send(":wq\r")
+    shell.wait_alt(False)
+    assert shell.run("cat f") == ("one\nfour\ntwo\nthree\nfive", 0)
+
+
+def _mixed_lines(width: int) -> list[str]:
+    """Lines of every length that matters to wrapping: empty, short, one
+    short of the width, exactly it, one over, two and three rows' worth,
+    each in a letter of its own so a line moved or cut short shows; and one
+    with wide characters, at its start (one cut by the edge is
+    test_wide_character_at_the_edge's)."""
+    lens = [0, 1, width - 1, width, width + 1, 2 * width, 2 * width + 1,
+            3 * width + 5, 7, width // 2] * 5
+    abc = "abcdefghijklmnopqrstuvwxyz"
+    lines = [abc[i % 26] * n for i, n in enumerate(lens)]
+    return lines + ["漢字" + "x" * (width - 2)]
+
+
+def _print_lines(lines: list[str]) -> str:
+    """A command that prints what _mixed_lines() gave."""
+    *same, wide = lines
+    lens = " ".join(str(len(line)) for line in same)
+    n = len(wide) - 2
+    return ("a=abcdefghijklmnopqrstuvwxyz; i=0; "
+            f"for n in {lens}; do printf -v s '%*s' $n ''; "
+            'echo "${s// /${a:i%26:1}}"; i=$((i+1)); done; '
+            f"printf -v s '%*s' {n} ''; " 'echo "漢字${s// /x}"')
+
+
+def _rows(lines: list[str], width: int) -> tuple[list[str], list[bool]]:
+    """The rows lines take in a terminal this wide, and which of them
+    continue the row before. A wide character that doesn't fit at the end
+    of a row starts the next one (as in xterm and VTE; not yet in the xterm
+    package, see test_wide_character_at_the_edge)."""
+    rows, wrapped = [], []
+    for line in lines:
+        row, col, cont = "", 0, False
+        for ch in line:
+            w = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+            if col + w > width:
+                rows.append(row)
+                wrapped.append(cont)
+                row, col, cont = "", 0, True
+            row += ch
+            col += w
+        rows.append(row)
+        wrapped.append(cont)
+    return rows, wrapped
+
+
+def _find_rows(shell: Shell, lines: list[str]) -> tuple[int, dict]:
+    """Where in the buffer the lines are, whole: their text, and the rows
+    they take at the terminal's width, wrapped where they should be.
+    Returns the buffer line of their first row, and the buffer."""
+    buf = shell.buffer()
+    assert "\n" + "\n".join(lines) + "\n" in buf["text"]
+    rows, wrapped = _rows(lines, buf["width"])
+    have = buf["lines"]
+    starts = [i for i in range(len(have) - len(rows) + 1)
+              if have[i:i + len(rows)] == rows]
+    assert len(starts) == 1, f"the rows are there {len(starts)} times"
+    (first,) = starts
+    assert buf["wrapped"][first:first + len(rows)] == wrapped
+    return first, buf
+
+
+def test_scrollback_while_scrolling(app: App, shell: Shell):
+    """The rows in view, scrolled up, down and up again, are the rows the
+    lines printed there, and scrolling changes nothing in the buffer."""
+    lines = _mixed_lines(shell.buffer()["width"])
+    assert shell.run(_print_lines(lines)) == ("\n".join(lines), 0)
+    first, buf = _find_rows(shell, lines)
+    rows, _ = _rows(lines, buf["width"])
+    view = buf["view"]
+    assert view["last"] == buf["cursor"]["line"] == buf["lineCount"] - 1
+    in_view = view["last"] - view["first"] + 1
+    assert in_view == buf["height"]
+
+    def check(moved, up: bool):
+        b = shell.buffer()
+        assert b["lines"] == buf["lines"] and b["wrapped"] == buf["wrapped"]
+        v = b["view"]
+        assert v["last"] - v["first"] + 1 in (in_view - 1, in_view)
+        assert (v["first"] < moved["first"]) if up else (v["first"] > moved["first"])
+        # What is in view is what was printed there.
+        for i in range(v["first"], v["last"] + 1):
+            if first <= i < first + len(rows):
+                assert b["lines"][i] == rows[i - first]
+        return v
+
+    # Each drag is a fling too: let it run out.
+    app.scroll("key", shell.key, dy=400, settle=3000)
+    up = check(view, up=True)
+    assert up["last"] < view["last"]
+    app.scroll("key", shell.key, dy=-150, settle=3000)
+    down = check(up, up=False)
+    app.scroll("key", shell.key, dy=400, settle=3000)
+    check(down, up=True)
+    app.scroll("key", shell.key, dy=-5000, settle=3000)
+    assert shell.buffer()["view"] == view
+    assert shell.run("echo after") == ("after", 0)
+
+
+def test_resize_keeps_scrollback(app: App, shell: Shell):
+    """The keyboard going down and up resizes the terminal (rows), the font
+    size too (columns: lines are wrapped anew). The shell is told, and the
+    lines printed before are all there, wrapped at the new width."""
+    keyboard_up(app)
+    width = shell.buffer()["width"]
+    lines = _mixed_lines(width)
+    assert shell.run(_print_lines(lines)) == ("\n".join(lines), 0)
+    _find_rows(shell, lines)
+    rows, _ = shell.wait_size()
+
+    app.tap("key", "keyboard-down")
+    app.wait_gone("key", "key-ctrl")
+    taller, cols = shell.wait_size()
+    assert taller > rows and cols == width
+    _find_rows(shell, lines)
+
+    keyboard_up(app)
+    assert shell.wait_size() == (rows, width)
+    _, buf = _find_rows(shell, lines)
+    assert buf["view"]["last"] == buf["cursor"]["line"]
+
+    try:
+        _set_number(app, "font-size", "17")
+        app.tap("key", f"tab-{shell.id}")
+        keyboard_up(app)
+        narrow_rows, narrow = shell.wait_size()
+        assert narrow < width
+        _, buf = _find_rows(shell, lines)
+        assert buf["view"]["last"] == buf["cursor"]["line"]
+    finally:
+        _set_number(app, "font-size", "13")
+    app.tap("key", f"tab-{shell.id}")
+    keyboard_up(app)
+    assert shell.wait_size() == (rows, width)
+    _find_rows(shell, lines)
+
+
+def test_vim_redraws_on_resize(app: App, shell: Shell):
+    """vim fills the screen it is given, again when the keyboard resizes
+    it."""
+    keyboard_up(app)
+    shell.scratch_dir()
+    assert shell.run("seq 1 200 > f") == ("", 0)
+
+    def shows(rows: int):
+        # The file from its first line down to the last row but one; the
+        # last is vim's own.
+        nums = "\\n".join(str(i) for i in range(1, rows))
+        shell.wait(pattern=f"^{nums}\\n(?!{rows}\\n)", screen=True)
+
+    rows = shell.buffer()["height"]
+    shell.send("vim f\r")
+    shell.wait_alt(True)
+    shows(rows)
+    app.tap("key", "keyboard-down")
+    app.wait_gone("key", "key-ctrl")
+    taller = shell.buffer()["height"]
+    assert taller > rows
+    shows(taller)
+    keyboard_up(app)
+    assert shell.buffer()["height"] == rows
+    shows(rows)
+    shell.send(":q\r")
+    shell.wait_alt(False)
+    assert shell.wait_size()[0] == rows
 
 
 # --- The keyboard ---
@@ -529,6 +808,33 @@ def test_key_bar_keys(app: App, shell: Shell):
     app.tap("key", "key-left")
     app.type("key", "keyboard-input", "X\n")
     shell.wait(pattern=r"^Xab$", start=at + 1)
+
+
+def test_key_bar_tab(app: App, shell: Shell):
+    keyboard_up(app)
+    shell.scratch_dir()
+    assert shell.run("touch beta_file") == ("", 0)
+    at = shell.cursor_line()
+    app.type("key", "keyboard-input", "echo bet")
+    app.tap("key", "key-tab")
+    shell.wait(pattern=r"^\$ echo beta_file $", start=at)
+    app.type("key", "keyboard-input", "\n")
+    shell.wait(pattern=r"^beta_file$", start=at + 1)
+
+
+def test_key_bar_esc_in_vim(app: App, shell: Shell):
+    keyboard_up(app)
+    shell.scratch_dir()
+    shell.send("vim g\r")
+    shell.wait_alt(True)
+    shell.wait(pattern=r"^~ *$", screen=True)  # vim pads rows with spaces
+    app.type("key", "keyboard-input", "ihello")
+    shell.wait(pattern=r"-- INSERT --", screen=True)
+    app.tap("key", "key-esc")
+    # Out of insert mode: the command is a command, not text.
+    app.type("key", "keyboard-input", ":wq\n")
+    shell.wait_alt(False)
+    assert shell.run("cat g") == ("hello", 0)
 
 
 def test_keyboard_down_hides_key_bar(app: App, shell: Shell):
