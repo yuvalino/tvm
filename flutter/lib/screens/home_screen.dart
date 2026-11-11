@@ -57,11 +57,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
   bool get _keyboardOpen => _keyboard.hasFocus;
 
-  // Down, however it went (the key bar, or the system taking it away), no
-  // touch on a terminal may raise it again: the views can't take focus
-  // until the keyboard is raised on purpose (_focusTarget).
+  // Down, however it went (the key bar, or the system taking it away: both
+  // unfocus, which leaves the focus on this route's scope), no touch on a
+  // terminal may raise it again: the views can't take focus until the
+  // keyboard is raised on purpose (_focusTarget). Focus only parked
+  // elsewhere (a dialog's route; the root scope while the app is inactive,
+  // which macOS gives back on resume) keeps the views focusable for its
+  // return.
   void _onKeyboardFocus() {
-    if (!_keyboard.hasFocus) {
+    if (!_keyboard.hasFocus &&
+        FocusManager.instance.primaryFocus == _keyboard.enclosingScope) {
       for (final s in _tabs.shells) {
         s.viewFocus.canRequestFocus = false;
       }
