@@ -204,11 +204,13 @@ def app(device):
     an app launched for that, whatever state the run left the last in.
     Settings need no SSH server: those launches don't wait for one (the
     user's port may be taken). SIGTERM and SIGHUP end the run through the
-    same restore (Python runs no finally for them by itself)."""
-    def leave(signum, frame):
-        # pytest takes a SystemExit for the test's failure and goes on
-        pytest.exit(f"signal {signum}", returncode=128 + signum)
-    handlers = {sig: signal.signal(sig, leave) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    same restore, as Ctrl-C does: Python runs no finally for them by
+    itself, and a KeyboardInterrupt is the one exception that no except
+    Exception (here, asyncio's, aiohttp's) takes for an ordinary error."""
+    handlers = {sig: signal.getsignal(sig)
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    signal.signal(signal.SIGHUP, signal.default_int_handler)
     try:
         yield from _app(device)
     finally:
@@ -239,6 +241,9 @@ def _app(device):
         finally:
             app.stop()
     finally:
+        # not interrupted itself: a second signal would leave a row unset
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
         last = _launch(device, ssh=False)
         try:
             _settings(last, original)
