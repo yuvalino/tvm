@@ -20,10 +20,7 @@ dependencies:
   flutter_svg: ^2.3.0
   # Drives the app from tests (tests/test_flutter.py); dormant unless the
   # app is launched with FRT_PORT set.
-  frt:
-    git:
-      url: https://github.com/yuvalino/frt.git
-      ref: master
+  frt: ^0.2.0
 
 dev_dependencies:
   flutter_test:
