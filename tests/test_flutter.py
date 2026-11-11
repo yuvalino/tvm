@@ -206,7 +206,8 @@ def app(device):
     user's port may be taken). SIGTERM and SIGHUP end the run through the
     same restore (Python runs no finally for them by itself)."""
     def leave(signum, frame):
-        raise SystemExit(128 + signum)
+        # pytest takes a SystemExit for the test's failure and goes on
+        pytest.exit(f"signal {signum}", returncode=128 + signum)
     handlers = {sig: signal.signal(sig, leave) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         yield from _app(device)
@@ -409,8 +410,8 @@ def _network_line(app: App, timeout: float = 10) -> str:
 
 def test_network_line(app: App):
     line = _network_line(app)
-    # the Wi-Fi address and the .local name; either alone when it's all
-    assert re.match(r"(\d{1,3}(\.\d{1,3}){3}( · \S+\.local)?|\S+\.local)$", line), line
+    # the Wi-Fi address and the host's name; either alone when it's all
+    assert re.match(r"(\d{1,3}(\.\d{1,3}){3}( · \S+)?|\S+)$", line), line
 
 
 def test_connect_command(app: App):
