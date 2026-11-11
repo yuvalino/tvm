@@ -23,6 +23,7 @@ import asyncio
 import itertools
 import os
 import re
+import signal
 import socket
 import subprocess
 import tempfile
@@ -187,6 +188,11 @@ def _settings(app: App, values: dict[str, str]):
             assert app.text(f"setting-{row}-value") == value
         except Exception as e:
             failure = failure or e
+            try:    # out of an editor left open, for the next row
+                if app.exists("editor-field"):
+                    _back(app)
+            except Exception:
+                pass
     if failure:
         raise failure
 
@@ -197,7 +203,19 @@ def app(device):
     terminal at FONT_SIZE. The user's settings are put back afterwards, by
     an app launched for that, whatever state the run left the last in.
     Settings need no SSH server: those launches don't wait for one (the
-    user's port may be taken)."""
+    user's port may be taken). SIGTERM and SIGHUP end the run through the
+    same restore (Python runs no finally for them by itself)."""
+    def leave(signum, frame):
+        raise SystemExit(128 + signum)
+    handlers = {sig: signal.signal(sig, leave) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield from _app(device)
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
+def _app(device):
     first = _launch(device, ssh=False)
     try:
         original = {row: first.text(f"setting-{row}-value")
@@ -391,7 +409,8 @@ def _network_line(app: App, timeout: float = 10) -> str:
 
 def test_network_line(app: App):
     line = _network_line(app)
-    assert re.match(r"\d{1,3}(\.\d{1,3}){3}( · \S+)?$", line), line
+    # the Wi-Fi address and the .local name; either alone when it's all
+    assert re.match(r"(\d{1,3}(\.\d{1,3}){3}( · \S+\.local)?|\S+\.local)$", line), line
 
 
 def test_connect_command(app: App):
@@ -544,7 +563,10 @@ def test_multiline_output(shell: Shell):
 def test_long_line_wraps(shell: Shell):
     width = shell.buffer()["width"]
     out, rc = shell.run(f"printf 'z%.0s' $(seq 1 {width + 7}); echo")
-    assert (out, rc) == ("z" * (width + 7), 0)
+    assert (out, rc) == ("z" * (width + 7), 0)   # soft wraps undone
+    buf = shell.buffer()
+    i = len(buf["lines"]) - 1 - buf["lines"][::-1].index("z" * width)
+    assert buf["lines"][i + 1] == "z" * 7 and buf["wrapped"][i + 1]
 
 
 def test_wide_characters(shell: Shell):
