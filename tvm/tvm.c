@@ -16142,7 +16142,7 @@ retry:
     int i = 0;
     char c = 0;
     struct file_stream *ufs = file_stream_fp(stream);
-    if (ufs->fs_ungetc && size > 1) {   // size 1: room for the NUL alone
+    if (ufs->fs_ungetc) {
         c = (char)(ufs->fs_ungetc - 1);
         ufs->fs_ungetc = 0;
         s[i++] = c;
