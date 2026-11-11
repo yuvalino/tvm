@@ -40,6 +40,36 @@ class _ShellViewState extends State<ShellView>
   @override
   bool get wantKeepAlive => true;
 
+  // The font size the view last laid out the terminal with while in front,
+  // and whether it has changed since out of sight. xterm only resizes a
+  // terminal when its size in cells changes during layout, and only while
+  // autoResize is on: a tab laid out with a new font behind another records
+  // the new size without telling the terminal, and is no different from it
+  // when it comes back. Such a view is built afresh in front, which measures
+  // and resizes as a new one does.
+  double? _font;
+  bool _stale = false;
+  int _generation = 0;
+
+  int _generationFor(ShellSession shell) {
+    final font = WorkerController.instance.terminalFontSizeNotifier.value;
+    if (!shell.active) {
+      if (_font != null && font != _font) _stale = true;
+      return _generation;
+    }
+    if (_stale) {
+      _stale = false;
+      _generation++;
+      // The new view starts at the top of its scrollback: back to the end.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final scroll = shell.scroll;
+        if (scroll.hasClients) scroll.jumpTo(scroll.position.maxScrollExtent);
+      });
+    }
+    _font = font;
+    return _generation;
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -81,25 +111,28 @@ class _ShellViewState extends State<ShellView>
                   builder: (context, _) => MediaQuery.removePadding(
                     context: context,
                     removeBottom: true,
-                    child: TerminalView(
-                      shell.terminal,
-                      // Only the tab in front follows the screen's size; one
-                      // coming to the front catches up on its first layout.
-                      autoResize: shell.active,
-                      focusNode: shell.viewFocus,
-                      scrollController: shell.scroll,
-                      hardwareKeyboardOnly: true,
-                      readOnly: true,
-                      theme: tvmTerminalTheme,
-                      textStyle: TerminalStyle(
-                        fontSize: WorkerController
-                            .instance
-                            .terminalFontSizeNotifier
-                            .value,
-                      ),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 4,
+                    child: KeyedSubtree(
+                      key: ValueKey(_generationFor(shell)),
+                      child: TerminalView(
+                        shell.terminal,
+                        // Only the tab in front follows the screen's size; one
+                        // coming to the front catches up on its first layout.
+                        autoResize: shell.active,
+                        focusNode: shell.viewFocus,
+                        scrollController: shell.scroll,
+                        hardwareKeyboardOnly: true,
+                        readOnly: true,
+                        theme: tvmTerminalTheme,
+                        textStyle: TerminalStyle(
+                          fontSize: WorkerController
+                              .instance
+                              .terminalFontSizeNotifier
+                              .value,
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 4,
+                        ),
                       ),
                     ),
                   ),
