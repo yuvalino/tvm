@@ -78,15 +78,15 @@ class App:
         return bool(self.find("key", key))
 
     def stop(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
         try:
             self._loop.run_until_complete(self._client.close())
         finally:
             self._loop.close()
-        if self.proc.poll() is None:
-            self.proc.kill()
-            self.proc.wait()
-        self._log.close()
-        os.unlink(self.log_path)
+            self._log.close()
+            os.unlink(self.log_path)
 
 
 def _kill_mac_app():
@@ -101,7 +101,9 @@ def _kill_mac_app():
     raise RuntimeError("a running tvm.app did not quit")
 
 
-def _launch(device: str | None) -> App:
+def _launch(device: str | None, ssh: bool = True) -> App:
+    """The app, driven by frt, once its first screen is up; with ssh, once
+    its SSH server listens too."""
     frt_port = _free_port() if device is None else 4800
     if device is None:
         if not os.path.exists(APP_EXE):
@@ -125,11 +127,17 @@ def _launch(device: str | None) -> App:
     app = App(proc, log, host, frt_port)
     try:
         app.connect(timeout=60)
+        # frt answers before the app's first frame
+        app.wait_for("key", "tab-tvm", timeout=30000)
         deadline = time.monotonic() + 30
-        while READY not in app.log():
+        while ssh and READY not in app.log():
             if proc.poll() is not None or time.monotonic() > deadline:
-                raise RuntimeError(f"the app's SSH server did not start:\n{app.log()}")
+                raise RuntimeError("the app's SSH server did not start")
             time.sleep(0.1)
+    except Exception as e:
+        log = app.log()
+        app.stop()
+        raise RuntimeError(f"{e}\nThe app's log:\n{log}") from e
     except BaseException:
         app.stop()
         raise
@@ -170,17 +178,27 @@ FONT_SIZE = "13"  # the tests' font size; they put it back to this
 
 
 def _settings(app: App, values: dict[str, str]):
+    """Set each row, all of them even when one fails (the first failure is
+    raised after)."""
+    failure = None
     for row, value in values.items():
-        _set_number(app, row, value)
-        assert app.text(f"setting-{row}-value") == value
+        try:
+            _set_number(app, row, value)
+            assert app.text(f"setting-{row}-value") == value
+        except Exception as e:
+            failure = failure or e
+    if failure:
+        raise failure
 
 
 @pytest.fixture(scope="module")
 def app(device):
     """The app, its SSH server on a port of its own for the run and the
     terminal at FONT_SIZE. The user's settings are put back afterwards, by
-    an app launched for that, whatever state the run left the last in."""
-    first = _launch(device)
+    an app launched for that, whatever state the run left the last in.
+    Settings need no SSH server: those launches don't wait for one (the
+    user's port may be taken)."""
+    first = _launch(device, ssh=False)
     try:
         original = {row: first.text(f"setting-{row}-value")
                     for row in ("port", "font-size")}
@@ -202,7 +220,7 @@ def app(device):
         finally:
             app.stop()
     finally:
-        last = _launch(device)
+        last = _launch(device, ssh=False)
         try:
             _settings(last, original)
         finally:
@@ -346,6 +364,11 @@ def _on_screen(app: App, key: str) -> bool:
     return "bounds" in match and abs(match["bounds"]["x"]) < 1
 
 
+def keyboard_down(app: App):
+    app.tap("key", "keyboard-down")
+    app.wait_gone("key", "key-ctrl")
+
+
 def keyboard_up(app: App):
     """Raise the app's keyboard, unless it is up (a new tab raises it)."""
     if app.exists("keyboard-up"):
@@ -380,14 +403,17 @@ def test_connect_command(app: App):
     # The command is the log's first entry, which a log following its end
     # has long scrolled away (and the lazy list no longer builds): scroll
     # back up to it, then follow again.
+    scrolled = False
     try:
         for _ in range(50):
             if app.exists("connect-command"):
                 break
             app.scroll("key", "log-list", dy=600)
+            scrolled = True     # which stops following
         assert app.text("connect-command") == f"ssh -p {app.ssh_port} {user}@{host}"
     finally:
-        app.tap("key", "log-follow")
+        if scrolled:
+            app.tap("key", "log-follow")
 
 
 def test_sections(app: App):
@@ -673,10 +699,10 @@ def _rows(lines: list[str], width: int) -> tuple[list[str], list[bool]]:
     return rows, wrapped
 
 
-def _find_rows(shell: Shell, lines: list[str]) -> tuple[int, dict]:
-    """Where in the buffer the lines are, whole: their text, and the rows
-    they take at the terminal's width, wrapped where they should be.
-    Returns the buffer line of their first row, and the buffer."""
+def _find_rows(shell: Shell, lines: list[str]) -> dict:
+    """That the buffer holds the lines, whole, once: their text, and the
+    rows they take at the terminal's width, wrapped where they should be.
+    Returns the buffer."""
     buf = shell.buffer()
     assert "\n" + "\n".join(lines) + "\n" in buf["text"]
     rows, wrapped = _rows(lines, buf["width"])
@@ -686,7 +712,7 @@ def _find_rows(shell: Shell, lines: list[str]) -> tuple[int, dict]:
     assert len(starts) == 1, f"the rows are there {len(starts)} times"
     (first,) = starts
     assert buf["wrapped"][first:first + len(rows)] == wrapped
-    return first, buf
+    return buf
 
 
 def test_scrollback_while_scrolling(app: App, shell: Shell):
@@ -695,7 +721,7 @@ def test_scrollback_while_scrolling(app: App, shell: Shell):
     scrolling changes nothing in."""
     lines = _mixed_lines(shell.buffer()["width"])
     assert shell.run(_print_lines(lines)) == ("\n".join(lines), 0)
-    _, buf = _find_rows(shell, lines)
+    buf = _find_rows(shell, lines)
     view = buf["view"]
     assert view["last"] == buf["cursor"]["line"] == buf["lineCount"] - 1
     in_view = view["last"] - view["first"] + 1
@@ -733,15 +759,14 @@ def test_resize_keeps_scrollback(app: App, shell: Shell):
     _find_rows(shell, lines)
     rows, _ = shell.wait_size()
 
-    app.tap("key", "keyboard-down")
-    app.wait_gone("key", "key-ctrl")
+    keyboard_down(app)
     taller, cols = shell.wait_size()
     assert taller > rows and cols == width
     _find_rows(shell, lines)
 
     keyboard_up(app)
     assert shell.wait_size() == (rows, width)
-    _, buf = _find_rows(shell, lines)
+    buf = _find_rows(shell, lines)
     assert buf["view"]["last"] == buf["cursor"]["line"]
 
     try:
@@ -750,7 +775,7 @@ def test_resize_keeps_scrollback(app: App, shell: Shell):
         keyboard_up(app)
         _, narrow = shell.wait_size()
         assert narrow < width
-        _, buf = _find_rows(shell, lines)
+        buf = _find_rows(shell, lines)
         assert buf["view"]["last"] == buf["cursor"]["line"]
     finally:
         _set_number(app, "font-size", FONT_SIZE)
@@ -778,8 +803,7 @@ def test_vim_redraws_on_resize(app: App, shell: Shell):
     shell.send("vim f\r")
     shell.wait_alt(True)
     shows(rows)
-    app.tap("key", "keyboard-down")
-    app.wait_gone("key", "key-ctrl")
+    keyboard_down(app)
     taller = shell.buffer()["height"]
     assert taller > rows
     shows(taller)
@@ -864,6 +888,5 @@ def test_key_bar_esc_in_vim(app: App, shell: Shell):
 
 def test_keyboard_down_hides_key_bar(app: App, shell: Shell):
     keyboard_up(app)
-    app.tap("key", "keyboard-down")
-    app.wait_gone("key", "key-ctrl")
+    keyboard_down(app)
     assert app.exists("keyboard-up")
