@@ -21,7 +21,6 @@ class TvmColors {
   static const magenta = Color(0xFFD3869B);
   static const blue = Color(0xFF83B6AC);
   static const cyan = Color(0xFF8FC8B4);
-  static const steel = Color(0xFFC3BCAE);
 
   /// The colour blocks neofetch prints, as the site shows them.
   static const blocks = [

@@ -52,7 +52,6 @@ class WorkerController {
   int? _serverPort;
   String? _serverPass;
 
-
   double get terminalFontSize => _prefs.getDouble('terminalFontSize') ?? 13.0;
   set terminalFontSize(double value) {
     _prefs.setDouble('terminalFontSize', value);
@@ -102,7 +101,7 @@ class WorkerController {
     _log('device: ${_NativeInfo.device()}');
     _log('pid: $pid');
     _log('uid: ${_NativeInfo.uid()}');
-    _log('username: ${_NativeInfo.username()}');
+    _log('username: $username');
     _log('hostname: ${Platform.localHostname}');
     _log('ssh port: $serverPort');
     _log('cwd: ${Directory.current.path}');

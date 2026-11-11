@@ -36,12 +36,12 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     WorkerController.instance.start();
     _tabs.addListener(_rebuild);
-    _keyboard.addListener(_rebuild);
+    _keyboard.addListener(_onKeyboardFocus);
   }
 
   @override
   void dispose() {
-    _keyboard.removeListener(_rebuild);
+    _keyboard.removeListener(_onKeyboardFocus);
     _keyboard.dispose();
     _tabs.removeListener(_rebuild);
     for (final s in [..._tabs.shells]) {
@@ -56,6 +56,18 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   bool get _keyboardOpen => _keyboard.hasFocus;
+
+  // Down, however it went (the key bar, or the system taking it away), no
+  // touch on a terminal may raise it again: the views can't take focus
+  // until the keyboard is raised on purpose (_focusTarget).
+  void _onKeyboardFocus() {
+    if (!_keyboard.hasFocus) {
+      for (final s in _tabs.shells) {
+        s.viewFocus.canRequestFocus = false;
+      }
+    }
+    _rebuild();
+  }
 
   // What holds focus for the tab in front while the keyboard is up.
   FocusNode get _focusTarget {
@@ -109,9 +121,6 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     if (_keyboardOpen) FocusManager.instance.primaryFocus?.unfocus();
-    for (final s in _tabs.shells) {
-      s.viewFocus.canRequestFocus = false;
-    }
   }
 
   // Cmd+V (a hardware keyboard, the Mac) pastes; other keys go to the shell
