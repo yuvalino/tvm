@@ -73,6 +73,7 @@ class _LogViewState extends State<LogView> with AutomaticKeepAliveClientMixin {
           builder: (context, logs, _) => ValueListenableBuilder<double>(
             valueListenable: _worker.terminalFontSizeNotifier,
             builder: (context, fontSize, _) => ListView.builder(
+              key: const ValueKey('log-list'),
               controller: _scroll,
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 64),
               itemCount: logs.length + 1,
@@ -99,6 +100,7 @@ class _LogViewState extends State<LogView> with AutomaticKeepAliveClientMixin {
           child: Row(
             children: [
               _FloatButton(
+                key: const ValueKey('log-copy'),
                 icon: StrokeIcon.copy,
                 label: 'Copy',
                 onTap: () => Clipboard.setData(
@@ -108,6 +110,7 @@ class _LogViewState extends State<LogView> with AutomaticKeepAliveClientMixin {
               ValueListenableBuilder<bool>(
                 valueListenable: _worker.autoScroll,
                 builder: (context, follow, _) => _FloatButton(
+                  key: const ValueKey('log-follow'),
                   icon: StrokeIcon.follow,
                   label: 'Follow',
                   on: follow,
@@ -215,6 +218,7 @@ class _ConnectCard extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(cmd,
+                    key: const ValueKey('connect-command'),
                     style: const TextStyle(
                         fontFamily: TvmColors.mono,
                         fontSize: 13,
@@ -241,6 +245,7 @@ class _ConnectCard extends StatelessWidget {
 
 class _FloatButton extends StatelessWidget {
   const _FloatButton({
+    super.key,
     required this.icon,
     required this.label,
     required this.onTap,

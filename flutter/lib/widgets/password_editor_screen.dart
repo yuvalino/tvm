@@ -43,6 +43,7 @@ class _PasswordEditorScreenState extends State<PasswordEditorScreen> {
       title: widget.title,
       footer: widget.footer,
       field: CupertinoTextField.borderless(
+        key: const ValueKey('editor-field'),
         controller: _controller,
         placeholder: widget.title,
         obscureText: !_showPassword,
@@ -56,6 +57,7 @@ class _PasswordEditorScreenState extends State<PasswordEditorScreen> {
         keyboardAppearance: Brightness.dark,
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         suffix: GestureDetector(
+          key: const ValueKey('password-reveal'),
           behavior: HitTestBehavior.opaque,
           onTap: () => setState(() => _showPassword = !_showPassword),
           child: Padding(

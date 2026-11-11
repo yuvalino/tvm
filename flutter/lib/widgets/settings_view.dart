@@ -37,6 +37,7 @@ class _SettingsViewState extends State<SettingsView> {
         const _Header('TERMINAL'),
         _Group([
           _Row(
+            id: 'font-size',
             icon: StrokeIcon.fontSize,
             tint: TvmColors.blue,
             title: 'Font Size',
@@ -55,6 +56,7 @@ class _SettingsViewState extends State<SettingsView> {
         const _Header('SSH SERVER'),
         _Group([
           _Row(
+            id: 'port',
             icon: StrokeIcon.globe,
             tint: TvmColors.yellow,
             title: 'Port',
@@ -68,6 +70,7 @@ class _SettingsViewState extends State<SettingsView> {
             ),
           ),
           _Row(
+            id: 'password',
             icon: StrokeIcon.lock,
             tint: TvmColors.red,
             title: 'Password',
@@ -87,7 +90,7 @@ class _SettingsViewState extends State<SettingsView> {
         ]),
         const _Footer('Changes apply on next launch.'),
         const _Header('ABOUT'),
-        _Group([_Row(title: 'Version', value: version)]),
+        _Group([_Row(id: 'version', title: 'Version', value: version)]),
         const SizedBox(height: 24),
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -198,6 +201,7 @@ class _Group extends StatelessWidget {
 
 class _Row extends StatelessWidget {
   const _Row({
+    required this.id,
     required this.title,
     this.icon,
     this.tint,
@@ -205,6 +209,8 @@ class _Row extends StatelessWidget {
     this.onTap,
   });
 
+  /// Keys the row `setting-<id>` and its value `setting-<id>-value`.
+  final String id;
   final String title;
   final List<String>? icon;
   final Color? tint;
@@ -214,6 +220,7 @@ class _Row extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
+      key: ValueKey('setting-$id'),
       behavior: HitTestBehavior.opaque,
       onTap: onTap,
       child: SizedBox(
@@ -240,6 +247,7 @@ class _Row extends StatelessWidget {
               const Spacer(),
               if (value != null)
                 Text(value!,
+                    key: ValueKey('setting-$id-value'),
                     style: const TextStyle(
                         fontFamily: TvmColors.mono,
                         fontSize: 15,
