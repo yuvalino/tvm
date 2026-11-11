@@ -2630,7 +2630,7 @@ def test_symlink_into_tvm(sshi: spawn):
     exec, open and directory lookups (the host knows no /tvm)."""
     out, rc = _sh(sshi, "rm -rf $TMPDIR/lnk && mkdir $TMPDIR/lnk && cd $TMPDIR/lnk && "
                         "ln -s /tvm/bin/bash sh2 && ln -s /tvm/etc/profile prof && ln -s /tvm/bin bindir && "
-                        "./sh2 -c 'echo exec ok' && head -c 1 prof && echo && ls bindir/bash; cd - >/dev/null")
+                        "./sh2 -c 'echo exec ok' && head -c 1 prof && echo && ls bindir/bash; cd - >/dev/null; rm -rf $TMPDIR/lnk")
     assert rc == 0, out
     lines = _lines(out)
     assert "exec ok" in lines and "#" in lines and "bindir/bash" in lines, out
