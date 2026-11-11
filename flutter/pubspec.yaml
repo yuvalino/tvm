@@ -5,7 +5,7 @@ publish_to: 'none'
 version: 1.0.0+10
 
 environment:
-  sdk: ^3.10.0
+  sdk: ^3.11.0
 
 dependencies:
   flutter:
@@ -18,6 +18,12 @@ dependencies:
   xterm: ^4.0.0
   dartssh2: ^4.1.0
   flutter_svg: ^2.3.0
+  # Drives the app from tests (tests/test_flutter.py); dormant unless the
+  # app is launched with FRT_PORT set.
+  frt:
+    git:
+      url: https://github.com/yuvalino/frt.git
+      ref: master
 
 dev_dependencies:
   flutter_test:

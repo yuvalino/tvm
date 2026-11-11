@@ -54,6 +54,7 @@ class _TvmTabState extends State<TvmTab> with AutomaticKeepAliveClientMixin {
                             alignment: Alignment.centerLeft,
                             child: Text(
                               [?net.address, ?net.name].join(' · '),
+                              key: const ValueKey('network-line'),
                               maxLines: 1,
                               style: const TextStyle(
                                   fontFamily: TvmColors.mono,
@@ -80,6 +81,7 @@ class _TvmTabState extends State<TvmTab> with AutomaticKeepAliveClientMixin {
                   children: {
                     for (final (i, label) in [(0, 'log'), (1, 'settings')])
                       i: Padding(
+                        key: ValueKey('section-$label'),
                         padding: const EdgeInsets.symmetric(vertical: 6),
                         child: Text(label,
                             style: TextStyle(

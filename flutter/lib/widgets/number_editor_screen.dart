@@ -54,6 +54,7 @@ class _NumberEditorScreenState extends State<NumberEditorScreen> {
       title: widget.title,
       footer: widget.footer,
       field: CupertinoTextField.borderless(
+        key: const ValueKey('editor-field'),
         controller: _controller,
         placeholder: widget.title,
         keyboardType: TextInputType.number,
