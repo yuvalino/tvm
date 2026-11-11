@@ -21,6 +21,7 @@ class ShellSession extends ChangeNotifier {
   ShellSession(this._title) : id = ++_lastId {
     terminal.onOutput = _send;
     terminal.onResize = _onResize;
+    terminal.addListener(_onTerminalChange);
   }
 
   static int _lastId = 0;
@@ -291,6 +292,24 @@ class ShellSession extends ChangeNotifier {
     if (scroll.hasClients) scroll.jumpTo(scroll.position.maxScrollExtent);
   }
 
+  // The alternate screen (vim, less) has only the rows in view, the main
+  // one its scrollback too. A switch leaves the view outside the new
+  // screen's extent, and the bouncing scroll physics (iOS, macOS) spring it
+  // back over half a second: the new screen slides into place, and if the
+  // program quits meanwhile, the spring goes on pulling the view up the main
+  // screen's scrollback, where it stays, the view no longer following
+  // output. So after the frame that lays out the new screen, the view is put
+  // at its end, which ends the spring.
+  bool _altBuffer = false;
+  void _onTerminalChange() {
+    final alt = terminal.isUsingAltBuffer;
+    if (alt == _altBuffer) return;
+    _altBuffer = alt;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_disposed) _scrollToEnd();
+    });
+  }
+
   void toggleCtrl() {
     ctrl = !ctrl;
     notifyListeners();
@@ -339,6 +358,7 @@ class ShellSession extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _teardown();
+    terminal.removeListener(_onTerminalChange);
     viewFocus.dispose();
     scroll.dispose();
     super.dispose();
