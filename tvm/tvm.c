@@ -18012,7 +18012,8 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     // (Python duplicates every descriptor this way). Passed to the host it
     // returned a host descriptor number, not one of the task's.
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        if ((long)arg < 0 || (long)arg >= MAX_FILES) {
+        int min = (int)(long)arg;  // an int, whatever the register's upper half
+        if (min < 0 || min >= MAX_FILES) {
             errno = EINVAL;     // as POSIX has it (task_assign_file_locked panics)
             return -1;
         }
