@@ -2047,6 +2047,15 @@ struct task_relocations {
 
 typedef void (*exit_t)(void);
 
+// One past the highest pthread key the host hands out: Darwin's run from
+// 258 to 767 (PTHREAD_KEYS_MAX, 512, is how many, not how high); glibc's
+// from 0 to PTHREAD_KEYS_MAX - 1.
+#if defined(__APPLE__)
+#define TVM_KEYS_END 768
+#else
+#define TVM_KEYS_END PTHREAD_KEYS_MAX
+#endif
+
 struct task {
     struct list_head tsk_list;
     struct task *tsk_parent;
@@ -2085,8 +2094,8 @@ struct task {
     struct task_map { uintptr_t start, end; } *tsk_maps;
     size_t tsk_nmaps;
     // pthread keys the task holds (see pthread_key_create), and their destructors
-    unsigned char tsk_keys[PTHREAD_KEYS_MAX];
-    void (*tsk_key_dtors[PTHREAD_KEYS_MAX])(void *);
+    unsigned char tsk_keys[TVM_KEYS_END];
+    void (*tsk_key_dtors[TVM_KEYS_END])(void *);
     uint32_t tsk_pending_sigs;  // bitmask of deferred signals (atomic via __atomic builtins)
     siginfo_t tsk_pending_siginfo[MAX_SIGNALS];
     ucontext_t tsk_pending_ucontext[MAX_SIGNALS];
@@ -6482,7 +6491,8 @@ static void tty_echo_open_locked(struct tty *tt, struct tty_obuf *o)
     o->fd = -1;
     o->n = 0;
     if (tt->t_hup || ISSET(tt->t_lflag, EXTPROC) ||
-        (!ISSET(tt->t_lflag, ECHO | ECHONL) && !ISSET(tt->t_iflag, IMAXBEL)))
+        (!ISSET(tt->t_lflag, ECHO | ECHONL) &&
+         !(ISSET(tt->t_lflag, ICANON) && ISSET(tt->t_iflag, IMAXBEL))))   // the bell (a full line)
         return;
     int slave = CALL_FUNC(dup, tt->t_sfd);
     if (-1 == slave)
@@ -20294,12 +20304,12 @@ FUNCTION_DEFINE1(int, pthread_detach, pthread_t, thread) {
  * hence the count.
  */
 static pthread_mutex_t keys_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned key_refs[PTHREAD_KEYS_MAX];   // tasks holding each key
+static unsigned key_refs[TVM_KEYS_END];   // tasks holding each key
 
 static void task_keys_ref(struct task *t)
 {
     pthread_mutex_lock(&keys_lock);
-    for (int k = 0; k < PTHREAD_KEYS_MAX; k++)
+    for (int k = 0; k < TVM_KEYS_END; k++)
         if (t->tsk_keys[k])
             key_refs[k]++;
     pthread_mutex_unlock(&keys_lock);
@@ -20314,7 +20324,7 @@ static void key_unref_locked(int k)
 static void task_keys_release(struct task *t)
 {
     pthread_mutex_lock(&keys_lock);
-    for (int k = 0; k < PTHREAD_KEYS_MAX; k++) {
+    for (int k = 0; k < TVM_KEYS_END; k++) {
         if (t->tsk_keys[k]) {
             t->tsk_keys[k] = 0;
             key_unref_locked(k);
@@ -20359,7 +20369,7 @@ static void task_keys_unstash(struct task *t, const unsigned char *keys, key_dto
 static void stashed_keys_release(const unsigned char *keys)
 {
     pthread_mutex_lock(&keys_lock);
-    for (int k = 0; k < PTHREAD_KEYS_MAX; k++)
+    for (int k = 0; k < TVM_KEYS_END; k++)
         if (keys[k])
             key_unref_locked(k);
     pthread_mutex_unlock(&keys_lock);
@@ -20371,12 +20381,14 @@ FUNCTION_DEFINE2(int, pthread_key_create, pthread_key_t *, key, key_dtor_t, dest
     int r = CALL_FUNC(pthread_key_create, key, NULL);
     if (r)
         return r;
-    if (*key >= PTHREAD_KEYS_MAX) {
+    if (*key >= TVM_KEYS_END) {
         // never seen; then the host's runs it, as it did
         CALL_FUNC(pthread_key_delete, *key);
         return CALL_FUNC(pthread_key_create, key, destructor);
     }
-    // the task's lock first, as taskalloc() takes them
+    // the task's lock first, as taskalloc() takes them; signals deferred, as
+    // a handler takes the task's lock too
+    tvm_sig_enter();
     task_lock(current);
     pthread_mutex_lock(&keys_lock);
     key_refs[*key] = 1;
@@ -20384,12 +20396,14 @@ FUNCTION_DEFINE2(int, pthread_key_create, pthread_key_t *, key, key_dtor_t, dest
     current->tsk_key_dtors[*key] = destructor;
     pthread_mutex_unlock(&keys_lock);
     task_unlock(current);
+    tvm_sig_leave();
     return 0;
 }
 
 FUNCTION_DEFINE1(int, pthread_key_delete, pthread_key_t, key) {
-    if (caller_is_tvm() || key >= PTHREAD_KEYS_MAX || !current->tsk_keys[key])
+    if (caller_is_tvm() || key >= TVM_KEYS_END || !current->tsk_keys[key])
         return CALL_FUNC(pthread_key_delete, key);
+    tvm_sig_enter();
     task_lock(current);
     pthread_mutex_lock(&keys_lock);
     current->tsk_keys[key] = 0;
@@ -20397,6 +20411,7 @@ FUNCTION_DEFINE1(int, pthread_key_delete, pthread_key_t, key) {
     key_unref_locked((int)key);
     pthread_mutex_unlock(&keys_lock);
     task_unlock(current);
+    tvm_sig_leave();
     return 0;
 }
 
@@ -20407,7 +20422,7 @@ static void run_key_destructors(void)
 {
     for (int iter = 0; iter < PTHREAD_DESTRUCTOR_ITERATIONS; iter++) {
         int ran = 0;
-        for (int k = 0; k < PTHREAD_KEYS_MAX; k++) {
+        for (int k = 0; k < TVM_KEYS_END; k++) {
             void (*dtor)(void *) = current->tsk_keys[k] ? current->tsk_key_dtors[k] : NULL;
             if (!dtor)
                 continue;
@@ -21341,6 +21356,9 @@ FUNCTION_DEFINE0(char ***, _NSGetEnviron) {
 FUNCTION_DEFINE0(char **, _NSGetProgname) {
     if (!current->tsk_data || !current->tsk_data->progname)
         return CALL_FUNC(_NSGetProgname);
+    // this task's name: a fork child's copy of tsk_data pointed at its
+    // parent's, which goes when the parent is reaped
+    current->tsk_data->progname = current->tsk_comm;
     return &current->tsk_data->progname;
 }
 
@@ -22605,8 +22623,8 @@ do_exec:
     current->tsk_nexits = current->tsk_exits_cap = 0;
     task_unlock(current);
     // and its pthread keys (see task_keys_stash)
-    unsigned char old_keys[PTHREAD_KEYS_MAX];
-    key_dtor_t old_key_dtors[PTHREAD_KEYS_MAX];
+    unsigned char old_keys[TVM_KEYS_END];
+    key_dtor_t old_key_dtors[TVM_KEYS_END];
     task_keys_stash(current, old_keys, old_key_dtors);
 
     main_func_t main_func = find_program(pathname);
@@ -23050,13 +23068,19 @@ struct tvm_spawnattr {
 
 static void *spawn_alloc(size_t size)
 {
-    return rmem_arena_alloc(arena_for_task(current), size);
+    tvm_sig_enter();    // the arena's lock (see tvm_calloc)
+    void *p = rmem_arena_alloc(arena_for_task(current), size);
+    tvm_sig_leave();
+    return p;
 }
 
 static void spawn_free(void *p)
 {
-    if (p)
-        rmem_arena_free(arena_for_task(current), p);
+    if (!p)
+        return;
+    tvm_sig_enter();
+    rmem_arena_free(arena_for_task(current), p);
+    tvm_sig_leave();
 }
 
 static struct tvm_spawn_file_actions *spawn_fa(const posix_spawn_file_actions_t *fa)
@@ -23498,6 +23522,19 @@ static int tvm_spawn(pid_t *pidp, const char *path, const posix_spawn_file_actio
     }
     if (pid == 0) {
         close(p[0]);
+        // the error pipe above every descriptor an action names, or a dup2
+        // or close there would take it (and a failed exec read as success)
+        int hi = 0;
+        for (int i = 0; fa && i < fa->count; i++)
+            if (fa->acts[i].fd >= hi)
+                hi = fa->acts[i].fd + 1;
+        if (p[1] < hi) {
+            int w = fcntl(p[1], F_DUPFD_CLOEXEC, hi);
+            if (w != -1) {
+                close(p[1]);
+                p[1] = w;
+            }
+        }
         int e = spawn_child_setup(fa, at);
         if (!e)
             e = spawn_exec(kpath, kargv, kenvp, search);
@@ -23976,7 +24013,13 @@ static void *tvm_calloc(size_t nmemb, size_t size) {
         return NULL;
     }
 
+    // Signals deferred while the arena's lock is held: one dispatched in
+    // there that frees from the arena too (a SIGKILL's teardown frees the
+    // task's streams) waited for the lock its own thread held, with
+    // tasks_lock, and the whole VM with it (bash's `sleep & kill -9 $!`).
+    tvm_sig_enter();
     void *p = rmem_arena_alloc(ar, total);
+    tvm_sig_leave();
     if (NULL == p)
         return NULL;
 
@@ -23996,7 +24039,9 @@ FUNCTION_DEFINE_VOID1(free, void *, ptr) {
     if (!ar)
         panic("free for task without arena %p", current);
 
+    tvm_sig_enter();    // the arena's lock (see tvm_calloc)
     rmem_arena_free(ar, ptr);
+    tvm_sig_leave();
 }
 
 /*
@@ -24014,7 +24059,10 @@ static void *tvm_memalign(size_t alignment, size_t size)
         errno = ENOMEM;
         return NULL;
     }
-    return rmem_arena_memalign(ar, alignment, size);
+    tvm_sig_enter();    // the arena's lock (see tvm_calloc)
+    void *p = rmem_arena_memalign(ar, alignment, size);
+    tvm_sig_leave();
+    return p;
 }
 
 FUNCTION_DEFINE3(int, posix_memalign, void **, memptr, size_t, alignment, size_t, size) {
@@ -24051,7 +24099,12 @@ FUNCTION_DEFINE2(void *, aligned_alloc, size_t, alignment, size_t, size) {
 static size_t tvm_usable_size(const void *ptr)
 {
     struct rmem_arena *ar = current ? arena_for_task(current) : NULL;
-    return ar ? rmem_arena_usable_size(ar, ptr) : 0;
+    if (!ar)
+        return 0;
+    tvm_sig_enter();    // the arena's lock (see tvm_calloc)
+    size_t n = rmem_arena_usable_size(ar, ptr);
+    tvm_sig_leave();
+    return n;
 }
 
 #if defined(__APPLE__)
@@ -24111,7 +24164,10 @@ FUNCTION_DEFINE2(void *, realloc, void *, ptr, size_t, size) {
             size = 1;
 #endif
     }
-    return rmem_arena_realloc(ar, ptr, size);
+    tvm_sig_enter();    // the arena's lock (see tvm_calloc)
+    void *p = rmem_arena_realloc(ar, ptr, size);
+    tvm_sig_leave();
+    return p;
 }
 
 FUNCTION_DEFINE1(char *, strdup, const char *, s) {
@@ -24313,9 +24369,11 @@ FUNCTION_DEFINE2(int, munmap, void *, addr, size_t, length) {
     if (r == 0) {
         size_t pagesz = (size_t)getpagesize();
         uintptr_t start = (uintptr_t)addr, end = (start + length + pagesz - 1) & ~(uintptr_t)(pagesz - 1);
+        tvm_sig_enter();    // a handler takes the task's lock too
         task_lock(current);
         task_maps_remove_locked(current, start, end);
         task_unlock(current);
+        tvm_sig_leave();
     }
     return r;
 }
