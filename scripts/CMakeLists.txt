@@ -170,10 +170,9 @@ function(mkinitrd_target NAME)
     # The keychain tool, as an empty keychain (scripts/security.sh): the
     # host's cannot run in TVM, and programs that keep secrets there save
     # them only when the keychain answers like one
-    if(APPLE)
-        string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/security.sh' \"$ROOTFS/bin/security\"\n")
-        string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/security\"\n\n")
-    endif()
+    # (installed everywhere, as init.rc binds it everywhere)
+    string(APPEND SCRIPT "cp '${ROOTDIR}/scripts/security.sh' \"$ROOTFS/bin/security\"\n")
+    string(APPEND SCRIPT "chmod 755 \"$ROOTFS/bin/security\"\n\n")
 
     # ── apple *_cmds ──
     foreach(module ${APPLE_CMDS_MODULES})
