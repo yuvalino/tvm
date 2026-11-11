@@ -293,18 +293,21 @@ class ShellSession extends ChangeNotifier {
   }
 
   // The alternate screen (vim, less) has only the rows in view, the main
-  // one its scrollback too. A switch leaves the view outside the new
-  // screen's extent, and the bouncing scroll physics (iOS, macOS) spring it
-  // back over half a second: the new screen slides into place, and if the
-  // program quits meanwhile, the spring goes on pulling the view up the main
-  // screen's scrollback, where it stays, the view no longer following
-  // output. So after the frame that lays out the new screen, the view is put
-  // at its end, which ends the spring.
+  // one its scrollback too. Entering it with the view down the main screen
+  // leaves the view past the new screen's end, and the bouncing scroll
+  // physics (iOS, macOS) spring it back over half a second: the screen
+  // slides into place, and if the program quits meanwhile the spring goes on
+  // pulling the view up the main screen's scrollback, where it stays, no
+  // longer following output. So on the way in the view is put at the top,
+  // before the new screen is laid out, and nothing springs; on the way out
+  // the terminal keeps to the bottom as it does with new output. After the
+  // frame that lays out either, the view is put at its end, in case.
   bool _altBuffer = false;
   void _onTerminalChange() {
     final alt = terminal.isUsingAltBuffer;
     if (alt == _altBuffer) return;
     _altBuffer = alt;
+    if (alt && scroll.hasClients) scroll.jumpTo(0);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_disposed) _scrollToEnd();
     });
