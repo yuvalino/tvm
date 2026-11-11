@@ -21,9 +21,9 @@ FRT_HOST=0.0.0.0, and driven over Wi-Fi. (Not run yet.)
 
 import asyncio
 import itertools
+import json
 import os
 import re
-import signal
 import socket
 import subprocess
 import tempfile
@@ -197,32 +197,30 @@ def _settings(app: App, values: dict[str, str]):
         raise failure
 
 
+# The user's settings as they were before a run changed them, until a run
+# puts them back: a run that died anyhow (SIGKILL, a closed terminal) left
+# them for the next to restore, which would otherwise take the test's port
+# for the user's own.
+SAVED_SETTINGS = os.path.join(tempfile.gettempdir(), "tvm_flutter_ui_settings.json")
+
+
 @pytest.fixture(scope="module")
 def app(device):
     """The app, its SSH server on a port of its own for the run and the
     terminal at FONT_SIZE. The user's settings are put back afterwards, by
     an app launched for that, whatever state the run left the last in.
     Settings need no SSH server: those launches don't wait for one (the
-    user's port may be taken). SIGTERM and SIGHUP end the run through the
-    same restore, as Ctrl-C does: Python runs no finally for them by
-    itself, and a KeyboardInterrupt is the one exception that no except
-    Exception (here, asyncio's, aiohttp's) takes for an ordinary error."""
-    handlers = {sig: signal.getsignal(sig)
-                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-    signal.signal(signal.SIGTERM, signal.default_int_handler)
-    signal.signal(signal.SIGHUP, signal.default_int_handler)
-    try:
-        yield from _app(device)
-    finally:
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-
-
-def _app(device):
+    user's port may be taken)."""
     first = _launch(device, ssh=False)
     try:
-        original = {row: first.text(f"setting-{row}-value")
-                    for row in ("port", "font-size")}
+        try:
+            with open(SAVED_SETTINGS) as f:
+                original = json.load(f)
+        except FileNotFoundError:
+            original = {row: first.text(f"setting-{row}-value")
+                        for row in ("port", "font-size")}
+            with open(SAVED_SETTINGS, "w") as f:
+                json.dump(original, f)
     except BaseException:
         first.stop()
         raise
@@ -241,14 +239,12 @@ def _app(device):
         finally:
             app.stop()
     finally:
-        # not interrupted itself: a second signal would leave a row unset
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            signal.signal(sig, signal.SIG_IGN)
         last = _launch(device, ssh=False)
         try:
             _settings(last, original)
         finally:
             last.stop()
+        os.unlink(SAVED_SETTINGS)
 
 
 _tokens = itertools.count(1)
