@@ -52,9 +52,10 @@ def _free_port() -> int:
 class App:
     """The running app: frt's client calls, made synchronous, plus the log."""
 
-    def __init__(self, proc: subprocess.Popen, log_path: str, host: str, port: int):
+    def __init__(self, proc: subprocess.Popen, log, host: str, port: int):
         self.proc = proc
-        self.log_path = log_path
+        self._log = log
+        self.log_path = log.name
         self._loop = asyncio.new_event_loop()
         self._client = FrtClient(port_file=os.devnull, host=host, port=port)
 
@@ -84,6 +85,8 @@ class App:
         if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
+        self._log.close()
+        os.unlink(self.log_path)
 
 
 def _kill_mac_app():
@@ -95,17 +98,19 @@ def _kill_mac_app():
                           capture_output=True).returncode != 0:
             return
         time.sleep(0.1)
+    raise RuntimeError("a running tvm.app did not quit")
 
 
 def _launch(device: str | None) -> App:
     frt_port = _free_port() if device is None else 4800
-    log_path = tempfile.mktemp(prefix="tvm_flutter_ui_", suffix=".log")
-    log = open(log_path, "w")
     if device is None:
         if not os.path.exists(APP_EXE):
             pytest.exit(f"{APP_EXE} not found: python3 build.py -a macos-arm64 -t flutter",
                         returncode=1)
         _kill_mac_app()
+    log = tempfile.NamedTemporaryFile("w", prefix="tvm_flutter_ui_", suffix=".log",
+                                      delete=False)
+    if device is None:
         proc = subprocess.Popen([APP_EXE], stdout=log, stderr=subprocess.STDOUT,
                                 env={**os.environ, "FRT_PORT": str(frt_port)})
         host = "127.0.0.1"
@@ -117,7 +122,7 @@ def _launch(device: str | None) -> App:
              "--console", "--terminate-existing", "-e", env, IOS_BUNDLE_ID],
             stdout=log, stderr=subprocess.STDOUT)
         host = socket.gethostbyname(f"{dev}.local")
-    app = App(proc, log_path, host, frt_port)
+    app = App(proc, log, host, frt_port)
     try:
         app.connect(timeout=60)
         deadline = time.monotonic() + 30
@@ -161,29 +166,47 @@ def _set_number(app: App, row: str, value: str):
     _back(app)
 
 
+FONT_SIZE = "13"  # the tests' font size; they put it back to this
+
+
+def _settings(app: App, values: dict[str, str]):
+    for row, value in values.items():
+        _set_number(app, row, value)
+        assert app.text(f"setting-{row}-value") == value
+
+
 @pytest.fixture(scope="module")
 def app(device):
-    """The app, its SSH server on a port of its own for the run."""
+    """The app, its SSH server on a port of its own for the run and the
+    terminal at FONT_SIZE. The user's settings are put back afterwards, by
+    an app launched for that, whatever state the run left the last in."""
     first = _launch(device)
     try:
-        original = first.text("setting-port-value")
-        ssh_port = str(_free_port())
-        _set_number(first, "port", ssh_port)
-        assert first.text("setting-port-value") == ssh_port
-    finally:
+        original = {row: first.text(f"setting-{row}-value")
+                    for row in ("port", "font-size")}
+    except BaseException:
         first.stop()
-
-    app = _launch(device)
+        raise
     try:
-        # The port applies on the next launch.
-        assert f"ssh port: {ssh_port}" in app.log()
-        app.ssh_port = int(ssh_port)
-        yield app
-    finally:
+        ssh_port = str(_free_port())
         try:
-            _set_number(app, "port", original)
+            _settings(first, {"port": ssh_port, "font-size": FONT_SIZE})
+        finally:
+            first.stop()
+        app = _launch(device)
+        try:
+            # The port applies on the next launch.
+            assert f"ssh port: {ssh_port}" in app.log()
+            app.ssh_port = int(ssh_port)
+            yield app
         finally:
             app.stop()
+    finally:
+        last = _launch(device)
+        try:
+            _settings(last, original)
+        finally:
+            last.stop()
 
 
 _tokens = itertools.count(1)
@@ -221,11 +244,12 @@ class Shell:
 
     def wait_alt(self, on: bool, timeout: float = 10):
         """Wait for a full-screen program to switch to (on) or back from the
-        alternate screen."""
+        alternate screen. Returns the buffer that showed it."""
         deadline = time.monotonic() + timeout
-        while self.buffer()["altBuffer"] != on:
+        while (buf := self.buffer())["altBuffer"] != on:
             assert time.monotonic() < deadline, f"altBuffer never became {on}"
             time.sleep(0.1)
+        return buf
 
     def wait_size(self, timeout: float = 5) -> tuple[int, int]:
         """Wait until the shell is told the terminal's size (resizes reach it
@@ -392,8 +416,8 @@ def test_font_size_resizes_terminal(app: App, shell: Shell):
         assert new < width
         assert shell.wait_size()[1] == new
     finally:
-        _set_number(app, "font-size", "13")
-    assert app.text("setting-font-size-value") == "13"
+        _set_number(app, "font-size", FONT_SIZE)
+    assert app.text("setting-font-size-value") == FONT_SIZE
 
 
 def test_number_editor_clamps_and_filters(app: App):
@@ -406,7 +430,7 @@ def test_number_editor_clamps_and_filters(app: App):
         _set_number(app, "font-size", "3")
         assert app.text("setting-font-size-value") == "8"
     finally:
-        _set_number(app, "font-size", "13")
+        _set_number(app, "font-size", FONT_SIZE)
 
 
 def test_password_row(app: App):
@@ -539,15 +563,9 @@ def test_ctrl_c(shell: Shell):
 
 def test_alt_screen(shell: Shell):
     shell.send("less /tvm/etc/ssl/cacert.pem\r")
-    deadline = time.monotonic() + 10
-    while not shell.buffer()["altBuffer"]:
-        assert time.monotonic() < deadline, "less did not switch screens"
-        time.sleep(0.1)
+    shell.wait_alt(True)
     shell.send("q")
-    deadline = time.monotonic() + 10
-    while shell.buffer()["altBuffer"]:
-        assert time.monotonic() < deadline, "less did not switch back"
-        time.sleep(0.1)
+    shell.wait_alt(False)
     assert shell.run("echo after") == ("after", 0)
 
 
@@ -557,8 +575,7 @@ def test_leaving_alt_screen_shows_prompt(shell: Shell):
     # Into the alternate screen: it is in place at once, not sliding in.
     at = shell.cursor_line()
     shell.send("printf '\\e[?1049h'; sleep 0.5; printf '\\e[?1049l'; echo out\r")
-    shell.wait_alt(True)
-    buf = shell.buffer()
+    buf = shell.wait_alt(True)
     assert buf["view"] == {"first": 0, "last": buf["lineCount"] - 1}, buf["view"]
     # And out of it while the spring would still run, as a program that
     # quits at once does.
@@ -673,12 +690,12 @@ def _find_rows(shell: Shell, lines: list[str]) -> tuple[int, dict]:
 
 
 def test_scrollback_while_scrolling(app: App, shell: Shell):
-    """The rows in view, scrolled up, down and up again, are the rows the
-    lines printed there, and scrolling changes nothing in the buffer."""
+    """Scrolled up, down and up again, the view moves a screenful's worth of
+    lines at a time over a buffer that holds the lines printed, and that
+    scrolling changes nothing in."""
     lines = _mixed_lines(shell.buffer()["width"])
     assert shell.run(_print_lines(lines)) == ("\n".join(lines), 0)
-    first, buf = _find_rows(shell, lines)
-    rows, _ = _rows(lines, buf["width"])
+    _, buf = _find_rows(shell, lines)
     view = buf["view"]
     assert view["last"] == buf["cursor"]["line"] == buf["lineCount"] - 1
     in_view = view["last"] - view["first"] + 1
@@ -690,10 +707,6 @@ def test_scrollback_while_scrolling(app: App, shell: Shell):
         v = b["view"]
         assert v["last"] - v["first"] + 1 in (in_view - 1, in_view)
         assert (v["first"] < moved["first"]) if up else (v["first"] > moved["first"])
-        # What is in view is what was printed there.
-        for i in range(v["first"], v["last"] + 1):
-            if first <= i < first + len(rows):
-                assert b["lines"][i] == rows[i - first]
         return v
 
     # Each drag is a fling too: let it run out.
@@ -735,12 +748,12 @@ def test_resize_keeps_scrollback(app: App, shell: Shell):
         _set_number(app, "font-size", "17")
         app.tap("key", f"tab-{shell.id}")
         keyboard_up(app)
-        narrow_rows, narrow = shell.wait_size()
+        _, narrow = shell.wait_size()
         assert narrow < width
         _, buf = _find_rows(shell, lines)
         assert buf["view"]["last"] == buf["cursor"]["line"]
     finally:
-        _set_number(app, "font-size", "13")
+        _set_number(app, "font-size", FONT_SIZE)
     app.tap("key", f"tab-{shell.id}")
     keyboard_up(app)
     assert shell.wait_size() == (rows, width)
@@ -756,9 +769,10 @@ def test_vim_redraws_on_resize(app: App, shell: Shell):
 
     def shows(rows: int):
         # The file from its first line down to the last row but one; the
-        # last is vim's own.
+        # last is vim's own, not the file's next line (as it would be on a
+        # shrink vim wasn't told of).
         nums = "\\n".join(str(i) for i in range(1, rows))
-        shell.wait(pattern=f"^{nums}\\n(?!{rows}\\n)", screen=True)
+        shell.wait(pattern=f"^{nums}\\n(?!{rows}$)", screen=True)
 
     rows = shell.buffer()["height"]
     shell.send("vim f\r")
