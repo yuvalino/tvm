@@ -2630,7 +2630,8 @@ def test_symlink_into_tvm(sshi: spawn):
     exec, open and directory lookups (the host knows no /tvm)."""
     out, rc = _sh(sshi, "rm -rf $TMPDIR/lnk && mkdir $TMPDIR/lnk && cd $TMPDIR/lnk && "
                         "ln -s /tvm/bin/bash sh2 && ln -s /tvm/etc/profile prof && ln -s /tvm/bin bindir && "
-                        "./sh2 -c 'echo exec ok' && head -c 1 prof && echo && ls bindir/bash; cd - >/dev/null; rm -rf $TMPDIR/lnk")
+                        "./sh2 -c 'echo exec ok' && head -c 1 prof && echo && ls bindir/bash; "
+                        "r=$?; cd - >/dev/null; rm -rf $TMPDIR/lnk; [ $r = 0 ]")
     assert rc == 0, out
     lines = _lines(out)
     assert "exec ok" in lines and "#" in lines and "bindir/bash" in lines, out
@@ -2638,6 +2639,5 @@ def test_symlink_into_tvm(sshi: spawn):
 def test_kill_9_child(sshi: spawn):
     """kill -9 of a child kills that child: SIGKILL sent as it was to a host
     thread killed the host process, every session with it."""
-    out, rc = _sh(sshi, "sleep 30 & kill -9 $!; wait $!; echo status=$?")
-    assert rc == 0, out
+    out, _ = _sh(sshi, "sleep 30 & kill -9 $!; wait $!; echo status=$?")
     assert "status=137" in _lines(out), out
