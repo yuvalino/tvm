@@ -60,6 +60,7 @@ class StrokeIcon extends StatelessWidget {
     'M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18',
   ];
   static const lock = ['M5 11h14v10H5z', 'M8 11V7a4 4 0 0 1 8 0v4'];
+  static const unlock = ['M5 11h14v10H5z', 'M8 11V7a4 4 0 0 1 7.9-.9'];
   static const rename = ['M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z'];
   static const reconnect = ['M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5'];
   static const closeOthers = ['M4 4h16v16H4z', 'M9 9l6 6M15 9l-6 6'];
