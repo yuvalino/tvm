@@ -617,7 +617,9 @@ def test_ctrl_c(shell: Shell):
 
 
 def test_alt_screen(shell: Shell):
-    shell.send("less /tvm/etc/ssl/cacert.pem\r")
+    shell.scratch_dir()
+    assert shell.run("seq 1 200 > f") == ("", 0)
+    shell.send("less f\r")
     shell.wait_alt(True)
     shell.send("q")
     shell.wait_alt(False)
