@@ -6,6 +6,7 @@ package does not ship it); update it from there.
 """
 
 import asyncio
+import base64
 import os
 
 import aiohttp
@@ -369,6 +370,18 @@ class FrtClient:
     async def tree(self, depth: int = 50) -> dict:
         """Get widget tree dump."""
         return await self._get("/tree", depth=str(depth))
+
+    async def screenshot(self, path: str | None = None,
+                         scale: float | None = None) -> bytes:
+        """The app's view as PNG bytes (written to path, if given). scale 1
+        is the device's full resolution."""
+        params = {} if scale is None else {"scale": str(scale)}
+        data = await self._get("/screenshot", **params)
+        png = base64.b64decode(data["png"])
+        if path:
+            with open(path, "wb") as f:
+                f.write(png)
+        return png
 
     async def ping(self) -> bool:
         """Health check."""
