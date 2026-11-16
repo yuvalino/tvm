@@ -117,7 +117,7 @@ class _LogViewState extends State<LogView> {
                   key: ValueKey('log-auto-scroll-${on ? 'on' : 'off'}'),
                   child: _FloatButton(
                     key: const ValueKey('log-auto-scroll'),
-                    icon: StrokeIcon.lock,
+                    icon: on ? StrokeIcon.lock : StrokeIcon.unlock,
                     label: 'Auto-scroll',
                     on: on,
                     onTap: () => _worker.autoScroll.value = !on,
@@ -216,47 +216,28 @@ class _ConnectCard extends StatelessWidget {
   Widget _build(String? host) {
     final w = WorkerController.instance;
     final cmd = 'ssh -p ${w.serverPort} ${w.username}@${host ?? 'localhost'}';
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.fromLTRB(12, 10, 4, 4),
-      decoration: BoxDecoration(
-        color: TvmColors.card,
-        border: Border.all(color: TvmColors.line),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
         children: [
-          const Text(
-            'CONNECT FROM ANOTHER MACHINE',
-            style: TextStyle(
-                color: TvmColors.dim,
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 0.6),
+          Expanded(
+            child: Text(cmd,
+                key: const ValueKey('connect-command'),
+                style: const TextStyle(
+                    fontFamily: TvmColors.mono,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                    color: TvmColors.bright)),
           ),
-          Row(
-            children: [
-              Expanded(
-                child: Text(cmd,
-                    key: const ValueKey('connect-command'),
-                    style: const TextStyle(
-                        fontFamily: TvmColors.mono,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                        color: TvmColors.bright)),
-              ),
-              CupertinoButton(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                minimumSize: const Size(0, 34),
-                onPressed: () => Clipboard.setData(ClipboardData(text: cmd)),
-                child: const Text('Copy',
-                    style: TextStyle(
-                        color: TvmColors.green,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600)),
-              ),
-            ],
+          CupertinoButton(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            minimumSize: const Size(0, 34),
+            onPressed: () => Clipboard.setData(ClipboardData(text: cmd)),
+            child: const Text('Copy',
+                style: TextStyle(
+                    color: TvmColors.green,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600)),
           ),
         ],
       ),
