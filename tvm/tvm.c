@@ -5436,6 +5436,20 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
             break;
         
 
+#if defined(TIOCGETD)
+        // the line discipline: the standard one only (toybox's stty asks)
+        case TIOCGETD:
+            *(int *)arg = 0;
+            ret = 0;
+            break;
+        case TIOCSETD:
+            if (*(int *)arg == 0)
+                ret = 0;
+            else
+                errno = EINVAL;
+            break;
+#endif
+
         case TIOCGWINSZ:
             memcpy(arg, &tt->t_winsize, sizeof(tt->t_winsize));
             ret = 0;
