@@ -426,20 +426,69 @@ def test_connect_command(app: App):
     user = re.search(r"^username: (.*)$", app.log(), re.M).group(1)
     app.tap("key", "tab-tvm")
     app.tap("key", "section-log")
-    # The command is the log's first entry, which a log following its end
-    # has long scrolled away (and the lazy list no longer builds): scroll
-    # back up to it, then follow again.
-    scrolled = False
+    # The command is the log's first entry, which the log at its end has
+    # long scrolled away (and the lazy list no longer builds): scroll back
+    # up to it, with Auto-scroll off (a new line would bring the view back).
+    was = _auto_scroll(app, False)
     try:
         for _ in range(50):
             if app.exists("connect-command"):
                 break
             app.scroll("key", "log-list", dy=600)
-            scrolled = True     # which stops following
         assert app.text("connect-command") == f"ssh -p {app.ssh_port} {user}@{host}"
     finally:
-        if scrolled:
-            app.tap("key", "log-follow")
+        _auto_scroll(app, was)
+        if app.exists("log-bottom-on"):
+            app.tap("key", "log-bottom")
+
+
+def _auto_scroll(app: App, on: bool) -> bool:
+    """Set the log's Auto-scroll; return what it was."""
+    was = app.exists("log-auto-scroll-on")
+    if was != on:
+        app.tap("key", "log-auto-scroll")
+        app.wait_for("key", f"log-auto-scroll-{'on' if on else 'off'}")
+    return was
+
+
+def test_log_bottom(app: App):
+    """Bottom brings the view to the log's end, and has nothing to do (is
+    off, takes no taps) there."""
+    app.tap("key", "tab-tvm")
+    app.tap("key", "section-log")
+    was = _auto_scroll(app, True)
+    try:
+        app.wait_for("key", "log-bottom-off")
+        with pytest.raises(FrtError) as exc_info:
+            app.tap("key", "log-bottom")
+        assert exc_info.value.error == "not_hittable"
+        app.scroll("key", "log-list", dy=300)
+        app.wait_for("key", "log-bottom-on")
+        app.tap("key", "log-bottom")
+        app.wait_for("key", "log-bottom-off")
+    finally:
+        _auto_scroll(app, was)
+
+
+def test_log_auto_scroll_toggles(app: App):
+    """Auto-scroll is a toggle, and scrolling by hand leaves it as it is.
+    (That a new line follows it is not tested: nothing here makes the app
+    log a line at will.)"""
+    app.tap("key", "tab-tvm")
+    app.tap("key", "section-log")
+    was = _auto_scroll(app, True)
+    try:
+        app.scroll("key", "log-list", dy=300)
+        assert app.exists("log-auto-scroll-on")
+        app.tap("key", "log-auto-scroll")
+        app.wait_for("key", "log-auto-scroll-off")
+        app.tap("key", "log-bottom")
+        app.wait_for("key", "log-bottom-off")
+        assert app.exists("log-auto-scroll-off")
+        app.tap("key", "log-auto-scroll")
+        app.wait_for("key", "log-auto-scroll-on")
+    finally:
+        _auto_scroll(app, was)
 
 
 def test_sections(app: App):
@@ -451,7 +500,7 @@ def test_sections(app: App):
     assert exc_info.value.error == "not_hittable"
     app.tap("key", "section-settings")
     with pytest.raises(FrtError) as exc_info:
-        app.tap("key", "log-follow")
+        app.tap("key", "log-auto-scroll")
     assert exc_info.value.error == "not_hittable"
 
 

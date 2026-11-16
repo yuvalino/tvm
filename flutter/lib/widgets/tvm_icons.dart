@@ -53,8 +53,7 @@ class StrokeIcon extends StatelessWidget {
   static const up = ['M6 15l6-6 6 6'];
   static const down = ['M6 9l6 6 6-6'];
   static const right = ['M9 6l6 6-6 6'];
-  static const copy = ['M9 9h11v11H9z', 'M5 15V5a2 2 0 0 1 2-2h8'];
-  static const follow = ['M12 5v14M6 13l6 6 6-6'];
+  static const bottom = ['M12 5v14M6 13l6 6 6-6'];
   static const fontSize = ['M4 7V4h16v3M9 20h6M12 4v16'];
   static const globe = [
     'M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z',
