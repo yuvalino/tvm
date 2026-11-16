@@ -48,7 +48,7 @@ mount --bind|-B|-o bind <source>:<mountpoint>
 
 - `hostpath` — CPIO (newc) file on the host, relative to cwd; mounted read-only
 - `guestpath`, `mountpoint` — absolute path; created if missing
-- `source` — absolute path (file or directory) the mount point shows
+- `source` — path (file or directory) the mount point shows; a relative one is taken from cwd, as `hostpath` is
 
 Mounts are merged with the host filesystem: paths no mount covers are the host's, and listings show both. A later mount at the same path replaces the earlier one.
 

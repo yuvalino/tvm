@@ -9,6 +9,12 @@
 #include <pthread.h>
 
 #include "rmem.h"
+// its mutexes are TVM's, counted (see the header); plain where rmem is
+// linked without TVM (test_rmem)
+#include "tvm_mutex.h"
+
+__attribute__((weak)) int tvm_mutex_lock(pthread_mutex_t *m) { return (pthread_mutex_lock)(m); }
+__attribute__((weak)) int tvm_mutex_unlock(pthread_mutex_t *m) { return (pthread_mutex_unlock)(m); }
 
 
 
@@ -89,6 +95,39 @@ size_t get_slab_size(size_t objsize) {
     slabsize = round_up(slabsize, pagesz);
 
     return slabsize;
+}
+
+/*
+ * Zero [p, p + len) of a slab, as a freed object (or the tail of a shrunk one)
+ * must be: the next allocation from it relies on it. The whole pages in it
+ * are replaced by fresh anonymous ones instead of written, which zeroes them
+ * just the same but hands their memory back to the system.
+ *
+ * memset kept every page an object had ever covered resident, and dirtied
+ * the pages it had not: a freed 128 KB object stayed 128 KB of the process's
+ * footprint even if its program had written a few bytes of it, and nothing in
+ * a slab was ever returned. node under TVM ran Claude Code with a 3.4 GB peak
+ * footprint, ~1.1 GB of it slabs of freed, zeroed V8 and libuv buffers, 16
+ * times its footprint outside TVM; iOS killed the app for it (jetsam,
+ * per-process-limit). Below RMEM_ZERO_REMAP the system call costs more than
+ * the memset it saves.
+ */
+#define RMEM_ZERO_REMAP ((size_t)64 << 10)
+
+static void rmem_zero(void *p, size_t len)
+{
+    if (len >= RMEM_ZERO_REMAP) {
+        size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
+        uintptr_t lo = round_up((uintptr_t)p, pagesz);
+        uintptr_t hi = ((uintptr_t)p + len) & ~(uintptr_t)(pagesz - 1);
+        if (hi > lo && hi - lo >= RMEM_ZERO_REMAP &&
+            rops.ro_mmap((void *)lo, hi - lo, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == (void *)lo) {
+            memset(p, 0, lo - (uintptr_t)p);
+            memset((void *)hi, 0, (uintptr_t)p + len - hi);
+            return;
+        }
+    }
+    memset(p, 0, len);
 }
 
 /* -------------------- BITMAP -------------------- */
@@ -465,7 +504,7 @@ static void rmem_slab_free(struct rmem_arena *ar, struct rmem_slab *sl, void *p)
     }
 
     bitmap_set_range(sl->sl_bitmap, idx, 1, 0);
-    memset(p, 0, sl->sl_objsize);
+    rmem_zero(p, sl->sl_objsize);
 
     uintptr_t obj_low  = addr;
     uintptr_t obj_high = addr + sl->sl_objsize;
@@ -667,6 +706,24 @@ void rmem_arena_free(struct rmem_arena *ar, void *p) {
     ABORT("invalid pointer %p", p);
 }
 
+size_t rmem_arena_usable_size(struct rmem_arena *ar, const void *p)
+{
+    size_t ret = 0;
+    if (!p)
+        return 0;
+    pthread_mutex_lock(&ar->ar_lock);
+    for (struct rmem_slab *sl = ar->ar_slabs; sl; sl = sl->sl_next) {
+        if ((uintptr_t)p < (uintptr_t)sl->sl_base || (uintptr_t)p >= ((uintptr_t)sl->sl_base + sl->sl_nobj * sl->sl_objsize))
+            continue;
+        uintptr_t off = (uintptr_t)p - (uintptr_t)sl->sl_base;
+        if (off % sl->sl_objsize == 0 && bitmap_test_range(sl->sl_bitmap, off / sl->sl_objsize, 1))
+            ret = sl->sl_objsize;
+        break;
+    }
+    pthread_mutex_unlock(&ar->ar_lock);
+    return ret;
+}
+
 void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
 {
     if (!p)
@@ -707,7 +764,7 @@ void *rmem_arena_realloc(struct rmem_arena *ar, void *p, size_t size)
         // short circuit, keep in same slab
         if (objsize == sl->sl_objsize) {
             if (objsize > size)
-                memset((char *)p + size, 0, sl->sl_objsize - size);
+                rmem_zero((char *)p + size, sl->sl_objsize - size);
             pthread_mutex_unlock(&ar->ar_lock);
             return p;
         }

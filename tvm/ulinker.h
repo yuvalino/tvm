@@ -1,6 +1,7 @@
 #pragma once
 #include <dlfcn.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #include <unicorn/unicorn.h>
@@ -72,6 +73,40 @@ void *ulinker_dlopen(struct ulinker *ulinker, const char *filename, int flags);
 int   ulinker_dlclose(void *handle);
 void *ulinker_dlsym(struct ulinker *ulinker, void *handle, const char *symbol, int all);
 char *ulinker_dlerror(void);
+
+// The unwind tables of the Mach-O image TVM loaded that holds addr, as
+// dyld's _dyld_find_unwind_sections() gives them (mh: its mach header).
+// Returns 0 when no image of the linker holds addr.
+struct ulinker_unwind_sections {
+    const void *mh;
+    const void *dwarf_section;
+    uintptr_t   dwarf_section_length;
+    const void *compact_unwind_section;
+    uintptr_t   compact_unwind_section_length;
+};
+int ulinker_find_unwind_sections(struct ulinker *ulinker, const void *addr, struct ulinker_unwind_sections *out);
+
+// The Mach-O images TVM loaded, as dyld's image list gives them
+// (_dyld_get_image_header & co.): the executable first, then the others
+// oldest first. Returns 0 past the last one.
+struct ulinker_image {
+    const void *mh;     // the mach header, where the image maps it
+    intptr_t    slide;  // its load address less its link-time one
+    const char *path;
+};
+int ulinker_image(struct ulinker *ulinker, size_t index, struct ulinker_image *out);
+
+// Thread-local variables across a fork (ulinker.c, "Thread-local variables"):
+// on the forking thread, record its TLV block of each image (returns how many
+// images have TLVs; up to max are recorded); in the child, once the parent's
+// memory is copied, point the child's thread at the copies (translate maps an
+// address in the parent's memory to the child's copy).
+size_t ulinker_tlv_snapshot(struct ulinker *ulinker, void **blocks, size_t max);
+void ulinker_tlv_restore(struct ulinker *ulinker, void *const *blocks, size_t count,
+                         void *(*translate)(void *arg, void *p), void *arg);
+// A thread of the linker's task is exiting (the task lives on): its TLV
+// blocks go back to the task's memory.
+void ulinker_tlv_thread_exit(struct ulinker *ulinker);
 
 enum {
     ULARCH_NONE = 0,
