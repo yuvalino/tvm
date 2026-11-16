@@ -1,5 +1,4 @@
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 
 import '../services/worker_controller.dart';
@@ -18,48 +17,53 @@ class LogView extends StatefulWidget {
 class _LogViewState extends State<LogView> {
   final _scroll = ScrollController();
   final _worker = WorkerController.instance;
+  // Whether the view shows the log's end; Bottom has nothing to do then.
+  final _atBottom = ValueNotifier(true);
 
   @override
   void initState() {
     super.initState();
     _worker.logs.addListener(_onLogs);
     _scroll.addListener(_onScroll);
-    _jumpToEnd();
+    _toEnd();
   }
 
   @override
   void dispose() {
     _worker.logs.removeListener(_onLogs);
     _scroll.dispose();
+    _atBottom.dispose();
     super.dispose();
   }
 
   void _onLogs() {
-    if (_worker.autoScroll.value) _jumpToEnd(animate: true);
+    if (_worker.autoScroll.value) _toEnd(animate: true);
   }
 
-  // Scrolling up by hand stops following; Follow (or reaching the end
-  // again) resumes it.
+  // On a scroll, and on a new line (the end moves away, the view does not).
   void _onScroll() {
     if (!_scroll.hasClients) return;
     final p = _scroll.position;
-    final atEnd = p.pixels >= p.maxScrollExtent - 20;
-    if (p.userScrollDirection == ScrollDirection.forward && !atEnd) {
-      _worker.autoScroll.value = false;
-    } else if (p.userScrollDirection == ScrollDirection.reverse && atEnd) {
-      _worker.autoScroll.value = true;
-    }
+    _atBottom.value = p.pixels >= p.maxScrollExtent - 20;
   }
 
-  void _jumpToEnd({bool animate = false}) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      final end = _scroll.position.maxScrollExtent;
-      animate
-          ? _scroll.animateTo(end,
-              duration: const Duration(milliseconds: 100), curve: Curves.easeOut)
-          : _scroll.jumpTo(end);
+  // The list builds lazily: the end it knows of is an estimate until the
+  // last lines are laid out, which going there does. So it goes again, a
+  // frame later, until the view stays at the end.
+  void _toEnd({bool animate = false, int tries = 10}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted || !_scroll.hasClients) return;
+      final p = _scroll.position;
+      if (p.pixels >= p.maxScrollExtent) return;
+      if (animate) {
+        await _scroll.animateTo(p.maxScrollExtent,
+            duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+      } else {
+        _scroll.jumpTo(p.maxScrollExtent);
+      }
+      if (tries > 0) _toEnd(tries: tries - 1);
     });
+    WidgetsBinding.instance.scheduleFrame();
   }
 
   @override
@@ -70,7 +74,13 @@ class _LogViewState extends State<LogView> {
           valueListenable: _worker.logs,
           builder: (context, logs, _) => ValueListenableBuilder<double>(
             valueListenable: _worker.terminalFontSizeNotifier,
-            builder: (context, fontSize, _) => ListView.builder(
+            builder: (context, fontSize, _) =>
+                NotificationListener<ScrollMetricsNotification>(
+              onNotification: (_) {
+                _onScroll();
+                return false;
+              },
+              child: ListView.builder(
               key: const ValueKey('log-list'),
               controller: _scroll,
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 64),
@@ -89,6 +99,7 @@ class _LogViewState extends State<LogView> {
                         ),
                       ),
                     ),
+              ),
             ),
           ),
         ),
@@ -97,25 +108,37 @@ class _LogViewState extends State<LogView> {
           bottom: 12,
           child: Row(
             children: [
-              _FloatButton(
-                key: const ValueKey('log-copy'),
-                icon: StrokeIcon.copy,
-                label: 'Copy',
-                onTap: () => Clipboard.setData(
-                    ClipboardData(text: _worker.logs.value.join('\n'))),
+              // Auto-scroll: each new line brings the view to the end.
+              // Bottom: to the end once; nothing to do at the end. Each one's
+              // state is in the key around it too, for the UI tests.
+              ValueListenableBuilder<bool>(
+                valueListenable: _worker.autoScroll,
+                builder: (context, on, _) => KeyedSubtree(
+                  key: ValueKey('log-auto-scroll-${on ? 'on' : 'off'}'),
+                  child: _FloatButton(
+                    key: const ValueKey('log-auto-scroll'),
+                    icon: StrokeIcon.lock,
+                    label: 'Auto-scroll',
+                    on: on,
+                    onTap: () => _worker.autoScroll.value = !on,
+                  ),
+                ),
               ),
               const SizedBox(width: 8),
               ValueListenableBuilder<bool>(
-                valueListenable: _worker.autoScroll,
-                builder: (context, follow, _) => _FloatButton(
-                  key: const ValueKey('log-follow'),
-                  icon: StrokeIcon.follow,
-                  label: 'Follow',
-                  on: follow,
-                  onTap: () {
-                    _worker.autoScroll.value = !follow;
-                    if (!follow) _jumpToEnd(animate: true);
-                  },
+                valueListenable: _atBottom,
+                builder: (context, atBottom, _) => KeyedSubtree(
+                  key: ValueKey('log-bottom-${atBottom ? 'off' : 'on'}'),
+                  child: IgnorePointer(
+                    ignoring: atBottom,
+                    child: _FloatButton(
+                      key: const ValueKey('log-bottom'),
+                      icon: StrokeIcon.bottom,
+                      label: 'Bottom',
+                      enabled: !atBottom,
+                      onTap: () => _toEnd(animate: true),
+                    ),
+                  ),
                 ),
               ),
             ],
@@ -248,16 +271,22 @@ class _FloatButton extends StatelessWidget {
     required this.label,
     required this.onTap,
     this.on = false,
+    this.enabled = true,
   });
 
   final List<String> icon;
   final String label;
   final VoidCallback onTap;
   final bool on;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
-    final fg = on ? TvmColors.bg : TvmColors.fg;
+    final fg = on
+        ? TvmColors.bg
+        : enabled
+            ? TvmColors.fg
+            : TvmColors.dimmer;
     return GestureDetector(
       onTap: onTap,
       child: Container(
