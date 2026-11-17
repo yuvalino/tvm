@@ -20974,6 +20974,11 @@ static int bsearch_compar_emulator(const void *a, const void *b)
     return (int)ret;
 }
 
+// glibc 2.43 (Ubuntu 26.04) makes bsearch a macro too, C23's
+// const-preserving one, which would take this definition for a call
+#ifdef bsearch
+#undef bsearch
+#endif
 FUNCTION_DEFINE5(void *, bsearch, const void *, key, const void *, base, size_t, nel, size_t, width, compar_t, compar) {
     bsearch_compar = compar;
     void *ret = CALL_FUNC(bsearch, key, base, nel, width, bsearch_compar_emulator);
