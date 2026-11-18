@@ -17,6 +17,7 @@ SSH into an iPhone and run unsigned code in a shell with bash, vim, toybox, and 
 [Website](https://tvm.yuvalino.com) ·
 [Research paper](https://yuvalino.com/rage-against-the-sandbox)
 
+<a href="https://discord.gg/kjkXcdByQm"><img alt="Join the tvm Discord community" src="https://img.shields.io/badge/Discord-5865F2?logo=discord&amp;logoColor=white" /></a>
 <a href="https://x.com/jachashx"><img alt="Follow Yuval on X" src="https://img.shields.io/badge/X-000000?logo=x&amp;logoColor=white" /></a>
 
 </div>
