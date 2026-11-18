@@ -24,9 +24,11 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # CFDictionaryApplyFunction, which calls the host's.
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(tvm_exe PRIVATE unicorn pthread util m crypt ${CMAKE_DL_LIBS})
-        # No -rdynamic: the host libraries must not bind to TVM's functions
-        # (a guest's are bound by the ulinker, from the hooks' metadata).
-        target_link_options(tvm_exe PRIVATE -Wl,--no-as-needed -pie)
+        # -rdynamic for dladdr's names in panic stack traces (global functions
+        # only; a static one is still `tvm + offset`, for addr2line). The hooks are
+        # __tvm_ names (a guest's `name` is bound by the ulinker, from their
+        # metadata), so no host library binds to one of TVM's functions.
+        target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         target_link_libraries(tvm_exe PRIVATE unicorn pthread m "-framework CoreFoundation")
     endif()
