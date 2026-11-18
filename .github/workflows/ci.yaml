@@ -41,7 +41,7 @@ jobs:
         sleep 3
         mkdir -p /tmp/sf && echo hi > /tmp/sf/a
         printf 'pwd\nls /tmp/sf\nget /tmp/sf/a /tmp/sf/b\n' > /tmp/batch
-        r=0; sshpass -p alpine sftp -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPubkeyAuthentication=no -P $PORT -b /tmp/batch $USER@localhost || r=$?
+        r=0; sshpass -p alpine sftp -oBatchMode=no -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPubkeyAuthentication=no -P $PORT -b /tmp/batch $USER@localhost || r=$?
         echo "sftp rc=$r"
         sleep 1
         grep -v initrc_ /tmp/db.log | grep -v "PAGE IN" | tail -120
