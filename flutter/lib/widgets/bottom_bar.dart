@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import '../services/shell_session.dart';
@@ -512,6 +513,7 @@ class _KeyBar extends StatelessWidget {
       listenable: shell ?? Listenable.merge(const []),
       builder: (context, _) {
         final keys = <Widget>[
+          _PasteKey(shell: shell),
           _Key(
               key: const ValueKey('key-esc'),
               label: 'esc',
@@ -581,6 +583,82 @@ class _KeyBar extends StatelessWidget {
   }
 }
 
+/// Pastes the clipboard's text into the shell, as Cmd+V does; dimmed while
+/// the clipboard holds no text. Whether it does is asked without reading it
+/// (UIPasteboard.hasStrings on iOS, so no paste prompt or banner), when the
+/// bar comes up, when the app comes back, and every second in between, since
+/// another app may change the clipboard at any time.
+class _PasteKey extends StatefulWidget {
+  const _PasteKey({required this.shell});
+
+  final ShellSession? shell;
+
+  @override
+  State<_PasteKey> createState() => _PasteKeyState();
+}
+
+class _PasteKeyState extends State<_PasteKey> with WidgetsBindingObserver {
+  bool _hasText = false;
+  Timer? _poll;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _check();
+    _poll = Timer.periodic(const Duration(seconds: 1), (_) => _check());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _check();
+  }
+
+  Future<void> _check() async {
+    bool has;
+    try {
+      has = await Clipboard.hasStrings();
+    } catch (_) {
+      has = false;
+    }
+    if (mounted && has != _hasText) setState(() => _hasText = has);
+  }
+
+  Future<void> _paste() async {
+    final shell = widget.shell;
+    ClipboardData? data;
+    try {
+      data = await Clipboard.getData(Clipboard.kTextPlain);
+    } catch (_) {
+      return;
+    }
+    final text = data?.text;
+    if (text != null && text.isNotEmpty) shell?.paste(text);
+    _check();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final key = _Key(
+      key: const ValueKey('key-paste'),
+      icon: const StrokeIcon(StrokeIcon.paste, size: 17, strokeWidth: 1.8),
+      enabled: _hasText,
+      onTap: _paste,
+    );
+    // Tests see the disabled state by this key.
+    return _hasText
+        ? key
+        : KeyedSubtree(key: const ValueKey('key-paste-disabled'), child: key);
+  }
+}
+
 class _Key extends StatefulWidget {
   const _Key({
     super.key,
@@ -590,6 +668,7 @@ class _Key extends StatefulWidget {
     this.modifier = false,
     this.latched = false,
     this.repeat = false,
+    this.enabled = true,
   });
 
   final VoidCallback onTap;
@@ -598,6 +677,9 @@ class _Key extends StatefulWidget {
   final bool modifier;
   final bool latched;
   final bool repeat;
+
+  /// Off, the key is dimmed and takes no touches.
+  final bool enabled;
 
   @override
   State<_Key> createState() => _KeyState();
@@ -626,7 +708,7 @@ class _KeyState extends State<_Key> {
         : widget.modifier
         ? TvmColors.yellow
         : TvmColors.fg;
-    return GestureDetector(
+    final key = GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTapDown: (_) => setState(() => _down = true),
       onTapUp: (_) => _stop(),
@@ -676,5 +758,7 @@ class _KeyState extends State<_Key> {
               ),
       ),
     );
+    if (widget.enabled) return key;
+    return IgnorePointer(child: Opacity(opacity: 0.35, child: key));
   }
 }

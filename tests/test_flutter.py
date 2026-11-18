@@ -966,6 +966,40 @@ def test_key_bar_esc_in_vim(app: App, shell: Shell):
     assert shell.run("cat g") == ("hello", 0)
 
 
+@pytest.fixture
+def clipboard():
+    """Set the Mac's clipboard (pbcopy) for a test, and put back what was
+    on it."""
+    saved = subprocess.run(["pbpaste"], capture_output=True).stdout
+
+    def put(text: str):
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+
+    yield put
+    subprocess.run(["pbcopy"], input=saved, check=True)
+
+
+def test_key_bar_paste(app: App, shell: Shell, clipboard):
+    """The paste key types the clipboard's text into the shell, as pasted
+    text (bracketed: it waits at the prompt until Return)."""
+    keyboard_up(app)
+    clipboard("echo pasted_text")
+    app.wait_gone("key", "key-paste-disabled")
+    at = shell.cursor_line()
+    app.tap("key", "key-paste")
+    shell.wait(pattern=r"^\$ echo pasted_text$", start=at)
+    app.type("key", "keyboard-input", "\n")
+    shell.wait(pattern=r"^pasted_text$", start=at + 1)
+
+
+def test_key_bar_paste_disabled_without_text(app: App, shell: Shell, clipboard):
+    keyboard_up(app)
+    clipboard("")
+    app.wait_for("key", "key-paste-disabled")
+    clipboard("x")
+    app.wait_gone("key", "key-paste-disabled")
+
+
 def test_keyboard_down_hides_key_bar(app: App, shell: Shell):
     keyboard_up(app)
     keyboard_down(app)
