@@ -32,14 +32,37 @@ jobs:
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
     - name: debug per-test
       continue-on-error: true
-      timeout-minutes: 25
+      timeout-minutes: 40
+      shell: bash
       run: |
-        for k in $(./output/linux-x64/bin/test_tvm -l | grep -o '[A-Za-z0-9_]*$' | tail -n +2); do
-          start=$(date +%s)
-          timeout 60 ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30 -k $k > /tmp/o.txt 2>&1; r=$?
-          echo "$k rc=$r $(( $(date +%s) - start ))s"
-          if [ $r != 0 ]; then tail -c 1500 /tmp/o.txt; fi
-        done
+        T=./output/linux-x64/bin/test_tvm
+        pertest() {  # $1: tvm binary, $2: label
+          for k in $($T -l | grep -o '[A-Za-z0-9_]*$' | tail -n +2); do
+            r=0; timeout 60 $1 $T -t 30 -k $k > /tmp/o.txt 2>&1 || r=$?
+            [ $r = 0 ] || { echo "[$2] $k rc=$r"; tail -c 800 /tmp/o.txt; }
+          done
+          echo "[$2] per-test done"
+        }
+        sighup() {  # $1: tvm binary, $2: label
+          for i in 1 2 3 4 5; do
+            r=0; timeout 30 $1 --verbose $T -t 20 -k TTYSighupRace > /tmp/v.txt 2>&1 || r=$?
+            echo "[$2] TTYSighupRace #$i rc=$r"
+            [ $r = 0 ] || grep -v initrc_ /tmp/v.txt | tail -40
+          done
+        }
+        cp ./output/linux-x64/bin/tvm /tmp/tvm_new
+        pertest /tmp/tvm_new new
+        sighup /tmp/tvm_new new
+        git fetch -q --depth=1 origin ui
+        F="tvm/tvm.c tvm/ulinker.c tvm/ulinker.h tvm/CMakeLists.txt"
+        for f in $F; do git show FETCH_HEAD:$f > $f; done; touch $F
+        ninja -C output/linux-x64/build tvm_exe > /tmp/uibuild.txt 2>&1 || tail -30 /tmp/uibuild.txt
+        cp ./output/linux-x64/bin/tvm /tmp/tvm_ui
+        git checkout -- $F; touch $F
+        ninja -C output/linux-x64/build tvm_exe > /dev/null 2>&1
+        cmp -s ./output/linux-x64/bin/tvm /tmp/tvm_ui && echo "restore FAILED" || echo "restored new tvm"
+        sighup /tmp/tvm_ui ui
+        pertest /tmp/tvm_ui ui
     - name: test_tvm
       timeout-minutes: 5
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
