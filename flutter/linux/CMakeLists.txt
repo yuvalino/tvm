@@ -98,7 +98,7 @@ target_link_libraries(tvm_bridge PRIVATE
   -Wl,--end-group
   pthread util z m ${CMAKE_DL_LIBS} crypt ncurses
 )
-target_link_options(tvm_bridge PRIVATE -rdynamic -Wl,--no-as-needed -Wl,-Bsymbolic)
+target_link_options(tvm_bridge PRIVATE -Wl,--no-as-needed)
 add_dependencies(tvm_bridge initrd_obj)
 
 # Application build; see runner/CMakeLists.txt.

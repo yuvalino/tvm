@@ -61,7 +61,6 @@
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/fileport.h>
-#include <mach-o/getsect.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <sys/sysctl.h>
 #elif defined(__linux__)
@@ -71,7 +70,6 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <asm/prctl.h>
-#include <link.h>
 #include <malloc.h>   // memalign, pvalloc
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
@@ -1677,15 +1675,30 @@ static void tvm_thread_destructor(void *arg) {
 // that is not a VM thread.
 #define TVM_TLS_PEEK() (tls_initialized ? (struct tvm_tls *)pthread_getspecific(tls_key) : NULL)
 
+// Die by SIGABRT with the default disposition, bypassing TVM's signal_handler,
+// which defers the signal or (on a thread with no VM identity) drops it, so a
+// plain abort() could return or spin instead.
+__attribute__((noreturn)) static void die_by_sigabrt(void)
+{
+    struct sigaction dfl = { .sa_handler = SIG_DFL };
+    sigaction(SIGABRT, &dfl, NULL);
+    sigset_t unblk;
+    sigemptyset(&unblk);
+    sigaddset(&unblk, SIGABRT);
+    pthread_sigmask(SIG_UNBLOCK, &unblk, NULL);
+    raise(SIGABRT);
+    _exit(128 + SIGABRT);
+}
+
 static inline struct tvm_tls *tvm_tls(void) {
     struct tvm_tls *t = TVM_TLS_PEEK();
     if (!t) {
         // No per-thread TLS and somebody still reached VM state: VM code on
-        // a thread that is not a VM thread. Raw report + abort — panic()/INFO read TLS via this
-        // very function and would recurse.
+        // a thread that is not a VM thread. Raw report: panic()/INFO read
+        // TLS via this very function and would recurse.
         static const char __msg[] = "tvm_tls: no thread TLS (VM code on a non-VM thread)\n";
         write(2, __msg, sizeof(__msg) - 1);
-        abort();
+        die_by_sigabrt();
     }
     return t;
 }
@@ -9305,11 +9318,12 @@ void tvm_register_program(const char *pathname, main_func_t main_routine)
     if (!pathname || !pathname[0])
         panic("pathname");
     
+    // a process-wide registry, kept for good: the host's heap, any thread
     struct exec_program *prog;
-    if (NULL == (prog = VMCALL(malloc, sizeof(*prog))))
+    if (NULL == (prog = malloc(sizeof(*prog))))
         panic("prog");
     
-    prog->pathname = VMCALL(strdup, pathname);
+    prog->pathname = strdup(pathname);
     if (!prog->pathname)
         panic("strdup");
     
@@ -9429,7 +9443,7 @@ uc_engine *uc_open_arch(int arch)
 #if defined(__linux__) && defined(__x86_64__)
         uint64_t fs_base;
         if (0 != syscall(SYS_arch_prctl, ARCH_GET_FS, &fs_base)) {
-            INFO("arch_prctl(ARCH_GET_FS) failed: %d (%s)", errno, VMCALL(strerror, errno));
+            INFO("arch_prctl(ARCH_GET_FS) failed: %d (%s)", errno, strerror(errno));
             uc_close(engine);
             return NULL;
         }
@@ -10577,7 +10591,7 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
         if (ess->ess_intr == ESS_INTR_MEM) {
             if (ess->ess_intr_memtype != UC_MEM_FETCH_PROT && ess->ess_intr_memtype != UC_MEM_FETCH_UNMAPPED) {
                 INFO("ess->ess_intr_memtype %d != UC_MEM_FETCH_PROT/UNMAPPED at %p", ess->ess_intr_memtype, (void *)ess->ess_intr_addr);
-                VMCALL(raise, SIGSEGV);
+                raise(SIGSEGV);
             }
 
             if (ess->ess_intr_addr == EMULATOR_CALL_END_LR) {
@@ -10926,13 +10940,6 @@ void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 #define FUNCTION_DEFINE_VOID5(_name, ...) __FUNCTION_DEFINE_VOIDx(5, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE_VOID6(_name, ...) __FUNCTION_DEFINE_VOIDx(6, _name, __VA_ARGS__)
 
-#define FUNCTION_DEFINE_NORET0(_name)      __FUNCTION_DEFINE_VOIDx(0, _name)
-#define FUNCTION_DEFINE_NORET1(_name, ...) __FUNCTION_DEFINE_VOIDx(1, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET2(_name, ...) __FUNCTION_DEFINE_VOIDx(2, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET3(_name, ...) __FUNCTION_DEFINE_VOIDx(3, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET4(_name, ...) __FUNCTION_DEFINE_VOIDx(4, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET5(_name, ...) __FUNCTION_DEFINE_VOIDx(5, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET6(_name, ...) __FUNCTION_DEFINE_VOIDx(6, _name, __VA_ARGS__)
 
 #define FUNCTION_DEFINE_VA1(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(1, _rettype, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE_VA2(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(2, _rettype, _name, __VA_ARGS__)
@@ -11719,7 +11726,7 @@ static void initrc_cmd_mount(const char *arg)
             return;
         }
         if (0 != vfs_bind(source, guestpath))
-            INFO("initrc: mount: cannot bind '%s' on '%s': %s", source, guestpath, VMCALL(strerror, errno));
+            INFO("initrc: mount: cannot bind '%s' on '%s': %s", source, guestpath, strerror(errno));
         else
             INFO("initrc: mounted '%s' on '%s'", source, guestpath);
         return;
@@ -11727,7 +11734,7 @@ static void initrc_cmd_mount(const char *arg)
 
     int fd = VMCALL(open, hostpath, O_RDONLY);
     if (fd == -1) {
-        INFO("initrc: mount: cannot open '%s': %s", hostpath, VMCALL(strerror, errno));
+        INFO("initrc: mount: cannot open '%s': %s", hostpath, strerror(errno));
         return;
     }
 
@@ -11855,7 +11862,7 @@ static void tvm_exec_initrc(const char *path)
 {
     int fd = VMCALL(open, path, O_RDONLY);
     if (fd == -1) {
-        INFO("initrc: cannot open '%s': %s", path, VMCALL(strerror, errno));
+        INFO("initrc: cannot open '%s': %s", path, strerror(errno));
         return;
     }
 
@@ -11914,6 +11921,12 @@ static void tvm_exec_initrc(const char *path)
 /**
  * I have no idea why `__panic()` is here and at this point, I'm too afraid to ask.
  */
+
+// An arena abort (a guest's free of memory the VM did not allocate) ends the
+// task, as the guest's own abort() would, not the whole VM.
+static void rmem_abort_cb(void) {
+    VMCALL(abort);
+}
 
 static void rmem_print_cb(char *msg) {
     char __ts[32];
@@ -12411,7 +12424,7 @@ static void user_passwd_init(void);
  */
 static int tvm_want_gdb_jit(void)
 {
-    const char *env = VMCALL(getenv, "TVM_GDB_JIT");
+    const char *env = getenv("TVM_GDB_JIT");
     if (env && *env)
         return 0 != strcmp(env, "0");
 
@@ -12561,7 +12574,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
             if (i == SIGKILL || i == SIGSTOP)
                 continue;
             if (0 != sigaction(i, &act, NULL))
-                panic("sigaction(%d): %s", i, VMCALL(strerror, errno));
+                panic("sigaction(%d): %s", i, strerror(errno));
         }
     }
 
@@ -12586,11 +12599,10 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
     sigemptyset(&empty_sigs);
     pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
 
-    // Guest-side setup. These are direct calls from libtvm text, so the
-    // interposed functions see a TVM return address and enter the VM.
+    // Guest-side setup: the VM's functions.
 
     if (ia->cwd && 0 != VMCALL(chdir, ia->cwd))
-        panic("tvm_start::chdir(%s): %s", ia->cwd, VMCALL(strerror, errno));
+        panic("tvm_start::chdir(%s): %s", ia->cwd, strerror(errno));
 
     if (ia->initrc)
         tvm_exec_initrc(ia->initrc);
@@ -12604,7 +12616,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
     // Exec. Never returns on success (ends in the in-VM exit()).
 
     VMCALL(execvp, ia->file, ia->argv);
-    panic("tvm_start::execvp(%s): %s", ia->file, VMCALL(strerror, errno));
+    panic("tvm_start::execvp(%s): %s", ia->file, strerror(errno));
 }
 
 static int tvm_started = 0;
@@ -12674,6 +12686,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
     rmem_setopt(RMEM_OPS, (void *)&rmem_ops);
+    rmem_setopt(RMEM_ABORT_CB, (void *)rmem_abort_cb);
 
     global_arena = rmem_arena_create(NULL);
     if (!global_arena)
@@ -12713,7 +12726,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
         else
             r = vfs_mount_cpio(abs, m->data, m->size);
         if (0 != r) {
-            INFO("tvm_start: mount %s failed: %s", abs, VMCALL(strerror, errno));
+            INFO("tvm_start: mount %s failed: %s", abs, strerror(errno));
             errno = EINVAL;
             return -1;
         }
@@ -12723,7 +12736,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     // config mounts, as the ptys' directory is under /tvm; the initrc's
     // mount of /tvm, when it is the initrc's, carries it over.
     if (0 != vfs_mount_devices()) {
-        INFO("tvm_start: mounting the devices failed: %s", VMCALL(strerror, errno));
+        INFO("tvm_start: mounting the devices failed: %s", strerror(errno));
         errno = EINVAL;
         return -1;
     }
@@ -12741,7 +12754,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
             dir = base;
         }
         if (!normalize_path(dir, cfg->initrc, abs) || 0 != vfs_access_path(abs, R_OK, 0)) {
-            INFO("tvm_start: initrc %s: %s", cfg->initrc, VMCALL(strerror, errno));
+            INFO("tvm_start: initrc %s: %s", cfg->initrc, strerror(errno));
             return -1;
         }
     }
@@ -12784,7 +12797,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
     pthread_attr_destroy(&attr);
     if (r)
-        panic("tvm_start: pthread_create: %s", VMCALL(strerror, r));
+        panic("tvm_start: pthread_create: %s", strerror(r));
 
     pthread_mutex_lock(&ia->mtx);
     while (!ia->ready)
@@ -12808,7 +12821,7 @@ char ***_tvm_environ()
 void tvm_log(const char *function, const char *msg, ...)
 {
     char msgbuf[0x1000];
-    struct tvm_tls *t = tvm_tls();
+    struct tvm_tls *t = TVM_TLS_PEEK(); // logging works on any thread
     int n = snprintf(msgbuf, sizeof(msgbuf), "%s(%d): %s: ", (t && t->tls_current ? t->tls_current->tsk_comm : "<null>"), __gettid(), function);
 
     va_list ap;
@@ -12850,7 +12863,7 @@ static void __panic(const char *msg, const char *file, int line)
     INFO(" host pid: %d", getpid());
     INFO(" current: %p", cur);
     INFO(" main_task: %p", main_task);
-    INFO(" errno: %d (%s)", errno, VMCALL(strerror, errno));
+    INFO(" errno: %d (%s)", errno, strerror(errno));
     INFO("Stacktrace:");
     dump_stacktrace();
 
@@ -12862,17 +12875,8 @@ static void __panic(const char *msg, const char *file, int line)
     // raise() returned, so the handler did not dispatch it: either it deferred
     // the signal (tvm_sig_blocked, in-emu, or the guest masked SIGABRT) or the
     // thread has no VM identity and the handler drops non-fault signals. A
-    // panic is fatal regardless, so die by SIGABRT with the default disposition,
-    // bypassing the handler, and never return to the caller.
-    struct sigaction dfl = { .sa_handler = SIG_DFL };
-    sigaction(SIGABRT, &dfl, NULL);
-    sigset_t unblk;
-    sigemptyset(&unblk);
-    sigaddset(&unblk, SIGABRT);
-    pthread_sigmask(SIG_UNBLOCK, &unblk, NULL);
-    raise(SIGABRT);
-    _exit(128 + SIGABRT);
-    __builtin_unreachable();
+    // panic is fatal regardless.
+    die_by_sigabrt();
 }
 
 /////////////
@@ -17290,7 +17294,7 @@ FUNCTION_DEFINE1(int, pthread_detach, pthread_t, thread) {
     return 0;
 }
 
-FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
+FUNCTION_DEFINE_VOID1(pthread_exit, void *, retval) {
     tvm_sig_enter();
 
     task_lock(current);
@@ -17302,7 +17306,7 @@ FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
     detach_current_thread_and_exit(retval);
 }
 
-FUNCTION_DEFINE_NORET1(exit, int, status) {
+FUNCTION_DEFINE_VOID1(exit, int, status) {
     tvm_sig_enter();
     task_lock(current);
     exit_t exits[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
@@ -17329,7 +17333,7 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
     VMCALL(_exit, status);
 }
 
-FUNCTION_DEFINE_NORET1(_exit, int, status) {
+FUNCTION_DEFINE_VOID1(_exit, int, status) {
     tvm_sig_enter();
     if (current == main_task)
         _exit(status);
@@ -17340,11 +17344,11 @@ FUNCTION_DEFINE_NORET1(_exit, int, status) {
     terminate_current_locked(mkwstatus(1, status));
 }
 
-FUNCTION_DEFINE_NORET1(_Exit, int, status) {
+FUNCTION_DEFINE_VOID1(_Exit, int, status) {
     VMCALL(_exit, status);
 }
 
-FUNCTION_DEFINE_NORET0(abort) {
+FUNCTION_DEFINE_VOID0(abort) {
     VMCALL(raise, SIGABRT);
     VMCALL(_exit, 1); // unreachable
 }
@@ -17404,7 +17408,7 @@ FUNCTION_DEFINE_NORET_VA2(err, int, eval, const char *, fmt) {
     VMCALL(verr, eval, fmt, __ap);
 }
 
-FUNCTION_DEFINE_NORET3(verr, int, eval, const char *, fmt, va_list, args) {
+FUNCTION_DEFINE_VOID3(verr, int, eval, const char *, fmt, va_list, args) {
     tvm_sig_enter();
     int saved_errno = errno;
 
@@ -17424,7 +17428,7 @@ FUNCTION_DEFINE_NORET3(verr, int, eval, const char *, fmt, va_list, args) {
     VMCALL(exit, eval);
 }
 
-FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
+FUNCTION_DEFINE_VOID3(verrx, int, eval, const char *, fmt, va_list, args) {
     tvm_sig_enter();
     if (*current->tsk_comm)
         VMCALL(fprintf, stderr, "%s: ", current->tsk_comm);
@@ -17695,7 +17699,7 @@ FUNCTION_DEFINE_VOID_VA2(warnc, int, code, const char *, fmt) {
     VMCALL(vwarnc, code, fmt, __ap);
 }
 
-FUNCTION_DEFINE_NORET4(verrc, int, eval, int, code, const char *, fmt, va_list, args) {
+FUNCTION_DEFINE_VOID4(verrc, int, eval, int, code, const char *, fmt, va_list, args) {
     tvm_sig_enter();
     tvm_vwarnc(code, fmt, args);
     // balance the tvm_sig_enter() above: exit() only leaves its own, so a
@@ -18357,7 +18361,7 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
     // Before any task exists (e.g. early in tvm_start) there is no per-task env;
     // fall back to the real libc getenv (process environ) instead of a NULL
-    // deref. This lets callers use bare getenv() uniformly.
+    // deref, so TVM's code can call VMCALL(getenv) at any point.
     if (!current)
         return getenv(name);
 
@@ -19551,11 +19555,6 @@ FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
 #endif
 }
 
-static void *tvm_calloc(size_t nmemb, size_t size);
-
-FUNCTION_DEFINE1(void *, malloc, size_t, size) {
-    return tvm_calloc(1, size);
-}
 
 // malloc(0) and calloc(0, n) return a unique, freeable pointer, as the host
 // libc does (Darwin and glibc alike). The arena used to return NULL, which a
@@ -19567,10 +19566,6 @@ FUNCTION_DEFINE1(void *, malloc, size_t, size) {
 // (plain "a" compiled, "^a" did not). The smallest arena object stands in
 // for the zero-sized one.
 FUNCTION_DEFINE2(void *, calloc, size_t, nmemb, size_t, size) {
-    return tvm_calloc(nmemb, size);
-}
-
-static void *tvm_calloc(size_t nmemb, size_t size) {
     size_t total = nmemb * size;
     if (nmemb && total / nmemb != size) {
         errno = ENOMEM;
@@ -19591,6 +19586,10 @@ static void *tvm_calloc(size_t nmemb, size_t size) {
     
     memset(p, 0, total);
     return p;
+}
+
+FUNCTION_DEFINE1(void *, malloc, size_t, size) {
+    return VMCALL(calloc, 1, size);
 }
 
 FUNCTION_DEFINE_VOID1(free, void *, ptr) {
@@ -20222,7 +20221,7 @@ static int bsearch_compar_emulator(const void *a, const void *b)
 
 FUNCTION_DEFINE5(void *, bsearch, const void *, key, const void *, base, size_t, nel, size_t, width, compar_t, compar) {
     bsearch_compar = compar;
-    void *ret = bsearch(key, base, nel, width, bsearch_compar_emulator);
+    void *ret = (void *)bsearch(key, base, nel, width, bsearch_compar_emulator);
     bsearch_compar = NULL;
     return ret;
 }
@@ -20248,7 +20247,7 @@ static void *vtimer_thread_entry(void *_arg)
     uint64_t pc = (uint64_t)(uintptr_t)a->func;
     uint64_t sigval_bits = 0;
     memcpy(&sigval_bits, &a->val, sizeof(a->val));
-    VMCALL(free, a); // current is set → intercepted free → tsk_ar
+    VMCALL(free, a); // the task's arena, as it was allocated
     emulator_call(NULL, pc, sigval_bits, 0, 0, 0, 0, 0);
     return NULL;
 }
@@ -20753,10 +20752,8 @@ FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len)
  *   functions at compile time by third_party/include-shim/
  *   tvm_stdio_unlocked.h, on every platform.)
  * - C99/C23 scanf: glibc's headers redirect fscanf to __isoc99_fscanf, or
- *   __isoc23_fscanf from 2.38 (git, toybox). This file's own
- *   fscanf/scanf/vfscanf are emitted under one of those names too, so a
- *   guest import only found them by symbol through dlsym, which works where
- *   TVM is the executable; register both spellings by name.
+ *   __isoc23_fscanf from 2.38 (git, toybox): both spellings are bound to
+ *   TVM's scanf family.
  * - Descriptors created outside the task table (accept4, memfd_create,
  *   inotify_init) and calls on task descriptors (fpathconf, ...).
  */
@@ -20854,12 +20851,14 @@ FUNCTION_DEFINE_VOID1(__fpurge, FILE *, stream) {
     tvm_sig_leave();
 }
 
-FUNCTION_METADATA(__isoc99_fscanf, &fscanf);
-FUNCTION_METADATA(__isoc99_scanf, &scanf);
-FUNCTION_METADATA(__isoc99_vfscanf, &vfscanf);
-FUNCTION_METADATA(__isoc23_fscanf, &fscanf);
-FUNCTION_METADATA(__isoc23_scanf, &scanf);
-FUNCTION_METADATA(__isoc23_vfscanf, &vfscanf);
+FUNCTION_METADATA(__isoc99_fscanf, &__tvm_fscanf);
+FUNCTION_METADATA(__isoc99_scanf, &__tvm_scanf);
+FUNCTION_METADATA(__isoc99_vfscanf, &__tvm_vfscanf);
+FUNCTION_METADATA(__isoc99_vscanf, &__tvm_vscanf);
+FUNCTION_METADATA(__isoc23_fscanf, &__tvm_fscanf);
+FUNCTION_METADATA(__isoc23_scanf, &__tvm_scanf);
+FUNCTION_METADATA(__isoc23_vfscanf, &__tvm_vfscanf);
+FUNCTION_METADATA(__isoc23_vscanf, &__tvm_vscanf);
 
 // _FORTIFY_SOURCE's open(): __open_2 checks that O_CREAT/O_TMPFILE came
 // with a mode, i.e. went to the variadic open instead.
