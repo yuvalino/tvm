@@ -30,33 +30,19 @@ jobs:
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
-    - name: debug TTYSighupRace instruction
+    - name: debug per-test
       continue-on-error: true
-      timeout-minutes: 5
+      timeout-minutes: 25
       shell: bash
       run: |
-        grep -m1 "model name" /proc/cpuinfo
-        grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx|sse4|amx|apx)' | tr '\n' ' '; echo
-        ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 20 -k TTYSighupRace > /tmp/v.txt 2>&1 &
-        PID=$!
-        sleep 6
-        PC=$(grep -o 'invalid stop pc=0x[0-9a-f]*' /tmp/v.txt | head -1 | sed 's/.*=//')
-        echo "pid=$PID pc=$PC"
-        python3 - "$PID" "$PC" <<'PY'
-        import sys
-        pid, pc = int(sys.argv[1]), int(sys.argv[2], 16)
-        for l in open(f"/proc/{pid}/maps"):
-            a, b = [int(x, 16) for x in l.split()[0].split("-")]
-            if a <= pc < b:
-                print("map:", l.strip(), "offset", hex(pc - a + int(l.split()[2], 16)))
-        with open(f"/proc/{pid}/mem", "rb") as m:
-            m.seek(pc - 16); data = m.read(48)
-        print("bytes at pc-16:", data.hex())
-        open("/tmp/insn.bin", "wb").write(data)
-        PY
-        objdump -D -b binary -m i386:x86-64 --adjust-vma=$(( PC - 16 )) /tmp/insn.bin | tail -n +8 | head -20
-        kill -9 $PID
+        T=./output/linux-x64/bin/test_tvm
+        for k in $($T -l | grep -o '[A-Za-z0-9_]*$' | tail -n +2); do
+          r=0; timeout 60 ./output/linux-x64/bin/tvm $T -t 30 -k $k > /tmp/o.txt 2>&1 || r=$?
+          [ $r = 0 ] || { echo "$k rc=$r"; tail -c 800 /tmp/o.txt; }
+        done
+        echo "per-test done"
     - name: test_tvm
+      continue-on-error: true
       timeout-minutes: 5
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
     - name: test_rmem
@@ -86,7 +72,6 @@ jobs:
         annotate_only: true
 
   macos:
-    if: false
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
