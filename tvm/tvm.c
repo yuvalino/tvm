@@ -3482,7 +3482,7 @@ static void *vtimer_thread(void *arg)
                 pthread_mutex_unlock(&vtimers_lock);
 
                 if (still_valid) {
-                    // allocate arg from task's arena (freed by wrapper via kfree)
+                    // allocate arg from task's arena (freed by the callback thread's VMCALL(free))
                     struct vtimer_thread_arg *a = rmem_arena_alloc(target->tsk_ar, sizeof(*a));
                     VERIFY(a);
 
@@ -12883,7 +12883,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
         pthread_cond_wait(&ia->cond, &ia->mtx);
     pthread_mutex_unlock(&ia->mtx);
 
-    // no TVM state on this thread any more: its calls go to the host
+    // no TVM state on this thread any more
     pthread_setspecific(tls_key, NULL);
     kfree(t);
     return 0;
@@ -18438,11 +18438,8 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
 }
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
-    // Before any task exists (e.g. early in tvm_start) there is no per-task env;
-    // fall back to the real libc getenv (process environ) instead of a NULL
-    // deref, so TVM's code can call VMCALL(getenv) at any point.
     if (!current)
-        return getenv(name);
+        panic("getenv(%s) without a task", name);
 
     char **env = NULL;
     if (*current->tsk_relocs.__environ)
@@ -19793,6 +19790,16 @@ FUNCTION_DEFINE1(void *, pvalloc, size_t, size) {
         return NULL;
     }
     return tvm_memalign(pagesz, rounded ? rounded : pagesz);
+}
+
+// glibc's own ends in `jmp realloc@plt`, which reaches the host's realloc.
+FUNCTION_DEFINE3(void *, reallocarray, void *, ptr, size_t, nmemb, size_t, size) {
+    size_t bytes;
+    if (__builtin_mul_overflow(nmemb, size, &bytes)) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return VMCALL(realloc, ptr, bytes);
 }
 #endif
 
