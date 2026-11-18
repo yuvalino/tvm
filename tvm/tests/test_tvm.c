@@ -3437,6 +3437,32 @@ TEST(EnvBasic) {
     ASSERT_NEQ(NULL, environ[0]);
 }
 
+TEST(EnvTvmUser) {
+    const char *user = "tvmusr7q2x"; // no host account has this name
+    uid_t uid = getuid();
+    ASSERT_EQ(0, setenv("TVM_USER", user, 1));
+
+    struct passwd *pw = getpwuid(uid);
+    ASSERT_NEQ(NULL, pw);
+    ASSERT_EQ(0, strcmp(user, pw->pw_name));
+    ASSERT_EQ(uid, pw->pw_uid);
+
+    pw = getpwnam(user);
+    ASSERT_NEQ(NULL, pw);
+    ASSERT_EQ(0, strcmp(user, pw->pw_name));
+    ASSERT_EQ(uid, pw->pw_uid);
+
+    // The entry keeps its own copy of the name.
+    ASSERT_EQ(0, setenv("TVM_USER", "other", 1));
+    ASSERT_EQ(0, strcmp(user, pw->pw_name));
+
+    ASSERT_EQ(0, unsetenv("TVM_USER"));
+    ASSERT_EQ(NULL, getpwnam(user));
+    pw = getpwuid(uid);
+    if (pw)
+        ASSERT_NEQ(0, strcmp(user, pw->pw_name));
+}
+
 TEST(EnvFork) {
     ASSERT_EQ(NULL, getenv("kd85n2lk2"));
     ASSERT_EQ(0, putenv("kd85n2lk2=1"));
