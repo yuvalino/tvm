@@ -4,6 +4,7 @@
 enum {
     RMEM_PRINT_CB,
     RMEM_OPS, // struct rmem_ops *
+    RMEM_ABORT_CB, // void (*)(void): how ABORT ends the caller (default abort())
 };
 
 struct rmem_ops {
