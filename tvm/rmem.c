@@ -15,6 +15,7 @@
 /* -------------------- Helpers -------------------- */
 
 static void (*print_cb)(char *, int) = NULL;
+static void (*abort_cb)(void) = NULL;
 
 
 #define PRINT0(_msg, _len) do { \
@@ -34,6 +35,7 @@ static void (*print_cb)(char *, int) = NULL;
     char __msgbuf[4096]; \
     int __len = snprintf(__msgbuf, sizeof(__msgbuf), "ABORT! %s:%d %s: " MSG "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); \
     PRINT0(__msgbuf, __len); \
+    if (abort_cb) { abort_cb(); } \
     abort(); \
 } while (0)
 // Code holding an arena lock unlocks it before ABORT: the abort is delivered
@@ -517,6 +519,11 @@ int rmem_setopt(int opt, void *val)
 
     if (opt == RMEM_OPS) {
         memcpy(&rops, val, sizeof(rops));
+        return 0;
+    }
+
+    if (opt == RMEM_ABORT_CB) {
+        abort_cb = (void (*)(void))val;
         return 0;
     }
 

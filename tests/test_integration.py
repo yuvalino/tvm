@@ -249,6 +249,37 @@ def sshi(forkless: Forkless) -> Iterator[spawn]:
         p.expect(r"\$ ")
         yield p
 
+def _hooked_names() -> set[str]:
+    """The libc names TVM hooks: FUNCTION_DEFINE*() and FUNCTION_METADATA()."""
+    src = open("tvm/tvm.c").read()
+    names = set(re.findall(r"FUNCTION_METADATA\((\w+),", src))
+    for m in re.finditer(r"FUNCTION_DEFINE(_VOID|_NORET)?(_VA)?\d\(([^)]*)\)", src):
+        args = [a.strip() for a in m.group(3).split(",")]
+        names.add(args[0] if m.group(1) else args[1])
+    return names - {"_name", "Name"}
+
+
+def test_no_hooked_name_defined():
+    """A hook is __tvm_<name>, bound to the guest's <name> by the ulinker;
+    tvm's binary never defines <name> itself, so the host libraries' own
+    calls (a tail call to free included) always reach the host's."""
+    darwin = PLATFORM.startswith("macos")
+    cmd = ["nm", "-gU", TVM_BIN] if darwin else ["nm", "-g", "--defined-only", TVM_BIN]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    defined = {l.split()[-1][1 if darwin else 0:] for l in out.splitlines() if l.strip()}
+    hooked = _hooked_names()
+    assert len(hooked) > 300
+    assert not (hooked & defined)
+
+
+def test_start_failure_returns():
+    """tvm_start fails cleanly (before any task exists) on a missing initrc."""
+    r = subprocess.run([TVM_BIN, "-i", "/nonexistent.rc", "/bin/echo", "hi"],
+                       capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "No such file or directory" in r.stdout + r.stderr
+
+
 def test_running(forkless: Forkless):
     pass
 
