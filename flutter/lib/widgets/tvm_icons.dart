@@ -65,6 +65,11 @@ class StrokeIcon extends StatelessWidget {
   static const reconnect = ['M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5'];
   static const closeOthers = ['M4 4h16v16H4z', 'M9 9l6 6M15 9l-6 6'];
   static const close = ['M6 6l12 12M18 6L6 18'];
+  // Paste: a clipboard.
+  static const paste = [
+    'M9 4.5H7a2 2 0 0 0-2 2V19a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6.5a2 2 0 0 0-2-2h-2',
+    'M9.5 3h5a1 1 0 0 1 1 1v1a1 1 0 0 1-1 1h-5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z',
+  ];
 
   @override
   Widget build(BuildContext context) {
