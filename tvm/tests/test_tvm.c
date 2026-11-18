@@ -25,6 +25,7 @@
 #include <setjmp.h>
 #include <ifaddrs.h>
 #include <stdarg.h>
+#include <pwd.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -2010,6 +2011,26 @@ TEST(QsortLarge) {
         ASSERT_EQ(a[i], i);
     free(a);
 }
+
+#ifdef __linux__
+// glibc's reallocarray is a tail call to realloc; its result is the guest's
+// to grow and free (bash's brace expansion does both).
+TEST(Reallocarray) {
+    int *a = reallocarray(NULL, 4, sizeof(int));
+    ASSERT_NEQ(a, NULL);
+    for (int i = 0; i < 4; i++)
+        a[i] = i;
+    a = reallocarray(a, 1000, sizeof(int));
+    ASSERT_NEQ(a, NULL);
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(a[i], i);
+    volatile size_t huge = SIZE_MAX;  // not a constant gcc warns about
+    errno = 0;
+    ASSERT_EQ(NULL, reallocarray(a, huge, 2));
+    ASSERT_EQ(errno, ENOMEM);
+    free(a);
+}
+#endif
 
 // getifaddrs allocates its list on the host, and freeifaddrs frees it there
 // (glibc's freeifaddrs is a tail call to free).
