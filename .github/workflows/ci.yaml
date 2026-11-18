@@ -30,10 +30,6 @@ jobs:
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
-    - name: debug ExecTextNoShebang
-      continue-on-error: true
-      run: |
-        ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 60 -v -k ExecTextNoShebang 2>&1 || echo "rc=$?"
     - name: test_tvm
       timeout-minutes: 5
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
@@ -64,7 +60,6 @@ jobs:
         annotate_only: true
 
   macos:
-    if: false
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
