@@ -9,20 +9,8 @@ enum {
     ULINKER_OPS, // struct ulinker_ops *
     ULINKER_ADD_EXTERNAL_DLINFO,
     ULINKER_PRINT_CB,
-    ULINKER_EVENT_CB,
     ULINKER_NOEMU, // deprecated — use RTLD_NOEMU per-dlopen instead
     ULINKER_GDB_JIT, // int (as void *): register loaded images with gdb's JIT interface (default 1)
-};
-
-enum {
-    ULEVENT_LOAD,   // struct ulinker_load_event *
-    ULEVENT_UNLOAD, // struct ulinker_load_event *
-};
-
-struct ulinker_load_event {
-    void  *ule_private;
-    void  *ule_base;
-    size_t ule_size;
 };
 
 #ifndef RTLD_NEXT
@@ -44,6 +32,7 @@ struct ulinker_ops {
     int     (*uo_close)(void *, int);
     ssize_t (*uo_read)(void *, int, void *, size_t);
     int     (*uo_fstat)(void *, int, struct stat *);
+    int     (*uo_fcntl)(void *, int, int, void *);
 
     void *(*uo_mmap)(void *, void *, size_t, int, int, int, off_t);
     int   (*uo_munmap)(void *, void *, size_t);

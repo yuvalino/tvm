@@ -23,6 +23,7 @@
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
 #include <setjmp.h>
+#include <ifaddrs.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -1985,6 +1986,54 @@ TEST(ExecEnvShebang) {
 
     ASSERT_EQ(0, unlink(path));
     ASSERT_EQ(0, rmdir(dir));
+}
+
+//// Host and VM allocations: a guest's malloc/free are the VM's, the host
+//// libraries' are the host's, whichever way they are called
+
+static int int_cmp(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+// The host's qsort sorts a large array with a scratch buffer of its own
+// (glibc's: malloc, then free in a tail call), which stays the host's.
+TEST(QsortLarge) {
+    enum { N = 10000 };
+    int *a = malloc(N * sizeof(int));
+    ASSERT_NEQ(a, NULL);
+    for (int i = 0; i < N; i++)
+        a[i] = (i * 7919) % N;
+    qsort(a, N, sizeof(int), int_cmp);
+    for (int i = 0; i < N; i++)
+        ASSERT_EQ(a[i], i);
+    free(a);
+}
+
+// getifaddrs allocates its list on the host, and freeifaddrs frees it there
+// (glibc's freeifaddrs is a tail call to free).
+TEST(IfaddrsHostAllocated) {
+    struct ifaddrs *ifa;
+    ASSERT_EQ(0, getifaddrs(&ifa));
+    freeifaddrs(ifa);
+}
+
+// A guest's free() of memory the VM did not allocate is a bug, and caught:
+// here getifaddrs's list, which only freeifaddrs may free.
+TEST(FreeHostPointerAborts) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct ifaddrs *ifa;
+        if (getifaddrs(&ifa))
+            _exit(2);
+        free(ifa);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFSIGNALED(s));
+    ASSERT_EQ(SIGABRT, WTERMSIG(s));
 }
 
 // A fork child longjmps to a setjmp its parent made before the fork, on the

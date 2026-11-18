@@ -33,19 +33,7 @@ static void (*print_cb)(char *, int) = NULL;
 static char errormsg[4096] = {0};
 #define ERROR(_msg, ...) do { snprintf(errormsg, sizeof(errormsg), (_msg), ##__VA_ARGS__); PRINT("%s", errormsg); } while (0)
 
-static void (*event_cb)(int, void *);
-
 static int noemu = 0; // deprecated — kept for ULINKER_NOEMU compat
-
-#define ULINKER_EVENT(_event, _arg) do { if (event_cb) event_cb((_event), (void *)(_arg)); } while (0)
-
-#define ULINKER_EVENT_LOAD(_event, _dl) do {    \
-    struct ulinker_load_event __ULE = {         \
-        .ule_private = DLPRIVATE(_dl),          \
-        .ule_base = DLBASE(_dl)->dl_base,       \
-        .ule_size = DLBASE(_dl)->dl_size};      \
-    ULINKER_EVENT((_event), &__ULE);            \
-} while (0)
 
 static size_t page_size() {
     return sysconf(_SC_PAGE_SIZE);
@@ -1902,6 +1890,7 @@ static int     open_wrapper(void *arg, const char *name)                { return
 static int     close_wrapper(void *arg, int fd)                         { return close(fd); }
 static ssize_t read_wrapper(void *arg, int fd, void *buf, size_t count) { return read(fd, buf, count); }
 static int     fstat_wrapper(void *arg, int fd, struct stat *statbuf)   { return fstat(fd, statbuf); }
+static int     fcntl_wrapper(void *arg, int fd, int cmd, void *cmdarg)  { return fcntl(fd, cmd, cmdarg); }
 
 static void *mmap_wrapper(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) { return mmap(hint, length, prot, flags, fd, offset); }
 static int   munmap_wrapper(void *arg, void *addr, size_t size)                                            { return munmap(addr, size); }
@@ -1921,6 +1910,7 @@ static struct ulinker_ops uo = {
     .uo_close = close_wrapper,
     .uo_read = read_wrapper,
     .uo_fstat = fstat_wrapper,
+    .uo_fcntl = fcntl_wrapper,
 
     .uo_mmap = mmap_wrapper,
     .uo_munmap = munmap_wrapper,
@@ -3770,7 +3760,7 @@ static struct dlinfo *load_macho64_library(struct ulinker *ulinker, const char *
         siginfo.fs_file_start = 0;
         siginfo.fs_blob_start = (void *)(long)codesig_off;
         siginfo.fs_blob_size  = codesig_size;
-        int sigresult = fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo);
+        int sigresult = uo.uo_fcntl(ulinker->ul_private, fd, F_ADDFILESIGS_RETURN, &siginfo);
         if (sigresult == -1) {
 #if TARGET_OS_IOS
             ERROR("failed to register code signature for \"%s\": -%d (%s)", filename, errno, strerror(errno));
@@ -4271,8 +4261,6 @@ static struct dlinfo *load_library_internal(struct ulinker *ulinker, const char 
     dl->dl_refcnt++;
     
     DLINFO_UNLOCK(ulinker);
-
-    ULINKER_EVENT_LOAD(ULEVENT_LOAD, dl);
 
     ret = dl;
 
@@ -4836,10 +4824,6 @@ int ulinker_setopt(int opt, void *val)
     if (opt == ULINKER_ADD_EXTERNAL_DLINFO) {
         return (add_external_dlinfo((struct ulinker_external_dlinfo_args *)val) ? 0 : 1);
     }
-    if (opt == ULINKER_EVENT_CB) {
-        event_cb = (void (*)(int, void *))val;
-        return 0;
-    }
     if (opt == ULINKER_NOEMU) {
         noemu = (int)(long)val;
         return 0;
@@ -4892,7 +4876,6 @@ void ulinker_destroy(struct ulinker *ulinker) {
             break;
         }
 
-        ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, curr_dl);
         ulinker->ul_dlinfo = curr_dl->dl_next;
         free_library(curr_dl);
     }
@@ -4944,7 +4927,6 @@ int ulinker_dlclose(void *handle)
 
     DLINFO_UNLOCK(ulinker);
 
-    ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, dl);
     release_dependency_refs(dl);
     free_library(dl);
 
@@ -5072,7 +5054,6 @@ out:
                 break;
             }
 
-            ULINKER_EVENT_LOAD(ULEVENT_UNLOAD, dl);
             new->ul_dlinfo = dl->dl_next;
             free_library(dl);
         }
