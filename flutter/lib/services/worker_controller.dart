@@ -221,8 +221,20 @@ class _NativeInfo {
     }
   }
 
+  static final Pointer<Utf8> Function(Pointer<Utf8>) _getenv =
+      _libc.lookupFunction<Pointer<Utf8> Function(Pointer<Utf8>),
+          Pointer<Utf8> Function(Pointer<Utf8>)>('getenv');
+
+  /// TVM_USER when set (the guest's user then, see tvm.c), else the host's
+  /// name for the app's uid.
   static String username() {
     try {
+      final key = 'TVM_USER'.toNativeUtf8();
+      final override = _getenv(key);
+      malloc.free(key);
+      if (override != nullptr && override.toDartString().isNotEmpty) {
+        return override.toDartString();
+      }
       final pw = _getpwuid(_getuid());
       if (pw == nullptr) return '';
       // pw_name is the first field of struct passwd (a char *).
