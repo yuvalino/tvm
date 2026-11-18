@@ -17,8 +17,7 @@
 extern char **environ;
 
 // The single kernel entry point, resolved from libtvm.dylib at runtime. It
-// boots and execs from inside libtvm text, so nothing in this file needs to
-// call interposed libc functions (which dispatch on return address).
+// boots and execs from inside libtvm; this file's libc calls are the host's.
 typedef int (*tvm_start_fn)(const char *file, char *const argv[],
                             char *const envp[], const struct tvm_config *cfg);
 
