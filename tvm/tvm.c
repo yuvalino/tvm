@@ -1503,6 +1503,7 @@ struct task_data {
     // from the task arena at the right size.
     struct passwd  pw_buf;
     char          *pw_strings;
+    char          *pw_name_override; // TVM_USER's copy, beside host strings
     struct group   gr_buf;
     char          *gr_strings;
     struct tm      tm_buf;
@@ -18546,52 +18547,101 @@ static void user_passwd_init(void)
     VMCALL(unsetenv, "TVM_PASSWORD");
 }
 
-FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
+// The host's entry for `name` (byname) or `uid`, into the task's pw_buf and
+// pw_strings. NULL when the host has none.
+static struct passwd *pw_host_lookup(int byname, const char *name, uid_t uid)
+{
     struct passwd *result = NULL;
     size_t bufsz = 256;
     for (;;) {
         char *buf = VMCALL(malloc, bufsz);
         if (!buf) return NULL;
-        int rc = getpwnam_r(name, &current->tsk_data->pw_buf, buf, bufsz, &result);
+        int rc = byname
+            ? getpwnam_r(name, &current->tsk_data->pw_buf, buf, bufsz, &result)
+            : getpwuid_r(uid, &current->tsk_data->pw_buf, buf, bufsz, &result);
         if (rc == ERANGE) { VMCALL(free, buf); bufsz *= 2; continue; }
         VMCALL(free, current->tsk_data->pw_strings);
         current->tsk_data->pw_strings = buf;
         break;
     }
-    if (!result) return NULL;
+    return result;
+}
+
+// TVM_USER, when set, is the guest user's name, whatever the host calls the
+// process's uid: getpwuid() of that uid and getpwnam() of that name both
+// answer with it. The entry is the uid's host entry renamed, or, where the
+// host has no account for the uid at all (an iOS Simulator app), one made
+// up from the uid and gid. Other names and uids are the host's.
+static const char *pw_user_override(void)
+{
+    const char *user = VMCALL(getenv, "TVM_USER");
+    return user && *user ? user : NULL;
+}
+
+static struct passwd *pw_current_user(const char *user)
+{
+    // Copied: the entry outlives a later setenv/unsetenv of TVM_USER.
+    size_t ulen = strlen(user) + 1;
+    struct passwd *pw = pw_host_lookup(0, NULL, getuid());
+    char *name = VMCALL(malloc, ulen);
+    if (!name)
+        return NULL;
+    memcpy(name, user, ulen);
+    if (!pw) {
+        // No host strings to keep: pw_strings holds the name alone.
+        VMCALL(free, current->tsk_data->pw_strings);
+        current->tsk_data->pw_strings = name;
+        pw = &current->tsk_data->pw_buf;
+        memset(pw, 0, sizeof(*pw));
+        pw->pw_uid = getuid();
+        pw->pw_gid = getgid();
+        pw->pw_passwd = "*";
+        pw->pw_gecos = "";
+        pw->pw_dir = "/";
+        pw->pw_shell = "/bin/sh";
+#ifdef __APPLE__
+        pw->pw_class = "";
+#endif
+    } else {
+        // The host strings stay in pw_strings; the name lives with them
+        // until the next lookup frees both.
+        current->tsk_data->pw_name_override = name;
+    }
+    pw->pw_name = name;
+    return pw;
+}
+
+// What every entry gets: the guest's HOME, shell and password.
+static struct passwd *pw_finish(struct passwd *pw)
+{
+    if (!pw) return NULL;
     const char *home = VMCALL(getenv, "HOME");
     if (home && *home)
-        current->tsk_data->pw_buf.pw_dir = (char *)home;
+        pw->pw_dir = (char *)home;
     const char *tvm_shell = VMCALL(getenv, "TVM_SHELL");
     if (tvm_shell && *tvm_shell)
-        current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
+        pw->pw_shell = (char *)tvm_shell;
     if (user_passwd_hash[0])
-        current->tsk_data->pw_buf.pw_passwd = user_passwd_hash;
-    return &current->tsk_data->pw_buf;
+        pw->pw_passwd = user_passwd_hash;
+    return pw;
+}
+
+FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
+    VMCALL(free, current->tsk_data->pw_name_override);
+    current->tsk_data->pw_name_override = NULL;
+    const char *user = pw_user_override();
+    if (user && name && 0 == strcmp(name, user))
+        return pw_finish(pw_current_user(user));
+    return pw_finish(pw_host_lookup(1, name, 0));
 }
 
 FUNCTION_DEFINE1(struct passwd *, getpwuid, uid_t, uid) {
-    struct passwd *result = NULL;
-    size_t bufsz = 256;
-    for (;;) {
-        char *buf = VMCALL(malloc, bufsz);
-        if (!buf) return NULL;
-        int rc = getpwuid_r(uid, &current->tsk_data->pw_buf, buf, bufsz, &result);
-        if (rc == ERANGE) { VMCALL(free, buf); bufsz *= 2; continue; }
-        VMCALL(free, current->tsk_data->pw_strings);
-        current->tsk_data->pw_strings = buf;
-        break;
-    }
-    if (!result) return NULL;
-    const char *home = VMCALL(getenv, "HOME");
-    if (home && *home)
-        current->tsk_data->pw_buf.pw_dir = (char *)home;
-    const char *tvm_shell = VMCALL(getenv, "TVM_SHELL");
-    if (tvm_shell && *tvm_shell)
-        current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
-    if (user_passwd_hash[0])
-        current->tsk_data->pw_buf.pw_passwd = user_passwd_hash;
-    return &current->tsk_data->pw_buf;
+    VMCALL(free, current->tsk_data->pw_name_override);
+    current->tsk_data->pw_name_override = NULL;
+    const char *user = pw_user_override();
+    if (user && uid == getuid())
+        return pw_finish(pw_current_user(user));
+    return pw_finish(pw_host_lookup(0, NULL, uid));
 }
 
 FUNCTION_DEFINE1(struct group *, getgrnam, const char *, name) {
