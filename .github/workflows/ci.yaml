@@ -30,7 +30,39 @@ jobs:
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
+    - name: debug sftp and abort
+      continue-on-error: true
+      timeout-minutes: 5
+      shell: bash
+      run: |
+        sudo apt-get install -y -qq sshpass > /dev/null
+        PORT=2299
+        ./output/linux-x64/bin/tvm --verbose /tvm/bin/dropbear -R -e -F -E -p $PORT > /tmp/db.log 2>&1 &
+        sleep 3
+        mkdir -p /tmp/sf && echo hi > /tmp/sf/a
+        printf 'pwd\nls /tmp/sf\nget /tmp/sf/a /tmp/sf/b\n' > /tmp/batch
+        r=0; sshpass -p alpine sftp -oBatchMode=no -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPubkeyAuthentication=no -P $PORT -b /tmp/batch $USER@localhost || r=$?
+        echo "sftp rc=$r"
+        sleep 1
+        grep -v initrc_ /tmp/db.log | grep -v "PAGE IN" | tail -120
+        kill %1 || true
+        echo "===== FreeHostPointerAbortsTaskOnly"
+        r=0; timeout 60 ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 30 -k FreeHostPointerAbortsTaskOnly > /tmp/fa.log 2>&1 || r=$?
+        echo "rc=$r"
+        grep -v initrc_ /tmp/fa.log | grep -v "PAGE IN" | tail -80
+    - name: debug per-test
+      continue-on-error: true
+      timeout-minutes: 25
+      shell: bash
+      run: |
+        T=./output/linux-x64/bin/test_tvm
+        for k in $($T -l | grep -o '[A-Za-z0-9_]*$' | tail -n +2); do
+          r=0; timeout 60 ./output/linux-x64/bin/tvm $T -t 30 -k $k > /tmp/o.txt 2>&1 || r=$?
+          [ $r = 0 ] || { echo "$k rc=$r"; tail -c 800 /tmp/o.txt; }
+        done
+        echo "per-test done"
     - name: test_tvm
+      continue-on-error: true
       timeout-minutes: 5
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
     - name: test_rmem

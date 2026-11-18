@@ -6,6 +6,7 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'mdns.dart';
 import 'tvm_bindings.dart';
 
 
@@ -18,7 +19,10 @@ class WorkerController {
   final ValueNotifier<List<String>> logs =
       ValueNotifier(const ['[INFO] App started']);
   final ValueNotifier<bool> autoScroll = ValueNotifier(true);
-  final ValueNotifier<double> fontSizeNotifier = ValueNotifier(14.0);
+  final ValueNotifier<double> terminalFontSizeNotifier = ValueNotifier(13.0);
+
+  /// The login name the shell tabs authenticate as (getpwuid(getuid())).
+  final String username = _NativeInfo.username();
 
   bool _started = false;
   String _lineBuf = '';
@@ -26,7 +30,7 @@ class WorkerController {
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
     autoScroll.value = _prefs.getBool('autoScroll') ?? true;
-    fontSizeNotifier.value = consoleFontSize;
+    terminalFontSizeNotifier.value = terminalFontSize;
     TvmBindings.instance.onOutput = _onOutput;
     TvmBindings.instance.init();
     autoScroll.addListener(() {
@@ -40,24 +44,69 @@ class WorkerController {
   String get sshPass => _prefs.getString('sshPass') ?? 'alpine';
   set sshPass(String value) => _prefs.setString('sshPass', value);
 
-  double get consoleFontSize => _prefs.getDouble('consoleFontSize') ?? 14.0;
-  set consoleFontSize(double value) {
-    _prefs.setDouble('consoleFontSize', value);
-    fontSizeNotifier.value = value;
+  /// The port and password the server was started with. The settings above
+  /// apply on next launch; until then the shell tabs and the shown ssh
+  /// command go by these.
+  int get serverPort => _serverPort ?? sshPort;
+  String get serverPass => _serverPass ?? sshPass;
+  int? _serverPort;
+  String? _serverPass;
+
+  double get terminalFontSize => _prefs.getDouble('terminalFontSize') ?? 13.0;
+  set terminalFontSize(double value) {
+    _prefs.setDouble('terminalFontSize', value);
+    terminalFontSizeNotifier.value = value;
+  }
+
+  /// How other machines on the Wi-Fi reach this one: its `.local` name and
+  /// its address, each null until known (or when there is none). Looked up
+  /// once, at start.
+  final ValueNotifier<({String? name, String? address})> network =
+      ValueNotifier((name: null, address: null));
+
+  Future<void> _lookUpNetwork() async {
+    final address = await _lanAddress();
+    network.value = (name: null, address: address);
+    // gethostname gives the mDNS name on macOS; iOS answers "localhost", so
+    // there the phone's own mDNS responder is asked instead.
+    final h = Platform.localHostname;
+    final name = h.isNotEmpty && h != 'localhost'
+        ? (h.contains('.') ? h : '$h.local')
+        : address == null
+            ? null
+            : await mdnsReverseLookup(address);
+    network.value = (name: name, address: address);
+    if (name != null) _log('mdns name: $name');
+  }
+
+  /// The Wi-Fi (en0) IPv4 address, or null when there is none.
+  Future<String?> _lanAddress() async {
+    try {
+      final ifaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
+      for (final i in ifaces) {
+        if (i.name == 'en0' && i.addresses.isNotEmpty) {
+          return i.addresses.first.address;
+        }
+      }
+    } catch (_) {}
+    return null;
   }
 
   void start() {
     if (_started) return;
     _started = true;
+    _serverPort = sshPort;
+    _serverPass = sshPass;
 
     _log('device: ${_NativeInfo.device()}');
     _log('pid: $pid');
     _log('uid: ${_NativeInfo.uid()}');
-    _log('username: ${_NativeInfo.username()}');
+    _log('username: $username');
     _log('hostname: ${Platform.localHostname}');
-    _log('ssh port: $sshPort');
+    _log('ssh port: $serverPort');
     _log('cwd: ${Directory.current.path}');
     _log('home: ${_NativeInfo.home()}');
+    _lookUpNetwork();
 
     if (!TvmBindings.instance.isAvailable) {
       _log('[WARN] TVM native library not loaded');
@@ -76,8 +125,8 @@ class WorkerController {
     _log('[INFO] Starting tvm');
     final result = TvmBindings.instance.start(
       libtvmPath: libtvmPath,
-      port: sshPort,
-      password: sshPass,
+      port: serverPort,
+      password: serverPass,
       initrcPath: '$assets/assets/init.flutter.rc',
       initrdPath: '$assets/assets/initrd.flutter.$arch.cpio',
     );

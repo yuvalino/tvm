@@ -20,11 +20,13 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # Only what TVM itself uses: a guest's own dependencies (libz, libiconv,
     # the frameworks curl's SecTrust verification uses, ...) are loaded by
     # the ulinker through the host as the guest names them (ulinker.c,
-    # "Dependencies"). CoreFoundation stays on Darwin for the interposer
-    # of CFDictionaryApplyFunction, resolved at startup.
+    # "Dependencies"). CoreFoundation stays on Darwin for TVM's
+    # CFDictionaryApplyFunction, which calls the host's.
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(tvm_exe PRIVATE unicorn pthread util m crypt ${CMAKE_DL_LIBS})
-        target_link_options(tvm_exe PRIVATE -rdynamic -Wl,--no-as-needed -pie)
+        # No -rdynamic: the host libraries must not bind to TVM's functions
+        # (a guest's are bound by the ulinker, from the hooks' metadata).
+        target_link_options(tvm_exe PRIVATE -Wl,--no-as-needed -pie)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         target_link_libraries(tvm_exe PRIVATE unicorn pthread m "-framework CoreFoundation")
     endif()

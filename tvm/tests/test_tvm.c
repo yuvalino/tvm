@@ -23,6 +23,8 @@
 #include <sys/statvfs.h>
 #include <sys/xattr.h>
 #include <setjmp.h>
+#include <ifaddrs.h>
+#include <stdarg.h>
 
 #if defined(__linux__)
 #include <pty.h>
@@ -1985,6 +1987,211 @@ TEST(ExecEnvShebang) {
 
     ASSERT_EQ(0, unlink(path));
     ASSERT_EQ(0, rmdir(dir));
+}
+
+//// Host and VM allocations: a guest's malloc/free are the VM's, the host
+//// libraries' are the host's, whichever way they are called
+
+static int int_cmp(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+// The host's qsort sorts a large array with a scratch buffer of its own
+// (glibc's: malloc, then free in a tail call), which stays the host's.
+TEST(QsortLarge) {
+    enum { N = 10000 };
+    int *a = malloc(N * sizeof(int));
+    ASSERT_NEQ(a, NULL);
+    for (int i = 0; i < N; i++)
+        a[i] = (i * 7919) % N;
+    qsort(a, N, sizeof(int), int_cmp);
+    for (int i = 0; i < N; i++)
+        ASSERT_EQ(a[i], i);
+    free(a);
+}
+
+// getifaddrs allocates its list on the host, and freeifaddrs frees it there
+// (glibc's freeifaddrs is a tail call to free).
+TEST(IfaddrsHostAllocated) {
+    struct ifaddrs *ifa;
+    ASSERT_EQ(0, getifaddrs(&ifa));
+    freeifaddrs(ifa);
+}
+
+// A guest's free() of memory the VM did not allocate is a bug, and caught:
+// here getifaddrs's list, which only freeifaddrs may free.
+TEST(FreeHostPointerAborts) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        struct ifaddrs *ifa;
+        if (getifaddrs(&ifa))
+            _exit(2);
+        free(ifa);
+        _exit(0);
+    }
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFSIGNALED(s));
+    ASSERT_EQ(SIGABRT, WTERMSIG(s));
+}
+
+static void abrt_handler(int sig) { (void)sig; }
+
+// ... and it ends that task only, also when the guest handles or blocks
+// SIGABRT (the VM, and so this parent, carries on).
+TEST(FreeHostPointerAbortsTaskOnly) {
+    for (int blocked = 0; blocked <= 1; blocked++) {
+        pid_t p = fork();
+        ASSERT_NEQ(p, -1);
+        if (!p) {
+            if (blocked) {
+                sigset_t set;
+                sigemptyset(&set);
+                sigaddset(&set, SIGABRT);
+                sigprocmask(SIG_BLOCK, &set, NULL);
+            } else {
+                struct sigaction act = { .sa_handler = abrt_handler };
+                sigaction(SIGABRT, &act, NULL);
+            }
+            struct ifaddrs *ifa;
+            if (getifaddrs(&ifa))
+                _exit(2);
+            free(ifa);
+            _exit(0);
+        }
+        int s;
+        ASSERT_EQ(p, waitpid(p, &s, 0));
+        ASSERT_EQ(1, (WIFSIGNALED(s) && WTERMSIG(s) == SIGABRT) ||
+                     (WIFEXITED(s) && WEXITSTATUS(s) == 1));
+    }
+}
+
+//// Bindings: a guest's calls reach the VM's functions under each of their
+//// names (glibc's headers rename the scanf family to __isoc99_/__isoc23_)
+
+static int vfscanf_args(FILE *f, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfscanf(f, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+static int vscanf_args(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vscanf(fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+TEST(ScanfFamily) {
+    char path[] = "/tmp/tvm_scanf_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NEQ(fd, -1);
+    ASSERT_EQ(9, write(fd, "42 word\n7", 9));
+    close(fd);
+    FILE *f = fopen(path, "r");
+    ASSERT_NEQ(f, NULL);
+    int n = 0;
+    char w[16];
+    int r = fscanf(f, "%d %15s", &n, w);
+    ASSERT_EQ(2, r);
+    ASSERT_EQ(42, n);
+    ASSERT_EQ(0, strcmp(w, "word"));
+    r = vfscanf_args(f, "%d", &n);
+    ASSERT_EQ(1, r);
+    ASSERT_EQ(7, n);
+    fclose(f);
+    ASSERT_EQ(0, unlink(path));
+
+    // scanf/vscanf read the task's stdin
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(pp[1]);
+        dup2(pp[0], 0);
+        close(pp[0]);
+        int a = 0, b = 0;
+        if (1 != scanf("%d", &a) || 1 != vscanf_args("%d", &b))
+            _exit(99);
+        _exit(a * 10 + b);
+    }
+    close(pp[0]);
+    ASSERT_EQ(4, write(pp[1], "5 6\n", 4));
+    close(pp[1]);
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(56, WEXITSTATUS(s));
+}
+
+static int exit_fd = -1;
+static void atexit_writer(void) { write(exit_fd, "a", 1); }
+
+// A guest's exit handlers are its task's: exit() runs them.
+TEST(AtexitRunsAtTaskExit) {
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(pp[0]);
+        exit_fd = pp[1];
+        atexit(atexit_writer);
+        exit(0);
+    }
+    close(pp[1]);
+    char c = 0;
+    ASSERT_EQ(1, read(pp[0], &c, 1));
+    ASSERT_EQ('a', c);
+    close(pp[0]);
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+}
+
+#if defined(__linux__)
+extern int __cxa_atexit(void (*)(void *), void *, void *);
+extern void *__dso_handle;
+static void cxa_writer(void *arg) { write(exit_fd, arg, 1); }
+
+// C++'s static destructors: run at the task's exit, with their argument.
+TEST(CxaAtexitRunsWithArg) {
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        close(pp[0]);
+        exit_fd = pp[1];
+        __cxa_atexit(cxa_writer, "c", &__dso_handle);
+        exit(0);
+    }
+    close(pp[1]);
+    char c = 0;
+    ASSERT_EQ(1, read(pp[0], &c, 1));
+    ASSERT_EQ('c', c);
+    close(pp[0]);
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+}
+#endif
+
+TEST(VforkExitStatus) {
+    pid_t p = vfork();
+    ASSERT_NEQ(p, -1);
+    if (!p)
+        _exit(5);
+    int s;
+    ASSERT_EQ(p, waitpid(p, &s, 0));
+    ASSERT_EQ(1, WIFEXITED(s));
+    ASSERT_EQ(5, WEXITSTATUS(s));
 }
 
 // A fork child longjmps to a setjmp its parent made before the fork, on the

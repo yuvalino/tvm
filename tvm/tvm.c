@@ -61,7 +61,6 @@
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/fileport.h>
-#include <mach-o/getsect.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <sys/sysctl.h>
 #elif defined(__linux__)
@@ -71,7 +70,6 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <asm/prctl.h>
-#include <link.h>
 #include <malloc.h>   // memalign, pvalloc
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
@@ -312,341 +310,45 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
 /////////////
 
 /**
- * Get pointers to POSIX API functions so we can call them from their hook.
- * 
- * Basically, DECL_FUNC() just declares a global variable for that function's original pointer
- *  and populates it on init.
- * 
- * Once a function is declared, we can provide CALL_FUNC(name, args...) and have the unhooked function called.
- * 
- * TODO:
- * - On older ubuntu (20.04 for sure) some basic functions are missing from libc (like stat()), need to deal with that.
+ * TVM's implementation of a libc function `name` is __tvm_name, defined with
+ * FUNCTION_DEFINE*() (see "Hooks API"). The name itself is never defined in
+ * the host's namespace: the ulinker binds a guest's `name` to __tvm_name by
+ * the metadata the definition registers, and every other caller -- TVM's own
+ * code, unicorn, the host libraries -- gets the host's function. TVM's code
+ * asks for the VM's version explicitly: VMCALL(open, path, flags).
  */
+#define VMCALL(Name, ...) (__tvm_##Name(__VA_ARGS__))
 
-#define LOCAL_SYM(Name) o_##Name
-#define DECL_FUNC_EX(Name, Opt) \
-    static typeof(Name) *LOCAL_SYM(Name) = NULL; \
-    static struct original_func_t _of_ ## Name = { .ptrdest = (void *)&LOCAL_SYM(Name), .name = #Name, .opt = (Opt) }; \
-    __attribute__((constructor)) \
-    static void _ofc_ ## Name () { list_add_tail( & (_of_ ## Name).list, &original_functions); }
-#define DECL_FUNC(Name)     DECL_FUNC_EX(Name, 0)
-#define DECL_FUNC_OPT(Name) DECL_FUNC_EX(Name, 1)
-#define CALL_FUNC(Name, ...) (LOCAL_SYM(Name) (__VA_ARGS__))
-
-struct original_func_t {
-    struct list_head list;
-    void **ptrdest;
-    const char *name;
-    int opt;
-};
-
-static LIST_HEAD(original_functions);
-
-DECL_FUNC(malloc);
-DECL_FUNC(calloc);
-DECL_FUNC(realloc);
-DECL_FUNC(free);
-DECL_FUNC(posix_memalign);
-DECL_FUNC(aligned_alloc);
-DECL_FUNC(valloc);
-
-DECL_FUNC(opendir)
-DECL_FUNC(fdopendir);
-DECL_FUNC(closedir);
-DECL_FUNC(readdir);
-DECL_FUNC(dirfd);
-DECL_FUNC(rewinddir);
-DECL_FUNC(telldir);
-DECL_FUNC(seekdir);
-
-
-DECL_FUNC(fopen);
-DECL_FUNC(fdopen);
-DECL_FUNC(popen);
-DECL_FUNC(pclose);
-DECL_FUNC(wait4);
-DECL_FUNC(wait3);
-DECL_FUNC(vwarn);
-DECL_FUNC(vwarnx);
-#if defined(__APPLE__)
-// BSD-only: glibc has none of these, and an unguarded DECL_FUNC both fails to
-// compile there and panics at startup when dlsym cannot find the original.
-DECL_FUNC(vwarnc);
-DECL_FUNC(verrc);
-DECL_FUNC(getprogname);
-DECL_FUNC(setprogname);
-#endif
-DECL_FUNC(freopen);
-DECL_FUNC(fclose);
-DECL_FUNC(fwrite);
-DECL_FUNC(fread);
-DECL_FUNC(fseek);
-DECL_FUNC(fseeko);
-DECL_FUNC(ftell);
-DECL_FUNC(ftello);
-DECL_FUNC(rewind);
-DECL_FUNC(flockfile);
-DECL_FUNC(ftrylockfile);
-DECL_FUNC(funlockfile);
-DECL_FUNC(fflush);
-DECL_FUNC(setbuf);
-DECL_FUNC(setbuffer);
-DECL_FUNC(setlinebuf);
-DECL_FUNC(setvbuf);
-DECL_FUNC(fputc);
-DECL_FUNC(fputs);
-DECL_FUNC(putc);
-DECL_FUNC(putchar);
-DECL_FUNC(puts);
-DECL_FUNC(fgetc);
-DECL_FUNC(fgets);
-DECL_FUNC(getc);
-DECL_FUNC(getchar);
-DECL_FUNC(ungetc);
-DECL_FUNC(clearerr);
-DECL_FUNC(feof);
-DECL_FUNC(ferror);
-DECL_FUNC(fileno);
-
-DECL_FUNC(printf);
-DECL_FUNC(fprintf);
-DECL_FUNC(dprintf);
-DECL_FUNC(vprintf);
-DECL_FUNC(vfprintf);
-DECL_FUNC(vdprintf);
-DECL_FUNC(scanf);
-DECL_FUNC(fscanf);
-DECL_FUNC(vscanf);
-DECL_FUNC(vfscanf);
-DECL_FUNC(perror);
-
-DECL_FUNC(open);
-DECL_FUNC(creat);
-DECL_FUNC(openat);
-DECL_FUNC(read);
-DECL_FUNC(write);
-DECL_FUNC(close);
-DECL_FUNC(readv);
-DECL_FUNC(writev);
-DECL_FUNC(pread);
-DECL_FUNC(pwrite);
-DECL_FUNC(preadv);
-DECL_FUNC(pwritev);
-DECL_FUNC(lseek);
-DECL_FUNC(fsync);
-DECL_FUNC(dup);
-DECL_FUNC(dup2);
-DECL_FUNC(pipe);
-DECL_FUNC(select);
-DECL_FUNC(poll);
-DECL_FUNC(pselect);
-#if defined(__linux__)
-DECL_FUNC(ppoll);
-#endif
-DECL_FUNC(shm_open);
-DECL_FUNC(fcntl);
-DECL_FUNC(ftruncate);
-DECL_FUNC(stat);
-DECL_FUNC(lstat);
-DECL_FUNC(fstat);
-DECL_FUNC(fstatat);
-DECL_FUNC(statfs);
-DECL_FUNC(fstatfs);
-DECL_FUNC(access);
-DECL_FUNC(faccessat);
-DECL_FUNC(chmod);
-DECL_FUNC(lchmod);
-DECL_FUNC(fchmod);
-DECL_FUNC(fchmodat);
-DECL_FUNC(chown);
-DECL_FUNC(lchown);
-DECL_FUNC(fchown);
-DECL_FUNC(fchownat);
-DECL_FUNC(flock);
-DECL_FUNC(lockf);
-DECL_FUNC(readlink);
-DECL_FUNC(readlinkat);
-DECL_FUNC(symlink);
-DECL_FUNC(symlinkat);
-DECL_FUNC(link);
-DECL_FUNC(linkat);
-DECL_FUNC(rename);
-DECL_FUNC(renameat);
-DECL_FUNC(unlink);
-DECL_FUNC(unlinkat);
-DECL_FUNC(mkdir);
-DECL_FUNC(mkdirat);
-DECL_FUNC(rmdir);
-DECL_FUNC(mkfifo);
-DECL_FUNC(mkfifoat);
-DECL_FUNC(mkstemp);
-DECL_FUNC(mkdtemp);
-DECL_FUNC(utimensat);
-DECL_FUNC(utimes);
-DECL_FUNC(lutimes);
-DECL_FUNC(utime);
-DECL_FUNC(futimens);
-DECL_FUNC(futimes);
-DECL_FUNC(truncate);
-DECL_FUNC(getxattr);
-DECL_FUNC(fgetxattr);
-DECL_FUNC(fsetxattr);
-DECL_FUNC(flistxattr);
-DECL_FUNC(fremovexattr);
-DECL_FUNC(statvfs);
-DECL_FUNC(fstatvfs);
-
-DECL_FUNC(socket);
-DECL_FUNC(accept);
-DECL_FUNC(bind);
-DECL_FUNC(listen);
-DECL_FUNC(connect);
-DECL_FUNC(getpeername);
-DECL_FUNC(getsockname);
-DECL_FUNC(getsockopt);
-DECL_FUNC(setsockopt);
-DECL_FUNC(send);
-DECL_FUNC(sendto);
-DECL_FUNC(sendmsg);
-DECL_FUNC(recv);
-DECL_FUNC(recvfrom);
-DECL_FUNC(recvmsg);
-DECL_FUNC(shutdown);
-DECL_FUNC(socketpair);
-DECL_FUNC(ioctl);
-
-DECL_FUNC(pthread_create);
-DECL_FUNC(pthread_exit);
-DECL_FUNC(pthread_join);
-DECL_FUNC(pthread_detach);
-DECL_FUNC(pthread_kill);
-
-DECL_FUNC(exit);
-DECL_FUNC(_exit);
-DECL_FUNC(_Exit);
-DECL_FUNC(abort);
-
-DECL_FUNC(verr);
-DECL_FUNC(verrx);
-
-DECL_FUNC(getpid);
-DECL_FUNC(getppid);
-DECL_FUNC(umask);
-
-DECL_FUNC(fork);
-DECL_FUNC(wait);
-DECL_FUNC(waitpid);
-
-DECL_FUNC(setsid);
-DECL_FUNC(getsid);
-DECL_FUNC(setpgid);
-DECL_FUNC(getpgid);
-DECL_FUNC(getpgrp);
-DECL_FUNC(setpgrp);
-
-DECL_FUNC(signal);
-DECL_FUNC(sigaction);
-DECL_FUNC(raise);
-DECL_FUNC(kill);
-DECL_FUNC(killpg);
-#if defined(__APPLE__)
-DECL_FUNC(sysctl);
-#endif
-DECL_FUNC(sigprocmask);
-DECL_FUNC(pthread_sigmask);
-DECL_FUNC(sigpending);
-DECL_FUNC(sigsuspend);
-DECL_FUNC(pause);
-DECL_FUNC(sigwait);
-DECL_FUNC_OPT(sigwaitinfo);
-DECL_FUNC_OPT(sigtimedwait);
-
-DECL_FUNC(getenv);
-DECL_FUNC(putenv);
-DECL_FUNC(setenv);
-DECL_FUNC(unsetenv);
-
-DECL_FUNC(execve);
-DECL_FUNC(execl);
-DECL_FUNC(execlp);
-DECL_FUNC(execle);
-DECL_FUNC(execv);
-DECL_FUNC(execvp);
-DECL_FUNC(system);
-
-DECL_FUNC(openpty);
-
-DECL_FUNC(tcgetpgrp);
-DECL_FUNC(tcsetpgrp);
-DECL_FUNC(isatty);
-DECL_FUNC(ttyname);
-DECL_FUNC(ttyname_r);
-DECL_FUNC(ptsname);
-DECL_FUNC(ptsname_r);
-
-DECL_FUNC(tcgetattr);
-DECL_FUNC(tcsetattr);
-DECL_FUNC(tcsendbreak);
-DECL_FUNC(tcdrain);
-DECL_FUNC(tcflush);
-DECL_FUNC(tcflow);
-
-DECL_FUNC(strdup);
-DECL_FUNC(strndup);
-DECL_FUNC(wcsdup);
-DECL_FUNC(asprintf);
-DECL_FUNC(vasprintf);
-DECL_FUNC(getline);
-DECL_FUNC(getdelim);
-
-DECL_FUNC(mmap);
-DECL_FUNC(munmap);
-DECL_FUNC(mprotect);
-
-DECL_FUNC(getopt);
-DECL_FUNC(getopt_long);
-DECL_FUNC(getopt_long_only);
-
-// never decl those
-// DECL_FUNC(dlopen);
-// DECL_FUNC(dlclose);
-// DECL_FUNC(dlsym);
-// DECL_FUNC(dlerror);
-// DECL_FUNC(dladdr);
-
-DECL_FUNC(realpath);
-DECL_FUNC(chdir);
-DECL_FUNC(fchdir);
-DECL_FUNC(getcwd);
-DECL_FUNC(getwd);
-
-DECL_FUNC(bsearch);
-DECL_FUNC(qsort);
-
-DECL_FUNC(setitimer);
-DECL_FUNC(getitimer);
-
-DECL_FUNC_OPT(timer_create);
-DECL_FUNC_OPT(timer_settime);
-DECL_FUNC_OPT(timer_gettime);
-DECL_FUNC_OPT(timer_delete);
-DECL_FUNC_OPT(timer_getoverrun);
+// The VM's functions TVM's code calls, typed as the host declares them.
+#define VMDECL(Name) extern __typeof__(Name) __tvm_##Name;
+VMDECL(_exit) VMDECL(abort) VMDECL(asprintf) VMDECL(calloc) VMDECL(chdir)
+VMDECL(clearerr) VMDECL(close) VMDECL(closedir) VMDECL(dirfd) VMDECL(dup2)
+VMDECL(err) VMDECL(errx) VMDECL(execl) VMDECL(execv) VMDECL(execve)
+VMDECL(execvp) VMDECL(exit) VMDECL(faccessat) VMDECL(fclose) VMDECL(fcntl)
+VMDECL(fdopen) VMDECL(fdopendir) VMDECL(fflush) VMDECL(fgetc) VMDECL(fgets)
+VMDECL(fileno) VMDECL(fopen) VMDECL(fork) VMDECL(fprintf) VMDECL(fputc)
+VMDECL(fputs) VMDECL(fread) VMDECL(free) VMDECL(freopen) VMDECL(fseek)
+VMDECL(fseeko) VMDECL(fstat) VMDECL(ftell) VMDECL(ftello) VMDECL(fwrite)
+VMDECL(getcwd) VMDECL(getdelim) VMDECL(getenv) VMDECL(getgrnam)
+VMDECL(getopt) VMDECL(getpgid) VMDECL(isatty) VMDECL(kill) VMDECL(lstat)
+VMDECL(malloc) VMDECL(mkdir) VMDECL(mkstemp) VMDECL(mmap) VMDECL(open)
+VMDECL(openat) VMDECL(opendir) VMDECL(perror) VMDECL(pipe)
+VMDECL(pread) VMDECL(preadv) VMDECL(printf)
+VMDECL(pselect) VMDECL(pthread_create) VMDECL(pthread_exit) VMDECL(ptsname_r)
+VMDECL(putchar) VMDECL(pwrite) VMDECL(pwritev) VMDECL(raise) VMDECL(read)
+VMDECL(readdir) VMDECL(readlink) VMDECL(realloc) VMDECL(setenv)
+VMDECL(setpgid) VMDECL(sigaction) VMDECL(signal) VMDECL(sigprocmask)
+VMDECL(stat) VMDECL(statfs) VMDECL(statvfs) VMDECL(strdup) VMDECL(strerror)
+VMDECL(strndup) VMDECL(system) VMDECL(tcsendbreak) VMDECL(timer_create)
+VMDECL(timer_gettime) VMDECL(timer_settime) VMDECL(ttyname_r)
+VMDECL(unsetenv) VMDECL(vasprintf) VMDECL(vdprintf) VMDECL(verr)
+VMDECL(verrx) VMDECL(vfprintf) VMDECL(vfscanf) VMDECL(vwarn)
+VMDECL(vwarnx) VMDECL(waitpid) VMDECL(write)
+// BSD's, which glibc does not declare (TVM has them on every platform)
+void __tvm_vwarnc(int, const char *, va_list);
+void __tvm_verrc(int, int, const char *, va_list);
 
 #if defined(__linux__)
-DECL_FUNC(memalign);
-DECL_FUNC(pvalloc);
-DECL_FUNC(pread64);
-DECL_FUNC(pwrite64);
-DECL_FUNC(preadv64);
-DECL_FUNC(pwritev64);
-DECL_FUNC(fdatasync);
-DECL_FUNC(mmap64);
-DECL_FUNC(statfs64);
-DECL_FUNC(mkstemp64);
-DECL_FUNC(fseeko64);
-DECL_FUNC(ftello64);
-DECL_FUNC(posix_fallocate);
-DECL_FUNC(posix_fallocate64);
 // glibc entry points that only its own headers' redirections name (fortify,
 // C23 scanf): not declared for this translation unit.
 extern int __open_2(const char *, int);
@@ -658,99 +360,14 @@ extern size_t __fread_chk(void *, size_t, size_t, size_t, FILE *);
 extern size_t __fread_unlocked_chk(void *, size_t, size_t, size_t, FILE *);
 extern char *__fgets_chk(char *, size_t, int, FILE *);
 extern char *__fgets_unlocked_chk(char *, size_t, int, FILE *);
-DECL_FUNC(__open_2);
-DECL_FUNC(__open64_2);
-DECL_FUNC(__vprintf_chk);
-DECL_FUNC(__vfprintf_chk);
-DECL_FUNC(__vdprintf_chk);
-DECL_FUNC(__fread_chk);
-DECL_FUNC(__fread_unlocked_chk);
-DECL_FUNC(__fgets_chk);
-DECL_FUNC(__fgets_unlocked_chk);
-DECL_FUNC(fread_unlocked);
-DECL_FUNC(fwrite_unlocked);
-DECL_FUNC(fgets_unlocked);
-DECL_FUNC(fputs_unlocked);
-DECL_FUNC(fputc_unlocked);
-DECL_FUNC(fflush_unlocked);
-DECL_FUNC(__fpurge);
-DECL_FUNC(accept4);
-DECL_FUNC(recvmmsg);
-DECL_FUNC(sendmmsg);
-DECL_FUNC(memfd_create);
-DECL_FUNC(inotify_init);
-DECL_FUNC(inotify_init1);
-DECL_FUNC(inotify_add_watch);
-DECL_FUNC(inotify_rm_watch);
-DECL_FUNC(sync_file_range);
-DECL_FUNC(fpathconf);
-DECL_FUNC(futimesat);
-DECL_FUNC(lgetxattr);
-DECL_FUNC(statvfs64);
-DECL_FUNC(fstatvfs64);
-DECL_FUNC(eaccess);
-DECL_FUNC(euidaccess);
-DECL_FUNC(mknod);
-DECL_FUNC(mknodat);
-DECL_FUNC(clearenv);
-DECL_FUNC(execvpe);
-DECL_FUNC(epoll_create);
-DECL_FUNC(epoll_create1);
-DECL_FUNC(timerfd_create);
-DECL_FUNC(eventfd);
-DECL_FUNC(eventfd_read);
-DECL_FUNC(eventfd_write);
-DECL_FUNC(pipe2);
-DECL_FUNC(fstatfs64);
-DECL_FUNC(open64);
-DECL_FUNC(openat64);
-DECL_FUNC(fstatat64);
-DECL_FUNC(lseek64);
-DECL_FUNC(ftruncate64);
-DECL_FUNC(readdir64);
-DECL_FUNC(fopen64);
-DECL_FUNC(freopen64);
-DECL_FUNC(stat64);
-DECL_FUNC(lstat64);
-DECL_FUNC(fstat64);
-DECL_FUNC(get_current_dir_name);
-#elif defined(__APPLE__)
-DECL_FUNC_OPT(CFDictionaryApplyFunction);
-DECL_FUNC(fileport_makeport);
-DECL_FUNC(fileport_makefd);
+VMDECL(posix_fallocate)
 #endif
-
-DECL_FUNC(setusershell);
-DECL_FUNC(getusershell);
-DECL_FUNC(endusershell);
-DECL_FUNC(getpwnam);
-DECL_FUNC(getpwuid);
-DECL_FUNC(getgrnam);
-DECL_FUNC(getgrgid);
-DECL_FUNC(localtime);
-DECL_FUNC(gmtime);
-DECL_FUNC(ctime);
-DECL_FUNC(strerror);
 
 static void log_write(const char *buf, int n)
 {
     if (g_outfd >= 0)
-        CALL_FUNC(write, g_outfd, buf, n);
+        write(g_outfd, buf, n);
 }
-
-__attribute__((constructor))
-static void init_funcs()
-{
-    struct original_func_t *curr_func;
-    list_for_each_entry(curr_func, &original_functions, list) {
-        *curr_func->ptrdest = dlsym(RTLD_NEXT, curr_func->name);
-        if (NULL == *curr_func->ptrdest) {
-            if (!curr_func->opt)
-                panic("function '%s' not found", curr_func->name);
-            *curr_func->ptrdest = (void *)0x4141DEAD;
-        }
-    }
-};
 
 __attribute__((constructor))
 static void format_time_init(void) {
@@ -779,8 +396,6 @@ void *kalloc(size_t size);
 void kfree(void *p);
 void *krealloc(void *ptr, size_t size);
 char *kstrdup(const char *s);
-
-int can_enter_tvm(void *lr);
 
 static int task_assign_file_locked(struct task *t, struct file *file, int min_fd);
 static void task_unassign_file_locked(struct task *t, struct file *file);
@@ -873,12 +488,12 @@ static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
     struct fdentry *fdt = NULL;
     size_t fdn = 0;
 
-    if (!(dirp = opendir("/proc/self/fd")))
+    if (!(dirp = VMCALL(opendir, "/proc/self/fd")))
         goto err;
     
     while (1) {
         errno = 0;
-        if (!(dent = readdir(dirp))) {
+        if (!(dent = VMCALL(readdir, dirp))) {
             if (errno)
                 goto err;
             break;
@@ -891,11 +506,11 @@ static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
         if (intparse(dent->d_name, &fd, 10))
             goto err;
         
-        if (dirfd(dirp) == fd)
+        if (VMCALL(dirfd, dirp) == fd)
             continue;
 
         struct fdentry fde = {.fd = (int)fd};
-        if (!(fdt = realloc(fdt, sizeof(*fdt) * (fdn + 1))))
+        if (!(fdt = VMCALL(realloc, fdt, sizeof(*fdt) * (fdn + 1))))
             goto err;
 
         memcpy(fdt + fdn, &fde, sizeof(*fdt));
@@ -907,9 +522,9 @@ static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
     ret = 0;
 err:
     if (ret)
-        free(fdt);
+        VMCALL(free, fdt);
     if (dirp)
-        closedir(dirp);
+        VMCALL(closedir, dirp);
     return ret;
 }
 #elif defined(__APPLE__)
@@ -931,20 +546,20 @@ static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
     size_t fdn = 0;
     int size = -1;
     
-    size = proc_pidinfo(CALL_FUNC(getpid), PROC_PIDLISTFDS, 0, 0, 0);
+    size = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, 0, 0);
     if (size < 0)
         goto err;
     
-    if (!(fdinfos = malloc(size)))
+    if (!(fdinfos = VMCALL(malloc, size)))
         goto err;
 
-    size = proc_pidinfo(CALL_FUNC(getpid), PROC_PIDLISTFDS, 0, fdinfos, size);
+    size = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fdinfos, size);
     if (size < 0)
         goto err;
 
     for (int i = 0; i < (size / sizeof(*fdinfos)); i++) {
         struct fdentry fde = {.fd = fdinfos[i].proc_fd};
-        if (!(fdt = realloc(fdt, sizeof(*fdt) * (fdn + 1))))
+        if (!(fdt = VMCALL(realloc, fdt, sizeof(*fdt) * (fdn + 1))))
             goto err;
 
         memcpy(fdt + fdn, &fde, sizeof(*fdt));
@@ -956,9 +571,9 @@ static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
     ret = 0;
 err:
     if (ret)
-        free(fdt);
+        VMCALL(free, fdt);
     if (fdinfos)
-        free(fdinfos);
+        VMCALL(free, fdinfos);
     return ret;
 }
 #endif
@@ -969,7 +584,7 @@ ssize_t fd_getpath(int fd, char *out, size_t outsize)
     char filepath[PATH_MAX];
     filepath[0] = 0;
 
-    if (-1 == CALL_FUNC(fcntl, fd, F_GETPATH, filepath))
+    if (-1 == fcntl(fd, F_GETPATH, filepath))
         return -1;
 
     size_t len = strlen(filepath);
@@ -989,7 +604,7 @@ ssize_t fd_getpath(int fd, char *out, size_t outsize)
     char link[64];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
 
-    ssize_t n = CALL_FUNC(readlink, link, out, outsize - 1);
+    ssize_t n = readlink(link, out, outsize - 1);
     if (n < 0)
         return -1;
 
@@ -1032,7 +647,7 @@ static void *read_all(int fd, size_t *out_size) {
     *out_size = 0;
 
     size_t cap = READ_CHUNK;
-    char *buf = malloc(cap);
+    char *buf = VMCALL(malloc, cap);
     if (!buf)
         return NULL;
 
@@ -1041,21 +656,21 @@ static void *read_all(int fd, size_t *out_size) {
     while (1) {
         if (total == cap) {
             size_t new_cap = cap * 2;
-            char *new_buf = realloc(buf, new_cap);
+            char *new_buf = VMCALL(realloc, buf, new_cap);
             if (!new_buf) {
-                free(buf);
+                VMCALL(free, buf);
                 return NULL;
             }
             buf = new_buf;
             cap = new_cap;
         }
 
-        ssize_t r = read(fd, buf + total, cap - total);
+        ssize_t r = VMCALL(read, fd, buf + total, cap - total);
         if (r < 0) {
             if (errno == EINTR)
                 continue;
 
-            free(buf);
+            VMCALL(free, buf);
             return NULL;
         }
 
@@ -1212,7 +827,7 @@ int jmp_save_mask(uint64_t *buf, int savemask, int nregs)
     struct jmp_sigmask *m = (struct jmp_sigmask *)(buf + nregs);
     m->savemask = savemask;
     if (savemask)
-        sigprocmask(SIG_BLOCK, NULL, &m->mask);
+        VMCALL(sigprocmask, SIG_BLOCK, NULL, &m->mask);
     return 0;
 }
 
@@ -1220,7 +835,7 @@ static void jmp_restore_mask(uint64_t *buf, int nregs)
 {
     struct jmp_sigmask *m = (struct jmp_sigmask *)(buf + nregs);
     if (m->savemask)
-        sigprocmask(SIG_SETMASK, &m->mask, NULL);
+        VMCALL(sigprocmask, SIG_SETMASK, &m->mask, NULL);
 }
 
 // setjmp saves the mask, _setjmp not, sigsetjmp if savemask
@@ -1452,7 +1067,7 @@ out:
 static char **addenv(char **env, char *string)
 {
     int sz = envsize(env);
-    char **newenv = malloc(sizeof(char *) * (sz+2));
+    char **newenv = VMCALL(malloc, sizeof(char *) * (sz+2));
     if (!newenv)
         return NULL;
 
@@ -1578,7 +1193,7 @@ void filedealloc_locked(struct file *file) {
     file->f_type = DEV_REG;
 
     if (file->f_rfd >= 0) {
-        if (0 != CALL_FUNC(close, file->f_rfd))
+        if (0 != close(file->f_rfd))
             panic("filedealloc close %d", file->f_rfd);
     }
 
@@ -1626,7 +1241,7 @@ static int rfd_adopt(int rfd)
 {
 #ifdef F_SETNOSIGPIPE
     if (rfd >= 0)
-        (void)CALL_FUNC(fcntl, rfd, F_SETNOSIGPIPE, 1);
+        (void)fcntl(rfd, F_SETNOSIGPIPE, 1);
 #endif
     return rfd;
 }
@@ -1658,7 +1273,7 @@ static void epipe_signal(void)
         // signal landing inside call_sighandler's ulinker_dladdr took its
         // mutex again (deadlock).
         if (!current_signal_ignored(SIGPIPE))
-            CALL_FUNC(pthread_kill, pthread_self(), SIGPIPE);
+            pthread_kill(pthread_self(), SIGPIPE);
         errno = last_errno;
     }
 #endif
@@ -1674,7 +1289,7 @@ static void epipe_signal_locked(struct task *t)
     if (errno == EPIPE) {
         int last_errno = errno;
         if (!task_signal_ignored_locked(t, SIGPIPE))
-            CALL_FUNC(pthread_kill, pthread_self(), SIGPIPE);
+            pthread_kill(pthread_self(), SIGPIPE);
         errno = last_errno;
     }
 #else
@@ -1797,7 +1412,7 @@ struct file *file_open(int dirfd, const char *dirpath, const char *pathname, int
         // relative to a descriptor with no recorded path (one adopted from
         // the host): the host's, by (dirfd, relative) -- the one relative
         // path an open ever sees, as every other caller normalizes theirs
-        int rfd = CALL_FUNC(openat, dirfd, pathname, flags, mode);
+        int rfd = openat(dirfd, pathname, flags, mode);
         if (rfd == -1)
             goto fail;
         file->f_rfd = rfd_adopt(rfd);
@@ -1821,13 +1436,13 @@ fail:
  */
 struct file *file_dup_locked(struct file *oldfile) {
     // we dup the rfd outside f_dup() and call it with the rfd already duped in f_rfd
-    int newfd = CALL_FUNC(dup, oldfile->f_rfd);
+    int newfd = dup(oldfile->f_rfd);
     if (newfd == -1)
         return NULL;
 
     struct file *newfile = filealloc_from_rfd(newfd);
     if (!newfile) {
-        if (0 != CALL_FUNC(close, newfd))
+        if (0 != close(newfd))
             panic("file_dup_locked close");
         return NULL;
     }
@@ -2002,14 +1617,12 @@ struct thread {
 static struct rmem_arena *global_arena = NULL;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
-struct tvm_call;
 typedef int (*compar_t)(const void *, const void *);
 
 struct tvm_tls {
     struct task *tls_current;
     struct thread *tls_current_thread;
 
-    int tls_thread_tvm_disallow;
     int tls_tvm_sig_blocked;
     int tls_tvm_sig_draining;
     int tls_tvm_sig_interrupted;
@@ -2019,8 +1632,6 @@ struct tvm_tls {
     int tls_tvm_emu_call_depth; // >0 while inside emulated execution in emulator_call_ex; signals defer and drain only at the emulator_step safe point
     int tls_sigshutup;
     int tls_tasks_lock_held; // set during task teardown when tasks_lock is held
-
-    struct tvm_call *tls_call;
 
     compar_t tls_bsearch_compar;
     compar_t tls_qsort_compar;
@@ -2045,8 +1656,8 @@ void threaddealloc(struct thread *thr);
 static void tvm_thread_destructor(void *arg) {
     struct tvm_tls *tls = arg;
     // glibc clears the key value BEFORE invoking the destructor, but the
-    // teardown below is VM code (emulator/task destruction reads TLS, e.g.
-    // TVM_OFF).  Chokepoint rule: re-install the TLS for the teardown's
+    // teardown below is VM code (emulator/task destruction reads TLS).
+    // Re-install the TLS for the teardown's
     // duration, and clear it at the end so glibc doesn't re-run us (it loops
     // while any key value is non-NULL).
     pthread_setspecific(tls_key, tls);
@@ -2058,29 +1669,42 @@ static void tvm_thread_destructor(void *arg) {
     kfree(tls);
 }
 
-// Peek at this thread's TLS without asserting it exists. ONLY for the VM-enter
-// chokepoints (FUNCTION_DEFINE wrappers, signal_handler, can_enter_tvm, panic):
-// they must gate on "no TLS -> host behavior" before any code that calls
-// tvm_tls(). Everything else calls tvm_tls(), which treats a missing TLS as a
-// fatal bug (a code path that slipped past every chokepoint).
+// Peek at this thread's TLS without asserting it exists, for the few places
+// that must work on any thread (signal_handler, panic). Everything else calls
+// tvm_tls(), which treats a missing TLS as a fatal bug: VM code on a thread
+// that is not a VM thread.
 #define TVM_TLS_PEEK() (tls_initialized ? (struct tvm_tls *)pthread_getspecific(tls_key) : NULL)
+
+// Die by SIGABRT with the default disposition, bypassing TVM's signal_handler,
+// which defers the signal or (on a thread with no VM identity) drops it, so a
+// plain abort() could return or spin instead.
+__attribute__((noreturn)) static void die_by_sigabrt(void)
+{
+    struct sigaction dfl = { .sa_handler = SIG_DFL };
+    sigaction(SIGABRT, &dfl, NULL);
+    sigset_t unblk;
+    sigemptyset(&unblk);
+    sigaddset(&unblk, SIGABRT);
+    pthread_sigmask(SIG_UNBLOCK, &unblk, NULL);
+    raise(SIGABRT);
+    _exit(128 + SIGABRT);
+}
 
 static inline struct tvm_tls *tvm_tls(void) {
     struct tvm_tls *t = TVM_TLS_PEEK();
     if (!t) {
-        // No per-thread TLS and somebody still reached VM state: missed
-        // chokepoint. Raw report + abort — panic()/INFO read TLS via this
-        // very function and would recurse.
-        static const char __msg[] = "tvm_tls: no thread TLS (code path missed a VM-enter chokepoint)\n";
-        CALL_FUNC(write, 2, __msg, sizeof(__msg) - 1);
-        CALL_FUNC(abort);
+        // No per-thread TLS and somebody still reached VM state: VM code on
+        // a thread that is not a VM thread. Raw report: panic()/INFO read
+        // TLS via this very function and would recurse.
+        static const char __msg[] = "tvm_tls: no thread TLS (VM code on a non-VM thread)\n";
+        write(2, __msg, sizeof(__msg) - 1);
+        die_by_sigabrt();
     }
     return t;
 }
 
 #define current                     (tvm_tls()->tls_current)
 #define current_thread              (tvm_tls()->tls_current_thread)
-#define thread_tvm_disallow         (tvm_tls()->tls_thread_tvm_disallow)
 #define tvm_sig_blocked             (tvm_tls()->tls_tvm_sig_blocked)
 #define tvm_sig_draining            (tvm_tls()->tls_tvm_sig_draining)
 #define tvm_sig_interrupted         (tvm_tls()->tls_tvm_sig_interrupted)
@@ -2090,7 +1714,6 @@ static inline struct tvm_tls *tvm_tls(void) {
 #define tvm_emu_call_depth          (tvm_tls()->tls_tvm_emu_call_depth)
 #define tasks_lock_held             (tvm_tls()->tls_tasks_lock_held)
 #define sigshutup                   (tvm_tls()->tls_sigshutup)
-#define call                        (tvm_tls()->tls_call)
 #define bsearch_compar              (tvm_tls()->tls_bsearch_compar)
 #define qsort_compar                (tvm_tls()->tls_qsort_compar)
 #if defined(__APPLE__)
@@ -2098,10 +1721,6 @@ static inline struct tvm_tls *tvm_tls(void) {
 #endif
 #define tty_name                    (tvm_tls()->tls_tty_name)
 #define pts_name                    (tvm_tls()->tls_pts_name)
-
-#define TVM_ON  do { thread_tvm_disallow = 0; } while (0)
-#define TVM_OFF ({ int __val = thread_tvm_disallow; thread_tvm_disallow = 1; __val; })
-#define TVM_RESTORE(_val) do { thread_tvm_disallow = (_val); } while (0)
 
 static void task_lock(struct task *t)
 {
@@ -2341,7 +1960,7 @@ struct rlock {
 static LIST_HEAD(rlocks);
 // Lock order: tasks_lock / a task lock -> rlocks_lock -> the global arena's
 // lock (close() and taskfreelastref release under their task locks; kalloc,
-// kfree and the CALL_FUNC(fcntl) syscalls run under rlocks_lock). Nothing
+// kfree and the fcntl() syscalls run under rlocks_lock). Nothing
 // takes a task lock under rlocks_lock.
 static pthread_mutex_t rlocks_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2367,7 +1986,7 @@ static void rlock_wake_locked(void)
         struct rlock_waiter *w = list_first_entry(&rlock_waiters, struct rlock_waiter, rw_list);
         list_del(&w->rw_list);
         INIT_LIST_HEAD(&w->rw_list);
-        (void)CALL_FUNC(write, w->rw_wake, "", 1);
+        (void)write(w->rw_wake, "", 1);
     }
 }
 
@@ -2410,12 +2029,12 @@ static int rlock_range(int rfd, const struct flock *fl, off_t *start, off_t *end
         base = 0;
         break;
     case SEEK_CUR:
-        if (-1 == (base = CALL_FUNC(lseek, rfd, 0, SEEK_CUR)))
+        if (-1 == (base = lseek(rfd, 0, SEEK_CUR)))
             return -1;
         break;
     case SEEK_END: {
         struct stat st;
-        if (-1 == CALL_FUNC(fstat, rfd, &st))
+        if (-1 == fstat(rfd, &st))
             return -1;
         base = st.st_size;
         break;
@@ -2477,7 +2096,7 @@ static int rlock_validate(int rfd, int cmd, const struct flock *fl, off_t *start
     case F_RDLCK:
     case F_WRLCK:
         if (cmd != F_GETLK) {
-            int flags = CALL_FUNC(fcntl, rfd, F_GETFL);
+            int flags = fcntl(rfd, F_GETFL);
             if (-1 == flags)
                 return -1;
             int acc = flags & O_ACCMODE;
@@ -2610,7 +2229,7 @@ static void rlock_apply_locked(struct rlock_spare *sp, dev_t dev, ino_t ino, str
 static void rlock_release(struct task *t, int rfd)
 {
     struct stat st;
-    if (rfd >= 0 && (-1 == CALL_FUNC(fstat, rfd, &st) || !S_ISREG(st.st_mode)))
+    if (rfd >= 0 && (-1 == fstat(rfd, &st) || !S_ISREG(st.st_mode)))
         return;
 
     pthread_mutex_lock(&rlocks_lock);
@@ -2733,9 +2352,9 @@ static struct task *taskalloc()
         // leaked into whatever they exec'd -- e.g. popen()'s pipes stayed open
         // in later popen() children, so pclose() of the first could hang.
         if (file) {
-            int fdflags = CALL_FUNC(fcntl, current->tsk_files[i]->f_rfd, F_GETFD);
+            int fdflags = fcntl(current->tsk_files[i]->f_rfd, F_GETFD);
             if (fdflags != -1 && (fdflags & FD_CLOEXEC))
-                (void)CALL_FUNC(fcntl, file->f_rfd, F_SETFD, FD_CLOEXEC);
+                (void)fcntl(file->f_rfd, F_SETFD, FD_CLOEXEC);
         }
         file_unlock(current->tsk_files[i], 1);
         if (!file)
@@ -3033,7 +2652,7 @@ static int task_kill_locked(struct task *t, int signum) {
         if (!fallback)
             fallback = thr;
         if (!__atomic_load_n(&thr->thr_sig_blocked, __ATOMIC_ACQUIRE)) {
-            r = CALL_FUNC(pthread_kill, thr->thr_pthread, signum);
+            r = pthread_kill(thr->thr_pthread, signum);
             goto delivered;
         }
     }
@@ -3044,7 +2663,7 @@ static int task_kill_locked(struct task *t, int signum) {
     // gets drained on the next tvm_sig_leave().
     if (!fallback)
         panic("fallback thread NULL");
-    r = CALL_FUNC(pthread_kill, fallback->thr_pthread, signum);
+    r = pthread_kill(fallback->thr_pthread, signum);
 
 delivered:
     // pthread_cond_wait is not EINTR-interruptible, so a thread sleeping in
@@ -3114,13 +2733,13 @@ static void detach_current_thread_and_exit(void *retval)
 
     sigset_t all_sigs;
     sigfillset(&all_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, NULL);
+    pthread_sigmask(SIG_BLOCK, &all_sigs, NULL);
 
     stack_exit(current_thread->thr_stack);
 
     // current_thread left set → tvm_thread_destructor calls threaddealloc
     current = NULL;
-    CALL_FUNC(pthread_exit, retval);
+    pthread_exit(retval);
     __builtin_unreachable();
 }
 
@@ -3216,7 +2835,7 @@ static void terminate_current_locked(int result)
     // re-raises.
     sigset_t all_sigs;
     sigfillset(&all_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, NULL);
+    pthread_sigmask(SIG_BLOCK, &all_sigs, NULL);
 
     // Decide now; `current` may be cleared before the exit below.
     int is_init = (current == main_task);
@@ -3245,7 +2864,7 @@ static void terminate_current_locked(int result)
         struct thread *sib;
         list_for_each_entry(sib, &current->tsk_threads, thr_list) {
             if (sib != current_thread)
-                CALL_FUNC(pthread_kill, sib->thr_pthread, SIGCONT);
+                pthread_kill(sib->thr_pthread, SIGCONT);
         }
         pthread_cond_broadcast(&current->tsk_wait_cond);
         task_unlock(current);
@@ -3293,7 +2912,7 @@ static void terminate_current_locked(int result)
         if (stack)
             stack_detach(stack, 1);
         else
-            CALL_FUNC(pthread_detach, pthread_self());
+            pthread_detach(pthread_self());
     }
     else {
         if (!parent)
@@ -3361,19 +2980,19 @@ static void terminate_current_locked(int result)
         if (WIFSIGNALED(result)) {
             int sig = WTERMSIG(result);
             struct sigaction dfl = { .sa_handler = SIG_DFL };
-            CALL_FUNC(sigaction, sig, &dfl, NULL);
+            sigaction(sig, &dfl, NULL);
             sigset_t unblk;
             sigemptyset(&unblk);
             sigaddset(&unblk, sig);
-            CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &unblk, NULL);
-            CALL_FUNC(raise, sig);
-            CALL_FUNC(_exit, 128 + sig);
+            pthread_sigmask(SIG_UNBLOCK, &unblk, NULL);
+            raise(sig);
+            _exit(128 + sig);
         }
-        CALL_FUNC(_exit, WEXITSTATUS(result));
+        _exit(WEXITSTATUS(result));
     }
 
     stack_exit(stack);
-    CALL_FUNC(pthread_exit, 0);
+    pthread_exit(0);
     __builtin_unreachable();
 }
 
@@ -3581,7 +3200,7 @@ void threaddealloc(struct thread *thr)
 {
     for (int i = 0; i < 2; i++)
         if (thr->thr_wake[i] >= 0)
-            CALL_FUNC(close, thr->thr_wake[i]);
+            close(thr->thr_wake[i]);
 
     if (thr->thr_emulator) {
         emulator_context_destroy(thr->thr_emulator);
@@ -3720,7 +3339,7 @@ static void *vtimer_thread(void *arg)
     // block all signals — manager thread must not receive TVM signals
     sigset_t all;
     sigfillset(&all);
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &all, NULL);
+    pthread_sigmask(SIG_SETMASK, &all, NULL);
 
     pthread_mutex_lock(&vtimers_lock);
 
@@ -3837,7 +3456,7 @@ static void vtimer_init(void)
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_t thr;
-    if (0 != CALL_FUNC(pthread_create, &thr, &attr, vtimer_thread, NULL))
+    if (0 != pthread_create(&thr, &attr, vtimer_thread, NULL))
         panic("vtimer_init: pthread_create failed");
     pthread_attr_destroy(&attr);
 }
@@ -3905,15 +3524,15 @@ void fp_setfileno(FILE *fp, int fd) {
 
 void init_file_stream_fp()
 {
-    int devnull = CALL_FUNC(open, "/dev/null", O_RDONLY);
+    int devnull = open("/dev/null", O_RDONLY);
     VERIFY(devnull != -1);
 
     int fd123;
-    VERIFY(123 == (fd123 = CALL_FUNC(fcntl, devnull, F_DUPFD, 123)));
+    VERIFY(123 == (fd123 = fcntl(devnull, F_DUPFD, 123)));
 
     FILE *fp123;
-    VERIFY(NULL != (fp123 = CALL_FUNC(fdopen, fd123, "r")));
-    VERIFY(CALL_FUNC(fileno, fp123) == 123);
+    VERIFY(NULL != (fp123 = fdopen(fd123, "r")));
+    VERIFY(fileno(fp123) == 123);
 
     for (int i = 0; i < 128; i += sizeof(FILE_FD_TYPE)) {
         if (*(FILE_FD_TYPE *)((uintptr_t)fp123 + i) == 123) {
@@ -3926,12 +3545,12 @@ void init_file_stream_fp()
     // make sure we found offset of FILE->fd
     VERIFY(filep_fd_offset != -1);
     fp_setfileno(fp123, 21235);
-    VERIFY(CALL_FUNC(fileno, fp123) == 21235);
+    VERIFY(fileno(fp123) == 21235);
     fp_setfileno(fp123, 123);
-    VERIFY(CALL_FUNC(fileno, fp123) == 123);
+    VERIFY(fileno(fp123) == 123);
 
-    VERIFY(0 == CALL_FUNC(fclose, fp123));
-    VERIFY(0 == CALL_FUNC(close, devnull));
+    VERIFY(0 == fclose(fp123));
+    VERIFY(0 == close(devnull));
 }
 
 #define DIR_FD_TYPE int
@@ -3945,15 +3564,15 @@ void dp_setfileno(DIR *dp, int fd) {
 
 void init_file_stream_dp()
 {
-    int dev = CALL_FUNC(open, "/", O_RDONLY | O_DIRECTORY);
+    int dev = open("/", O_RDONLY | O_DIRECTORY);
     VERIFY(dev != -1);
 
     int fd123;
-    VERIFY(123 == (fd123 = CALL_FUNC(fcntl, dev, F_DUPFD, 123)));
+    VERIFY(123 == (fd123 = fcntl(dev, F_DUPFD, 123)));
 
     DIR *dp123;
-    VERIFY(NULL != (dp123 = CALL_FUNC(fdopendir, fd123)));
-    VERIFY(CALL_FUNC(dirfd, dp123) == 123);
+    VERIFY(NULL != (dp123 = fdopendir(fd123)));
+    VERIFY(dirfd(dp123) == 123);
 
     for (int i = 0; i < 128; i += sizeof(DIR_FD_TYPE)) {
         if (*(FILE_FD_TYPE *)((uintptr_t)dp123 + i) == 123) {
@@ -3966,12 +3585,12 @@ void init_file_stream_dp()
     // make sure we found offset of DIR->fd
     VERIFY(dirp_fd_offset != -1);
     dp_setfileno(dp123, 21235);
-    VERIFY(CALL_FUNC(dirfd, dp123) == 21235);
+    VERIFY(dirfd(dp123) == 21235);
     dp_setfileno(dp123, 123);
-    VERIFY(CALL_FUNC(dirfd, dp123) == 123);
+    VERIFY(dirfd(dp123) == 123);
 
-    VERIFY(0 == CALL_FUNC(closedir, dp123));
-    VERIFY(0 == CALL_FUNC(close, dev));
+    VERIFY(0 == closedir(dp123));
+    VERIFY(0 == close(dev));
 }
 
 void init_file_stream()
@@ -4057,7 +3676,7 @@ int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
                     // A failed flush is fclose()'s failure: the buffered
                     // output is lost, and the caller's check of fclose() is
                     // how it learns of EPIPE/ENOSPC/EIO on the final write.
-                    if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                    if (fflush(fs->fs_fp) == EOF) {
                         ret = EOF;
                         flush_errno = errno;
                         epipe_signal_locked(t);  // t is locked here
@@ -4066,7 +3685,7 @@ int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
                 }
             }
             fp_setfileno(fs->fs_fp, -1);
-            (void)CALL_FUNC(fclose, fs->fs_fp);
+            (void)fclose(fs->fs_fp);
             errno = last_errno;
             fs->fs_fp = NULL;
         }
@@ -4075,7 +3694,7 @@ int task_filestreamdealloc_locked(struct task *t, struct file_stream *fs)
         if (fs->fs_dp) {
             int last_errno = errno;
             dp_setfileno(fs->fs_dp, -1);
-            CALL_FUNC(closedir, fs->fs_dp);
+            closedir(fs->fs_dp);
             errno = last_errno;
             fs->fs_dp = NULL;
         }
@@ -4101,7 +3720,7 @@ static void stream_flocks_release_locked(struct task *t)
         if (__atomic_load_n(&fs->fs_flock_n, __ATOMIC_ACQUIRE) <= 0 || !pthread_equal(fs->fs_flock_owner, pthread_self()))
             continue;
         for (; fs->fs_flock_n > 0; fs->fs_flock_n--)
-            CALL_FUNC(funlockfile, fs->fs_fp);
+            funlockfile(fs->fs_fp);
     }
 }
 
@@ -4137,16 +3756,16 @@ void task_filestreamdealloc_list(struct task *t, struct list_head *head) {
 // becomes after fclose() (see there). Operations on it fail with EBADF.
 static FILE *fp_detached(const char *mode)
 {
-    int fd = CALL_FUNC(open, "/dev/null", O_RDWR);
+    int fd = open("/dev/null", O_RDWR);
     if (fd == -1)
         return NULL;
-    FILE *fp = CALL_FUNC(fdopen, fd, mode);
+    FILE *fp = fdopen(fd, mode);
     if (!fp) {
-        CALL_FUNC(close, fd);
+        close(fd);
         return NULL;
     }
     fp_setfileno(fp, -1);
-    CALL_FUNC(close, fd);
+    close(fd);
     return fp;
 }
 
@@ -4182,7 +3801,7 @@ static void task_exec_reset_streams_locked(struct task *t)
         if (file) {
             fs->fs_nfd = i;
             fs->fs_gencnt = file->f_gencnt;
-            fs->fs_fp = CALL_FUNC(fdopen, file->f_rfd, fs->fs_mode);
+            fs->fs_fp = fdopen(file->f_rfd, fs->fs_mode);
             file_unlock(file, 1);
         }
         if (!fs->fs_fp) {
@@ -4191,7 +3810,7 @@ static void task_exec_reset_streams_locked(struct task *t)
                 panic("execve: detached std stream %d", i);
         }
         else
-            (void)CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0);
+            (void)setvbuf(fs->fs_fp, NULL, _IOLBF, 0);
         t->tsk_io_filestreams[i] = fs;
     }
 }
@@ -4214,19 +3833,19 @@ int task_filestreamrealloc_locked(struct task *t, struct file_stream *fs) {
         /* a directory the VFS serves has no host DIR (fdopendir): the
            child reads the listing through the file it shares */
         int vfs = file->f_ops && file->f_ops->f_readdir;
-        if (!vfs && !(fs->fs_dp = CALL_FUNC(fdopendir, file->f_rfd))) {
+        if (!vfs && !(fs->fs_dp = fdopendir(file->f_rfd))) {
             file_unlock(file, 1);
             return -1;
         }
     }
     else if (fs->fs_type == FS_FILE) {
-        if (!(fs->fs_fp = CALL_FUNC(fdopen, file->f_rfd, fs->fs_mode))) {
+        if (!(fs->fs_fp = fdopen(file->f_rfd, fs->fs_mode))) {
             file_unlock(file, 1);
             return -1;
         }
         fs->fs_flock_n = 0; // the parent's holds, not on this FILE
 
-        VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
+        VERIFY(0 == setvbuf(fs->fs_fp, NULL, _IOLBF, 0));
     }
 
     file_unlock(file, 1);
@@ -4462,17 +4081,17 @@ struct safeio_ctx
 
 static int safeio_open(struct safeio_ctx *out)
 {
-    if (-1 == CALL_FUNC(pipe, out->p))
+    if (-1 == pipe(out->p))
         return -1;
     return 0;
 }
 
 static ssize_t safeio_copy(struct safeio_ctx *ctx, void *dst, void *src, size_t size)
 {
-    if (size != CALL_FUNC(write, ctx->p[1], src, size))
+    if (size != write(ctx->p[1], src, size))
         return -1;
 
-    if (size != CALL_FUNC(read, ctx->p[0], dst, size))
+    if (size != read(ctx->p[0], dst, size))
         return -1;
 
     return size;
@@ -4481,12 +4100,12 @@ static ssize_t safeio_copy(struct safeio_ctx *ctx, void *dst, void *src, size_t 
 static void safeio_close(struct safeio_ctx *ctx)
 {
     if (-1 != ctx->p[0]) {
-        CALL_FUNC(close, ctx->p[0]);
+        close(ctx->p[0]);
         ctx->p[0] = -1;
     }
 
     if (-1 != ctx->p[1]) {
-        CALL_FUNC(close, ctx->p[1]);
+        close(ctx->p[1]);
         ctx->p[1] = -1;
     }
 }
@@ -4650,7 +4269,7 @@ static void signal_dispatch(int signum, siginfo_t *siginfo, ucontext_t *ucontext
     sigset_t one;
     sigemptyset(&one);
     sigaddset(&one, signum);
-    CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &one, NULL);
+    pthread_sigmask(SIG_UNBLOCK, &one, NULL);
 
     if (a.sa_flags & SA_SIGINFO)
         call_sighandler((uint64_t)a.sa_sigaction, signum, (uint64_t)siginfo, (uint64_t)ucontext);
@@ -4734,9 +4353,8 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     if (signum < 1 || signum >= MAX_SIGNALS)
         return;
 
-    // VM-enter chokepoint: a thread with no VM identity (no TLS: newborn,
-    // dying, or TVM-internal; or TLS but no task yet) has no task to
-    // virtualize the signal into.
+    // A thread with no VM identity (no TLS: newborn, dying, or TVM-internal;
+    // or TLS but no task yet) has no task to virtualize the signal into.
     struct tvm_tls *tls = TVM_TLS_PEEK();
     if (!tls || !tls->tls_current) {
         int hwfault = siginfo->si_code > 0 &&
@@ -4750,13 +4368,13 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             // have become mapped meanwhile), and surviving would leave this
             // handler uninstalled process-wide.
             struct sigaction dfl = { .sa_handler = SIG_DFL };
-            CALL_FUNC(sigaction, signum, &dfl, NULL);
+            sigaction(signum, &dfl, NULL);
             sigset_t unblk;
             sigemptyset(&unblk);
             sigaddset(&unblk, signum);
-            CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &unblk, NULL);
-            CALL_FUNC(raise, signum);
-            CALL_FUNC(_exit, 128 + signum);
+            pthread_sigmask(SIG_UNBLOCK, &unblk, NULL);
+            raise(signum);
+            _exit(128 + signum);
         }
         // Everything else: DROP, even fatal-by-default signals.  These threads
         // exist inside an embedding app (flutter UI/Dart threads never have a
@@ -4787,7 +4405,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         // recursive crash in panic, gotta go with the nuclear option
         if (tvm_sig_synchronous_depth > 3) {
             INFO("RECURSIVE SIGNAL DEPTH (signum %d)", signum);
-            CALL_FUNC(abort);
+            abort();
             __builtin_unreachable();
         }
         
@@ -4835,7 +4453,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
             INFO("HWFAULT signum=%d at %p pc=0x%lx bp=0x%lx sp=0x%lx si_code=%d in_emu=%d sigblk=%d emu_depth=%d",
                  signum, siginfo->si_addr, fault_pc, fault_bp, fault_sp, siginfo->si_code,
                  tvm_in_emu, tvm_sig_blocked, tvm_emu_call_depth);
-            CALL_FUNC(_exit, 139);
+            _exit(139);
             __builtin_unreachable();
         }
 
@@ -4850,7 +4468,7 @@ static void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
         int wake = __atomic_load_n(&thr->thr_wake[1], __ATOMIC_ACQUIRE);
         if (wake >= 0) {
             int last_errno = errno;
-            (void)CALL_FUNC(write, wake, "", 1);
+            (void)write(wake, "", 1);
             errno = last_errno;
         }
         tvm_sig_depth--;
@@ -4955,13 +4573,13 @@ static struct tty *ttyalloc()
 {
     int ends[2] = {-1, -1};
     
-    if (-1 == CALL_FUNC(socketpair, AF_UNIX, SOCK_STREAM, 0, ends))
+    if (-1 == socketpair(AF_UNIX, SOCK_STREAM, 0, ends))
         return NULL;
     
     struct tty *tt = kalloc(sizeof(*tt));
     if (!tt) {
-        CALL_FUNC(close, ends[0]);
-        CALL_FUNC(close, ends[1]);
+        close(ends[0]);
+        close(ends[1]);
         return NULL;
     }
 
@@ -4975,7 +4593,7 @@ static struct tty *ttyalloc()
 
     tt->t_mode = S_IRUSR | S_IWUSR | S_IWGRP;
     tt->t_uid = getuid();
-    struct group *grp = getgrnam("tty");
+    struct group *grp = VMCALL(getgrnam, "tty");
     if (grp)
         tt->t_gid = grp->gr_gid;
     else
@@ -4989,7 +4607,7 @@ static struct tty *ttyalloc()
     tt->t_termios.c_ispeed = tt->t_termios.c_ospeed = TTYDEF_SPEED;
     
     struct stat st;
-    if (-1 == CALL_FUNC(fstat, tt->t_mfd, &st)) {
+    if (-1 == fstat(tt->t_mfd, &st)) {
         goto fail;
     }
 
@@ -5009,14 +4627,14 @@ static struct tty *ttyalloc()
     // It only happens on the first socket after reboot, but its so odd to do it that it happened to me on every stage I demo'd it on a real iPhone.
     // So for now, we stat twice on Apple products if we get a zero inode and that should fix it.
 
-    if (st.st_ino == 0 && -1 == CALL_FUNC(fstat, tt->t_mfd, &st)) {
+    if (st.st_ino == 0 && -1 == fstat(tt->t_mfd, &st)) {
         goto fail;
     }
 #endif
     
     tt->t_mfd_ino = st.st_ino;
 
-    if (-1 == CALL_FUNC(fstat, tt->t_sfd, &st)) {
+    if (-1 == fstat(tt->t_sfd, &st)) {
         goto fail;
     }
     tt->t_sfd_ino = st.st_ino;
@@ -5029,8 +4647,8 @@ static struct tty *ttyalloc()
 
 fail:
 
-    CALL_FUNC(close, ends[0]);
-    CALL_FUNC(close, ends[1]);
+    close(ends[0]);
+    close(ends[1]);
     kfree(tt);
 
     return NULL;
@@ -5039,9 +4657,9 @@ fail:
 static void ttydealloc(struct tty *tt)
 {
     if (tt->t_mfd != -1)
-        CALL_FUNC(close, tt->t_mfd);
+        close(tt->t_mfd);
     if (tt->t_sfd != -1)
-        CALL_FUNC(close, tt->t_sfd);
+        close(tt->t_sfd);
 
     pthread_mutex_destroy(&tt->t_lock);
 
@@ -5285,7 +4903,7 @@ static int tty_open_file(struct tty *tt, int flags, struct file *out)
     if (tt->t_sfd == -1)
         panic("tty %d t_sfd invalid?", tt->t_mfd);
 
-    int r_sfd = CALL_FUNC(dup, tt->t_sfd);
+    int r_sfd = dup(tt->t_sfd);
     if (r_sfd == -1) {
         if (0 == (flags & O_NOCTTY))
             task_unlock(current);
@@ -5436,6 +5054,20 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
             break;
         
 
+#if defined(TIOCGETD)
+        // the line discipline: the standard one only (toybox's stty asks)
+        case TIOCGETD:
+            *(int *)arg = 0;
+            ret = 0;
+            break;
+        case TIOCSETD:
+            if (*(int *)arg == 0)
+                ret = 0;
+            else
+                errno = EINVAL;
+            break;
+#endif
+
         case TIOCGWINSZ:
             memcpy(arg, &tt->t_winsize, sizeof(tt->t_winsize));
             ret = 0;
@@ -5453,7 +5085,7 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
             tty_unlock(tt, 1);
             file_unlock(file, 0);
 
-            kill(-pgid, SIGWINCH);
+            VMCALL(kill, -pgid, SIGWINCH);
 
             file_lock(file, 0);
 
@@ -5514,8 +5146,8 @@ static int ttyop_ioctl(struct file *file, unsigned long request, void *arg)
             pgid = tt->t_pgid;
             tty_unlock(tt, 1);
 
-            kill(-pgid, SIGHUP);
-            kill(-pgid, SIGCONT);
+            VMCALL(kill, -pgid, SIGHUP);
+            VMCALL(kill, -pgid, SIGCONT);
 
             file_lock(file, 0);
             ret = 0;
@@ -5626,7 +5258,7 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
     // without one, and vim redrew visibly slowly on the iPhone. A blocking
     // read of the socket returns as soon as anything is there.
     if (ttymode == TTM_MASTER) {
-        ssize_t n = count ? CALL_FUNC(read, file->f_rfd, buf, count) : 0;
+        ssize_t n = count ? read(file->f_rfd, buf, count) : 0;
         int last_errno = errno;
         tty_lock(tt, 0);
         tty_unlock(tt, 1);
@@ -5667,7 +5299,7 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
         }
         //INFO("ttyop_read VMIN %d VTIME %d poll_timeout %d", vmin, vtime, poll_timeout);
 
-        int ret = CALL_FUNC(poll, &pfd, 1, poll_timeout);
+        int ret = poll(&pfd, 1, poll_timeout);
         if (ret == 0) {
             // Timeout
             break;
@@ -5680,7 +5312,7 @@ static ssize_t ttyop_read(struct file *file, void *buf, size_t count, int offset
 
         // Data is available: read one byte at a time
         unsigned char c;
-        ssize_t n = CALL_FUNC(read, file->f_rfd, &c, 1);
+        ssize_t n = read(file->f_rfd, &c, 1);
         if (n < 0) {
             tty_lock(tt, 0);
             tty_unlock(tt, 1);
@@ -5812,7 +5444,7 @@ static int tty_obuf_flush(struct tty_obuf *o)
 {
     size_t off = 0;
     while (off < o->n) {
-        ssize_t w = CALL_FUNC(write, o->fd, o->b + off, o->n - off);
+        ssize_t w = write(o->fd, o->b + off, o->n - off);
         if (w > 0) {
             off += w;
             continue;
@@ -5822,12 +5454,12 @@ static int tty_obuf_flush(struct tty_obuf *o)
         if (errno != EWOULDBLOCK && errno != EAGAIN)
             return -1;
 
-        if (-1 == CALL_FUNC(fcntl, o->fd, F_SETFL, 0))
+        if (-1 == fcntl(o->fd, F_SETFL, 0))
             return -1;
         tty_unlock(o->tt, 0);
-        w = CALL_FUNC(write, o->fd, o->b + off, o->n - off);
+        w = write(o->fd, o->b + off, o->n - off);
         tty_lock(o->tt, 0);
-        if (-1 == CALL_FUNC(fcntl, o->fd, F_SETFL, O_NONBLOCK))
+        if (-1 == fcntl(o->fd, F_SETFL, O_NONBLOCK))
             return -1;
         if (w <= 0)
             return -1;
@@ -5901,10 +5533,10 @@ static ssize_t tty_output_buffer_locked(struct tty *tt, struct file *file, const
     int fflags;
     ssize_t ret = -1;
 
-    if (-1 == (fflags = CALL_FUNC(fcntl, file->f_rfd, F_GETFL)))
+    if (-1 == (fflags = fcntl(file->f_rfd, F_GETFL)))
         return -1;
 
-    if (-1 == CALL_FUNC(fcntl, file->f_rfd, F_SETFL, O_NONBLOCK))
+    if (-1 == fcntl(file->f_rfd, F_SETFL, O_NONBLOCK))
         return -1;
 
     file_unlock(file, 0);
@@ -5922,7 +5554,7 @@ static ssize_t tty_output_buffer_locked(struct tty *tt, struct file *file, const
 
     ret = done;
 
-    CALL_FUNC(fcntl, file->f_rfd, F_SETFL, fflags);
+    fcntl(file->f_rfd, F_SETFL, fflags);
 
     return ret;
 }
@@ -5935,12 +5567,12 @@ static void tty_echo_locked(struct tty *tt, int c)
 		return;
 	}
 
-    int slave = CALL_FUNC(dup, tt->t_sfd);
+    int slave = dup(tt->t_sfd);
     if (-1 == slave)
         return;
     
-    if (-1 == CALL_FUNC(fcntl, slave, F_SETFL, O_NONBLOCK)) {
-        CALL_FUNC(close, slave);
+    if (-1 == fcntl(slave, F_SETFL, O_NONBLOCK)) {
+        close(slave);
         return;
     }
 
@@ -5959,7 +5591,7 @@ static void tty_echo_locked(struct tty *tt, int c)
 
 	tty_output_locked(tt, &o, c);
     (void)tty_obuf_flush(&o);
-    CALL_FUNC(close, slave);
+    close(slave);
 }
 
 static int tty_input_locked(struct tty *tt, int fd, int c)
@@ -5975,7 +5607,7 @@ static int tty_input_locked(struct tty *tt, int fd, int c)
                 int pgid = tt->t_pgid;
                 int sig = CCEQ(tt->t_cc[VINTR], c) ? SIGINT : (CCEQ(tt->t_cc[VQUIT], c) ? SIGQUIT : SIGTSTP);
                 tty_unlock(tt, 0);
-                kill(-pgid, sig); // TODO check TS_CTTY
+                VMCALL(kill, -pgid, sig); // TODO check TS_CTTY
                 tty_lock(tt, 0);
                 return 0;
             }
@@ -6004,10 +5636,10 @@ static ssize_t tty_input_buffer_locked(struct tty *tt, struct file *file, const 
     int fflags;
     ssize_t ret = -1;
 
-    if (-1 == (fflags = CALL_FUNC(fcntl, file->f_rfd, F_GETFL)))
+    if (-1 == (fflags = fcntl(file->f_rfd, F_GETFL)))
         return -1;
 
-    if (-1 == CALL_FUNC(fcntl, file->f_rfd, F_SETFL, O_NONBLOCK))
+    if (-1 == fcntl(file->f_rfd, F_SETFL, O_NONBLOCK))
         return -1;
 
     file_unlock(file, 0);
@@ -6019,7 +5651,7 @@ static ssize_t tty_input_buffer_locked(struct tty *tt, struct file *file, const 
     
     ret = i;
 
-    CALL_FUNC(fcntl, file->f_rfd, F_SETFL, fflags);
+    fcntl(file->f_rfd, F_SETFL, fflags);
 
     return ret;
 }
@@ -6115,8 +5747,8 @@ static void ttyop_close(struct file *file) {
                 kill_target_tasks_locked(-tty_pgid, SIGCONT);
             } else {
                 pthread_mutex_unlock(&tasks_lock);
-                kill(-tty_pgid, SIGHUP);
-                kill(-tty_pgid, SIGCONT);
+                VMCALL(kill, -tty_pgid, SIGHUP);
+                VMCALL(kill, -tty_pgid, SIGCONT);
             }
         }
 
@@ -6167,8 +5799,8 @@ static void ttyop_close(struct file *file) {
             kill_target_tasks_locked(tty_sid, SIGHUP);
             kill_target_tasks_locked(tty_sid, SIGCONT);
         } else {
-            kill(tty_sid, SIGHUP);
-            kill(tty_sid, SIGCONT);
+            VMCALL(kill, tty_sid, SIGHUP);
+            VMCALL(kill, tty_sid, SIGCONT);
         }
     }
 
@@ -6218,7 +5850,7 @@ static struct tty *tty_for_file_locked(struct file *file, int *out_ttymode) {
     }
 
     struct stat st;
-    if (-1 == CALL_FUNC(fstat, file->f_rfd, &st)) {
+    if (-1 == fstat(file->f_rfd, &st)) {
         tty_unlock(tt, 1);
         return NULL;
     }
@@ -6245,7 +5877,7 @@ static int ptm_open_file(struct file *file)
     if (!tt)
         return -1;
 
-    int mfd = CALL_FUNC(dup, tt->t_mfd);
+    int mfd = dup(tt->t_mfd);
     if (-1 == mfd) {
         ttydealloc(tt);
         return -1;
@@ -6286,13 +5918,13 @@ static struct file *ptm_open()
 }
 
 static struct file *pts_open_locked(struct tty *tt) {
-    int sfd = CALL_FUNC(dup, tt->t_sfd);
+    int sfd = dup(tt->t_sfd);
     if (-1 == sfd)
         return NULL;
 
     struct file *file = filealloc_from_rfd(sfd);
     if (!file) {
-        VERIFY(0 == CALL_FUNC(close, sfd));
+        VERIFY(0 == close(sfd));
         return NULL;
     }
 
@@ -7898,7 +7530,7 @@ static int vfs_node_mutate(struct vfs_node *vn, const char *path)
 static int vfs_node_dirfd(struct vfs_node *vn, const char *path, int flags)
 {
     const struct vfs_nodeops *ops = vn->vn_ops;
-    return ops->o_dirfd ? ops->o_dirfd(vn, path, flags) : CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
+    return ops->o_dirfd ? ops->o_dirfd(vn, path, flags) : open("/", (flags & O_ACCMODE) | O_DIRECTORY);
 }
 
 /* open of `vn` into `out` (o_open's contract: a file nobody can reach yet) */
@@ -7953,7 +7585,7 @@ static int vfs_file_open(struct vfs_node *vn, int flags, int rfd, struct file *o
 {
     struct vfs_file *vf = vfalloc();
     if (!vf) {
-        CALL_FUNC(close, rfd);
+        close(rfd);
         errno = ENOMEM;
         return -1;
     }
@@ -7984,7 +7616,7 @@ static int vfs_own_open(struct vfs_node *vn, const char *path, int flags, mode_t
     if (isdir)
         rfd = vfs_node_dirfd(vn, path, flags);
     else
-        rfd = CALL_FUNC(open, "/dev/null", flags & O_ACCMODE);
+        rfd = open("/dev/null", flags & O_ACCMODE);
     if (rfd == -1)
         return -1;
     return vfs_file_open(vn, flags, rfd, out);
@@ -8021,32 +7653,32 @@ static const struct vfs_nodeops vfs_cpio_ops = {
  */
 static int host_stat(struct vfs_node *vn, const char *path, struct stat *st, int flags)
 {
-    return CALL_FUNC(fstatat, AT_FDCWD, path, st, flags);
+    return fstatat(AT_FDCWD, path, st, flags);
 }
 
 static int host_access(struct vfs_node *vn, const char *path, int mode, int flags)
 {
-    return CALL_FUNC(faccessat, AT_FDCWD, path, mode, flags);
+    return faccessat(AT_FDCWD, path, mode, flags);
 }
 
 static int host_chmod(struct vfs_node *vn, const char *path, mode_t mode, int flags)
 {
-    return CALL_FUNC(fchmodat, AT_FDCWD, path, mode, flags);
+    return fchmodat(AT_FDCWD, path, mode, flags);
 }
 
 static int host_chown(struct vfs_node *vn, const char *path, uid_t owner, gid_t group, int flags)
 {
-    return CALL_FUNC(fchownat, AT_FDCWD, path, owner, group, flags);
+    return fchownat(AT_FDCWD, path, owner, group, flags);
 }
 
 static ssize_t host_readlink(struct vfs_node *vn, const char *path, char *buf, size_t bufsiz)
 {
-    return CALL_FUNC(readlink, path, buf, bufsiz);
+    return readlink(path, buf, bufsiz);
 }
 
 static int host_open(struct vfs_node *vn, const char *path, int flags, mode_t mode, struct file *out)
 {
-    int rfd = CALL_FUNC(openat, AT_FDCWD, path, flags, mode);
+    int rfd = openat(AT_FDCWD, path, flags, mode);
     if (rfd == -1)
         return -1;
     out->f_rfd = rfd_adopt(rfd);
@@ -8055,39 +7687,39 @@ static int host_open(struct vfs_node *vn, const char *path, int flags, mode_t mo
 
 static int host_dirfd(struct vfs_node *vn, const char *path, int flags)
 {
-    int rfd = CALL_FUNC(open, path, (flags & O_ACCMODE) | O_DIRECTORY);
+    int rfd = open(path, (flags & O_ACCMODE) | O_DIRECTORY);
     if (rfd == -1)
-        rfd = CALL_FUNC(open, "/", (flags & O_ACCMODE) | O_DIRECTORY);
+        rfd = open("/", (flags & O_ACCMODE) | O_DIRECTORY);
     return rfd;
 }
 
 static int host_statfs(struct vfs_node *vn, const char *path, struct statfs *buf)
 {
-    return CALL_FUNC(statfs, path, buf);
+    return statfs(path, buf);
 }
 
 static int host_utimens(struct vfs_node *vn, const char *path, const struct timespec *times, int flags)
 {
-    return CALL_FUNC(utimensat, AT_FDCWD, path, times, flags);
+    return utimensat(AT_FDCWD, path, times, flags);
 }
 
 static ssize_t host_getxattr(struct vfs_node *vn, const char *path, const char *name, void *value, size_t size, uint32_t position, int options)
 {
 #if defined(__APPLE__)
-    return CALL_FUNC(getxattr, path, name, value, size, position, options);
+    return getxattr(path, name, value, size, position, options);
 #else
-    return (options & XATTR_NOFOLLOW) ? CALL_FUNC(lgetxattr, path, name, value, size) : CALL_FUNC(getxattr, path, name, value, size);
+    return (options & XATTR_NOFOLLOW) ? lgetxattr(path, name, value, size) : getxattr(path, name, value, size);
 #endif
 }
 
 static int host_statvfs(struct vfs_node *vn, const char *path, struct statvfs *buf)
 {
-    return CALL_FUNC(statvfs, path, buf);
+    return statvfs(path, buf);
 }
 
 static int host_truncate(struct vfs_node *vn, const char *path, off_t length)
 {
-    return CALL_FUNC(truncate, path, length);
+    return truncate(path, length);
 }
 
 static int host_list(struct vfs_node *vn, const char *path, struct vfs_dir *d)
@@ -8130,7 +7762,7 @@ static int overlay_stat(struct vfs_node *vn, const char *path, struct stat *st, 
 {
     struct stat own;
     vfs_own_stat(vn, path, &own, 0);
-    if (0 == CALL_FUNC(fstatat, AT_FDCWD, path, st, 0) && S_ISDIR(st->st_mode))
+    if (0 == fstatat(AT_FDCWD, path, st, 0) && S_ISDIR(st->st_mode))
         return 0;
     *st = own;
     st->st_mode = S_IFDIR | 0755;
@@ -8153,8 +7785,8 @@ static int overlay_chown(struct vfs_node *vn, const char *path, uid_t owner, gid
 static int overlay_statfs(struct vfs_node *vn, const char *path, struct statfs *buf)
 {
     struct stat st;
-    if (0 == CALL_FUNC(fstatat, AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode))
-        return CALL_FUNC(statfs, path, buf);
+    if (0 == fstatat(AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode))
+        return statfs(path, buf);
     return vfs_statfs_synthetic(path, buf);
 }
 
@@ -8163,8 +7795,8 @@ static int overlay_statfs(struct vfs_node *vn, const char *path, struct statfs *
 static int overlay_statvfs(struct vfs_node *vn, const char *path, struct statvfs *buf)
 {
     struct stat st;
-    if (0 == CALL_FUNC(fstatat, AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode))
-        return CALL_FUNC(statvfs, path, buf);
+    if (0 == fstatat(AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode))
+        return statvfs(path, buf);
     return vfs_own_statvfs(vn, path, buf);
 }
 
@@ -8176,7 +7808,7 @@ static int overlay_list(struct vfs_node *vn, const char *path, struct vfs_dir *d
 static int overlay_mutate(struct vfs_node *vn, const char *path)
 {
     struct stat st;
-    return 0 == CALL_FUNC(fstatat, AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode) ? 0 : EROFS;
+    return 0 == fstatat(AT_FDCWD, path, &st, 0) && S_ISDIR(st.st_mode) ? 0 : EROFS;
 }
 
 static const struct vfs_nodeops vfs_overlay_ops = {
@@ -8944,13 +8576,13 @@ static void vfs_dir_stat_entries(struct vfs_dir *d, const char *path)
 static int vfs_dir_add_host(struct vfs_dir *d, const char *path)
 {
     int r = 0;
-    DIR *hd = CALL_FUNC(opendir, path);
+    DIR *hd = opendir(path);
     if (!hd)
         return 0;
     struct dirent *e;
-    while (!r && (e = CALL_FUNC(readdir, hd)))
+    while (!r && (e = readdir(hd)))
         r = vfs_dir_add_covered(d, e->d_name, e->d_ino, e->d_type);
-    CALL_FUNC(closedir, hd);
+    closedir(hd);
     return r;
 }
 
@@ -9115,7 +8747,7 @@ void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file
         return MAP_FAILED;
     }
 
-    void *ret = CALL_FUNC(mmap, hint, size, PROT_READ | PROT_WRITE, flags | MAP_ANONYMOUS, -1, 0);
+    void *ret = mmap(hint, size, PROT_READ | PROT_WRITE, flags | MAP_ANONYMOUS, -1, 0);
     if (ret == MAP_FAILED) {
         vn_unlock(vn, 1);
         return MAP_FAILED;
@@ -9134,7 +8766,7 @@ void *vfsop_mmap(void *hint, size_t size, int prot, int flags, struct file *file
     memcpy(ret, vn->vn_data + op_offset, op_size);
 
     if (prot != (PROT_READ | PROT_WRITE)) {
-        VERIFY(0 == CALL_FUNC(mprotect, ret, size, prot));
+        VERIFY(0 == mprotect(ret, size, prot));
     }
 
     vn_unlock(vn, 1);
@@ -9686,6 +9318,7 @@ void tvm_register_program(const char *pathname, main_func_t main_routine)
     if (!pathname || !pathname[0])
         panic("pathname");
     
+    // a process-wide registry, kept for good: the host's heap, any thread
     struct exec_program *prog;
     if (NULL == (prog = malloc(sizeof(*prog))))
         panic("prog");
@@ -10077,7 +9710,7 @@ void emulator_saved_state_destroy(struct emulator_saved_state *ss) {
 #ifdef TRACE_MMAP
         INFO("munmap %p-%p (emu stack)", ss->ess_stack, (uintptr_t)ss->ess_stack + ss->ess_stack_size);
 #endif
-        CALL_FUNC(munmap, ss->ess_stack, ss->ess_stack_size);
+        munmap(ss->ess_stack, ss->ess_stack_size);
         ss->ess_stack = NULL;
         ss->ess_stack_size = 0;
     }
@@ -10201,7 +9834,6 @@ struct emulator_context *emulator_context_create(struct ulinker *ulinker)
 
 void emulator_context_destroy(struct emulator_context *ec)
 {
-    int prevtvm = TVM_OFF;
 
     while (ec->ec_all_engines) {
         struct emulator_engine *engine = ec->ec_all_engines;
@@ -10217,7 +9849,6 @@ void emulator_context_destroy(struct emulator_context *ec)
         emulator_saved_state_destroy(ess);
     }
 
-    TVM_RESTORE(prevtvm);
     kfree(ec);
 }
 
@@ -10729,7 +10360,7 @@ int emulator_sigaction(int signum, const struct sigaction *act, struct sigaction
             *handler_func = EMUFUNC_MARK(*handler_func);
     }
 
-    int ret = sigaction(signum, act, oldact);
+    int ret = VMCALL(sigaction, signum, act, oldact);
 
     // unmark old handler
     if (0 == ret && oldact) {
@@ -10755,7 +10386,7 @@ sig_t emulator_signal(int signum, sig_t handler)
     if (handler && handler != SIG_DFL && handler != SIG_IGN && emulated_pc(current_thread->thr_emulator, (uint64_t)handler))
         handler = EMUFUNC_MARK(handler);
     
-    handler = signal(signum, handler);
+    handler = VMCALL(signal, signum, handler);
 
     // unmark old handler (NOTE: must check SIG_ERR)
     // its okay to always strip emulator marker even if not emulated pc, its no-op in that case
@@ -10866,7 +10497,6 @@ static const uint64_t EMULATOR_CALL_END_LR = 0x0000DEADBEEF4141ULL;
 
 int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_params *params, uint64_t *out_ret)
 {
-    int prevtvm;
     int r = 1;
     int emu_deferred = 0;  // did we enter the emulated path (and bump tvm_emu_call_depth)?
     struct emulator_saved_state *ess = NULL;
@@ -10882,11 +10512,9 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
         pcinfo = &local_pcinfo;
     }
 
-    prevtvm = TVM_OFF;
 
     // fast path: upcall to host
     if (!pcinfo->udli_femu) {
-        TVM_ON;
         uint64_t ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
@@ -10898,7 +10526,6 @@ int emulator_call_ex(struct ulinker_dladdr_info *pcinfo, struct emulator_call_pa
         );
         if (out_ret)
             *out_ret = ret;
-        TVM_OFF;
         r = 0;
         goto out;
     }
@@ -11056,7 +10683,6 @@ out:
     if (emu_deferred)
         tvm_emu_call_depth--;
 
-    TVM_RESTORE(prevtvm);
 
     return r;
 }
@@ -11071,18 +10697,14 @@ int emulator_call(uint64_t *out_ret, uint64_t pc, uint64_t arg0, uint64_t arg1, 
 }
 
 /*
- * A guest signal handler is top-level guest code: it runs with no call chain
- * (tls_call) and outside the drain, both put back when it returns. One that
- * longjmps out (siglongjmp to the main loop) leaves neither behind: a chain
- * entry of the wrapper it was called under (raise's, say), dead with that
- * frame, which the next interposed call would walk; or tvm_sig_draining
- * set, which would keep every later drain from delivering anything.
+ * A guest signal handler runs outside the drain, which is put back when it
+ * returns. One that longjmps out (siglongjmp to the main loop) leaves no
+ * tvm_sig_draining behind, which would keep every later drain from
+ * delivering anything.
  */
 void call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
     struct tvm_tls *tls = tvm_tls();
-    struct tvm_call *chain = tls->tls_call;
     int draining = tls->tls_tvm_sig_draining;
-    tls->tls_call = NULL;
     tls->tls_tvm_sig_draining = 0;
 
     if (!EMUFUNC_MARKED(handler_pc)) {
@@ -11094,7 +10716,6 @@ void call_sighandler(uint64_t handler_pc, uint64_t arg0, uint64_t arg1, uint64_t
         INFO("sighandler in emulator end");
     }
 
-    tls->tls_call = chain;
     tls->tls_tvm_sig_draining = draining;
 }
 
@@ -11119,7 +10740,7 @@ int emulator_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void 
 {
     // short-circuit for non-emulated PC addresses
     if (!emulated_pc(current_thread->thr_emulator, (uint64_t)start_routine))
-        return pthread_create(thread, attr, start_routine, _arg);
+        return VMCALL(pthread_create, thread, attr, start_routine, _arg);
 
     struct emulator_pthread_create_arg *arg = kalloc(sizeof(*arg));
     if (!arg) {
@@ -11129,7 +10750,7 @@ int emulator_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void 
     arg->start_fn = start_routine;
     arg->arg = _arg;
 
-    int ret = pthread_create(thread, attr, (void *(*)(void *))tvm_emulator_thread_entry, (void *)arg);
+    int ret = VMCALL(pthread_create, thread, attr, (void *(*)(void *))tvm_emulator_thread_entry, (void *)arg);
 
     if (ret) {
         kfree(arg);
@@ -11142,7 +10763,6 @@ int emulator_duplicate(struct emulator_context *old, struct emulator_context *ne
 {
     int ret = 1;
 
-    int prevtvm = TVM_OFF;
 
     // duplicate engines
     struct emulator_engine *new_prev_ee = NULL;
@@ -11205,12 +10825,10 @@ int emulator_duplicate(struct emulator_context *old, struct emulator_context *ne
         memcpy((void *)new_sp, (void *)old_sp, size_sp);
 
         if (dup_cb) {
-            TVM_ON;
             dup_cb(arg, (void *)&old_ess->ess_context, (void *)&new_ess->ess_context, sizeof(new_ess->ess_context));
             dup_cb(arg, (void *)old_sp, (void *)new_sp, size_sp);
             dup_cb(arg, (void *)&old_ess->ess_fault_lr, (void *)&new_ess->ess_fault_lr, sizeof(new_ess->ess_fault_lr));
             dup_cb(arg, (void *)&old_ess->ess_intr_addr, (void *)&new_ess->ess_intr_addr, sizeof(new_ess->ess_intr_addr));
-            TVM_OFF;
         }
     }
 
@@ -11218,7 +10836,6 @@ int emulator_duplicate(struct emulator_context *old, struct emulator_context *ne
 
 out:
 
-    TVM_RESTORE(prevtvm);
 
     return ret;
 }
@@ -11226,228 +10843,6 @@ out:
 /////////////
 // MARK: Hooks API
 /////////////
-
-struct tvm_call {
-    struct tvm_call *prev;
-    void *lr;
-};
-
-// Defined per-platform below; _phdr_callback (Linux) takes its address to
-// locate the executable text segment, so it needs the forward declaration.
-void get_text(uintptr_t *out_start, uintptr_t *out_end);
-
-#if defined(__linux__)
-
-static int _phdr_callback(struct dl_phdr_info *info, size_t size, void *data)
-{
-    uintptr_t *out = data;
-    uintptr_t addr = (uintptr_t)get_text;
-    for (int i = 0; i < info->dlpi_phnum; i++) {
-        if (info->dlpi_phdr[i].p_type != PT_LOAD ||
-            !(info->dlpi_phdr[i].p_flags & PF_X))
-            continue;
-        uintptr_t seg_start = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr;
-        uintptr_t seg_end = seg_start + info->dlpi_phdr[i].p_memsz;
-        if (addr >= seg_start && addr < seg_end) {
-            out[0] = seg_start;
-            out[1] = seg_end;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-void get_text(uintptr_t *out_start, uintptr_t *out_end)
-{
-    // The executable segment containing get_text() is the main binary's .text —
-    // fixed for the process lifetime — so cache it (as the __APPLE__ path does).
-    // Beyond avoiding a dl_iterate_phdr on every malloc/free/can_enter_tvm, this
-    // is a correctness fix: glibc thread exit runs __libc_thread_freeres, which
-    // frees TLS-internal buffers via free() -> can_enter_tvm -> get_text. Calling
-    // dl_iterate_phdr there re-resolves TLS (_dl_tls_get_addr_soft) on a thread
-    // whose TLS is being torn down -> SIGSEGV. can_enter_tvm short-circuits on
-    // current_thread for normal calls, so get_text is often first *reached* on
-    // exactly that thread-exit path — hence the eager constructor below warms
-    // the cache on the main thread before any worker thread can exit. A benign
-    // first-call race just recomputes the same value.
-    static uintptr_t cached_start = 0;
-    static uintptr_t cached_end = 0;
-    if (!cached_start) {
-        uintptr_t out[2] = {0, 0};
-        dl_iterate_phdr(_phdr_callback, out);
-        cached_start = out[0];
-        cached_end = out[1];
-    }
-    *out_start = cached_start;
-    *out_end = cached_end;
-}
-
-// Warm get_text()'s cache before main(), on the main thread — so the interposed
-// free() on any later thread-exit path hits the cache and never calls
-// dl_iterate_phdr during that thread's TLS teardown. dl_iterate_phdr is safe in
-// a constructor (the link map is complete post-relocation).
-__attribute__((constructor))
-static void _warm_get_text_cache(void)
-{
-    uintptr_t s, e;
-    get_text(&s, &e);
-}
-
-#elif defined(__APPLE__)
-
-static uintptr_t text_start = 0;
-static size_t text_size = 0;
-
-static const struct mach_header_64 *current_header(void)
-{
-    Dl_info info;
-    if (dladdr((void *)&current_header, &info)) {
-        return (const struct mach_header_64 *)info.dli_fbase;
-    }
-    return NULL;
-}
-
-void get_text(uintptr_t *out_start, uintptr_t *out_end)
-{
-    if (!text_start) {
-        unsigned long size;
-        void *text = getsectiondata(
-            current_header(),
-            "__TEXT",
-            "__text",
-            &size
-        );
-
-        text_start = (uintptr_t)text;
-        text_size = (size_t)size;
-    }
-
-    *out_start = text_start;
-    *out_end = text_start + text_size;
-}
-
-#endif
-
-struct ulinker_loaded_range {
-    struct list_head ulr_list;
-    struct ulinker_load_event ulr_event;
-};
-
-static LIST_HEAD(all_ulinker_loaded_ranges);
-static pthread_mutex_t all_ulinker_loaded_ranges_lock = PTHREAD_MUTEX_INITIALIZER;
-
-void add_ulinker_loaded_range(struct ulinker_load_event *ule) {
-    struct ulinker_loaded_range *ulr = kalloc(sizeof(*ulr));
-    if (!ulr)
-        panic("add_ulinker_loaded_range");
-
-    memcpy(&ulr->ulr_event, ule, sizeof(*ule));
-
-    pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
-    list_add(&ulr->ulr_list, &all_ulinker_loaded_ranges);
-    pthread_mutex_unlock(&all_ulinker_loaded_ranges_lock);
-}
-
-void remove_ulinker_loaded_range(struct ulinker_load_event *ule) {
-    struct ulinker_loaded_range *ulr;
-    pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
-    list_for_each_entry(ulr, &all_ulinker_loaded_ranges, ulr_list) {
-        if (0 == memcmp(&ulr->ulr_event, ule, sizeof(*ule))) {
-            list_del(&ulr->ulr_list);
-            kfree(ulr);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&all_ulinker_loaded_ranges_lock);
-}
-
-struct ulinker_loaded_range *find_containing_ulinker_loaded_range_locked(void *addr) {
-    struct ulinker_loaded_range *ulr;
-    list_for_each_entry(ulr, &all_ulinker_loaded_ranges, ulr_list) {
-        if ((uintptr_t)addr >= (uintptr_t)ulr->ulr_event.ule_base && (uintptr_t)addr < ((uintptr_t)ulr->ulr_event.ule_base) + ulr->ulr_event.ule_size) {
-            return ulr;
-        }
-    }
-
-    return NULL;
-}
-
-int in_tvm_range(void *lr) {
-    uintptr_t text_start;
-    uintptr_t text_end;
-    get_text(&text_start, &text_end);
-
-    if ((uintptr_t)lr >= text_start && (uintptr_t)lr < text_end)
-        return 1;
-
-    // Defer guest signal dispatch while holding the ranges lock. This runs in
-    // every interposer prologue, i.e. OUTSIDE the wrapper's own tvm_sig_enter
-    // section, so a signal landing here used to run the guest handler
-    // synchronously on top of the held mutex; the handler's first syscall
-    // (dropbear's SIGCHLD handler writes to its self-pipe) re-entered
-    // can_enter_tvm -> in_tvm_range and self-deadlocked on this non-recursive
-    // lock, leaving the task hung forever (seen as random 30s integration
-    // timeouts: session never closes, comsub never returns). tvm_sig_leave
-    // drains the deferred signal right after the unlock.
-    tvm_sig_enter();
-    pthread_mutex_lock(&all_ulinker_loaded_ranges_lock);
-    int r = (NULL != find_containing_ulinker_loaded_range_locked(lr));
-    pthread_mutex_unlock(&all_ulinker_loaded_ranges_lock);
-    tvm_sig_leave();
-
-    return r;
-}
-
-int can_enter_tvm(void *lr) {
-    // A thread without per-thread TLS (newborn inside pthread_create, dying
-    // after the key destructor, TVM-internal helpers) never enters TVM.
-    // This must come first.
-    //
-    // The TLS block is looked up once and its fields read directly: this runs
-    // on every interposed call, and each use of the `call` /
-    // `thread_tvm_disallow` macros was a separate pthread_getspecific() --
-    // together with the wrapper's own lookups the hottest thing in a bash
-    // loop, ahead of the allocator.
-    struct tvm_tls *t = TVM_TLS_PEEK();
-    if (!t)
-        return 0;
-
-    // not initialized
-    if (!main_task)
-        return 0;
-
-    if (t->tls_thread_tvm_disallow) {
-        return 0;
-    }
-
-    struct tvm_call *c = t->tls_call;
-    if (!lr) {
-        if (!c)
-            return 0;
-        lr = c->lr;
-    }
-
-
-    if (!(in_tvm_range(lr)))
-        return 0;
-
-    // fork() does not use call (for now)
-    if (!c)
-        return 1;
-
-    // if this isn't an inner call, just go
-    if (!c->prev)
-        return 1;
-
-    // if this is an inner call, check first call
-    struct tvm_call *call_itr = c;
-    while (call_itr) {
-        lr = call_itr->lr;
-        call_itr = call_itr->prev;
-    }
-
-    return in_tvm_range(lr);
-}
 
 struct function_metadata {
     struct list_head fm_list;
@@ -11457,12 +10852,11 @@ struct function_metadata {
 
 static LIST_HEAD(all_function_metadata);
 
+// Registers `_ptr` as what the ulinker binds a guest's `_name` to.
 #define FUNCTION_METADATA(_name, _ptr) \
 static struct function_metadata _fm_##_name = { .fm_name = #_name, .fm_ptr = (void *)_ptr }; \
 __attribute__((constructor)) \
 static void _fmc_ ## _name () { list_add_tail( & (_fm_ ## _name).fm_list, &all_function_metadata); }
-
-
 
 #define __MAP0(m,...)
 #define __MAP1(m,t,a,...) m(t,a)
@@ -11484,114 +10878,50 @@ static void _fmc_ ## _name () { list_add_tail( & (_fm_ ## _name).fm_list, &all_f
 #define __FN_DECL(t, a)	t a
 #define __FN_ARGS(t, a)	a
 
-// VM-enter chokepoint: a thread with no per-thread TLS is not a VM thread —
-// route it straight to the host function and touch NOTHING of TVM's state
-// (in particular the tls_call chain: glibc calls interposed functions on
-// newborn threads inside pthread_create and on dying threads after the key
-// destructor, and pushing onto shared state from there is a data race).
+// TVM's `_name`: __tvm_##_name, which a guest's `_name` is bound to (and
+// TVM's own code reaches with VMCALL).
 #define __FUNCTION_DEFINEx(_x, _rettype, _name, ...) \
 _rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
-_rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
-    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
-    if (!__tls) \
-        return CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); \
-    struct tvm_call __call = { __tls->tls_call, __builtin_return_address(0) }; \
-    __tls->tls_call = &__call; \
-    _rettype __r; \
-    if (!can_enter_tvm(NULL)) { __r = CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    else { __r = __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    __tls->tls_call = __call.prev; \
-    return __r; \
-} \
-FUNCTION_METADATA(_name, &_name); \
+FUNCTION_METADATA(_name, &__tvm_##_name); \
 _rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
 
-#define __FUNCTION_DEFINE_VOIDx(_x, _name, ...) \
-void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
-void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
-    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
-    if (!__tls) { \
-        CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); \
-        return; \
-    } \
-    struct tvm_call __call = { __tls->tls_call, __builtin_return_address(0) }; \
-    __tls->tls_call = &__call; \
-    if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    else { __tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    __tls->tls_call = __call.prev; \
-} \
-FUNCTION_METADATA(_name, &_name); \
-void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
+#define __FUNCTION_DEFINE_VOIDx(_x, _name, ...) __FUNCTION_DEFINEx(_x, void, _name, __VA_ARGS__)
 
-#define __FUNCTION_DEFINE_NORETx(_x, _name, ...) \
-void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__)); \
-void _name(__MAP(_x, __FN_DECL, __VA_ARGS__)) { \
-    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
-    if (!__tls) { \
-        CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); \
-        CALL_FUNC(abort); \
-        __builtin_unreachable(); \
-    } \
-    struct tvm_call __call = { __tls->tls_call, __builtin_return_address(0) }; \
-    __tls->tls_call = &__call; \
-    if (!can_enter_tvm(NULL)) { CALL_FUNC(_name, __MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    else {__tvm_##_name (__MAP(_x, __FN_ARGS, __VA_ARGS__)); } \
-    panic("returned"); \
-    __builtin_unreachable(); \
-} \
-FUNCTION_METADATA(_name, &_name); \
-void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__))
-
+// A variadic `_name` is defined on its va_list: __tvm_##_name##_va, which
+// reads the variadic arguments off __ap; __tvm_##_name passes them on.
 #define __FUNCTION_DEFINE_VAx(_x, _rettype, _name, ...) \
 _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
-_rettype _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
-    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
-    struct tvm_call __call = { __tls ? __tls->tls_call : NULL, __builtin_return_address(0) }; \
-    if (__tls) \
-        __tls->tls_call = &__call; \
+_rettype __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
     va_list __ap; \
     va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
     _rettype __r = __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
     va_end(__ap); \
-    if (__tls) \
-        __tls->tls_call = __call.prev; \
     return __r; \
 } \
-FUNCTION_METADATA(_name, &_name); \
+FUNCTION_METADATA(_name, &__tvm_##_name); \
 _rettype __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 
 #define __FUNCTION_DEFINE_VOID_VAx(_x, _name, ...) \
 void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
-void _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
-    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
-    struct tvm_call __call = { __tls ? __tls->tls_call : NULL, __builtin_return_address(0) }; \
-    if (__tls) \
-        __tls->tls_call = &__call; \
+void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
     va_list __ap; \
     va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
     __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
     va_end(__ap); \
-    if (__tls) \
-        __tls->tls_call = __call.prev; \
 } \
-FUNCTION_METADATA(_name, &_name); \
+FUNCTION_METADATA(_name, &__tvm_##_name); \
 void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 
+// A noreturn one: its _va does not return either.
 #define __FUNCTION_DEFINE_NORET_VAx(_x, _name, ...) \
 void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap); \
-void _name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
-    struct tvm_tls *__tls = TVM_TLS_PEEK(); \
-    struct tvm_call __call = { __tls ? __tls->tls_call : NULL, __builtin_return_address(0) }; \
-    if (__tls) \
-        __tls->tls_call = &__call; \
+void __tvm_##_name(__MAP(_x, __FN_DECL, __VA_ARGS__), ...) { \
     va_list __ap; \
     va_start(__ap, __LAST(_x, __FN_ARGS, __VA_ARGS__)); \
     __tvm_##_name##_va (__MAP(_x, __FN_ARGS, __VA_ARGS__), __ap); \
-    va_end(__ap); \
-    panic("returned"); \
-    __builtin_unreachable(); \
+    abort(); \
 } \
-FUNCTION_METADATA(_name, &_name); \
+FUNCTION_METADATA(_name, &__tvm_##_name); \
 void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 
 #define FUNCTION_DEFINE0(_rettype, _name)      __FUNCTION_DEFINEx(0, _rettype, _name)
@@ -11610,13 +10940,6 @@ void __tvm_##_name##_va(__MAP(_x, __FN_DECL, __VA_ARGS__), va_list __ap)
 #define FUNCTION_DEFINE_VOID5(_name, ...) __FUNCTION_DEFINE_VOIDx(5, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE_VOID6(_name, ...) __FUNCTION_DEFINE_VOIDx(6, _name, __VA_ARGS__)
 
-#define FUNCTION_DEFINE_NORET0(_name)      __FUNCTION_DEFINE_NORETx(0, _name)
-#define FUNCTION_DEFINE_NORET1(_name, ...) __FUNCTION_DEFINE_NORETx(1, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET2(_name, ...) __FUNCTION_DEFINE_NORETx(2, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET3(_name, ...) __FUNCTION_DEFINE_NORETx(3, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET4(_name, ...) __FUNCTION_DEFINE_NORETx(4, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET5(_name, ...) __FUNCTION_DEFINE_NORETx(5, _name, __VA_ARGS__)
-#define FUNCTION_DEFINE_NORET6(_name, ...) __FUNCTION_DEFINE_NORETx(6, _name, __VA_ARGS__)
 
 #define FUNCTION_DEFINE_VA1(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(1, _rettype, _name, __VA_ARGS__)
 #define FUNCTION_DEFINE_VA2(_rettype, _name, ...) __FUNCTION_DEFINE_VAx(2, _rettype, _name, __VA_ARGS__)
@@ -11677,12 +11000,12 @@ static void cli_table_dealloc(struct cli_table *tbl)
 {
     if (tbl->ct_rows) {
         for (int i = 0; i < (tbl->ct_coln * tbl->ct_rown); i++)
-            free(tbl->ct_rows[i]);
-        free(tbl->ct_rows);
+            VMCALL(free, tbl->ct_rows[i]);
+        VMCALL(free, tbl->ct_rows);
     }
 
     if (tbl->ct_cols)
-        free(tbl->ct_cols);
+        VMCALL(free, tbl->ct_cols);
 }
 
 static int cli_table_alloc(struct cli_column *cols, size_t coln, struct cli_table *out_tbl)
@@ -11690,11 +11013,11 @@ static int cli_table_alloc(struct cli_column *cols, size_t coln, struct cli_tabl
     int ret = -1;
     struct cli_table tbl = { .ct_coln = coln , .ct_rown = 1 };
 
-    tbl.ct_cols = calloc(tbl.ct_coln, sizeof(*tbl.ct_cols));
+    tbl.ct_cols = VMCALL(calloc, tbl.ct_coln, sizeof(*tbl.ct_cols));
     if (!tbl.ct_cols)
         goto err;
 
-    tbl.ct_rows = calloc(1 * tbl.ct_coln, sizeof(const char *));
+    tbl.ct_rows = VMCALL(calloc, 1 * tbl.ct_coln, sizeof(const char *));
     if (!tbl.ct_rows)
         goto err;
     
@@ -11702,7 +11025,7 @@ static int cli_table_alloc(struct cli_column *cols, size_t coln, struct cli_tabl
     for (int i = 0; i < tbl.ct_coln; i++) {
         memcpy(&tbl.ct_cols[i].desc, cols + i, sizeof(*cols));
         tbl.ct_cols[i].currw = strlen(tbl.ct_cols[i].desc.cc_title); 
-        if (!(CT_CELL(&tbl, 0, i) = strdup(tbl.ct_cols[i].desc.cc_title)))
+        if (!(CT_CELL(&tbl, 0, i) = VMCALL(strdup, tbl.ct_cols[i].desc.cc_title)))
             goto err;
     }
 
@@ -11718,7 +11041,7 @@ err:
 static char **cli_table_new_row(struct cli_table *tbl) {
     char **rowp = NULL;
 
-    if (!(tbl->ct_rows = realloc(tbl->ct_rows, (tbl->ct_rown + 1) * tbl->ct_coln * sizeof(const char *))))
+    if (!(tbl->ct_rows = VMCALL(realloc, tbl->ct_rows, (tbl->ct_rown + 1) * tbl->ct_coln * sizeof(const char *))))
         goto err;
     
     memset(tbl->ct_rows + (tbl->ct_rown * tbl->ct_coln), 0, tbl->ct_coln * sizeof(const char *));
@@ -11734,14 +11057,14 @@ static int cli_table_print(struct cli_table *tbl, int verbose) {
 
     // print all rows
     for (int r = 0; r < tbl->ct_rown; r++) {
-        printf("  ");
+        VMCALL(printf, "  ");
         int first = 1;
         for (int c = 0; c < tbl->ct_coln; c++) {
             if (tbl->ct_cols[c].desc.cc_verbose && !verbose)
                 continue;
             
             if (!first)
-                putchar(' ');
+                VMCALL(putchar, ' ');
             first = 0;
             
             char *cell = CT_CELL(tbl, r, c);
@@ -11749,19 +11072,19 @@ static int cli_table_print(struct cli_table *tbl, int verbose) {
 
             if (tbl->ct_cols[c].desc.cc_align == CCAL_RIGHT)
                 for (int i = celln; i < tbl->ct_cols[c].currw; i++)
-                    putchar(' ');
+                    VMCALL(putchar, ' ');
 
             if (cell) {
                 size_t towrite = ((celln > tbl->ct_cols[c].currw) ? tbl->ct_cols[c].currw : celln);
-                if (towrite != fwrite(cell, 1, towrite, stdout))
+                if (towrite != VMCALL(fwrite, cell, 1, towrite, stdout))
                     goto err;
             }
             
             if (tbl->ct_cols[c].desc.cc_align == CCAL_LEFT)
                 for (int i = celln; i < tbl->ct_cols[c].currw; i++)
-                    putchar(' ');
+                    VMCALL(putchar, ' ');
         }
-        putchar('\n');
+        VMCALL(putchar, '\n');
     }
 
     ret = 0;
@@ -11799,34 +11122,34 @@ static int tvm_ps(int argc, char **argv)
         char **cellp;
         CT_ROW_FOR_EACH(cellp, &tbl, rowp) {
             if (CT_IS_CELL(&tbl, cellp, "PID")) {
-                if (-1 == asprintf(cellp, "%d", t->tsk_pid))
+                if (-1 == VMCALL(asprintf, cellp, "%d", t->tsk_pid))
                     goto err;
             }
 
             else if (CT_IS_CELL(&tbl, cellp, "PPID")) {
-                if (-1 == asprintf(cellp, "%d", (t->tsk_parent ? t->tsk_parent->tsk_pid : 1)))
+                if (-1 == VMCALL(asprintf, cellp, "%d", (t->tsk_parent ? t->tsk_parent->tsk_pid : 1)))
                     goto err;
             }
 
             else if (CT_IS_CELL(&tbl, cellp, "SID")) {
-                if (-1 == asprintf(cellp, "%d", t->tsk_sid))
+                if (-1 == VMCALL(asprintf, cellp, "%d", t->tsk_sid))
                     goto err;
             }
 
             else if (CT_IS_CELL(&tbl, cellp, "PGID")) {
-                if (-1 == asprintf(cellp, "%d", t->tsk_pgid))
+                if (-1 == VMCALL(asprintf, cellp, "%d", t->tsk_pgid))
                     goto err;
             }
 
             else if (CT_IS_CELL(&tbl, cellp, "TTY")) {
-                if (-1 == asprintf(cellp, "?")) // TODO
+                if (-1 == VMCALL(asprintf, cellp, "?")) // TODO
                     goto err;
             }
 
             else if (CT_IS_CELL(&tbl, cellp, "CMD")) {
                 if (t->tsk_state & TS_ZOMBIE) {
                     int commlen = strnlen(t->tsk_comm, sizeof(t->tsk_comm));
-                    if (!(*cellp = malloc(commlen + 3)))
+                    if (!(*cellp = VMCALL(malloc, commlen + 3)))
                         goto err;
                     memcpy((*cellp)+1, t->tsk_comm, commlen);
                     (*cellp)[0] = '[';
@@ -11834,7 +11157,7 @@ static int tvm_ps(int argc, char **argv)
                     (*cellp)[commlen + 2] = 0;
                 }
                 else {
-                    if (!(*cellp = strndup(t->tsk_comm, sizeof(t->tsk_comm))))
+                    if (!(*cellp = VMCALL(strndup, t->tsk_comm, sizeof(t->tsk_comm))))
                         goto err;
                 }
             }
@@ -11852,7 +11175,7 @@ static int tvm_ps(int argc, char **argv)
     ret = 0;
 err:
     if (ret)
-        perror("tvm: ps");
+        VMCALL(perror, "tvm: ps");
     if (t)
         task_unlock(t);
     cli_table_dealloc(&tbl);
@@ -11894,7 +11217,7 @@ static int tvm_lsof(int argc, char **argv)
     if (read_fdtable(&fdt, &fdn))
         goto err;
     
-    if (!(fdr = calloc(sizeof(*fdr), fdn)))
+    if (!(fdr = VMCALL(calloc, sizeof(*fdr), fdn)))
         goto err;
     
     for (int i = 0; i < fdn; i++) {
@@ -11950,7 +11273,7 @@ static int tvm_lsof(int argc, char **argv)
     }
 
     // no longer needed, copied to `fdr`
-    free(fdt);
+    VMCALL(free, fdt);
     fdt = NULL;
 
     struct cli_column cols[] = {
@@ -11973,28 +11296,28 @@ static int tvm_lsof(int argc, char **argv)
         char **cellp;
         CT_ROW_FOR_EACH(cellp, &tbl, rowp) {
             if (CT_IS_CELL(&tbl, cellp, "RFD")) {
-                if (-1 == asprintf(cellp, "%d", fdr[i].rfd))
+                if (-1 == VMCALL(asprintf, cellp, "%d", fdr[i].rfd))
                     goto err;
             }
 
             if (CT_IS_CELL(&tbl, cellp, "PID")) {
                 if (fdr[i].type == LSOFT_PROC) {
                     if (verbose) {
-                        if (-1 == asprintf(cellp, "%s/%d", fdr[i].proc.comm, fdr[i].proc.pid))
+                        if (-1 == VMCALL(asprintf, cellp, "%s/%d", fdr[i].proc.comm, fdr[i].proc.pid))
                             goto err;
                     }
                     else {
-                        if (-1 == asprintf(cellp, "%d", fdr[i].proc.pid))
+                        if (-1 == VMCALL(asprintf, cellp, "%d", fdr[i].proc.pid))
                             goto err;
                     }
                 }
                 else if (fdr[i].type == LSOFT_PTY) {
                     if (fdr[i].tty.sid > 0) {
-                        if (-1 == asprintf(cellp, "%d/pty", fdr[i].tty.sid))
+                        if (-1 == VMCALL(asprintf, cellp, "%d/pty", fdr[i].tty.sid))
                             goto err;
                     }
                     else {
-                        if (-1 == asprintf(cellp, "-/pty"))
+                        if (-1 == VMCALL(asprintf, cellp, "-/pty"))
                             goto err;
                     }
                 }
@@ -12002,11 +11325,11 @@ static int tvm_lsof(int argc, char **argv)
 
             if (CT_IS_CELL(&tbl, cellp, "VAL")) {
                 if (fdr[i].type == LSOFT_PROC) {
-                    if (-1 == asprintf(cellp, "%d", fdr[i].proc.nfd))
+                    if (-1 == VMCALL(asprintf, cellp, "%d", fdr[i].proc.nfd))
                             goto err;
                 }
                 else if (fdr[i].type == LSOFT_PTY) {
-                    if (-1 == asprintf(cellp, "/dev/pts%d", fdr[i].tty.mfd))
+                    if (-1 == VMCALL(asprintf, cellp, "/dev/pts%d", fdr[i].tty.mfd))
                         goto err;
                 }
             }
@@ -12014,11 +11337,11 @@ static int tvm_lsof(int argc, char **argv)
             if (CT_IS_CELL(&tbl, cellp, "TYPE")) {
                 if (fdr[i].type == LSOFT_PROC) {
                     if (fdr[i].proc.fdtype)
-                        if (-1 == asprintf(cellp, "%s", fdr[i].proc.fdtype))
+                        if (-1 == VMCALL(asprintf, cellp, "%s", fdr[i].proc.fdtype))
                                 goto err;
                 }
                 else if (fdr[i].type == LSOFT_PTY) {
-                    if (-1 == asprintf(cellp, "%s", fdr[i].tty.end))
+                    if (-1 == VMCALL(asprintf, cellp, "%s", fdr[i].tty.end))
                         goto err;
                 }
             }
@@ -12031,10 +11354,10 @@ static int tvm_lsof(int argc, char **argv)
     ret = 0;
 err:
     if (ret)
-        perror("tvm: lsof");
+        VMCALL(perror, "tvm: lsof");
     cli_table_dealloc(&tbl);
     if (fdt)
-        free(fdt);
+        VMCALL(free, fdt);
     return ret;
 }
 
@@ -12042,9 +11365,9 @@ err:
 static int tvm_pwd(int argc, char **argv)
 {
     char pwd[PATH_MAX];
-    getcwd(pwd, sizeof(pwd));
+    VMCALL(getcwd, pwd, sizeof(pwd));
 
-    printf("%s\n", pwd);
+    VMCALL(printf, "%s\n", pwd);
     return 0;
 }
 
@@ -12054,7 +11377,7 @@ static int tvm_env(int argc, char **argv)
     if (argc > 1)
         p = environ;
     for (; p && *p; p++)
-        printf("%s\n", *p);
+        VMCALL(printf, "%s\n", *p);
     return 0;
 }
 
@@ -12062,33 +11385,33 @@ static int is_noemu_binary(const char *pathname);
 static int tvm_sorunner(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "USAGE: tvm sorunner LIBRARY\n");
+        VMCALL(fprintf, stderr, "USAGE: tvm sorunner LIBRARY\n");
         return 1;
     }
 
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, argv[1], pathname_abs)) {
-        fprintf(stderr, "failed to exec \"%s\": -%d (%s)\n", argv[1], errno, strerror(errno));
+        VMCALL(fprintf, stderr, "failed to exec \"%s\": -%d (%s)\n", argv[1], errno, VMCALL(strerror, errno));
         return 1;
     }
 
     int dlflags = RTLD_NOW | (is_noemu_binary(pathname_abs) ? RTLD_NOEMU : 0);
     void *handle = ulinker_dlopen(current->tsk_linker, pathname_abs, dlflags);
     if (!handle) {
-        fprintf(stderr, "failed to exec \"%s\": %s\n", pathname_abs, ulinker_dlerror());
+        VMCALL(fprintf, stderr, "failed to exec \"%s\": %s\n", pathname_abs, ulinker_dlerror());
         return 1;
     }
 
     void *sym = ulinker_dlsym(current->tsk_linker, handle, "main", 1);
     if (!sym) {
-        fprintf(stderr, "failed to exec \"%s\": %s\n", pathname_abs, ulinker_dlerror());
+        VMCALL(fprintf, stderr, "failed to exec \"%s\": %s\n", pathname_abs, ulinker_dlerror());
         return 1;
     }
 
     struct ulinker_dladdr_info info;
     ulinker_dladdr(current->tsk_linker, sym, &info, 0);
 
-    printf("sorunner %s %s %p base %p\n", argv[1], "main", sym, info.udli_fbase);
+    VMCALL(printf, "sorunner %s %s %p base %p\n", argv[1], "main", sym, info.udli_fbase);
 
     uint64_t ret;
     int callerr = emulator_call(&ret, (uint64_t)sym,
@@ -12097,7 +11420,7 @@ static int tvm_sorunner(int argc, char **argv)
                   (uint64_t)*current->tsk_relocs.__environ,
                 0, 0, 0);
     if (callerr)
-        printf("sorunner emulator_call failed!\n");
+        VMCALL(printf, "sorunner emulator_call failed!\n");
 
     return (callerr ? callerr : (int)ret);
 }
@@ -12128,7 +11451,7 @@ static void tvm_cpio_print_mode(uint32_t mode) {
     buf[8] = (mode & 0002) ? 'w' : '-';
     buf[9] = (mode & 0001) ? 'x' : '-';
 
-    printf("%s ", buf);
+    VMCALL(printf, "%s ", buf);
 }
 
 static int tvm_cpio_cb(void *arg, const cpio_t *cpio) {
@@ -12137,26 +11460,26 @@ static int tvm_cpio_cb(void *arg, const cpio_t *cpio) {
     tvm_cpio_print_mode(cpio->c_mode);
 
     /* uid/gid */
-    printf("%u %u ", cpio->c_uid, cpio->c_gid);
+    VMCALL(printf, "%u %u ", cpio->c_uid, cpio->c_gid);
 
     /* name */
-    printf("%s\n", cpio->name);
+    VMCALL(printf, "%s\n", cpio->name);
 
     return 0;
 }
 
 static int tvm_cpio(int argc, char **argv)
 {
-    if (isatty(STDIN_FILENO))
-        err(1, "isatty(0)");
+    if (VMCALL(isatty, STDIN_FILENO))
+        VMCALL(err, 1, "isatty(0)");
 
     size_t size;
     void *buf = read_all(STDIN_FILENO, &size);
     if (!buf)
-        err(1, "read(0)");
+        VMCALL(err, 1, "read(0)");
 
     if (0 != cpio_parse(buf, size, (cpio_cb)tvm_cpio_cb, NULL))
-        errx(1, "cpio_parse");
+        VMCALL(errx, 1, "cpio_parse");
 
     return 0;
 }
@@ -12188,52 +11511,52 @@ static int tvm_mount(int argc, char **argv)
     int type = TVM_MOUNT_CPIO, i = 1, n;
     while (i < argc && 0 != (n = mount_opt(argv[i], argv[i + 1], &type))) {
         if (n < 0)
-            errx(1, "mount: unknown option '%s'", argv[i]);
+            VMCALL(errx, 1, "mount: unknown option '%s'", argv[i]);
         i += n;
     }
     if (argc - i != 2)
-        errx(1, "USAGE: tvm mount [-t cpio] FILE TARGET\n"
+        VMCALL(errx, 1, "USAGE: tvm mount [-t cpio] FILE TARGET\n"
                 "       tvm mount --bind|-B|-o bind SOURCE TARGET");
 
     char target_abs[PATH_MAX];
     if (!normalize_path(NULL, argv[i + 1], target_abs))
-        err(1, "%s", argv[i + 1]);
+        VMCALL(err, 1, "%s", argv[i + 1]);
 
     if (type == TVM_MOUNT_BIND) {
         char source_abs[PATH_MAX];
         if (!normalize_path(NULL, argv[i], source_abs))
-            err(1, "%s", argv[i]);
+            VMCALL(err, 1, "%s", argv[i]);
         if (0 != vfs_bind(source_abs, target_abs))
-            err(1, "mount --bind %s %s", source_abs, target_abs);
+            VMCALL(err, 1, "mount --bind %s %s", source_abs, target_abs);
         return 0;
     }
 
-    int fd = open(argv[i], O_RDONLY);
+    int fd = VMCALL(open, argv[i], O_RDONLY);
     if (fd == -1)
-        err(1, "%s", argv[i]);
+        VMCALL(err, 1, "%s", argv[i]);
 
     size_t size;
     void *buf = read_all(fd, &size);
     if (!buf)
-        err(1, "read");
+        VMCALL(err, 1, "read");
 
-    close(fd);
+    VMCALL(close, fd);
 
     if (0 != vfs_mount_cpio(target_abs, buf, size))
-        err(1, "mount %s %s", argv[i], target_abs);
+        VMCALL(err, 1, "mount %s %s", argv[i], target_abs);
 
     return 0;
 }
 
 int tvm_info(int argc, char **argv) {
-    printf("tvm\n");
+    VMCALL(printf, "tvm\n");
     return 0;
 }
 
 static int tvm_shell(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "USAGE: tvm shell COMMAND [ARGS..]\n");
+        VMCALL(fprintf, stderr, "USAGE: tvm shell COMMAND [ARGS..]\n");
         return 1;
     }
 
@@ -12253,30 +11576,30 @@ static int tvm_shell(int argc, char **argv)
         *p++ = (i < argc - 1) ? ' ' : '\0';
     }
 
-    int r = system(cmd);
+    int r = VMCALL(system, cmd);
     return WIFEXITED(r) ? WEXITSTATUS(r) : 128 + WTERMSIG(r);
 }
 
 static int tvm_main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "USAGE: tvm COMMAND\n");
+        VMCALL(fprintf, stderr, "USAGE: tvm COMMAND\n");
         return 1;
     }
 
     if (0 == strcmp(argv[1], "-h")) {
-        printf("USAGE: tvm COMMAND\n");
-        printf("TembleOS Virtual Machine Diagnostics\n\n");
-        printf("COMMANDs:\n");
-        printf("  ps             tasks list\n");
-        printf("  lsof           fd list\n");
-        printf("  pwd            print working directory\n");
-        printf("  env            print environment variables\n");
-        printf("  sorunner       run shared object\n");
-        printf("  cpio           CPIO archive reader\n");
-        printf("  mount          VFS mount\n");
-        printf("  shell          execute command via system()\n");
-        printf("\n");
+        VMCALL(printf, "USAGE: tvm COMMAND\n");
+        VMCALL(printf, "TembleOS Virtual Machine Diagnostics\n\n");
+        VMCALL(printf, "COMMANDs:\n");
+        VMCALL(printf, "  ps             tasks list\n");
+        VMCALL(printf, "  lsof           fd list\n");
+        VMCALL(printf, "  pwd            print working directory\n");
+        VMCALL(printf, "  env            print environment variables\n");
+        VMCALL(printf, "  sorunner       run shared object\n");
+        VMCALL(printf, "  cpio           CPIO archive reader\n");
+        VMCALL(printf, "  mount          VFS mount\n");
+        VMCALL(printf, "  shell          execute command via system()\n");
+        VMCALL(printf, "\n");
         return 0;
     }
 
@@ -12290,8 +11613,8 @@ static int tvm_main(int argc, char **argv)
     if (0 == strcmp(argv[1], "info")) return tvm_info(argc - 1, argv + 1);
     if (0 == strcmp(argv[1], "shell")) return tvm_shell(argc - 1, argv + 1);
 
-    fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
-    fprintf(stderr, "Try 'tvm -h' for more information.\n");
+    VMCALL(fprintf, stderr, "tvm: invalid argument '%s'\n", argv[1]);
+    VMCALL(fprintf, stderr, "Try 'tvm -h' for more information.\n");
     return 1;
 }
 
@@ -12327,7 +11650,7 @@ static int initrc_expand_vars(const char *input, char *output, size_t output_siz
                 if (var_len >= sizeof(name)) var_len = sizeof(name) - 1;
                 memcpy(name, var_start, var_len);
                 name[var_len] = 0;
-                const char *val = getenv(name);
+                const char *val = VMCALL(getenv, name);
                 if (val) {
                     while (*val && out < end)
                         *out++ = *val++;
@@ -12409,7 +11732,7 @@ static void initrc_cmd_mount(const char *arg)
         return;
     }
 
-    int fd = open(hostpath, O_RDONLY);
+    int fd = VMCALL(open, hostpath, O_RDONLY);
     if (fd == -1) {
         INFO("initrc: mount: cannot open '%s': %s", hostpath, strerror(errno));
         return;
@@ -12417,7 +11740,7 @@ static void initrc_cmd_mount(const char *arg)
 
     size_t size;
     void *buf = read_all(fd, &size);
-    close(fd);
+    VMCALL(close, fd);
     if (!buf) {
         INFO("initrc: mount: cannot read '%s'", hostpath);
         return;
@@ -12428,7 +11751,7 @@ static void initrc_cmd_mount(const char *arg)
     else
         INFO("initrc: mounted '%s' at '%s'", hostpath, guestpath);
 
-    free(buf);
+    VMCALL(free, buf);
 }
 
 static void initrc_setenv_internal(const char *arg, int overwrite)
@@ -12445,7 +11768,7 @@ static void initrc_setenv_internal(const char *arg, int overwrite)
     const char *name = expanded;
     const char *value = eq + 1;
 
-    if (!overwrite && getenv(name)) {
+    if (!overwrite && VMCALL(getenv, name)) {
         INFO("initrc: setenv %s already set, skipping", name);
         return;
     }
@@ -12455,7 +11778,7 @@ static void initrc_setenv_internal(const char *arg, int overwrite)
 
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
-    char *string = malloc(name_len + value_len + 2);
+    char *string = VMCALL(malloc, name_len + value_len + 2);
     if (!string)
         return;
     memcpy(string, name, name_len);
@@ -12466,16 +11789,16 @@ static void initrc_setenv_internal(const char *arg, int overwrite)
         ? findenv(*current->tsk_relocs.__environ, name, name_len)
         : NULL;
     if (env) {
-        free(*env);
+        VMCALL(free, *env);
         *env = string;
     } else {
         char **old_environ = *current->tsk_relocs.__environ;
         char **new_environ = addenv(old_environ, string);
         if (new_environ) {
             *current->tsk_relocs.__environ = new_environ;
-            free(old_environ);
+            VMCALL(free, old_environ);
         } else
-            free(string);
+            VMCALL(free, string);
     }
 
     INFO("initrc: setenv %s=%s", name, value);
@@ -12501,7 +11824,7 @@ static void initrc_cmd_mkdir(const char *arg)
         p += strcspn(p, "/");
         char saved = *p;
         *p = '\0';
-        mkdir(expanded, 0755);
+        VMCALL(mkdir, expanded, 0755);
         *p = saved;
     }
 }
@@ -12537,7 +11860,7 @@ static struct {
 
 static void tvm_exec_initrc(const char *path)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = VMCALL(open, path, O_RDONLY);
     if (fd == -1) {
         INFO("initrc: cannot open '%s': %s", path, strerror(errno));
         return;
@@ -12545,7 +11868,7 @@ static void tvm_exec_initrc(const char *path)
 
     size_t size;
     void *buf = read_all(fd, &size);
-    close(fd);
+    VMCALL(close, fd);
     if (!buf) {
         INFO("initrc: cannot read '%s'", path);
         return;
@@ -12588,7 +11911,7 @@ static void tvm_exec_initrc(const char *path)
         }
     }
 
-    free(buf);
+    VMCALL(free, buf);
 }
 
 /////////////
@@ -12598,6 +11921,12 @@ static void tvm_exec_initrc(const char *path)
 /**
  * I have no idea why `__panic()` is here and at this point, I'm too afraid to ask.
  */
+
+// An arena abort (a guest's free of memory the VM did not allocate) ends the
+// task, as the guest's own abort() would, not the whole VM.
+static void rmem_abort_cb(void) {
+    VMCALL(abort);
+}
 
 static void rmem_print_cb(char *msg) {
     char __ts[32];
@@ -12663,14 +11992,14 @@ static void tvm_mmap_release(uintptr_t lo, uintptr_t hi, int have_w, uintptr_t w
     uintptr_t whi = w + TVM_MMAP_GUARD < hi ? w + TVM_MMAP_GUARD : hi;
     if (!have_w || wlo >= whi) {
         if (lo < hi)
-            CALL_FUNC(munmap, (void *)lo, hi - lo);
+            munmap((void *)lo, hi - lo);
         return;
     }
     if (lo < wlo)
-        CALL_FUNC(munmap, (void *)lo, wlo - lo);
-    CALL_FUNC(mprotect, (void *)wlo, whi - wlo, PROT_NONE);
+        munmap((void *)lo, wlo - lo);
+    mprotect((void *)wlo, whi - wlo, PROT_NONE);
     if (whi < hi)
-        CALL_FUNC(munmap, (void *)whi, hi - whi);
+        munmap((void *)whi, hi - whi);
 }
 
 // An anonymous private mapping of `size` bytes that contains no address in
@@ -12679,7 +12008,7 @@ static void tvm_mmap_release(uintptr_t lo, uintptr_t hi, int have_w, uintptr_t w
 // big enough, the rest is given back (the window itself stays, PROT_NONE).
 static void *tvm_mmap_guarded(size_t size, int prot, int flags)
 {
-    void *map = CALL_FUNC(mmap, NULL, size, prot, flags, -1, 0);
+    void *map = mmap(NULL, size, prot, flags, -1, 0);
     if (map == MAP_FAILED)
         return map;
 
@@ -12694,12 +12023,12 @@ static void *tvm_mmap_guarded(size_t size, int prot, int flags)
         return map;
     }
 
-    CALL_FUNC(munmap, map, size);
-    uintptr_t r = (uintptr_t)CALL_FUNC(mmap, NULL, rsize, prot, flags, -1, 0);
+    munmap(map, size);
+    uintptr_t r = (uintptr_t)mmap(NULL, rsize, prot, flags, -1, 0);
     if (r == (uintptr_t)MAP_FAILED) {
         // out of address space for the reservation: better unguarded than
         // ENOMEM for a mapping that was just possible
-        return CALL_FUNC(mmap, NULL, size, prot, flags, -1, 0);
+        return mmap(NULL, size, prot, flags, -1, 0);
     }
 
     uintptr_t start;
@@ -12747,7 +12076,7 @@ static pthread_mutex_t stacks_lock = PTHREAD_MUTEX_INITIALIZER;
 static void stack_free(struct tvm_stack *st)
 {
     size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-    CALL_FUNC(munmap, (char *)st->st_base - pg, st->st_size + pg);
+    munmap((char *)st->st_base - pg, st->st_size + pg);
     kfree(st);
 }
 
@@ -12772,7 +12101,7 @@ static void stack_drain(size_t size, struct tvm_stack **reuse)
     for (st = list_first_entry(&done, struct tvm_stack, st_list);
          !list_entry_is_head(st, &done, st_list); st = next) {
         next = list_next_entry(st, st_list);
-        CALL_FUNC(pthread_join, st->st_pthread, NULL);
+        pthread_join(st->st_pthread, NULL);
         if (reuse && !*reuse && st->st_size == size)
             *reuse = st;
         else
@@ -12798,7 +12127,7 @@ static struct tvm_stack *stack_alloc(struct task *tsk, size_t size, int reuse)
             kfree(st);
             return NULL;
         }
-        CALL_FUNC(mprotect, map, pg, PROT_NONE);
+        mprotect(map, pg, PROT_NONE);
         st->st_base = map + pg;
         st->st_size = size;
     }
@@ -12872,7 +12201,7 @@ void *rmem_mmap(void *hint, size_t size, int prot, int flags, int fd, off_t offs
     if (!hint && fd == -1 && !(flags & MAP_FIXED))
         map = tvm_mmap_guarded(size, prot, flags);
     else
-        map = CALL_FUNC(mmap, hint, size, prot, flags, fd, offset);
+        map = mmap(hint, size, prot, flags, fd, offset);
 #ifdef TRACE_MMAP
     INFO("mmap %p-%p (rmem)", map, (uintptr_t)map + size);
 #endif
@@ -12883,7 +12212,7 @@ int rmem_munmap(void *addr, size_t size) {
 #ifdef TRACE_MMAP
     INFO("munmap %p-%p (rmem)", addr, (uintptr_t)addr + size);
 #endif
-    return CALL_FUNC(munmap, addr, size);
+    return munmap(addr, size);
 }
 
 struct rmem_ops rmem_ops = {
@@ -12899,25 +12228,26 @@ static void *ulinker_malloc(void *arg, size_t size)             { return rmem_ar
 static void  ulinker_free(void *arg, void *ptr)                 { rmem_arena_free(ULINKER_ARENA(arg), ptr); }
 static void *ulinker_realloc(void *arg, void *ptr, size_t size) { return rmem_arena_realloc(ULINKER_ARENA(arg), ptr, size); }
 
-static int     ulinker_open(void *arg, const char *name)                { VERIFY(arg == current); return open(name, O_RDONLY); }
-static int     ulinker_close(void *arg, int fd)                         { VERIFY(arg == current); return close(fd); }
-static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { VERIFY(arg == current); return read(fd, buf, count); }
-static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { VERIFY(arg == current); return fstat(fd, statbuf); }
+static int     ulinker_open(void *arg, const char *name)                { VERIFY(arg == current); return VMCALL(open, name, O_RDONLY); }
+static int     ulinker_close(void *arg, int fd)                         { VERIFY(arg == current); return VMCALL(close, fd); }
+static ssize_t ulinker_read(void *arg, int fd, void *buf, size_t count) { VERIFY(arg == current); return VMCALL(read, fd, buf, count); }
+static int     ulinker_fstat(void *arg, int fd, struct stat *statbuf)   { VERIFY(arg == current); return VMCALL(fstat, fd, statbuf); }
+static int     ulinker_fcntl(void *arg, int fd, int cmd, void *cmdarg)  { VERIFY(arg == current); return VMCALL(fcntl, fd, cmd, cmdarg); }
 
 static void *ulinker_mmap(void *arg, void *hint, size_t length, int prot, int flags, int fd, off_t offset) {
     VERIFY(arg == current);
     // an image's address range (its writable segments are copied by fork)
     if (!hint && fd == -1 && !(flags & MAP_FIXED))
         return tvm_mmap_guarded(length, prot, flags);
-    return mmap(hint, length, prot, flags, fd, offset);
+    return VMCALL(mmap, hint, length, prot, flags, fd, offset);
 }
 static int   ulinker_munmap(void *arg, void *addr, size_t size)                                            {
                                                                     #ifdef TRACE_MMAP
                                                                         INFO("munmap %p-%p (ulinker)", addr, (uintptr_t)addr + size);
                                                                     #endif
-                                                                    return CALL_FUNC(munmap, addr, size);
+                                                                    return munmap(addr, size);
                                                                 }
-static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return CALL_FUNC(mprotect, addr, size, flags); }
+static int   ulinker_mprotect(void *arg, void *addr, size_t size, int flags)                               { return mprotect(addr, size, flags); }
 
 static void *ulinker_call(void *arg, void *addr) {
     uint64_t ret;
@@ -12947,6 +12277,7 @@ static struct ulinker_ops ulinker_ops = {
     .uo_close = ulinker_close,
     .uo_read = ulinker_read,
     .uo_fstat = ulinker_fstat,
+    .uo_fcntl = ulinker_fcntl,
 
     .uo_mmap = ulinker_mmap,
     .uo_munmap = ulinker_munmap,
@@ -13015,29 +12346,18 @@ static struct ulinker_external_dlinfo_args ulinker_tvm_external_args = {
     .ue_dlsym = ulinker_external_dlsym,
 };
 
-static void ulinker_event_cb(int event, void *arg)
-{
-    struct ulinker_load_event *ule = (struct ulinker_load_event *)arg;
-    if (event == ULEVENT_LOAD) {
-        add_ulinker_loaded_range(ule);
-    }
-    else if (event == ULEVENT_UNLOAD) {
-        remove_ulinker_loaded_range(ule);
-    }
-}
-
 static const char *noemu_list = NULL;
 static int noemu_global = 0;
 
 static void tvm_parse_noemu(void)
 {
-    const char *env = getenv("TVM_NOEMU");
+    const char *env = VMCALL(getenv, "TVM_NOEMU");
     if (!env)
         return;
     if (strcmp(env, "1") == 0)
         noemu_global = 1;
     else
-        noemu_list = strdup(env);
+        noemu_list = VMCALL(strdup, env);
 }
 
 static int is_noemu_binary(const char *pathname)
@@ -13057,7 +12377,7 @@ static int is_noemu_binary(const char *pathname)
 
     char link[PATH_MAX];
     ssize_t n;
-    while ((n = readlink(resolved, link, sizeof(link) - 1)) > 0) {
+    while ((n = VMCALL(readlink, resolved, link, sizeof(link) - 1)) > 0) {
         link[n] = 0;
         if (link[0] == '/') {
             strncpy(resolved, link, PATH_MAX - 1);
@@ -13109,11 +12429,11 @@ static int tvm_want_gdb_jit(void)
         return 0 != strcmp(env, "0");
 
     char buf[4096];
-    int fd = CALL_FUNC(open, "/proc/self/status", O_RDONLY);
+    int fd = open("/proc/self/status", O_RDONLY);
     if (fd < 0)
         return 0;
-    ssize_t n = CALL_FUNC(read, fd, buf, sizeof(buf) - 1);
-    CALL_FUNC(close, fd);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
     if (n <= 0)
         return 0;
     buf[n] = 0;
@@ -13155,7 +12475,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
     current->tsk_pid = __gettid();
     current->tsk_sid = current->tsk_pgid = current->tsk_pid;
     current->tsk_umask = 022;
-    CALL_FUNC(umask, 0); // real umask=0; per-task tsk_umask applied in interposed open/mkdir
+    umask(0); // real umask=0; per-task tsk_umask applied in interposed open/mkdir
 
     current->tsk_data = rmem_arena_alloc(current->tsk_ar, sizeof(*current->tsk_data));
     if (!current->tsk_data)
@@ -13177,7 +12497,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
 
     // dup 0,1,2 fds
     for (int i = 0; i < 3; i++) {
-        int rfd = CALL_FUNC(dup, i);
+        int rfd = dup(i);
         if (-1 == rfd)
             panic("tvm_start::dup %d", i);
 
@@ -13207,11 +12527,11 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
         memset(fs->fs_mode, 0, sizeof(fs->fs_mode));
         strncpy(fs->fs_mode, (i?"w":"r"), sizeof(fs->fs_mode)-1);
 
-        VERIFY((fs->fs_fp = CALL_FUNC(fdopen, file->f_rfd, fs->fs_mode)));
+        VERIFY((fs->fs_fp = fdopen(file->f_rfd, fs->fs_mode)));
         file_unlock(file, 1);
         current->tsk_io_filestreams[i] = fs;
 
-        VERIFY(0 == CALL_FUNC(setvbuf, fs->fs_fp, NULL, _IOLBF, 0));
+        VERIFY(0 == setvbuf(fs->fs_fp, NULL, _IOLBF, 0));
     }
 
     // The guest environment. Everything TVM reads about itself from here on
@@ -13235,7 +12555,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
     current->tsk_threads_cnt++;
 
     current->tsk_cwd[0] = 0;
-    if (!CALL_FUNC(getcwd, current->tsk_cwd, sizeof(current->tsk_cwd)))
+    if (!getcwd(current->tsk_cwd, sizeof(current->tsk_cwd)))
         panic("tvm_start::getcwd");
 
     // execve() replaces this with the program's basename
@@ -13250,10 +12570,10 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
     };
 
     for (int i = 0; i < MAX_SIGNALS; i++) {
-        if (0 == CALL_FUNC(sigaction, i, NULL, current->tsk_sighandlers + i)) {
+        if (0 == sigaction(i, NULL, current->tsk_sighandlers + i)) {
             if (i == SIGKILL || i == SIGSTOP)
                 continue;
-            if (0 != CALL_FUNC(sigaction, i, &act, NULL))
+            if (0 != sigaction(i, &act, NULL))
                 panic("sigaction(%d): %s", i, strerror(errno));
         }
     }
@@ -13261,11 +12581,11 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
     tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    setenv("PLATFORM", "macos-arm64", 0);
+    VMCALL(setenv, "PLATFORM", "macos-arm64", 0);
 #elif defined(__linux__) && defined(__x86_64__)
-    setenv("PLATFORM", "linux-x64", 0);
+    VMCALL(setenv, "PLATFORM", "linux-x64", 0);
 #elif defined(__linux__) && defined(__aarch64__)
-    setenv("PLATFORM", "linux-arm64", 0);
+    VMCALL(setenv, "PLATFORM", "linux-arm64", 0);
 #endif
 
     // The init task is set up: tvm_start returns (OS signals were blocked
@@ -13277,12 +12597,11 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
 
     sigset_t empty_sigs;
     sigemptyset(&empty_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
+    pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
 
-    // Guest-side setup. These are direct calls from libtvm text, so the
-    // interposed functions see a TVM return address and enter the VM.
+    // Guest-side setup: the VM's functions.
 
-    if (ia->cwd && 0 != chdir(ia->cwd))
+    if (ia->cwd && 0 != VMCALL(chdir, ia->cwd))
         panic("tvm_start::chdir(%s): %s", ia->cwd, strerror(errno));
 
     if (ia->initrc)
@@ -13296,7 +12615,7 @@ static void *tvm_init_entry(struct tvm_init_arg *ia)
 
     // Exec. Never returns on success (ends in the in-VM exit()).
 
-    execvp(ia->file, ia->argv);
+    VMCALL(execvp, ia->file, ia->argv);
     panic("tvm_start::execvp(%s): %s", ia->file, strerror(errno));
 }
 
@@ -13348,7 +12667,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     if (cfg->cwd) {
         struct stat st;
-        if (0 != CALL_FUNC(fstatat, AT_FDCWD, cfg->cwd, &st, 0))
+        if (0 != fstatat(AT_FDCWD, cfg->cwd, &st, 0))
             return -1;
         if (!S_ISDIR(st.st_mode)) {
             errno = ENOTDIR;
@@ -13367,6 +12686,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
 
     rmem_setopt(RMEM_PRINT_CB, (void *)rmem_print_cb);
     rmem_setopt(RMEM_OPS, (void *)&rmem_ops);
+    rmem_setopt(RMEM_ABORT_CB, (void *)rmem_abort_cb);
 
     global_arena = rmem_arena_create(NULL);
     if (!global_arena)
@@ -13384,7 +12704,6 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     ulinker_setopt(ULINKER_PRINT_CB, (void *)ulinker_print_cb);
     ulinker_setopt(ULINKER_OPS, &ulinker_ops);
     ulinker_setopt(ULINKER_ADD_EXTERNAL_DLINFO, &ulinker_tvm_external_args);
-    ulinker_setopt(ULINKER_EVENT_CB, (void *)ulinker_event_cb);
 #if defined(__linux__)
     ulinker_setopt(ULINKER_GDB_JIT, (void *)(long)tvm_want_gdb_jit());
 #endif
@@ -13430,7 +12749,7 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
         char base[PATH_MAX], abs[PATH_MAX];
         const char *dir = cfg->cwd;
         if (!dir) {
-            if (!CALL_FUNC(getcwd, base, sizeof(base)))
+            if (!getcwd(base, sizeof(base)))
                 return -1;
             dir = base;
         }
@@ -13472,10 +12791,10 @@ int tvm_start(const char *file, char *const argv[], char *const envp[], const st
     sigdelset(&all_sigs, SIGBUS);
     sigdelset(&all_sigs, SIGILL);
     sigdelset(&all_sigs, SIGFPE);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
+    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
     pthread_t pth;
-    int r = CALL_FUNC(pthread_create, &pth, &attr, (start_routine_fn)tvm_init_entry, ia);
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
+    int r = pthread_create(&pth, &attr, (start_routine_fn)tvm_init_entry, ia);
+    pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
     pthread_attr_destroy(&attr);
     if (r)
         panic("tvm_start: pthread_create: %s", strerror(r));
@@ -13502,7 +12821,7 @@ char ***_tvm_environ()
 void tvm_log(const char *function, const char *msg, ...)
 {
     char msgbuf[0x1000];
-    struct tvm_tls *t = tvm_tls();
+    struct tvm_tls *t = TVM_TLS_PEEK(); // logging works on any thread
     int n = snprintf(msgbuf, sizeof(msgbuf), "%s(%d): %s: ", (t && t->tls_current ? t->tls_current->tsk_comm : "<null>"), __gettid(), function);
 
     va_list ap;
@@ -13518,12 +12837,12 @@ void tvm_log(const char *function, const char *msg, ...)
 void tvm_dump(int mode)
 {
     if (mode == TVM_DUMP_FUNCS) {
-        printf("tvm functions:\n");
+        VMCALL(printf, "tvm functions:\n");
         struct function_metadata *fm;
         list_for_each_entry(fm, &all_function_metadata, fm_list) {
-            printf("  %08zx  %s\n", (uintptr_t)fm->fm_ptr, fm->fm_name);
+            VMCALL(printf, "  %08zx  %s\n", (uintptr_t)fm->fm_ptr, fm->fm_name);
         }
-        printf("\n");
+        VMCALL(printf, "\n");
     }
 }
 
@@ -13541,7 +12860,7 @@ static void __panic(const char *msg, const char *file, int line)
     INFO("%s:%d", file, line);
     INFO("Thread Info:");
     INFO(" ppid: %d", (cur?(cur->tsk_parent?cur->tsk_parent->tsk_pid:1):-1));
-    INFO(" host pid: %d", CALL_FUNC(getpid));
+    INFO(" host pid: %d", getpid());
     INFO(" current: %p", cur);
     INFO(" main_task: %p", main_task);
     INFO(" errno: %d (%s)", errno, strerror(errno));
@@ -13551,22 +12870,13 @@ static void __panic(const char *msg, const char *file, int line)
     // Normal path: TVM's own signal_handler dispatches the SIGABRT as a fatal
     // signal to the current task (terminate_current_locked), which never
     // returns — the thread is gone, or for the init task the process is.
-    CALL_FUNC(raise, SIGABRT);
+    raise(SIGABRT);
 
     // raise() returned, so the handler did not dispatch it: either it deferred
     // the signal (tvm_sig_blocked, in-emu, or the guest masked SIGABRT) or the
     // thread has no VM identity and the handler drops non-fault signals. A
-    // panic is fatal regardless, so die by SIGABRT with the default disposition,
-    // bypassing the handler, and never return to the caller.
-    struct sigaction dfl = { .sa_handler = SIG_DFL };
-    CALL_FUNC(sigaction, SIGABRT, &dfl, NULL);
-    sigset_t unblk;
-    sigemptyset(&unblk);
-    sigaddset(&unblk, SIGABRT);
-    CALL_FUNC(pthread_sigmask, SIG_UNBLOCK, &unblk, NULL);
-    CALL_FUNC(raise, SIGABRT);
-    CALL_FUNC(_exit, 128 + SIGABRT);
-    __builtin_unreachable();
+    // panic is fatal regardless.
+    die_by_sigabrt();
 }
 
 /////////////
@@ -13604,13 +12914,13 @@ FUNCTION_DEFINE1(DIR *, opendir, const char *, pathname) {
 
     pathname = pathname_abs;
 
-    int fd = open(pathname, O_RDONLY | O_DIRECTORY);
+    int fd = VMCALL(open, pathname, O_RDONLY | O_DIRECTORY);
     if (-1 == fd)
         return NULL;
 
-    DIR *dp = fdopendir(fd);
+    DIR *dp = VMCALL(fdopendir, fd);
     if (!dp)
-        close(fd);
+        VMCALL(close, fd);
     return dp;
 }
 
@@ -13654,7 +12964,7 @@ FUNCTION_DEFINE1(DIR *, fdopendir, int, fd) {
             errno = ENOTDIR;
     }
     else
-        ok = NULL != (dp = CALL_FUNC(fdopendir, file->f_rfd));
+        ok = NULL != (dp = fdopendir(file->f_rfd));
     if (!ok) {
         int last_errno = errno;
         task_filestreamdealloc_locked(current, fs);
@@ -13694,7 +13004,7 @@ FUNCTION_DEFINE1(int, closedir, DIR *, dir) {
     task_unlock(current);
     tvm_sig_leave();
     
-    if (-1 == close(nfd))
+    if (-1 == VMCALL(close, nfd))
         return errno;
     return 0;
 }
@@ -13711,7 +13021,7 @@ FUNCTION_DEFINE1(struct dirent *, readdir, DIR *, dir) {
 
     if (!file->f_ops || !file->f_ops->f_readdir) {
         file_unlock(file, 0);
-        struct dirent *dent = CALL_FUNC(readdir, real_dp(dir));
+        struct dirent *dent = readdir(real_dp(dir));
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
@@ -13766,11 +13076,11 @@ static long dir_seek(DIR *dir, int op, long loc)
     else {
         file_unlock(file, 0);
         if (op == DIR_TELL)
-            ret = CALL_FUNC(telldir, real_dp(dir));
+            ret = telldir(real_dp(dir));
         else if (op == DIR_SEEK)
-            CALL_FUNC(seekdir, real_dp(dir), loc);
+            seekdir(real_dp(dir), loc);
         else
-            CALL_FUNC(rewinddir, real_dp(dir));
+            rewinddir(real_dp(dir));
         file_lock(file, 0);
     }
 
@@ -13835,13 +13145,13 @@ FUNCTION_DEFINE2(FILE *, fopen, const char *, pathname, const char *, mode)
     if (fmode_to_flags(mode, &flags))
         return NULL;
 
-    int fd = open(pathname, flags, 0666);
+    int fd = VMCALL(open, pathname, flags, 0666);
     if (-1 == fd)
         return NULL;
 
-    FILE *fp = fdopen(fd, mode);
+    FILE *fp = VMCALL(fdopen, fd, mode);
     if (!fp)
-        close(fd);
+        VMCALL(close, fd);
     return fp;
 }
 
@@ -13868,7 +13178,7 @@ FUNCTION_DEFINE2(FILE *, fdopen, int, fd, const char *, mode) {
 
     uint64_t gencnt = file->f_gencnt;
 
-    FILE *fp = CALL_FUNC(fdopen, file->f_rfd, mode);
+    FILE *fp = fdopen(file->f_rfd, mode);
     if (!fp) {
         task_filestreamdealloc_locked(current, fs);
         task_unlock(current);
@@ -13914,12 +13224,12 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
         return NULL;
     }
 
-    const char *sh = getenv("TVM_SHELL");
+    const char *sh = VMCALL(getenv, "TVM_SHELL");
     if (!sh || !*sh)
         sh = "/bin/sh";
 
     int fds[2];
-    if (pipe(fds) == -1)
+    if (VMCALL(pipe, fds) == -1)
         return NULL;
     int parent_end = reading ? fds[0] : fds[1];
     int child_end  = reading ? fds[1] : fds[0];
@@ -13930,37 +13240,37 @@ FUNCTION_DEFINE2(FILE *, popen, const char *, command, const char *, mode) {
     // pipe open: awk's `print | "sort"; print | "sort -r"; close("sort")`
     // hung, sort never saw EOF because `sort -r`'s shell still had the write
     // end, and pclose() waited on it forever.
-    (void)fcntl(parent_end, F_SETFD, FD_CLOEXEC);
+    (void)VMCALL(fcntl, parent_end, F_SETFD, FD_CLOEXEC);
 
-    pid_t pid = fork();
+    pid_t pid = VMCALL(fork);
     if (pid == -1) {
         int last_errno = errno;
-        close(fds[0]);
-        close(fds[1]);
+        VMCALL(close, fds[0]);
+        VMCALL(close, fds[1]);
         errno = last_errno;
         return NULL;
     }
     if (pid == 0) {
-        close(parent_end);
+        VMCALL(close, parent_end);
         int target = reading ? STDOUT_FILENO : STDIN_FILENO;
         // with 0 and 1 closed, pipe() can hand out the target itself; dup2
         // is then a no-op and the close would remove the only descriptor
         if (child_end != target) {
-            if (dup2(child_end, target) == -1)
-                _exit(127);
-            close(child_end);
+            if (VMCALL(dup2, child_end, target) == -1)
+                VMCALL(_exit, 127);
+            VMCALL(close, child_end);
         }
-        execl(sh, "sh", "-c", command, (char *)NULL);
-        _exit(127);
+        VMCALL(execl, sh, "sh", "-c", command, (char *)NULL);
+        VMCALL(_exit, 127);
     }
 
-    close(child_end);
-    FILE *fp = fdopen(parent_end, reading ? "r" : "w");
+    VMCALL(close, child_end);
+    FILE *fp = VMCALL(fdopen, parent_end, reading ? "r" : "w");
     if (!fp) {
         int last_errno = errno;
-        close(parent_end);
+        VMCALL(close, parent_end);
         int status;
-        while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
+        while (VMCALL(waitpid, pid, &status, 0) == -1 && errno == EINTR)
             ;
         errno = last_errno;
         return NULL;
@@ -13976,10 +13286,10 @@ FUNCTION_DEFINE1(int, pclose, FILE *, stream) {
         return -1;
     }
     pid_t pid = fs->fs_pid;
-    fclose(stream);
+    VMCALL(fclose, stream);
 
     int status;
-    while (waitpid(pid, &status, 0) == -1) {
+    while (VMCALL(waitpid, pid, &status, 0) == -1) {
         if (errno != EINTR)
             return -1;
     }
@@ -14027,7 +13337,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     // closed: libc's FILE is freed with it.
     FILE *fp = fs->fs_type == FS_FILE ? fs->fs_fp : NULL;
     if (fp)
-        CALL_FUNC(flockfile, fp);
+        flockfile(fp);
     task_lock(current);
 
     if (std >= 0) {
@@ -14041,7 +13351,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
             // (printf("x"); dup2(fd, 1); fclose(stdout) left the file empty).
             struct file *file = file_for_task_stream_locked(current, fs, FS_FILE);
             if (file) {
-                if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                if (fflush(fs->fs_fp) == EOF) {
                     ret = EOF;
                     last_errno = errno;
                 }
@@ -14052,13 +13362,13 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
         fs->fs_nfd = -1;
         task_unlock(current);
         if (fp)
-            CALL_FUNC(funlockfile, fp);
+            funlockfile(fp);
         pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
         errno = last_errno;
         if (ret == EOF)
             epipe_signal();
-        if (close(nfd) == -1)
+        if (VMCALL(close, nfd) == -1)
             return EOF;
         errno = last_errno;
         return ret;
@@ -14066,7 +13376,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
 
     int nfd = fs->fs_nfd;
     if (fp)
-        CALL_FUNC(funlockfile, fp);
+        funlockfile(fp);
     // The fclose-time flush failed: EOF with its errno, like libc's fclose
     // (this returned close()'s 0 and the caller never learned of the lost
     // output, e.g. EPIPE with SIGPIPE ignored).
@@ -14076,7 +13386,7 @@ FUNCTION_DEFINE1(int, fclose, FILE *, stream) {
     pthread_mutex_unlock(&current->tsk_streams_lock);
     tvm_sig_leave();
 
-    if (close(nfd) == -1)
+    if (VMCALL(close, nfd) == -1)
         return EOF;
     if (ret == EOF) {
         errno = flush_errno;
@@ -14112,13 +13422,13 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     // know -- so the buffered output of every stream given to freopen was
     // silently dropped.
     if (fs->fs_fp && fs->fs_nfd >= 0)
-        (void)fflush(stream);
+        (void)VMCALL(fflush, stream);
 
     if (fs->fs_nfd >= 0)
-        close(fs->fs_nfd);
+        VMCALL(close, fs->fs_nfd);
     fs->fs_nfd = -1;
 
-    int fd = open(pathname, flags, 0666);
+    int fd = VMCALL(open, pathname, flags, 0666);
     int open_errno = errno;
 
     tvm_sig_enter();
@@ -14127,13 +13437,13 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
     pthread_mutex_lock(&current->tsk_streams_lock);
     FILE *old = fs->fs_fp;
     if (old)
-        CALL_FUNC(flockfile, old);
+        flockfile(old);
     task_lock(current);
 
     if (old) {
         fp_setfileno(old, -1);
-        CALL_FUNC(funlockfile, old);
-        CALL_FUNC(fclose, old);
+        funlockfile(old);
+        fclose(old);
     }
     fs->fs_fp = NULL;
     fs->fs_flock_n = 0; // holds of the FILE closed, the caller's own (fclose waits for others')
@@ -14152,19 +13462,19 @@ FUNCTION_DEFINE3(FILE *, freopen, const char *, pathname, const char *, mode, FI
         task_unlock(current);
         pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
-        close(fd);
+        VMCALL(close, fd);
         return NULL;
     }
 
     uint64_t gencnt = file->f_gencnt;
 
-    FILE *fp = CALL_FUNC(fdopen, file->f_rfd, mode);
+    FILE *fp = fdopen(file->f_rfd, mode);
     if (!fp) {
         task_unlock(current);
         file_unlock(file, 1);
         pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
-        close(fd);
+        VMCALL(close, fd);
         return NULL;
     }
 
@@ -14200,7 +13510,7 @@ FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb,
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fwrite, ptr, size, nmemb, real_fp(stream));
+        ret = fwrite(ptr, size, nmemb, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
@@ -14244,12 +13554,12 @@ FUNCTION_DEFINE4(size_t, fwrite, const void *, ptr, size_t, size, size_t, nmemb,
 // dispatched and tvm_sig_interrupted set; they pass the errno the call left.
 static int stdio_host_read_interrupted(FILE *real, int call_errno)
 {
-    if (call_errno != EINTR || !CALL_FUNC(ferror, real))
+    if (call_errno != EINTR || !ferror(real))
         return 0;
     if (tvm_sig_interrupted &&
         !(current->tsk_sighandlers[tvm_sig_interrupted].sa_flags & SA_RESTART))
         return 0;
-    CALL_FUNC(clearerr, real);
+    clearerr(real);
     return 1;
 }
 
@@ -14268,7 +13578,7 @@ retry:
 
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fread, ptr, size, nmemb, real_fp(stream));
+        ret = fread(ptr, size, nmemb, real_fp(stream));
         int last_errno = errno;
         file_lock(file, 0);
         file_unlock(file, 1);
@@ -14315,7 +13625,7 @@ FUNCTION_DEFINE3(int, fseek, FILE *, stream, long, offset, int, whence) {
         ret = file->f_ops->f_lseek(file, offset, whence) < 0 ? -1 : 0;
     } else {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fseek, real_fp(stream), offset, whence);
+        ret = fseek(real_fp(stream), offset, whence);
         file_lock(file, 0);
     }
     file_unlock(file, 1);
@@ -14336,7 +13646,7 @@ FUNCTION_DEFINE1(long, ftell, FILE *, stream) {
         ret = (long)file->f_ops->f_lseek(file, 0, SEEK_CUR);
     } else {
         file_unlock(file, 0);
-        ret = CALL_FUNC(ftell, real_fp(stream));
+        ret = ftell(real_fp(stream));
         file_lock(file, 0);
     }
     file_unlock(file, 1);
@@ -14345,11 +13655,11 @@ FUNCTION_DEFINE1(long, ftell, FILE *, stream) {
 }
 
 FUNCTION_DEFINE3(int, fseeko, FILE *, stream, off_t, offset, int, whence) {
-    return fseek(stream, (long)offset, whence);
+    return VMCALL(fseek, stream, (long)offset, whence);
 }
 
 FUNCTION_DEFINE1(off_t, ftello, FILE *, stream) {
-    return (off_t)ftell(stream);
+    return (off_t)VMCALL(ftell, stream);
 }
 
 // rewind, for the same reason as every other stdio interposer here: a guest
@@ -14359,8 +13669,8 @@ FUNCTION_DEFINE1(off_t, ftello, FILE *, stream) {
 // SQL function) and died with SIGSEGV on the rewind. fseek() is interposed,
 // so rewind is what C99 says: fseek(stream, 0, SEEK_SET) plus clearerr().
 FUNCTION_DEFINE_VOID1(rewind, FILE *, stream) {
-    fseek(stream, 0L, SEEK_SET);
-    clearerr(stream);
+    VMCALL(fseek, stream, 0L, SEEK_SET);
+    VMCALL(clearerr, stream);
 }
 
 // Count a guest flockfile() (`d` 1) or funlockfile() (-1) of `fs` by the
@@ -14398,7 +13708,7 @@ FUNCTION_DEFINE_VOID1(flockfile, FILE *, stream) {
     struct file_stream *fs = file_stream_fp(stream);
     if (!fs->fs_fp)
         return;
-    CALL_FUNC(flockfile, fs->fs_fp);
+    flockfile(fs->fs_fp);
     stream_flock_count(fs, 1);
 }
 
@@ -14406,7 +13716,7 @@ FUNCTION_DEFINE1(int, ftrylockfile, FILE *, stream) {
     struct file_stream *fs = file_stream_fp(stream);
     if (!fs->fs_fp)
         return 0;
-    int ret = CALL_FUNC(ftrylockfile, fs->fs_fp);
+    int ret = ftrylockfile(fs->fs_fp);
     if (ret == 0)
         stream_flock_count(fs, 1);
     return ret;
@@ -14417,7 +13727,7 @@ FUNCTION_DEFINE_VOID1(funlockfile, FILE *, stream) {
     if (!fs->fs_fp)
         return;
     stream_flock_count(fs, -1);
-    CALL_FUNC(funlockfile, fs->fs_fp);
+    funlockfile(fs->fs_fp);
 }
 
 FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
@@ -14447,11 +13757,11 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
             struct file_stream *fs = fsle->fsle_stream;
             if (fs->fs_type != FS_FILE || !fs->fs_fp || !strpbrk(fs->fs_mode, "wa+"))
                 continue;
-            CALL_FUNC(flockfile, fs->fs_fp);
+            flockfile(fs->fs_fp);
             task_lock(current);
             struct file *file = fs->fs_nfd >= 0 ? file_for_task_stream_locked(current, fs, FS_FILE) : NULL;
             if (file) {
-                if (CALL_FUNC(fflush, fs->fs_fp) == EOF) {
+                if (fflush(fs->fs_fp) == EOF) {
                     ret = EOF;
                     if (errno == EPIPE)
                         saw_epipe = 1;
@@ -14459,7 +13769,7 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
                 file_unlock(file, 1);
             }
             task_unlock(current);
-            CALL_FUNC(funlockfile, fs->fs_fp);
+            funlockfile(fs->fs_fp);
         }
         pthread_mutex_unlock(&current->tsk_streams_lock);
         tvm_sig_leave();
@@ -14477,7 +13787,7 @@ FUNCTION_DEFINE1(int, fflush, FILE *, stream) {
     }
 
     file_unlock(file, 0);
-    int ret = CALL_FUNC(fflush, real_fp(stream));
+    int ret = fflush(real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14493,9 +13803,9 @@ FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
     if (!file) {
         FILE *fp = real_fp(stream);
         if (fp) {
-            int last_fd = CALL_FUNC(fileno, fp);
+            int last_fd = fileno(fp);
             fp_setfileno(fp, -1);
-            CALL_FUNC(setbuf, fp, buf);
+            setbuf(fp, buf);
             fp_setfileno(fp, last_fd);
         }
         tvm_sig_leave();
@@ -14503,7 +13813,7 @@ FUNCTION_DEFINE_VOID2(setbuf, FILE *, stream, char *, buf) {
     }
 
     file_unlock(file, 0);
-    CALL_FUNC(setbuf, real_fp(stream), buf);
+    setbuf(real_fp(stream), buf);
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14519,9 +13829,9 @@ FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
     if (!file) {
         FILE *fp = real_fp(stream);
         if (fp) {
-            int last_fd = CALL_FUNC(fileno, fp);
+            int last_fd = fileno(fp);
             fp_setfileno(fp, -1);
-            CALL_FUNC(setbuffer, fp, buf, size);
+            setbuffer(fp, buf, size);
             fp_setfileno(fp, last_fd);
         }
         tvm_sig_leave();
@@ -14529,7 +13839,7 @@ FUNCTION_DEFINE_VOID3(setbuffer, FILE *, stream, char *, buf, int, size) {
     }
 
     file_unlock(file, 0);
-    CALL_FUNC(setbuffer, real_fp(stream), buf, size);
+    setbuffer(real_fp(stream), buf, size);
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14546,7 +13856,7 @@ FUNCTION_DEFINE_VOID1(setlinebuf, FILE *, stream) {
     }
 
     file_unlock(file, 0);
-    CALL_FUNC(setlinebuf, real_fp(stream));
+    setlinebuf(real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14562,7 +13872,7 @@ FUNCTION_DEFINE1(int, setlinebuf, FILE *, stream) {
     }
 
     file_unlock(file, 0);
-    int ret = CALL_FUNC(setlinebuf, real_fp(stream));
+    int ret = setlinebuf(real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14580,7 +13890,7 @@ FUNCTION_DEFINE4(int, setvbuf, FILE *, stream, char *, buf, int, mode, size_t, s
     }
 
     file_unlock(file, 0);
-    int ret = CALL_FUNC(setvbuf, real_fp(stream), buf, mode, size);
+    int ret = setvbuf(real_fp(stream), buf, mode, size);
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14600,7 +13910,7 @@ FUNCTION_DEFINE2(int, fputc, int, c, FILE *, stream) {
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fputc, c, real_fp(stream));
+        ret = fputc(c, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
@@ -14630,7 +13940,7 @@ FUNCTION_DEFINE2(int, fputs, const char *, s, FILE *, stream) {
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fputs, s, real_fp(stream));
+        ret = fputs(s, real_fp(stream));
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
@@ -14648,17 +13958,17 @@ FUNCTION_DEFINE2(int, fputs, const char *, s, FILE *, stream) {
 }
 
 FUNCTION_DEFINE2(int, putc, int, c, FILE *, stream) {
-    return fputc(c, stream);
+    return VMCALL(fputc, c, stream);
 }
 
 FUNCTION_DEFINE1(int, putchar, int, c) {
-    return fputc(c, stdout);
+    return VMCALL(fputc, c, stdout);
 }
 
 FUNCTION_DEFINE1(int, puts, const char *, s) {
-    if (EOF == fputs(s, stdout))
+    if (EOF == VMCALL(fputs, s, stdout))
         return EOF;
-    return fputc('\n', stdout);
+    return VMCALL(fputc, '\n', stdout);
 }
 
 FUNCTION_DEFINE1(int, fgetc, FILE *, stream) {
@@ -14674,7 +13984,7 @@ retry:
 
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fgetc, real_fp(stream));
+        ret = fgetc(real_fp(stream));
         int last_errno = errno;
         file_lock(file, 0);
         file_unlock(file, 1);
@@ -14707,7 +14017,7 @@ retry:
 
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fgets, s, size, real_fp(stream));
+        ret = fgets(s, size, real_fp(stream));
         int last_errno = errno;
         file_lock(file, 0);
         file_unlock(file, 1);
@@ -14758,11 +14068,11 @@ retry:
 }
 
 FUNCTION_DEFINE1(int, getc, FILE *, stream) {
-    return fgetc(stream);
+    return VMCALL(fgetc, stream);
 }
 
 FUNCTION_DEFINE0(int, getchar) {
-    return fgetc(stdin);
+    return VMCALL(fgetc, stdin);
 }
 
 // A stream a failed freopen() left closed has no libc FILE (real_fp() is
@@ -14776,23 +14086,23 @@ FUNCTION_DEFINE2(int, ungetc, int, c, FILE *, stream) {
         errno = EBADF;
         return EOF;
     }
-    return CALL_FUNC(ungetc, c, fp);
+    return ungetc(c, fp);
 }
 
 FUNCTION_DEFINE_VOID1(clearerr, FILE *, stream) {
     FILE *fp = real_fp(stream);
     if (fp)
-        CALL_FUNC(clearerr, fp);
+        clearerr(fp);
 }
 
 FUNCTION_DEFINE1(int, feof, FILE *, stream) {
     FILE *fp = real_fp(stream);
-    return fp ? CALL_FUNC(feof, fp) : 0;
+    return fp ? feof(fp) : 0;
 }
 
 FUNCTION_DEFINE1(int, ferror, FILE *, stream) {
     FILE *fp = real_fp(stream);
-    return fp ? CALL_FUNC(ferror, fp) : 1;
+    return fp ? ferror(fp) : 1;
 }
 
 FUNCTION_DEFINE1(int, fileno, FILE *, stream) {
@@ -14803,19 +14113,19 @@ FUNCTION_DEFINE1(int, fileno, FILE *, stream) {
 }
 
 FUNCTION_DEFINE_VA1(int, printf, const char *, format) {
-    return vfprintf(stdout, format, __ap);
+    return VMCALL(vfprintf, stdout, format, __ap);
 }
 
 FUNCTION_DEFINE_VA2(int, fprintf, FILE *, stream, const char *, format) {
-    return vfprintf(stream, format, __ap);
+    return VMCALL(vfprintf, stream, format, __ap);
 }
 
 FUNCTION_DEFINE_VA2(int, dprintf, int, fd, const char *, format) {
-    return vdprintf(fd, format, __ap);
+    return VMCALL(vdprintf, fd, format, __ap);
 }
 
 FUNCTION_DEFINE2(int, vprintf, const char *, format, va_list, ap) {
-    return vfprintf(stdout, format, ap);
+    return VMCALL(vfprintf, stdout, format, ap);
 }
 
 FUNCTION_DEFINE3(int, vfprintf, FILE *, stream, const char *, format, va_list, ap) {
@@ -14829,7 +14139,7 @@ FUNCTION_DEFINE3(int, vfprintf, FILE *, stream, const char *, format, va_list, a
 
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(vfprintf, real_fp(stream), format, ap);
+        ret = vfprintf(real_fp(stream), format, ap);
         file_lock(file, 0);
         file_unlock(file, 1);
         tvm_sig_leave();
@@ -14841,7 +14151,7 @@ FUNCTION_DEFINE3(int, vfprintf, FILE *, stream, const char *, format, va_list, a
     file_unlock(file, 1);
     tvm_sig_leave();
 
-    return vdprintf(fileno(stream), format, ap);
+    return VMCALL(vdprintf, VMCALL(fileno, stream), format, ap);
 }
 
 FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
@@ -14856,7 +14166,7 @@ FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
     int ret = -1;
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(vdprintf, file->f_rfd, format, ap);
+        ret = vdprintf(file->f_rfd, format, ap);
         if (ret < 0)
             epipe_signal_fd(fd, 0);
         file_lock(file, 0);
@@ -14872,7 +14182,7 @@ FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
             goto out;
         }
         
-        char *s = malloc(size+1);
+        char *s = VMCALL(malloc, size+1);
         if (!s) {
             ret = -ENOMEM;
             goto out;
@@ -14880,7 +14190,7 @@ FUNCTION_DEFINE3(int, vdprintf, int, fd, const char *, format, va_list, ap) {
         
         int wsize = vsnprintf(s, size+1, format, ap);
         ret = (int)file->f_ops->f_write(file, s, wsize, -1);
-        free(s);
+        VMCALL(free, s);
     }
     
 out:
@@ -14891,15 +14201,15 @@ out:
 }
 
 FUNCTION_DEFINE_VA1(int, scanf, const char *, format) {
-    return vfscanf(stdin, format, __ap);
+    return VMCALL(vfscanf, stdin, format, __ap);
 }
 
 FUNCTION_DEFINE_VA2(int, fscanf, FILE *, stream, const char *, format) {
-    return vfscanf(stream, format, __ap);
+    return VMCALL(vfscanf, stream, format, __ap);
 }
 
 FUNCTION_DEFINE2(int, vscanf, const char *, format, va_list, ap) {
-    return vfscanf(stdin, format, ap);
+    return VMCALL(vfscanf, stdin, format, ap);
 }
 
 FUNCTION_DEFINE3(int, vfscanf, FILE *, stream, const char *, format, va_list, ap) {
@@ -14911,7 +14221,7 @@ FUNCTION_DEFINE3(int, vfscanf, FILE *, stream, const char *, format, va_list, ap
     }
 
     file_unlock(file, 0);
-    int ret = CALL_FUNC(vfscanf, real_fp(stream), format, ap);
+    int ret = vfscanf(real_fp(stream), format, ap);
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -14919,26 +14229,20 @@ FUNCTION_DEFINE3(int, vfscanf, FILE *, stream, const char *, format, va_list, ap
 }
 
 FUNCTION_DEFINE_VOID1(perror, const char *, s) {
-    fprintf(stderr, "%s: %s\n", s, strerror(errno));
+    VMCALL(fprintf, stderr, "%s: %s\n", s, VMCALL(strerror, errno));
 }
 
 FUNCTION_DEFINE_VA2(int, open, const char *, pathname, int, flags) {
     mode_t mode = va_arg(__ap, int);
-    if (!can_enter_tvm(NULL))
-        return CALL_FUNC(open, pathname, flags, mode);
-
-    return openat(AT_FDCWD, pathname, flags, mode);
+    return VMCALL(openat, AT_FDCWD, pathname, flags, mode);
 }
 
 FUNCTION_DEFINE2(int, creat, const char *, pathname, mode_t, mode) {
-    return open(pathname, O_CREAT | O_WRONLY | O_TRUNC, mode);
+    return VMCALL(open, pathname, O_CREAT | O_WRONLY | O_TRUNC, mode);
 }
 
 FUNCTION_DEFINE_VA3(int, openat, int, dirfd, const char *, pathname, int, flags) {
     mode_t mode = va_arg(__ap, int);
-    if (!can_enter_tvm(NULL))
-        return CALL_FUNC(openat, dirfd, pathname, flags, mode);
-
     if (flags & O_CREAT)
         mode &= ~current->tsk_umask;
 
@@ -14990,7 +14294,7 @@ retry:
     if (!file->f_ops || !file->f_ops->f_read) {
         int rfd = file->f_rfd;
         file_unlock(file, 0);
-        ret = CALL_FUNC(read, rfd, buf, count);
+        ret = read(rfd, buf, count);
         file_lock(file, 0);
     }
     else
@@ -15064,7 +14368,7 @@ retry:
     if (!file->f_ops || !file->f_ops->f_write) {
         int wfd = file->f_rfd;
         file_unlock(file, 0);
-        ret = CALL_FUNC(write, wfd, buf, count);
+        ret = write(wfd, buf, count);
         file_lock(file, 0);
     }
     else
@@ -15128,7 +14432,7 @@ FUNCTION_DEFINE3(ssize_t, readv, int, fd, const struct iovec *, iov, int, iovcnt
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(readv, file->f_rfd, iov, iovcnt);
+        ret = readv(file->f_rfd, iov, iovcnt);
         file_lock(file, 0);
     }
     else {
@@ -15172,7 +14476,7 @@ FUNCTION_DEFINE3(ssize_t, writev, int, fd, const struct iovec *, iov, int, iovcn
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(writev, file->f_rfd, iov, iovcnt);
+        ret = writev(file->f_rfd, iov, iovcnt);
         file_lock(file, 0);
     }
     else {
@@ -15223,7 +14527,7 @@ retry:
     if (!file->f_ops || !file->f_ops->f_read) {
         int rfd = file->f_rfd;
         file_unlock(file, 0);
-        ret = CALL_FUNC(pread, rfd, buf, count, offset);
+        ret = pread(rfd, buf, count, offset);
         file_lock(file, 0);
     }
     else
@@ -15257,7 +14561,7 @@ retry:
     if (!file->f_ops || !file->f_ops->f_write) {
         int wfd = file->f_rfd;
         file_unlock(file, 0);
-        ret = CALL_FUNC(pwrite, wfd, buf, count, offset);
+        ret = pwrite(wfd, buf, count, offset);
         file_lock(file, 0);
     }
     else
@@ -15291,7 +14595,7 @@ FUNCTION_DEFINE4(ssize_t, preadv, int, fd, const struct iovec *, iov, int, iovcn
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_read) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(preadv, file->f_rfd, iov, iovcnt, offset);
+        ret = preadv(file->f_rfd, iov, iovcnt, offset);
         file_lock(file, 0);
     }
     else {
@@ -15335,7 +14639,7 @@ FUNCTION_DEFINE4(ssize_t, pwritev, int, fd, const struct iovec *, iov, int, iovc
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_write) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(pwritev, file->f_rfd, iov, iovcnt, offset);
+        ret = pwritev(file->f_rfd, iov, iovcnt, offset);
         file_lock(file, 0);
     }
     else {
@@ -15384,7 +14688,7 @@ FUNCTION_DEFINE3(off_t, lseek, int, fd, off_t, offset, int, whence) {
     if (file->f_ops && file->f_ops->f_lseek)
         ret = file->f_ops->f_lseek(file, offset, whence);
     else
-        ret = CALL_FUNC(lseek, file->f_rfd, offset, whence);
+        ret = lseek(file->f_rfd, offset, whence);
 
     file_unlock(file, 1);
     tvm_sig_leave();
@@ -15392,7 +14696,7 @@ FUNCTION_DEFINE3(off_t, lseek, int, fd, off_t, offset, int, whence) {
 }
 
 FUNCTION_DEFINE1(int, fsync, int, fd) {
-    return CURRENT_RFD(fd, CALL_FUNC(fsync, __rfd));
+    return CURRENT_RFD(fd, fsync(__rfd));
 }
 
 #if defined(__linux__)
@@ -15406,29 +14710,29 @@ FUNCTION_DEFINE1(int, fsync, int, fd) {
  * so they are the same functions.
  */
 FUNCTION_DEFINE4(ssize_t, pread64, int, fd, void *, buf, size_t, count, off64_t, offset) {
-    return pread(fd, buf, count, offset);
+    return VMCALL(pread, fd, buf, count, offset);
 }
 
 FUNCTION_DEFINE4(ssize_t, pwrite64, int, fd, const void *, buf, size_t, count, off64_t, offset) {
-    return pwrite(fd, buf, count, offset);
+    return VMCALL(pwrite, fd, buf, count, offset);
 }
 
 FUNCTION_DEFINE4(ssize_t, preadv64, int, fd, const struct iovec *, iov, int, iovcnt, off64_t, offset) {
-    return preadv(fd, iov, iovcnt, offset);
+    return VMCALL(preadv, fd, iov, iovcnt, offset);
 }
 
 FUNCTION_DEFINE4(ssize_t, pwritev64, int, fd, const struct iovec *, iov, int, iovcnt, off64_t, offset) {
-    return pwritev(fd, iov, iovcnt, offset);
+    return VMCALL(pwritev, fd, iov, iovcnt, offset);
 }
 
 // sqlite on Linux syncs with fdatasync (HAVE_FDATASYNC), not fsync.
 FUNCTION_DEFINE1(int, fdatasync, int, fd) {
-    return CURRENT_RFD(fd, CALL_FUNC(fdatasync, __rfd));
+    return CURRENT_RFD(fd, fdatasync(__rfd));
 }
 #endif
 
 FUNCTION_DEFINE1(int, dup, int, oldfd) {
-    return fcntl(oldfd, F_DUPFD, 0);
+    return VMCALL(fcntl, oldfd, F_DUPFD, 0);
 }
 
 FUNCTION_DEFINE2(int, dup2, int, oldfd, int, newfd) {
@@ -15507,21 +14811,21 @@ FUNCTION_DEFINE1(int, pipe, int *, pipefd) {
     tvm_sig_enter();
 
     int r[2], f[2];
-    if (0 != CALL_FUNC(pipe, r)) {
+    if (0 != pipe(r)) {
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f[0] = task_new_fd(current, r[0]))) {
-        VERIFY(0 == CALL_FUNC(close, r[0]));
-        VERIFY(0 == CALL_FUNC(close, r[1]));
+        VERIFY(0 == close(r[0]));
+        VERIFY(0 == close(r[1]));
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f[1] = task_new_fd(current, r[1]))) {
-        VERIFY(0 == close(f[0]));
-        VERIFY(0 == CALL_FUNC(close, r[1]));
+        VERIFY(0 == VMCALL(close, f[0]));
+        VERIFY(0 == close(r[1]));
         tvm_sig_leave();
         return -1;
     }
@@ -15565,7 +14869,7 @@ static int tvm_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *excep
         if (!currfd.events)
             continue;
         
-        fds = realloc(fds, sizeof(*fds) * (fdcount+1));
+        fds = VMCALL(realloc, fds, sizeof(*fds) * (fdcount+1));
         if (!fds) {
             errno = ENOMEM;
             return -1;
@@ -15578,7 +14882,7 @@ static int tvm_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *excep
     int r = tvm_poll_host(fds, fdcount, tvm_timespec_to_ms(ts), ts, os_mask);
 
     if (r == -1) {
-        free(fds);
+        VMCALL(free, fds);
         return -1;
     }
 
@@ -15593,7 +14897,7 @@ static int tvm_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *excep
 
     for (int i = 0; i < fdcount; i++) {
         if (fds[i].revents & POLLNVAL) {
-            free(fds);
+            VMCALL(free, fds);
             errno = EBADF;
             return -1;
         }
@@ -15617,7 +14921,7 @@ static int tvm_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *excep
         }
     }
 
-    free(fds);
+    VMCALL(free, fds);
     return r;
 }
 
@@ -15641,7 +14945,7 @@ FUNCTION_DEFINE5(int, select, int, nfds, fd_set *, readfds, fd_set *, writefds, 
 static int tvm_poll_host_masked(struct pollfd *realfds, nfds_t nfds, const struct timespec *ts, const sigset_t *os_mask)
 {
 #if defined(__linux__)
-    return CALL_FUNC(ppoll, realfds, nfds, ts, os_mask);
+    return ppoll(realfds, nfds, ts, os_mask);
 #else
     fd_set hr, hw, he;
     FD_ZERO(&hr);
@@ -15667,14 +14971,14 @@ static int tvm_poll_host_masked(struct pollfd *realfds, nfds_t nfds, const struc
     }
     if (toobig) {
         sigset_t blocked;
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, os_mask, &blocked);
-        int ret = CALL_FUNC(poll, realfds, nfds, tvm_timespec_to_ms(ts));
+        pthread_sigmask(SIG_SETMASK, os_mask, &blocked);
+        int ret = poll(realfds, nfds, tvm_timespec_to_ms(ts));
         int err = errno;
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &blocked, NULL);
+        pthread_sigmask(SIG_SETMASK, &blocked, NULL);
         errno = err;
         return ret;
     }
-    int ret = CALL_FUNC(pselect, maxfd + 1, &hr, &hw, &he, ts, os_mask);
+    int ret = pselect(maxfd + 1, &hr, &hw, &he, ts, os_mask);
     if (ret <= 0)
         return ret;
     ret = 0;
@@ -15702,16 +15006,16 @@ static int tvm_poll_host_masked(struct pollfd *realfds, nfds_t nfds, const struc
 static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const struct timespec *ts, const sigset_t *os_mask)
 {
     int ret = -1;
-    struct pollfd *realfds = malloc(nfds * sizeof(*fds));
+    struct pollfd *realfds = VMCALL(malloc, nfds * sizeof(*fds));
     if (!realfds) {
         errno = ENOMEM;
         return ret;
     }
     memcpy(realfds, fds, nfds * sizeof(*fds));
 
-    struct file **files = malloc(nfds * (sizeof(struct file *)));
+    struct file **files = VMCALL(malloc, nfds * (sizeof(struct file *)));
     if (!files) {
-        free(realfds);
+        VMCALL(free, realfds);
         errno = ENOMEM;
         return ret;
     }
@@ -15726,8 +15030,8 @@ static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const str
                 file_unlock(files[j], 1);
             }
             tvm_sig_leave();
-            free(files);
-            free(realfds);
+            VMCALL(free, files);
+            VMCALL(free, realfds);
             return ret;
         }
         realfds[i].fd = files[i]->f_rfd;
@@ -15737,7 +15041,7 @@ static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const str
     if (os_mask)
         ret = tvm_poll_host_masked(realfds, nfds, ts, os_mask);
     else
-        ret = CALL_FUNC(poll, realfds, nfds, timeout);
+        ret = poll(realfds, nfds, timeout);
     int err = errno;
 
     for (int i = 0; i < nfds; i++)
@@ -15751,8 +15055,8 @@ static int tvm_poll_host(struct pollfd *fds, nfds_t nfds, int timeout, const str
 
     tvm_sig_leave();
 
-    free(files);
-    free(realfds);
+    VMCALL(free, files);
+    VMCALL(free, realfds);
     errno = err;
     return ret;
 }
@@ -15829,7 +15133,7 @@ FUNCTION_DEFINE6(int, pselect, int, nfds, fd_set *, readfds, fd_set *, writefds,
 
     sigset_t all, os_old;
     sigfillset(&all);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+    pthread_sigmask(SIG_BLOCK, &all, &os_old);
 
     int r;
     for (;;) {
@@ -15859,7 +15163,7 @@ FUNCTION_DEFINE6(int, pselect, int, nfds, fd_set *, readfds, fd_set *, writefds,
     }
     int err = errno;
 
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+    pthread_sigmask(SIG_SETMASK, &os_old, NULL);
     tvm_sig_leave();
     current_thread->thr_sigmask = old;
     errno = err;
@@ -15887,15 +15191,15 @@ static int thread_wake_fd(void)
     struct thread *thr = current_thread;
     if (thr->thr_wake[0] < 0) {
         int p[2];
-        if (0 != CALL_FUNC(pipe, p))
+        if (0 != pipe(p))
             return -1;
-        CALL_FUNC(fcntl, p[0], F_SETFL, O_NONBLOCK);
-        CALL_FUNC(fcntl, p[1], F_SETFL, O_NONBLOCK);
+        fcntl(p[0], F_SETFL, O_NONBLOCK);
+        fcntl(p[1], F_SETFL, O_NONBLOCK);
         thr->thr_wake[0] = p[0];
         __atomic_store_n(&thr->thr_wake[1], p[1], __ATOMIC_RELEASE); // signal_handler's
     }
     char buf[64];
-    while (CALL_FUNC(read, thr->thr_wake[0], buf, sizeof(buf)) > 0)
+    while (read(thr->thr_wake[0], buf, sizeof(buf)) > 0)
         ;
     return thr->thr_wake[0];
 }
@@ -15911,7 +15215,7 @@ static int rlock_sleep(int fd, int timeout_ms)
 {
     if (!signal_deliverable()) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        (void)CALL_FUNC(poll, &pfd, 1, timeout_ms);
+        (void)poll(&pfd, 1, timeout_ms);
     }
     if (!signal_deliverable())
         return 0;
@@ -15944,8 +15248,8 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
     struct stat st;
     off_t start, end;
     struct rlock_spare spare;
-    if (!emulate || -1 == CALL_FUNC(fstat, rfd, &st) || !S_ISREG(st.st_mode))
-        ret = CALL_FUNC(fcntl, rfd, cmd, fl);
+    if (!emulate || -1 == fstat(rfd, &st) || !S_ISREG(st.st_mode))
+        ret = fcntl(rfd, cmd, fl);
     else if (0 == rlock_validate(rfd, cmd, fl, &start, &end)) {
         if (cmd == F_GETLK) {
             // An F_UNLCK query is answered as a read lock's would be (xnu
@@ -15964,7 +15268,7 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
             }
             pthread_mutex_unlock(&rlocks_lock);
             if (!c) // no task holds one; a process outside TVM may
-                ret = CALL_FUNC(fcntl, rfd, F_GETLK, fl);
+                ret = fcntl(rfd, F_GETLK, fl);
         }
         else if (0 == rlock_spare_alloc(&spare, fl->l_type)) {
             for (;;) {
@@ -15983,7 +15287,7 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
                     // then the table, which cannot fail (its entries were
                     // taken up front). Always F_SETLK: a kernel F_SETLKW
                     // would sleep with rlocks_lock held.
-                    ret = CALL_FUNC(fcntl, rfd, F_SETLK, fl);
+                    ret = fcntl(rfd, F_SETLK, fl);
                     if (0 == ret)
                         rlock_apply_locked(&spare, st.st_dev, st.st_ino, current, fl->l_type, start, end);
                     if (fl->l_type == F_UNLCK)
@@ -16041,9 +15345,6 @@ static int fcntl_rlock(int fd, int cmd, struct flock *fl)
 
 FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     void *arg = va_arg (__ap, void *);
-    if (!can_enter_tvm(NULL))
-        return CALL_FUNC(fcntl, fd, cmd, arg);
-
     if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
         // An F_SETLKW a signal ended restarts, as read() does: unless a guest
         // handler ran and was installed without SA_RESTART (fcntl_rlock's
@@ -16123,7 +15424,7 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         return fd;
     }
 
-    return CURRENT_RFD(fd, CALL_FUNC(fcntl, __rfd, cmd, arg));
+    return CURRENT_RFD(fd, fcntl(__rfd, cmd, arg));
 }
 
 #if defined(__linux__)
@@ -16131,12 +15432,12 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
 // struct flock is struct flock64 and F_*LK64 are F_*LK on x86-64.
 FUNCTION_DEFINE_VA2(int, fcntl64, int, fd, int, cmd/*, ...  arg */ ) {
     void *arg = va_arg(__ap, void *);
-    return fcntl(fd, cmd, arg);
+    return VMCALL(fcntl, fd, cmd, arg);
 }
 #endif
 
 FUNCTION_DEFINE2(int, ftruncate, int, fd, off_t, length) {
-    return CURRENT_RFD(fd, CALL_FUNC(ftruncate, __rfd, length));
+    return CURRENT_RFD(fd, ftruncate(__rfd, length));
 }
 
 FUNCTION_DEFINE2(int, stat, const char *, pathname, struct stat *, statbuf) {
@@ -16194,7 +15495,7 @@ FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_fstat) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fstat, file->f_rfd, statbuf);
+        ret = fstat(file->f_rfd, statbuf);
         file_lock(file, 0);
     }
     else
@@ -16220,7 +15521,7 @@ FUNCTION_DEFINE2(int, fstat, int, fd, struct stat *, statbuf) {
 // /dev/null, whose devfs answer is as good as any for a read-only mount, and
 // a VFS path is simply not on the host.
 FUNCTION_DEFINE2(int, fstatfs, int, fd, struct statfs *, buf) {
-    return CURRENT_RFD(fd, CALL_FUNC(fstatfs, __rfd, buf));
+    return CURRENT_RFD(fd, fstatfs(__rfd, buf));
 }
 
 // Through the VFS: the host's answer for the host path behind a guest
@@ -16313,7 +15614,7 @@ FUNCTION_DEFINE4(int, faccessat, int, dirfd, const char *, pathname, int, mode, 
  */
 static int tvm_eaccess(const char *pathname, int mode)
 {
-    return faccessat(AT_FDCWD, pathname, mode, AT_EACCESS);
+    return VMCALL(faccessat, AT_FDCWD, pathname, mode, AT_EACCESS);
 }
 
 FUNCTION_DEFINE2(int, eaccess, const char *, pathname, int, mode) {
@@ -16361,7 +15662,7 @@ FUNCTION_DEFINE2(int, fchmod, int, fd, mode_t, mode) {
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_fchmod) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fchmod, file->f_rfd, mode);
+        ret = fchmod(file->f_rfd, mode);
         file_lock(file, 0);
     }
     else
@@ -16424,7 +15725,7 @@ FUNCTION_DEFINE3(int, fchown, int, fd, uid_t, owner, gid_t, group) {
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_fchown) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(fchown, file->f_rfd, owner, group);
+        ret = fchown(file->f_rfd, owner, group);
         file_lock(file, 0);
     }
     else
@@ -16449,7 +15750,7 @@ FUNCTION_DEFINE5(int, fchownat, int, dirfd, const char *, pathname, uid_t, owner
 }
 
 FUNCTION_DEFINE2(int, flock, int, fd, int, operation) {
-    return CURRENT_RFD(fd, CALL_FUNC(flock, __rfd, operation));
+    return CURRENT_RFD(fd, flock(__rfd, operation));
 }
 
 // lockf() is fcntl() record locking under another name -- Apple's Libc and
@@ -16531,7 +15832,7 @@ static int tvm_symlink(const char *target, const char *linkpath_abs)
     tvm_sig_enter();
     int ret = vfs_create_path(linkpath_abs, &m);
     if (0 == ret)
-        ret = CALL_FUNC(symlink, target, m.path);
+        ret = symlink(target, m.path);
     tvm_sig_leave();
     return ret;
 }
@@ -16574,7 +15875,7 @@ static int tvm_link(const char *oldpath_abs, const char *newpath_abs, int flags)
         errno = EXDEV;
         goto out;
     }
-    ret = CALL_FUNC(linkat, AT_FDCWD, old.path, AT_FDCWD, m.path, flags);
+    ret = linkat(AT_FDCWD, old.path, AT_FDCWD, m.path, flags);
 out:
     tvm_sig_leave();
     return ret;
@@ -16607,7 +15908,7 @@ static int tvm_rename(const char *oldpath_abs, const char *newpath_abs)
         if (src.mount_id != dst.mount_id)
             errno = EXDEV;
         else
-            ret = CALL_FUNC(rename, src.path, dst.path);
+            ret = rename(src.path, dst.path);
     }
     tvm_sig_leave();
     return ret;
@@ -16635,7 +15936,7 @@ static int tvm_unlink(const char *pathname_abs, int flags)
     tvm_sig_enter();
     int ret = vfs_remove_path(pathname_abs, &m);
     if (0 == ret)
-        ret = CALL_FUNC(unlinkat, AT_FDCWD, m.path, flags);
+        ret = unlinkat(AT_FDCWD, m.path, flags);
     tvm_sig_leave();
     return ret;
 }
@@ -16667,7 +15968,7 @@ static int tvm_mkdir(const char *pathname_abs, mode_t mode)
     tvm_sig_enter();
     int ret = vfs_create_path(pathname_abs, &m);
     if (0 == ret)
-        ret = CALL_FUNC(mkdir, m.path, mode & ~current->tsk_umask);
+        ret = mkdir(m.path, mode & ~current->tsk_umask);
     tvm_sig_leave();
     return ret;
 }
@@ -16692,7 +15993,7 @@ static int tvm_mkfifo(const char *pathname_abs, mode_t mode)
     tvm_sig_enter();
     int ret = vfs_create_path(pathname_abs, &m);
     if (0 == ret)
-        ret = CALL_FUNC(mkfifo, m.path, mode & ~current->tsk_umask);
+        ret = mkfifo(m.path, mode & ~current->tsk_umask);
     tvm_sig_leave();
     return ret;
 }
@@ -16730,14 +16031,14 @@ FUNCTION_DEFINE1(int, mkstemp, char *, template) {
     if (!normalize_path(NULL, template, abs))
         return -1;
     tvm_sig_enter();
-    if (0 != vfs_template_path(abs, host) || -1 == (r = CALL_FUNC(mkstemp, host))) {
+    if (0 != vfs_template_path(abs, host) || -1 == (r = mkstemp(host))) {
         tvm_sig_leave();
         return -1;
     }
     mktemp_copyback(template, host);
 
     if (-1 == (f = task_new_fd(current, r))) {
-        VERIFY(0 == CALL_FUNC(close, r));
+        VERIFY(0 == close(r));
         errno = EMFILE;
     }
 
@@ -16761,7 +16062,7 @@ FUNCTION_DEFINE1(char *, mkdtemp, char *, template) {
     if (!normalize_path(NULL, template, abs))
         return NULL;
     tvm_sig_enter();
-    char *ret = 0 == vfs_template_path(abs, host) ? CALL_FUNC(mkdtemp, host) : NULL;
+    char *ret = 0 == vfs_template_path(abs, host) ? mkdtemp(host) : NULL;
     tvm_sig_leave();
     if (!ret)
         return NULL;
@@ -16816,7 +16117,7 @@ static const struct timespec *timeval_to_timespec(const struct timeval *tv, stru
 
 FUNCTION_DEFINE4(int, utimensat, int, dirfd, const char *, pathname, const struct timespec *, times, int, flags) {
     if (!pathname)  // Linux: the descriptor itself, as futimens
-        return CURRENT_RFD(dirfd, CALL_FUNC(utimensat, __rfd, NULL, times, flags));
+        return CURRENT_RFD(dirfd, utimensat(__rfd, NULL, times, flags));
     return tvm_utimensat(dirfd, pathname, times, flags);
 }
 
@@ -16836,11 +16137,11 @@ FUNCTION_DEFINE2(int, utime, const char *, pathname, const struct utimbuf *, tim
 }
 
 FUNCTION_DEFINE2(int, futimens, int, fd, const struct timespec *, times) {
-    return CURRENT_RFD(fd, CALL_FUNC(futimens, __rfd, times));
+    return CURRENT_RFD(fd, futimens(__rfd, times));
 }
 
 FUNCTION_DEFINE2(int, futimes, int, fd, const struct timeval *, times) {
-    return CURRENT_RFD(fd, CALL_FUNC(futimes, __rfd, times));
+    return CURRENT_RFD(fd, futimes(__rfd, times));
 }
 
 FUNCTION_DEFINE2(int, truncate, const char *, pathname, off_t, length) {
@@ -16880,19 +16181,19 @@ FUNCTION_DEFINE6(ssize_t, getxattr, const char *, pathname, const char *, name, 
 }
 
 FUNCTION_DEFINE6(ssize_t, fgetxattr, int, fd, const char *, name, void *, value, size_t, size, u_int32_t, position, int, options) {
-    return CURRENT_RFD(fd, CALL_FUNC(fgetxattr, __rfd, name, value, size, position, options));
+    return CURRENT_RFD(fd, fgetxattr(__rfd, name, value, size, position, options));
 }
 
 FUNCTION_DEFINE6(int, fsetxattr, int, fd, const char *, name, const void *, value, size_t, size, u_int32_t, position, int, options) {
-    return CURRENT_RFD(fd, CALL_FUNC(fsetxattr, __rfd, name, value, size, position, options));
+    return CURRENT_RFD(fd, fsetxattr(__rfd, name, value, size, position, options));
 }
 
 FUNCTION_DEFINE4(ssize_t, flistxattr, int, fd, char *, list, size_t, size, int, options) {
-    return CURRENT_RFD(fd, CALL_FUNC(flistxattr, __rfd, list, size, options));
+    return CURRENT_RFD(fd, flistxattr(__rfd, list, size, options));
 }
 
 FUNCTION_DEFINE3(int, fremovexattr, int, fd, const char *, name, int, options) {
-    return CURRENT_RFD(fd, CALL_FUNC(fremovexattr, __rfd, name, options));
+    return CURRENT_RFD(fd, fremovexattr(__rfd, name, options));
 }
 #else
 FUNCTION_DEFINE4(ssize_t, getxattr, const char *, pathname, const char *, name, void *, value, size_t, size) {
@@ -16900,19 +16201,19 @@ FUNCTION_DEFINE4(ssize_t, getxattr, const char *, pathname, const char *, name, 
 }
 
 FUNCTION_DEFINE4(ssize_t, fgetxattr, int, fd, const char *, name, void *, value, size_t, size) {
-    return CURRENT_RFD(fd, CALL_FUNC(fgetxattr, __rfd, name, value, size));
+    return CURRENT_RFD(fd, fgetxattr(__rfd, name, value, size));
 }
 
 FUNCTION_DEFINE5(int, fsetxattr, int, fd, const char *, name, const void *, value, size_t, size, int, flags) {
-    return CURRENT_RFD(fd, CALL_FUNC(fsetxattr, __rfd, name, value, size, flags));
+    return CURRENT_RFD(fd, fsetxattr(__rfd, name, value, size, flags));
 }
 
 FUNCTION_DEFINE3(ssize_t, flistxattr, int, fd, char *, list, size_t, size) {
-    return CURRENT_RFD(fd, CALL_FUNC(flistxattr, __rfd, list, size));
+    return CURRENT_RFD(fd, flistxattr(__rfd, list, size));
 }
 
 FUNCTION_DEFINE2(int, fremovexattr, int, fd, const char *, name) {
-    return CURRENT_RFD(fd, CALL_FUNC(fremovexattr, __rfd, name));
+    return CURRENT_RFD(fd, fremovexattr(__rfd, name));
 }
 #endif
 
@@ -16933,7 +16234,7 @@ FUNCTION_DEFINE2(int, statvfs, const char *, pathname, struct statvfs *, buf) {
 }
 
 FUNCTION_DEFINE2(int, fstatvfs, int, fd, struct statvfs *, buf) {
-    return CURRENT_RFD(fd, CALL_FUNC(fstatvfs, __rfd, buf));
+    return CURRENT_RFD(fd, fstatvfs(__rfd, buf));
 }
 
 // A new host descriptor, entered into the task's table (cf. eventfd).
@@ -16943,7 +16244,7 @@ static int tvm_task_adopt_fd(int r)
     if (-1 == r)
         return -1;
     if (-1 == (f = task_new_fd(current, r))) {
-        CALL_FUNC(close, r);
+        close(r);
         errno = EMFILE;
     }
     return f;
@@ -16964,7 +16265,7 @@ FUNCTION_DEFINE_VA2(int, shm_open, const char *, name, int, oflag) {
 FUNCTION_DEFINE3(int, shm_open, const char *, name, int, oflag, mode_t, mode) {
 #endif
     tvm_sig_enter();
-    int f = tvm_task_adopt_fd(CALL_FUNC(shm_open, name, oflag, mode));
+    int f = tvm_task_adopt_fd(shm_open(name, oflag, mode));
     tvm_sig_leave();
     return f;
 }
@@ -16974,13 +16275,13 @@ FUNCTION_DEFINE3(int, socket, int, domain, int, type, int, protocol) {
 
     tvm_sig_enter();
 
-    if (-1 == (r = CALL_FUNC(socket, domain, type, protocol))) {
+    if (-1 == (r = socket(domain, type, protocol))) {
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f = task_new_fd(current, r))) {
-        VERIFY(0 == CALL_FUNC(close, r));
+        VERIFY(0 == close(r));
         errno = EMFILE;
     }
 
@@ -16994,13 +16295,13 @@ FUNCTION_DEFINE3(int, accept, int, sockfd, struct sockaddr *, addr, socklen_t *,
     
     tvm_sig_enter();
 
-    if (-1 == (r = CURRENT_RFD(sockfd, CALL_FUNC(accept, __rfd, addr, addrlen)))) {
+    if (-1 == (r = CURRENT_RFD(sockfd, accept(__rfd, addr, addrlen)))) {
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f = task_new_fd(current, r))) {
-        VERIFY(0 == CALL_FUNC(close, r));
+        VERIFY(0 == close(r));
         errno = EMFILE;
     }
 
@@ -17011,23 +16312,23 @@ FUNCTION_DEFINE3(int, accept, int, sockfd, struct sockaddr *, addr, socklen_t *,
 
 FUNCTION_DEFINE3(int, bind, int, sockfd, const struct sockaddr *, addr, socklen_t, addrlen) {
     // TODO: apply tsk_umask for AF_UNIX sockets (real umask is 0)
-    return CURRENT_RFD(sockfd, CALL_FUNC(bind, __rfd, addr, addrlen));
+    return CURRENT_RFD(sockfd, bind(__rfd, addr, addrlen));
 }
 
 FUNCTION_DEFINE2(int, listen, int, sockfd, int,  backlog) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(listen, __rfd, backlog));
+    return CURRENT_RFD(sockfd, listen(__rfd, backlog));
 }
 
 FUNCTION_DEFINE3(int, connect, int, sockfd, const struct sockaddr *, addr, socklen_t, addrlen) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(connect, __rfd, addr, addrlen));
+    return CURRENT_RFD(sockfd, connect(__rfd, addr, addrlen));
 }
 
 FUNCTION_DEFINE3(int, getpeername, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(getpeername, __rfd, addr, addrlen));
+    return CURRENT_RFD(sockfd, getpeername(__rfd, addr, addrlen));
 }
 
 FUNCTION_DEFINE3(int, getsockname, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(getsockname, __rfd, addr, addrlen));
+    return CURRENT_RFD(sockfd, getsockname(__rfd, addr, addrlen));
 }
 
 FUNCTION_DEFINE5(int, getsockopt, int, sockfd, int, level, int, optname, void *, optval, socklen_t *, optlen) {
@@ -17052,7 +16353,7 @@ FUNCTION_DEFINE5(int, getsockopt, int, sockfd, int, level, int, optname, void *,
         return 0;
     }
 #endif
-    return CURRENT_RFD(sockfd, CALL_FUNC(getsockopt, __rfd, level, optname, optval, optlen));
+    return CURRENT_RFD(sockfd, getsockopt(__rfd, level, optname, optval, optlen));
 }
 
 FUNCTION_DEFINE5(int, setsockopt, int, sockfd, int, level, int, optname, const void *, optval, socklen_t, optlen) {
@@ -17077,65 +16378,65 @@ FUNCTION_DEFINE5(int, setsockopt, int, sockfd, int, level, int, optname, const v
         return 0;
     }
 #endif
-    return CURRENT_RFD(sockfd, CALL_FUNC(setsockopt, __rfd, level, optname, optval, optlen));
+    return CURRENT_RFD(sockfd, setsockopt(__rfd, level, optname, optval, optlen));
 }
 
 FUNCTION_DEFINE4(ssize_t, send, int, sockfd, const void *, buf, size_t, len, int, flags) {
-    ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(send, __rfd, buf, len, flags));
+    ssize_t ret = CURRENT_RFD(sockfd, send(__rfd, buf, len, flags));
     if (ret == -1)
         epipe_signal_fd(sockfd, flags);
     return ret;
 }
 
 FUNCTION_DEFINE6(ssize_t, sendto, int, sockfd, const void *, buf, size_t, len, int, flags, const struct sockaddr *, dest_addr, socklen_t, addrlen) {
-    ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(sendto, __rfd, buf, len, flags, dest_addr, addrlen));
+    ssize_t ret = CURRENT_RFD(sockfd, sendto(__rfd, buf, len, flags, dest_addr, addrlen));
     if (ret == -1)
         epipe_signal_fd(sockfd, flags);
     return ret;
 }
 
 FUNCTION_DEFINE3(ssize_t, sendmsg, int, sockfd, const struct msghdr *, msg, int, flags) {
-    ssize_t ret = CURRENT_RFD(sockfd, CALL_FUNC(sendmsg, __rfd, msg, flags));
+    ssize_t ret = CURRENT_RFD(sockfd, sendmsg(__rfd, msg, flags));
     if (ret == -1)
         epipe_signal_fd(sockfd, flags);
     return ret;
 }
 
 FUNCTION_DEFINE4(ssize_t, recv, int, sockfd, void *, buf, size_t, len, int, flags) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(recv, __rfd, buf, len, flags));
+    return CURRENT_RFD(sockfd, recv(__rfd, buf, len, flags));
 }
 
 FUNCTION_DEFINE6(ssize_t, recvfrom, int, sockfd, void *, buf, size_t, len, int, flags, struct sockaddr *, src_addr, socklen_t *, addrlen) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(recvfrom, __rfd, buf, len, flags, src_addr, addrlen));
+    return CURRENT_RFD(sockfd, recvfrom(__rfd, buf, len, flags, src_addr, addrlen));
 }
 
 FUNCTION_DEFINE3(ssize_t, recvmsg, int, sockfd, struct msghdr *, msg, int, flags) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(recvmsg, __rfd, msg, flags));
+    return CURRENT_RFD(sockfd, recvmsg(__rfd, msg, flags));
 }
 
 FUNCTION_DEFINE2(int, shutdown, int, sockfd, int, how) {
-    return CURRENT_RFD(sockfd, CALL_FUNC(shutdown, __rfd, how));
+    return CURRENT_RFD(sockfd, shutdown(__rfd, how));
 }
 
 FUNCTION_DEFINE4(int, socketpair, int, domain, int, type, int, protocol, int *, sv) {
     tvm_sig_enter();
 
     int r[2], f[2];
-    if (0 != CALL_FUNC(socketpair, domain, type, protocol, r)) {
+    if (0 != socketpair(domain, type, protocol, r)) {
         tvm_sig_leave();
         return -1;
     }
     
     if (-1 == (f[0] = task_new_fd(current, r[0]))) {
-        VERIFY(0 == CALL_FUNC(close, r[0]));
-        VERIFY(0 == CALL_FUNC(close, r[1]));
+        VERIFY(0 == close(r[0]));
+        VERIFY(0 == close(r[1]));
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f[1] = task_new_fd(current, r[1]))) {
-        VERIFY(0 == close(f[0]));
-        VERIFY(0 == CALL_FUNC(close, r[1]));
+        VERIFY(0 == VMCALL(close, f[0]));
+        VERIFY(0 == close(r[1]));
         tvm_sig_leave();
         return -1;
     }
@@ -17147,9 +16448,6 @@ FUNCTION_DEFINE4(int, socketpair, int, domain, int, type, int, protocol, int *, 
 
 FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     void* arg = va_arg(__ap, void*);
-    if (!can_enter_tvm(NULL))
-        return CALL_FUNC(ioctl, fd, request, arg);
-
     tvm_sig_enter();
     struct file *file = file_for_task(current, fd);
     if (!file) {
@@ -17161,7 +16459,7 @@ FUNCTION_DEFINE_VA2(int, ioctl, int, fd, unsigned long, request) {
     size_t ret;
     if (!file->f_ops || !file->f_ops->f_ioctl) {
         file_unlock(file, 0);
-        ret = CALL_FUNC(ioctl, file->f_rfd, request, arg);
+        ret = ioctl(file->f_rfd, request, arg);
         file_lock(file, 0);
     }
     else
@@ -17311,7 +16609,7 @@ static void *tvm_proc_entry(struct fork_arg *arg)
     // a fully-blocked signal mask.
     sigset_t empty_sigs;
     sigemptyset(&empty_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
+    pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
 
     // when this function fails, it is probably running on an adjusted stack
     // so we need to restore to the original stack frame of this function to return
@@ -17536,14 +16834,7 @@ fail:
     tvm__longjmp(arg->jmpbuf_fail, 1);
 }
 
-// for now we need strict control of how many frames we need to restore on new stack
-// so do not use wrapper
-//FUNCTION_DEFINE0(pid_t, fork) {
-FUNCTION_METADATA(fork, &fork);
-pid_t fork(void) {
-    if (!can_enter_tvm(__builtin_return_address(0)))
-        return CALL_FUNC(fork);
-    
+FUNCTION_DEFINE0(pid_t, fork) {
     struct task *tsk = NULL;
     struct thread *thr = NULL;
     struct fork_arg *arg = NULL;
@@ -17604,7 +16895,7 @@ pid_t fork(void) {
     arg->parent_thr = current_thread;
     arg->emu_call_depth = tvm_emu_call_depth;  // child resumes emulation at this depth
 
-    arg->tmp_stack = CALL_FUNC(mmap, NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    arg->tmp_stack = mmap(NULL, TEMP_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #ifdef TRACE_MMAP
     INFO("mmap %p-%p (tmp stack)", arg->tmp_stack, (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE);
 #endif
@@ -17659,16 +16950,16 @@ pid_t fork(void) {
     sigdelset(&all_sigs, SIGBUS);
     sigdelset(&all_sigs, SIGILL);
     sigdelset(&all_sigs, SIGFPE);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all_sigs, &old_sigs);
+    pthread_sigmask(SIG_BLOCK, &all_sigs, &old_sigs);
 
     pthread_t pth;
-    if ((r = CALL_FUNC(pthread_create, &pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg))) {
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
+    if ((r = pthread_create(&pth, &attr, (void *(*)(void *))tvm_proc_entry, (void *)arg))) {
+        pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
         errno = r;
         goto out;
     }
 
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old_sigs, NULL);
+    pthread_sigmask(SIG_SETMASK, &old_sigs, NULL);
 
     // failure no longer allowed on parent
 
@@ -17684,7 +16975,7 @@ pid_t fork(void) {
     if (ret == -1) {
         // we are not allowed to fail here
         void *thread_r;
-        if ((r = CALL_FUNC(pthread_join, pth, &thread_r)))
+        if ((r = pthread_join(pth, &thread_r)))
             panic("fork::pthread_join failed (errno %d)", r);
 
         errno = (int)(long)(thread_r);
@@ -17701,7 +16992,7 @@ out:
 #ifdef TRACE_MMAP
             INFO("munmap %p-%p (tmp stack)", arg->tmp_stack, (uintptr_t)arg->tmp_stack + TEMP_STACK_SIZE);
 #endif
-            CALL_FUNC(munmap, arg->tmp_stack, TEMP_STACK_SIZE);
+            munmap(arg->tmp_stack, TEMP_STACK_SIZE);
             arg->tmp_stack = NULL;
         }        
 
@@ -17742,9 +17033,8 @@ out:
 
 // vfork() is used by toybox (xargs, etc.) — redirect to TVM's fork()
 // since TVM's fork already uses pthreads with COW semantics.
-FUNCTION_METADATA(vfork, &vfork);
-pid_t vfork(void) {
-    return fork();
+FUNCTION_DEFINE0(pid_t, vfork) {
+    return VMCALL(fork);
 }
 
 struct pthread_create_arg
@@ -17795,9 +17085,9 @@ static void *tvm_thread_entry(struct pthread_create_arg *arg)
     // unblock OS signals now that we're safe with locks
     sigset_t empty_sigs;
     sigemptyset(&empty_sigs);
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &empty_sigs, NULL);
+    pthread_sigmask(SIG_SETMASK, &empty_sigs, NULL);
 
-    pthread_exit(start_fn(start_arg));
+    VMCALL(pthread_exit, start_fn(start_arg));
 }
 
 // The size of the stack TVM gives a thread created with `attr` (NULL: the
@@ -17900,11 +17190,11 @@ static int task_create_thread_locked(struct task *tsk, start_routine_fn start_fn
 
     sigset_t all, old;
     sigfillset(&all);
-    CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &old);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
 
-    ret = CALL_FUNC(pthread_create, out_thread, stack ? &hattr : attr, (start_routine_fn)tvm_thread_entry, a);
+    ret = pthread_create(out_thread, stack ? &hattr : attr, (start_routine_fn)tvm_thread_entry, a);
 
-    CALL_FUNC(pthread_sigmask, SIG_SETMASK, &old, NULL);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
     if (stack)
         pthread_attr_destroy(&hattr);
 
@@ -17964,7 +17254,7 @@ FUNCTION_DEFINE2(int, pthread_join, pthread_t, thread, void **, retval) {
     struct tvm_stack *st = stack_find(thread);
     if (st && st->st_detached)
         return EINVAL;
-    int ret = CALL_FUNC(pthread_join, thread, retval);
+    int ret = pthread_join(thread, retval);
     if (!ret && st)
         stack_release(st);
     return ret;
@@ -17987,7 +17277,7 @@ FUNCTION_DEFINE2(int, pthread_kill, pthread_t, thread, int, sig) {
     list_for_each_entry(st, &stacks, st_list)
         live |= pthread_equal(st->st_pthread, thread);
     if (live)
-        ret = CALL_FUNC(pthread_kill, thread, sig);
+        ret = pthread_kill(thread, sig);
     pthread_mutex_unlock(&stacks_lock);
     task_unlock(current);
     tvm_sig_leave();
@@ -17997,26 +17287,26 @@ FUNCTION_DEFINE2(int, pthread_kill, pthread_t, thread, int, sig) {
 FUNCTION_DEFINE1(int, pthread_detach, pthread_t, thread) {
     struct tvm_stack *st = stack_find(thread);
     if (!st)
-        return CALL_FUNC(pthread_detach, thread);
+        return pthread_detach(thread);
     if (st->st_detached)
         return EINVAL;
     stack_detach(st, 1);
     return 0;
 }
 
-FUNCTION_DEFINE_NORET1(pthread_exit, void *, retval) {
+FUNCTION_DEFINE_VOID1(pthread_exit, void *, retval) {
     tvm_sig_enter();
 
     task_lock(current);
     if (current->tsk_threads_cnt == 1) {
         task_unlock(current);
-        exit((int) ((long) retval));
+        VMCALL(exit, (int) ((long) retval));
     }
 
     detach_current_thread_and_exit(retval);
 }
 
-FUNCTION_DEFINE_NORET1(exit, int, status) {
+FUNCTION_DEFINE_VOID1(exit, int, status) {
     tvm_sig_enter();
     task_lock(current);
     exit_t exits[sizeof(current->tsk_exits)/sizeof(*current->tsk_exits)];
@@ -18030,7 +17320,7 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
     for (int i = 0; i < sizeof(current->tsk_exits)/sizeof(*current->tsk_exits); i++) {
         if (exits[i]) {
             if (0 != emulator_call(NULL, (uint64_t)exits[i], (uint64_t)exit_args[i], 0, 0, 0, 0, 0))
-                abort();
+                VMCALL(abort);
         }
     }
 
@@ -18038,15 +17328,15 @@ FUNCTION_DEFINE_NORET1(exit, int, status) {
     // for the exiting task, as in exit(3). Under the tvm_sig_enter() above it
     // would only be deferred, and _exit() never drains it. _exit() re-enters.
     tvm_sig_leave();
-    fflush(NULL);
+    VMCALL(fflush, NULL);
 
-    _exit(status);
+    VMCALL(_exit, status);
 }
 
-FUNCTION_DEFINE_NORET1(_exit, int, status) {
+FUNCTION_DEFINE_VOID1(_exit, int, status) {
     tvm_sig_enter();
     if (current == main_task)
-        CALL_FUNC(_exit, status);
+        _exit(status);
 
     pthread_mutex_lock(&tasks_lock);
     task_lock(current);
@@ -18054,56 +17344,36 @@ FUNCTION_DEFINE_NORET1(_exit, int, status) {
     terminate_current_locked(mkwstatus(1, status));
 }
 
-FUNCTION_DEFINE_NORET1(_Exit, int, status) {
-    _exit(status);
+FUNCTION_DEFINE_VOID1(_Exit, int, status) {
+    VMCALL(_exit, status);
 }
 
-FUNCTION_DEFINE_NORET0(abort) {
-    raise(SIGABRT);
-    _exit(1); // unreachable
+FUNCTION_DEFINE_VOID0(abort) {
+    VMCALL(raise, SIGABRT);
+    VMCALL(_exit, 1); // unreachable
 }
 
-// atexit is implemented in the executable rather than libc
-// so we cannot really call the original one
-//
-// It is a plain function, not a FUNCTION_DEFINE interposer, so no tvm_call
-// record is pushed for it, and can_enter_tvm(NULL) -- which takes the
-// caller's address from that record -- found none and said no: every
-// guest's atexit() returned 0 and registered nothing, and no guest exit
-// handler ever ran. OpenSSL registers OPENSSL_cleanup() with atexit() (curl,
-// git's curl helpers) so that its thread-state destructor does not fire
-// during the task thread's teardown -- where it aborts in libmalloc and
-// leaves the caller waiting forever, so every `git clone https://...` hung
-// -- on every exit path, die() included. The
-// caller is now taken from the return address, as the interposer wrappers
-// record it, so a guest's registration is kept and exit() runs it.
-static int tvm_atexit(exit_t function, void *arg, void *lr);
+// A guest's exit handlers are the task's: exit() runs them. OpenSSL
+// registers OPENSSL_cleanup() with atexit() (curl, git's curl helpers) so
+// that its thread-state destructor does not fire during the task thread's
+// teardown -- where it aborts in libmalloc and leaves the caller waiting
+// forever, so every `git clone https://...` hung.
+static int tvm_atexit(exit_t function, void *arg);
 
 #if defined(__linux__)
 // C++ static destructors: func(arg) at exit. The argument used to be
 // dropped, so every destructor ran on a NULL object.
-int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle) {
-    return tvm_atexit((exit_t)func, arg, __builtin_return_address(0));
+typedef void (*cxa_dtor_t)(void *);
+FUNCTION_DEFINE3(int, __cxa_atexit, cxa_dtor_t, func, void *, arg, void *, dso_handle) {
+    return tvm_atexit((exit_t)func, arg);
 }
 #endif
 
-//FUNCTION_DEFINE1(int, atexit, exit_t, function) {
-int atexit(exit_t function) {
-    return tvm_atexit(function, NULL, __builtin_return_address(0));
+FUNCTION_DEFINE1(int, atexit, exit_t, function) {
+    return tvm_atexit(function, NULL);
 }
-// Listed with the interposers so the linker binds a guest's atexit here by
-// name. Without the entry, ulinker_external_dlsym fell back to
-// dlsym(RTLD_DEFAULT), which finds this definition only where the TVM
-// executable itself exports it (the CLI); in the apps TVM is libtvm.dylib,
-// searched after libSystem, so guests got libc's atexit and their handlers
-// were queued for the app's own exit, never run at the task's.
-FUNCTION_METADATA(atexit, &atexit);
 
-static int tvm_atexit(exit_t function, void *arg, void *lr) {
-    
-    if (!can_enter_tvm(lr))
-        return 0;
-
+static int tvm_atexit(exit_t function, void *arg) {
     tvm_sig_enter();
 
     if (!function) {
@@ -18131,48 +17401,48 @@ static int tvm_atexit(exit_t function, void *arg, void *lr) {
 }
 
 FUNCTION_DEFINE_NORET_VA2(errx, int, eval, const char *, fmt) {
-    verrx(eval, fmt, __ap);
+    VMCALL(verrx, eval, fmt, __ap);
 }
 
 FUNCTION_DEFINE_NORET_VA2(err, int, eval, const char *, fmt) {
-    verr(eval, fmt, __ap);
+    VMCALL(verr, eval, fmt, __ap);
 }
 
-FUNCTION_DEFINE_NORET3(verr, int, eval, const char *, fmt, va_list, args) {
+FUNCTION_DEFINE_VOID3(verr, int, eval, const char *, fmt, va_list, args) {
     tvm_sig_enter();
     int saved_errno = errno;
 
     if (*current->tsk_comm)
-        fprintf(stderr, "%s: ", current->tsk_comm);
+        VMCALL(fprintf, stderr, "%s: ", current->tsk_comm);
 
     if (fmt) {
-        vfprintf(stderr, fmt, args);
-        fprintf(stderr, ": ");
+        VMCALL(vfprintf, stderr, fmt, args);
+        VMCALL(fprintf, stderr, ": ");
     }
 
-    fprintf(stderr, "%s\n", strerror(saved_errno));
+    VMCALL(fprintf, stderr, "%s\n", VMCALL(strerror, saved_errno));
     // balance the tvm_sig_enter() above: exit() only leaves its own, so a
     // SIGPIPE from the flush it does would otherwise stay deferred and be
     // lost at _exit()
     tvm_sig_leave();
-    exit(eval);
+    VMCALL(exit, eval);
 }
 
-FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
+FUNCTION_DEFINE_VOID3(verrx, int, eval, const char *, fmt, va_list, args) {
     tvm_sig_enter();
     if (*current->tsk_comm)
-        fprintf(stderr, "%s: ", current->tsk_comm);
+        VMCALL(fprintf, stderr, "%s: ", current->tsk_comm);
 
     if (fmt) {
-        vfprintf(stderr, fmt, args);
+        VMCALL(vfprintf, stderr, fmt, args);
     }
 
-    fprintf(stderr, "\n");
+    VMCALL(fprintf, stderr, "\n");
     // balance the tvm_sig_enter() above: exit() only leaves its own, so a
     // SIGPIPE from the flush it does would otherwise stay deferred and be
     // lost at _exit()
     tvm_sig_leave();
-    exit(eval);
+    VMCALL(exit, eval);
 }
 
 // warn(3) family. The host libc's versions write straight to the host's
@@ -18182,15 +17452,15 @@ FUNCTION_DEFINE_NORET3(verrx, int, eval, const char *, fmt, va_list, args) {
 static void tvm_vwarnc(int code, const char *fmt, va_list ap)
 {
     if (*current->tsk_comm)
-        fprintf(stderr, "%s: ", current->tsk_comm);
+        VMCALL(fprintf, stderr, "%s: ", current->tsk_comm);
     if (fmt) {
-        vfprintf(stderr, fmt, ap);
+        VMCALL(vfprintf, stderr, fmt, ap);
         if (code >= 0)
-            fprintf(stderr, ": ");
+            VMCALL(fprintf, stderr, ": ");
     }
     if (code >= 0)
-        fprintf(stderr, "%s", strerror(code));
-    fprintf(stderr, "\n");
+        VMCALL(fprintf, stderr, "%s", VMCALL(strerror, code));
+    VMCALL(fprintf, stderr, "\n");
 }
 
 FUNCTION_DEFINE_VOID2(vwarn, const char *, fmt, va_list, args) {
@@ -18214,11 +17484,11 @@ FUNCTION_DEFINE_VOID3(vwarnc, int, code, const char *, fmt, va_list, args) {
 #endif
 
 FUNCTION_DEFINE_VOID_VA1(warn, const char *, fmt) {
-    vwarn(fmt, __ap);
+    VMCALL(vwarn, fmt, __ap);
 }
 
 FUNCTION_DEFINE_VOID_VA1(warnx, const char *, fmt) {
-    vwarnx(fmt, __ap);
+    VMCALL(vwarnx, fmt, __ap);
 }
 
 #if defined(__APPLE__)
@@ -18306,7 +17576,7 @@ static int tvm_sysctl_value_fallback(int *oid, u_int len, void *oldp, size_t *ol
 // sysctl(2) for a plain value, with the sandbox fallback.
 static int tvm_sysctl_value(int *oid, u_int len, void *oldp, size_t *oldlenp)
 {
-    int r = CALL_FUNC(sysctl, oid, len, oldp, oldlenp, NULL, 0);
+    int r = sysctl(oid, len, oldp, oldlenp, NULL, 0);
     if (r != 0 && errno == EPERM)
         r = tvm_sysctl_value_fallback(oid, len, oldp, oldlenp);
     return r;
@@ -18317,13 +17587,13 @@ static int tvm_sysctl_infer_fmt(int *oid, u_int len, void *oldp, size_t *oldlenp
     size_t vlen = 0;
     if (tvm_sysctl_value(oid, len, NULL, &vlen) != 0)
         return -1;
-    unsigned char *val = calloc(1, vlen + 1);
+    unsigned char *val = VMCALL(calloc, 1, vlen + 1);
     if (!val)
         return -1;
     size_t got = vlen;
     if (vlen && tvm_sysctl_value(oid, len, val, &got) != 0) {
         int e = errno;
-        free(val);
+        VMCALL(free, val);
         errno = e;
         return -1;
     }
@@ -18368,7 +17638,7 @@ static int tvm_sysctl_infer_fmt(int *oid, u_int len, void *oldp, size_t *oldlenp
     }
     if (!*fmt)
         kind |= CTLTYPE_OPAQUE;
-    free(val);
+    VMCALL(free, val);
 
     size_t need = sizeof(kind) + strlen(fmt) + 1;
     if (*oldlenp < need) {
@@ -18383,7 +17653,7 @@ static int tvm_sysctl_infer_fmt(int *oid, u_int len, void *oldp, size_t *oldlenp
 
 FUNCTION_DEFINE6(int, sysctl, int *, name, u_int, namelen, void *, oldp, size_t *, oldlenp, void *, newp, size_t, newlen) {
     struct tvm_tls *tls = tvm_tls();
-    int r = CALL_FUNC(sysctl, name, namelen, oldp, oldlenp, newp, newlen);
+    int r = sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     if (!oldlenp)
         return r;
     if (namelen < 2 || name[0] != TVM_CTL_SYSCTL) {
@@ -18426,21 +17696,21 @@ FUNCTION_DEFINE6(int, sysctl, int *, name, u_int, namelen, void *, oldp, size_t 
 
 #if defined(__APPLE__)  // warnc/errc/getprogname/setprogname are BSD-only
 FUNCTION_DEFINE_VOID_VA2(warnc, int, code, const char *, fmt) {
-    vwarnc(code, fmt, __ap);
+    VMCALL(vwarnc, code, fmt, __ap);
 }
 
-FUNCTION_DEFINE_NORET4(verrc, int, eval, int, code, const char *, fmt, va_list, args) {
+FUNCTION_DEFINE_VOID4(verrc, int, eval, int, code, const char *, fmt, va_list, args) {
     tvm_sig_enter();
     tvm_vwarnc(code, fmt, args);
     // balance the tvm_sig_enter() above: exit() only leaves its own, so a
     // SIGPIPE from the flush it does would otherwise stay deferred and be
     // lost at _exit()
     tvm_sig_leave();
-    exit(eval);
+    VMCALL(exit, eval);
 }
 
 FUNCTION_DEFINE_NORET_VA3(errc, int, eval, int, code, const char *, fmt) {
-    verrc(eval, code, fmt, __ap);
+    VMCALL(verrc, eval, code, fmt, __ap);
 }
 
 // The BSD program name is per task, not the host process's ("tvm").
@@ -18468,7 +17738,7 @@ FUNCTION_DEFINE1(mode_t, umask, mode_t, mask) {
 
 FUNCTION_DEFINE0(pid_t, getppid) {
     if (main_task == current)
-        return CALL_FUNC(getppid);
+        return getppid();
 
     tvm_sig_enter();
     task_lock(current);
@@ -18480,7 +17750,7 @@ FUNCTION_DEFINE0(pid_t, getppid) {
 }
 
 FUNCTION_DEFINE1(pid_t, wait, int *, wstatus) {
-    return waitpid(-1, wstatus, 0);
+    return VMCALL(waitpid, -1, wstatus, 0);
 }
 
 static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
@@ -18559,7 +17829,7 @@ static pid_t tvm_wait4(pid_t pid, int *wstatus, int options, struct rusage *ru)
     if (list_empty(&zombiet->tsk_threads))
         panic("waitpid tsk_pthreads empty");
     struct thread *thr = list_entry(zombiet->tsk_threads.next, struct thread, thr_list);
-    CALL_FUNC(pthread_join, thr->thr_pthread, NULL);
+    pthread_join(thr->thr_pthread, NULL);
     if (thr->thr_stack)
         stack_release(thr->thr_stack);
 
@@ -18631,7 +17901,7 @@ FUNCTION_DEFINE1(pid_t, getsid, pid_t, pid) {
     struct task *t = task_lookup_pid(pid, 1);
     if (!t) {
         tvm_sig_leave();
-        return CALL_FUNC(getsid, pid);
+        return getsid(pid);
     }
     pid_t sid = t->tsk_sid;
     task_unlock(t);
@@ -18661,7 +17931,7 @@ FUNCTION_DEFINE2(int, setpgid, pid_t, pid, pid_t, pgid) {
     if (!t) {
         pthread_mutex_unlock(&tasks_lock);
         tvm_sig_leave();
-        return CALL_FUNC(setpgid, pid, pgid);
+        return setpgid(pid, pgid);
     }
 
     int ret = task_set_pgid(t, pgid);
@@ -18680,7 +17950,7 @@ FUNCTION_DEFINE1(pid_t, getpgid, pid_t, pid) {
     struct task *t = task_lookup_pid(pid, 1);
     if (!t) {
         tvm_sig_leave();
-        return CALL_FUNC(getpgid, pid);
+        return getpgid(pid);
     }
     
     pid_t pgid = t->tsk_pgid;
@@ -18690,11 +17960,11 @@ FUNCTION_DEFINE1(pid_t, getpgid, pid_t, pid) {
 }
 
 FUNCTION_DEFINE0(pid_t, getpgrp) {
-    return getpgid(0);
+    return VMCALL(getpgid, 0);
 }
 
 FUNCTION_DEFINE0(int, setpgrp) {
-    return setpgid(0, 0);
+    return VMCALL(setpgid, 0, 0);
 }
 
 #if defined(__linux__)
@@ -18707,7 +17977,7 @@ FUNCTION_DEFINE2(sig_t, signal, int, signum, sig_t, handler) {
         .sa_flags = SA_RESTART,
     };
 
-    if (-1 == sigaction(signum, &act, &oldact)) {
+    if (-1 == VMCALL(sigaction, signum, &act, &oldact)) {
         return SIG_ERR;
     }
 
@@ -18743,7 +18013,7 @@ FUNCTION_DEFINE1(int, raise, int, sig) {
         return 0;
     }
 
-    int r = CALL_FUNC(pthread_kill, pthread_self(), sig);
+    int r = pthread_kill(pthread_self(), sig);
     if (r != 0) {
         errno = r;
         r = -1;
@@ -18820,7 +18090,7 @@ FUNCTION_DEFINE2(int, kill, pid_t, pid, int, sig) {
     
     // must save self for last because if we die from the signal, we miss some of the target recipients
     if (self) {
-        if (0 == raise(sig))
+        if (0 == VMCALL(raise, sig))
             kills_confirmed++;
     }
 
@@ -18837,7 +18107,7 @@ FUNCTION_DEFINE2(int, killpg, pid_t, pgrp, int, sig) {
         errno = EINVAL;
         return -1;
     }
-    return kill(pgrp ? -pgrp : 0, sig);
+    return VMCALL(kill, pgrp ? -pgrp : 0, sig);
 }
 
 static int tvm_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
@@ -18920,10 +18190,10 @@ FUNCTION_DEFINE1(int, sigsuspend, const sigset_t *, mask) {
         sigset_t all, os_old, empty;
         sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        pthread_sigmask(SIG_BLOCK, &all, &os_old);
         if (!tvm_sig_interrupted)
-            CALL_FUNC(sigsuspend, &empty);
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+            sigsuspend(&empty);
+        pthread_sigmask(SIG_SETMASK, &os_old, NULL);
         // Drain again — the handler may have deferred a now-unblocked signal
         tvm_sig_drain();
     }
@@ -18942,10 +18212,10 @@ FUNCTION_DEFINE0(int, pause) {
         sigset_t all, os_old, empty;
         sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        pthread_sigmask(SIG_BLOCK, &all, &os_old);
         if (!tvm_sig_interrupted)
-            CALL_FUNC(sigsuspend, &empty);
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+            sigsuspend(&empty);
+        pthread_sigmask(SIG_SETMASK, &os_old, NULL);
         tvm_sig_drain();
     }
 
@@ -18990,10 +18260,10 @@ FUNCTION_DEFINE2(int, sigwait, const sigset_t *, set, int *, sig) {
         sigset_t all, os_old, empty;
         sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        pthread_sigmask(SIG_BLOCK, &all, &os_old);
         if (!(s = tvm_consume_pending(set, NULL)))
-            CALL_FUNC(sigsuspend, &empty);
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+            sigsuspend(&empty);
+        pthread_sigmask(SIG_SETMASK, &os_old, NULL);
         if (s)
             break;
     }
@@ -19009,10 +18279,10 @@ FUNCTION_DEFINE2(int, sigwaitinfo, const sigset_t *, set, siginfo_t *, info) {
         sigset_t all, os_old, empty;
         sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        pthread_sigmask(SIG_BLOCK, &all, &os_old);
         if (!(s = tvm_consume_pending(set, &local_info)))
-            CALL_FUNC(sigsuspend, &empty);
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+            sigsuspend(&empty);
+        pthread_sigmask(SIG_SETMASK, &os_old, NULL);
         if (s)
             break;
     }
@@ -19076,10 +18346,10 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
         sigset_t all, os_old, empty;
         sigfillset(&all);
         sigemptyset(&empty);
-        CALL_FUNC(pthread_sigmask, SIG_BLOCK, &all, &os_old);
+        pthread_sigmask(SIG_BLOCK, &all, &os_old);
         if (!(s = tvm_consume_pending(set, &local_info)))
-            pselect(0, NULL, NULL, NULL, &remaining, &empty);
-        CALL_FUNC(pthread_sigmask, SIG_SETMASK, &os_old, NULL);
+            VMCALL(pselect, 0, NULL, NULL, NULL, &remaining, &empty);
+        pthread_sigmask(SIG_SETMASK, &os_old, NULL);
         if (s)
             break;
     }
@@ -19091,9 +18361,9 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
     // Before any task exists (e.g. early in tvm_start) there is no per-task env;
     // fall back to the real libc getenv (process environ) instead of a NULL
-    // deref. This lets callers use bare getenv() uniformly.
+    // deref, so TVM's code can call VMCALL(getenv) at any point.
     if (!current)
-        return CALL_FUNC(getenv, name);
+        return getenv(name);
 
     char **env = NULL;
     if (*current->tsk_relocs.__environ)
@@ -19145,7 +18415,7 @@ FUNCTION_DEFINE1(int, putenv, char *, string) {
 FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, overwrite) {
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
-    char *string = malloc(name_len + value_len + 2);
+    char *string = VMCALL(malloc, name_len + value_len + 2);
     if (!string) {
         errno = ENOMEM;
         return -1;
@@ -19162,13 +18432,13 @@ FUNCTION_DEFINE3(int, setenv, const char *, name, const char *, value, int, over
         if (overwrite)
             *env = string;
         else
-            free(string);
+            VMCALL(free, string);
         return 0;
     }
 
     char **new_environ = addenv(*current->tsk_relocs.__environ, string);
     if (!new_environ) {
-        free(string);
+        VMCALL(free, string);
         errno = ENOMEM;
         return -1;
     }
@@ -19229,15 +18499,15 @@ static void usershell_cache_init(void)
     char **list = kalloc(cap * sizeof(char *));
     if (!list) return;
 
-    CALL_FUNC(setusershell);
+    setusershell();
     char *sh;
-    while ((sh = CALL_FUNC(getusershell)) != NULL)
+    while ((sh = getusershell()) != NULL)
         usershell_cache_add(&list, &n, &cap, sh);
-    CALL_FUNC(endusershell);
+    endusershell();
 
     // Runs after the init task and the initrc exist, so this reads the guest
     // environment (including a `setenv TVM_SHELL=...` from the rc file).
-    const char *tvm_shell = getenv("TVM_SHELL");
+    const char *tvm_shell = VMCALL(getenv, "TVM_SHELL");
     if (tvm_shell && *tvm_shell)
         usershell_cache_add(&list, &n, &cap, tvm_shell);
 
@@ -19258,7 +18528,7 @@ static char user_passwd_hash[32];
 // out of the environment: nothing started from here on sees it.
 static void user_passwd_init(void)
 {
-    const char *pw = getenv("TVM_PASSWORD");
+    const char *pw = VMCALL(getenv, "TVM_PASSWORD");
     if (!pw || !*pw)
         pw = "alpine";
 
@@ -19273,26 +18543,26 @@ static void user_passwd_init(void)
     if (!hash || strlen(hash) >= sizeof(user_passwd_hash))
         panic("tvm_start::crypt");
     strcpy(user_passwd_hash, hash);
-    unsetenv("TVM_PASSWORD");
+    VMCALL(unsetenv, "TVM_PASSWORD");
 }
 
 FUNCTION_DEFINE1(struct passwd *, getpwnam, const char *, name) {
     struct passwd *result = NULL;
     size_t bufsz = 256;
     for (;;) {
-        char *buf = malloc(bufsz);
+        char *buf = VMCALL(malloc, bufsz);
         if (!buf) return NULL;
         int rc = getpwnam_r(name, &current->tsk_data->pw_buf, buf, bufsz, &result);
-        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
-        free(current->tsk_data->pw_strings);
+        if (rc == ERANGE) { VMCALL(free, buf); bufsz *= 2; continue; }
+        VMCALL(free, current->tsk_data->pw_strings);
         current->tsk_data->pw_strings = buf;
         break;
     }
     if (!result) return NULL;
-    const char *home = getenv("HOME");
+    const char *home = VMCALL(getenv, "HOME");
     if (home && *home)
         current->tsk_data->pw_buf.pw_dir = (char *)home;
-    const char *tvm_shell = getenv("TVM_SHELL");
+    const char *tvm_shell = VMCALL(getenv, "TVM_SHELL");
     if (tvm_shell && *tvm_shell)
         current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
     if (user_passwd_hash[0])
@@ -19304,19 +18574,19 @@ FUNCTION_DEFINE1(struct passwd *, getpwuid, uid_t, uid) {
     struct passwd *result = NULL;
     size_t bufsz = 256;
     for (;;) {
-        char *buf = malloc(bufsz);
+        char *buf = VMCALL(malloc, bufsz);
         if (!buf) return NULL;
         int rc = getpwuid_r(uid, &current->tsk_data->pw_buf, buf, bufsz, &result);
-        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
-        free(current->tsk_data->pw_strings);
+        if (rc == ERANGE) { VMCALL(free, buf); bufsz *= 2; continue; }
+        VMCALL(free, current->tsk_data->pw_strings);
         current->tsk_data->pw_strings = buf;
         break;
     }
     if (!result) return NULL;
-    const char *home = getenv("HOME");
+    const char *home = VMCALL(getenv, "HOME");
     if (home && *home)
         current->tsk_data->pw_buf.pw_dir = (char *)home;
-    const char *tvm_shell = getenv("TVM_SHELL");
+    const char *tvm_shell = VMCALL(getenv, "TVM_SHELL");
     if (tvm_shell && *tvm_shell)
         current->tsk_data->pw_buf.pw_shell = (char *)tvm_shell;
     if (user_passwd_hash[0])
@@ -19328,11 +18598,11 @@ FUNCTION_DEFINE1(struct group *, getgrnam, const char *, name) {
     struct group *result = NULL;
     size_t bufsz = 256;
     for (;;) {
-        char *buf = malloc(bufsz);
+        char *buf = VMCALL(malloc, bufsz);
         if (!buf) return NULL;
         int rc = getgrnam_r(name, &current->tsk_data->gr_buf, buf, bufsz, &result);
-        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
-        free(current->tsk_data->gr_strings);
+        if (rc == ERANGE) { VMCALL(free, buf); bufsz *= 2; continue; }
+        VMCALL(free, current->tsk_data->gr_strings);
         current->tsk_data->gr_strings = buf;
         break;
     }
@@ -19343,11 +18613,11 @@ FUNCTION_DEFINE1(struct group *, getgrgid, gid_t, gid) {
     struct group *result = NULL;
     size_t bufsz = 256;
     for (;;) {
-        char *buf = malloc(bufsz);
+        char *buf = VMCALL(malloc, bufsz);
         if (!buf) return NULL;
         int rc = getgrgid_r(gid, &current->tsk_data->gr_buf, buf, bufsz, &result);
-        if (rc == ERANGE) { free(buf); bufsz *= 2; continue; }
-        free(current->tsk_data->gr_strings);
+        if (rc == ERANGE) { VMCALL(free, buf); bufsz *= 2; continue; }
+        VMCALL(free, current->tsk_data->gr_strings);
         current->tsk_data->gr_strings = buf;
         break;
     }
@@ -19438,7 +18708,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     // Open the file and inspect magic bytes before entering the signal-critical section.
     // If it's a #! script, rewrite pathname/argv to point at the interpreter.
     char hdr[256];
-    int sfd = open(pathname, O_RDONLY);
+    int sfd = VMCALL(open, pathname, O_RDONLY);
     if (sfd < 0) {
         // Keep open()'s errno: EACCES (mode 000), ENOENT, ENOTDIR, ELOOP are
         // all valid execve errors and shells map them to different exit
@@ -19446,9 +18716,9 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
         INFO("  failed(open) errno=%d", errno);
         return -1;
     }
-    ssize_t n = read(sfd, hdr, sizeof(hdr) - 1);
+    ssize_t n = VMCALL(read, sfd, hdr, sizeof(hdr) - 1);
     int read_errno = errno;
-    close(sfd);
+    VMCALL(close, sfd);
 
     INFO("  open=%d read=%zd errno=%d magic=%02x%02x%02x%02x",
          sfd, n, read_errno,
@@ -19461,7 +18731,7 @@ FUNCTION_DEFINE3(int, execve, const char *, pathname, char * const *, argv, char
     // that for their "Permission denied" / 126 status. TVM's access() drops
     // X_OK on purpose, so check here.
     struct stat st;
-    if (0 == stat(pathname, &st)) {
+    if (0 == VMCALL(stat, pathname, &st)) {
         if (S_ISDIR(st.st_mode)) {
             INFO("  failed(EACCES): directory");
             errno = EACCES;
@@ -19661,9 +18931,6 @@ do_exec:
     frame[0] = NULL;
     frame[1] = NULL;
 
-    // reset stale call chain from the old executable
-    call = NULL;
-
     // TODO: kill all other threads
     if (current->tsk_threads_cnt != 1)
         panic("_exit tsk_threads_cnt");
@@ -19683,14 +18950,14 @@ do_exec:
     // close all file-descriptors marked as CLOEXEC
     int last_errno = errno;
     for (int i = 0; i < MAX_FILES; i++) {
-        int fd_flags = fcntl(i, F_GETFD);
+        int fd_flags = VMCALL(fcntl, i, F_GETFD);
         if (-1 == fd_flags) {
             VERIFY(errno == EBADF);
             continue;
         }
 
         if (fd_flags & FD_CLOEXEC)
-            VERIFY(0 == close(i));
+            VERIFY(0 == VMCALL(close, i));
     }
     errno = last_errno;
 
@@ -19710,7 +18977,7 @@ do_exec:
         struct sigaction *cur = current->tsk_sighandlers + i;
         if (!(cur->sa_flags & SA_SIGINFO) && cur->sa_handler == SIG_IGN)
             continue;
-        if (0 != sigaction(i, &act, NULL))
+        if (0 != VMCALL(sigaction, i, &act, NULL))
             panic("sigaction(%d)", i);
     }
 
@@ -19756,9 +19023,9 @@ do_exec:
                   (uint64_t)envp,
                 0, 0, 0);
     if (callerr)
-        printf("execve emulator_call failed!\n");
+        VMCALL(printf, "execve emulator_call failed!\n");
 
-    exit((int)ret);
+    VMCALL(exit, (int)ret);
 }
 
 FUNCTION_DEFINE_VA2(int, execl, const char *, pathname, const char *, arg/*, ... , (char *) NULL */) {
@@ -19775,7 +19042,7 @@ FUNCTION_DEFINE_VA2(int, execl, const char *, pathname, const char *, arg/*, ...
         return -1;
     }
 
-    char **argv = malloc(sizeof(char *) * (argc+1));
+    char **argv = VMCALL(malloc, sizeof(char *) * (argc+1));
     if (!argv) {
         errno = ENOMEM;
         return -1;
@@ -19786,8 +19053,8 @@ FUNCTION_DEFINE_VA2(int, execl, const char *, pathname, const char *, arg/*, ...
     for (char **a = (argv+1); a < (argv + argc); a++)
         *a = va_arg(__ap, char *);
 
-    int r = execv(pathname, argv);
-    free(argv);
+    int r = VMCALL(execv, pathname, argv);
+    VMCALL(free, argv);
     return r;
 }
 
@@ -19805,7 +19072,7 @@ FUNCTION_DEFINE_VA2(int, execlp, const char *, file, const char *, arg/*, ... , 
         return -1;
     }
 
-    char **argv = malloc(sizeof(char *) * (argc+1));
+    char **argv = VMCALL(malloc, sizeof(char *) * (argc+1));
     if (!argv) {
         errno = ENOMEM;
         return -1;
@@ -19815,8 +19082,8 @@ FUNCTION_DEFINE_VA2(int, execlp, const char *, file, const char *, arg/*, ... , 
     for (char **a = argv; a < (argv + argc); a++)
         *a = va_arg(__ap, char *);
 
-    int r = execvp(file, argv);
-    free(argv);
+    int r = VMCALL(execvp, file, argv);
+    VMCALL(free, argv);
     return r;
 }
 
@@ -19834,7 +19101,7 @@ FUNCTION_DEFINE_VA2(int, execle, const char *, pathname, const char *, arg/*, ..
         return -1;
     }
 
-    char **argv = malloc(sizeof(char *) * (argc+1));
+    char **argv = VMCALL(malloc, sizeof(char *) * (argc+1));
     if (!argv) {
         errno = ENOMEM;
         return -1;
@@ -19845,13 +19112,13 @@ FUNCTION_DEFINE_VA2(int, execle, const char *, pathname, const char *, arg/*, ..
         *a = va_arg(__ap, char *);
     char **envp = va_arg(__ap, char **);
 
-    int r = execve(pathname, argv, envp);
-    free(argv);
+    int r = VMCALL(execve, pathname, argv, envp);
+    VMCALL(free, argv);
     return r;
 }
 
 FUNCTION_DEFINE2(int, execv, const char *, pathname, char * const *, argv) {
-    return execve(pathname, argv, *current->tsk_relocs.__environ);
+    return VMCALL(execve, pathname, argv, *current->tsk_relocs.__environ);
 }
 
 /**
@@ -19866,7 +19133,7 @@ static int tvm_path_search(const char *file, char *out)
         snprintf(out, PATH_MAX, "%s", pathname);
         return 0;
     }
-    const char *path = getenv("PATH");
+    const char *path = VMCALL(getenv, "PATH");
     if (!path) path = "/usr/local/bin:/bin:/usr/bin";
     int eacces = 0;
     while (*path) {
@@ -19885,7 +19152,7 @@ static int tvm_path_search(const char *file, char *out)
             if (find_program(out))
                 return 0;
             struct stat st;
-            if (0 == stat(out, &st)) {
+            if (0 == VMCALL(stat, out, &st)) {
                 if (S_ISREG(st.st_mode) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
                     return 0;
                 eacces = 1;
@@ -19913,9 +19180,9 @@ static int tvm_execvpe(const char *file, char * const *argv,
         return -1;
     }
     file = file_abs;
-    int rc = execve(file, argv, envp);
+    int rc = VMCALL(execve, file, argv, envp);
     if (errno == ENOEXEC) {
-        const char *sh = getenv("TVM_SHELL");
+        const char *sh = VMCALL(getenv, "TVM_SHELL");
         if (!sh || !*sh) sh = "/bin/sh";
         int argc = 0;
         while (argv[argc]) argc++;
@@ -19925,7 +19192,7 @@ static int tvm_execvpe(const char *file, char * const *argv,
         nargv[1] = (char *)file;
         for (int i = 1; i <= argc; i++)
             nargv[i + 1] = argv[i];
-        rc = execve(sh, nargv, envp);
+        rc = VMCALL(execve, sh, nargv, envp);
         kfree(nargv);
     }
     return rc;
@@ -19940,49 +19207,49 @@ FUNCTION_DEFINE1(int, system, const char *, command) {
     if (!command)
         return 1; // shell is available
 
-    const char *sh = getenv("TVM_SHELL");
+    const char *sh = VMCALL(getenv, "TVM_SHELL");
     if (!sh || !*sh)
         sh = "/bin/sh";
 
     // POSIX: ignore SIGINT/SIGQUIT, block SIGCHLD during system()
     struct sigaction ign = { .sa_handler = SIG_IGN };
     struct sigaction old_int, old_quit;
-    sigaction(SIGINT, &ign, &old_int);
-    sigaction(SIGQUIT, &ign, &old_quit);
+    VMCALL(sigaction, SIGINT, &ign, &old_int);
+    VMCALL(sigaction, SIGQUIT, &ign, &old_quit);
 
     sigset_t chld, old_mask;
     sigemptyset(&chld);
     sigaddset(&chld, SIGCHLD);
-    sigprocmask(SIG_BLOCK, &chld, &old_mask);
+    VMCALL(sigprocmask, SIG_BLOCK, &chld, &old_mask);
 
-    pid_t pid = fork();
+    pid_t pid = VMCALL(fork);
     if (pid == -1) {
-        sigaction(SIGINT, &old_int, NULL);
-        sigaction(SIGQUIT, &old_quit, NULL);
-        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        VMCALL(sigaction, SIGINT, &old_int, NULL);
+        VMCALL(sigaction, SIGQUIT, &old_quit, NULL);
+        VMCALL(sigprocmask, SIG_SETMASK, &old_mask, NULL);
         return -1;
     }
 
     if (pid == 0) {
-        sigaction(SIGINT, &old_int, NULL);
-        sigaction(SIGQUIT, &old_quit, NULL);
-        sigprocmask(SIG_SETMASK, &old_mask, NULL);
-        execl(sh, "sh", "-c", command, (char *)NULL);
-        _exit(127);
+        VMCALL(sigaction, SIGINT, &old_int, NULL);
+        VMCALL(sigaction, SIGQUIT, &old_quit, NULL);
+        VMCALL(sigprocmask, SIG_SETMASK, &old_mask, NULL);
+        VMCALL(execl, sh, "sh", "-c", command, (char *)NULL);
+        VMCALL(_exit, 127);
     }
 
     // parent: wait for child
     int status;
-    while (waitpid(pid, &status, 0) == -1) {
+    while (VMCALL(waitpid, pid, &status, 0) == -1) {
         if (errno != EINTR) {
             status = -1;
             break;
         }
     }
 
-    sigaction(SIGINT, &old_int, NULL);
-    sigaction(SIGQUIT, &old_quit, NULL);
-    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+    VMCALL(sigaction, SIGINT, &old_int, NULL);
+    VMCALL(sigaction, SIGQUIT, &old_quit, NULL);
+    VMCALL(sigprocmask, SIG_SETMASK, &old_mask, NULL);
 
     return status;
 }
@@ -20030,7 +19297,7 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
     if (!slave) {
         task_unlock(current);
         tty_unlock(tt, 1);
-        VERIFY(0 == close(fmaster));
+        VERIFY(0 == VMCALL(close, fmaster));
         tvm_sig_leave();
         return -1;
     }
@@ -20043,7 +19310,7 @@ FUNCTION_DEFINE5(int, openpty, int *, amaster, int *, aslave, char *, name, stru
         task_unlock(current);
         tty_unlock(tt, 1);
         file_unlock(slave, 1);
-        VERIFY(0 == close(fmaster));
+        VERIFY(0 == VMCALL(close, fmaster));
         tvm_sig_leave();
         return -1;
     }
@@ -20064,12 +19331,12 @@ FUNCTION_DEFINE1(int, isatty, int, fd) {
     if (islocaltty(fd))
         return 1;
     
-    return CURRENT_RFD(fd, CALL_FUNC(isatty, __rfd));
+    return CURRENT_RFD(fd, isatty(__rfd));
 }
 
 FUNCTION_DEFINE3(int, ttyname_r, int, fd, char *, buf, size_t, buflen) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(ttyname_r, __rfd, buf, buflen));
+        return CURRENT_RFD(fd, ttyname_r(__rfd, buf, buflen));
     
     tvm_sig_enter();
 
@@ -20098,9 +19365,9 @@ FUNCTION_DEFINE3(int, ttyname_r, int, fd, char *, buf, size_t, buflen) {
 
 FUNCTION_DEFINE1(char *, ttyname, int, fd) {
     if (!islocaltty(fd))
-        return (char *)CURRENT_RFD(fd, (long)CALL_FUNC(ttyname, __rfd));
+        return (char *)CURRENT_RFD(fd, (long)ttyname(__rfd));
 
-    int r = ttyname_r(fd, tty_name, sizeof(tty_name));
+    int r = VMCALL(ttyname_r, fd, tty_name, sizeof(tty_name));
     if (r) {
         errno = r;
         return NULL;
@@ -20111,7 +19378,7 @@ FUNCTION_DEFINE1(char *, ttyname, int, fd) {
 
 FUNCTION_DEFINE3(int, ptsname_r, int, fd, char *, buf, size_t, buflen) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(ptsname_r, __rfd, buf, buflen));
+        return CURRENT_RFD(fd, ptsname_r(__rfd, buf, buflen));
     
     tvm_sig_enter();
     struct tty *tt = tty_for_nfd(fd, NULL);
@@ -20132,9 +19399,9 @@ FUNCTION_DEFINE3(int, ptsname_r, int, fd, char *, buf, size_t, buflen) {
 
 FUNCTION_DEFINE1(char *, ptsname, int, fd) {
     if (!islocaltty(fd))
-        return (char *)CURRENT_RFD(fd, (long)CALL_FUNC(ptsname, __rfd));
+        return (char *)CURRENT_RFD(fd, (long)ptsname(__rfd));
 
-    int r = ptsname_r(fd, pts_name, sizeof(pts_name));
+    int r = VMCALL(ptsname_r, fd, pts_name, sizeof(pts_name));
     if (r) {
         errno = r;
         return NULL;
@@ -20147,7 +19414,7 @@ FUNCTION_DEFINE1(pid_t, tcgetpgrp, int, fd) {
     if (!islocaltty(fd)) {
         // For native (host) TTYs, TVM tasks are threads sharing one real PID
         // so real tcsetpgrp/tcgetpgrp cannot work.  Virtualise it.
-        return CURRENT_RFD(fd, CALL_FUNC(isatty, __rfd) ? (long)current->tsk_pgid : (long)CALL_FUNC(tcgetpgrp, __rfd));
+        return CURRENT_RFD(fd, isatty(__rfd) ? (long)current->tsk_pgid : (long)tcgetpgrp(__rfd));
     }
 
     pid_t ret;
@@ -20160,7 +19427,7 @@ FUNCTION_DEFINE2(int, tcsetpgrp, int, fd, pid_t, pgrp) {
     if (!islocaltty(fd)) {
         // For native (host) TTYs, TVM tasks are threads sharing one real PID
         // so real tcsetpgrp/tcgetpgrp cannot work.  Virtualise it: no-op success.
-        return CURRENT_RFD(fd, CALL_FUNC(isatty, __rfd) ? 0L : (long)CALL_FUNC(tcsetpgrp, __rfd, pgrp));
+        return CURRENT_RFD(fd, isatty(__rfd) ? 0L : (long)tcsetpgrp(__rfd, pgrp));
     }
 
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TIOCSPGRP, &pgrp));
@@ -20168,7 +19435,7 @@ FUNCTION_DEFINE2(int, tcsetpgrp, int, fd, pid_t, pgrp) {
 
 FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcgetattr, __rfd, termios_p));
+        return CURRENT_RFD(fd, tcgetattr(__rfd, termios_p));
 
 #if defined(__linux__)
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TCGETS, termios_p));
@@ -20179,7 +19446,7 @@ FUNCTION_DEFINE2(int, tcgetattr, int, fd, struct termios *, termios_p) {
 
 FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct termios *, termios_p) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcsetattr, __rfd, optional_actions, termios_p));
+        return CURRENT_RFD(fd, tcsetattr(__rfd, optional_actions, termios_p));
     
     int request;
     switch (optional_actions) {
@@ -20217,7 +19484,7 @@ FUNCTION_DEFINE3(int, tcsetattr, int, fd, int, optional_actions, const struct te
 
 FUNCTION_DEFINE2(int, tcsendbreak, int, fd, int, duration) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcsendbreak, __rfd, duration));
+        return CURRENT_RFD(fd, tcsendbreak(__rfd, duration));
     
 #if defined(__linux__)
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TCSBRK, (void *)(long)duration));
@@ -20237,10 +19504,10 @@ FUNCTION_DEFINE2(int, tcsendbreak, int, fd, int, duration) {
 
 FUNCTION_DEFINE1(int, tcdrain, int, fd) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcdrain, __rfd));
+        return CURRENT_RFD(fd, tcdrain(__rfd));
     
 #if defined(__linux__)
-    return tcsendbreak(fd, 1);
+    return VMCALL(tcsendbreak, fd, 1);
 #elif defined(__APPLE__)
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TIOCDRAIN, NULL));
 #endif
@@ -20248,7 +19515,7 @@ FUNCTION_DEFINE1(int, tcdrain, int, fd) {
 
 FUNCTION_DEFINE2(int, tcflush, int, fd, int, queue_selector) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcflush, __rfd, queue_selector));
+        return CURRENT_RFD(fd, tcflush(__rfd, queue_selector));
 
 #if defined(__linux__)
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TCFLSH, (void *)(long)queue_selector));
@@ -20264,7 +19531,7 @@ FUNCTION_DEFINE2(int, tcflush, int, fd, int, queue_selector) {
 
 FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
     if (!islocaltty(fd))
-        return CURRENT_RFD(fd, CALL_FUNC(tcflow, __rfd, action));
+        return CURRENT_RFD(fd, tcflow(__rfd, action));
 
 #if defined(__linux__)
     return CURRENT_FILE(fd, ttyop_ioctl(__file, TCXONC, (void *)(long)action));
@@ -20288,14 +19555,6 @@ FUNCTION_DEFINE2(int, tcflow, int, fd, int, action) {
 #endif
 }
 
-static void *tvm_calloc(size_t nmemb, size_t size);
-
-// Straight to the implementation: going through the interposed calloc
-// symbol ran the whole interposer wrapper (TLS lookups, can_enter_tvm, call
-// chain) a second time for every malloc.
-FUNCTION_DEFINE1(void *, malloc, size_t, size) {
-    return tvm_calloc(1, size);
-}
 
 // malloc(0) and calloc(0, n) return a unique, freeable pointer, as the host
 // libc does (Darwin and glibc alike). The arena used to return NULL, which a
@@ -20307,10 +19566,6 @@ FUNCTION_DEFINE1(void *, malloc, size_t, size) {
 // (plain "a" compiled, "^a" did not). The smallest arena object stands in
 // for the zero-sized one.
 FUNCTION_DEFINE2(void *, calloc, size_t, nmemb, size_t, size) {
-    return tvm_calloc(nmemb, size);
-}
-
-static void *tvm_calloc(size_t nmemb, size_t size) {
     size_t total = nmemb * size;
     if (nmemb && total / nmemb != size) {
         errno = ENOMEM;
@@ -20331,6 +19586,10 @@ static void *tvm_calloc(size_t nmemb, size_t size) {
     
     memset(p, 0, total);
     return p;
+}
+
+FUNCTION_DEFINE1(void *, malloc, size_t, size) {
+    return VMCALL(calloc, 1, size);
 }
 
 FUNCTION_DEFINE_VOID1(free, void *, ptr) {
@@ -20431,7 +19690,7 @@ FUNCTION_DEFINE2(void *, realloc, void *, ptr, size_t, size) {
 
 FUNCTION_DEFINE1(char *, strdup, const char *, s) {
     size_t len = strlen(s);
-    char *p = malloc(len + 1);
+    char *p = VMCALL(malloc, len + 1);
     if (!p)
         return NULL;
     memcpy(p, s, len);
@@ -20441,7 +19700,7 @@ FUNCTION_DEFINE1(char *, strdup, const char *, s) {
 
 FUNCTION_DEFINE2(char *, strndup, const char *, s, size_t, n) {
     size_t len = strnlen(s, n);
-    char *p = malloc(len + 1);
+    char *p = VMCALL(malloc, len + 1);
     if (!p)
         return NULL;
     memcpy(p, s, len);
@@ -20458,7 +19717,7 @@ FUNCTION_DEFINE2(char *, strndup, const char *, s, size_t, n) {
 // shell down with SIGABRT; in the C locale the byte path never calls it.
 FUNCTION_DEFINE1(wchar_t *, wcsdup, const wchar_t *, s) {
     size_t len = wcslen(s);
-    wchar_t *p = malloc((len + 1) * sizeof(wchar_t));
+    wchar_t *p = VMCALL(malloc, (len + 1) * sizeof(wchar_t));
     if (!p)
         return NULL;
     memcpy(p, s, (len + 1) * sizeof(wchar_t));
@@ -20466,7 +19725,7 @@ FUNCTION_DEFINE1(wchar_t *, wcsdup, const wchar_t *, s) {
 }
 
 FUNCTION_DEFINE_VA2(int, asprintf, char **, strp, const char *, format) {
-    return vasprintf(strp, format, __ap);
+    return VMCALL(vasprintf, strp, format, __ap);
 }
 
 FUNCTION_DEFINE3(int, vasprintf, char **, strp, const char *, format, va_list, ap) {
@@ -20478,13 +19737,13 @@ FUNCTION_DEFINE3(int, vasprintf, char **, strp, const char *, format, va_list, a
     if (n < 0)
         return -1;
 
-    void *s = malloc(n + 1);
+    void *s = VMCALL(malloc, n + 1);
     if (!s)
         return -1;
     
     int n2 = vsnprintf(s, n + 1, format, ap);
     if (n != n2) {
-        free(s);
+        VMCALL(free, s);
         return -1;
     }
 
@@ -20493,7 +19752,7 @@ FUNCTION_DEFINE3(int, vasprintf, char **, strp, const char *, format, va_list, a
 }
 
 FUNCTION_DEFINE3(ssize_t, getline, char **, lineptr, size_t *, n, FILE *, stream) {
-    return getdelim(lineptr, n, '\n', stream);
+    return VMCALL(getdelim, lineptr, n, '\n', stream);
 }
 
 FUNCTION_DEFINE4(ssize_t, getdelim, char **, lineptr, size_t *, n, int, delim, FILE *, stream) {
@@ -20512,13 +19771,13 @@ retry:
     // TODO f_ops
 
     file_unlock(file, 0);
-    ssize_t r = CALL_FUNC(getdelim, &tmp, &tmpn, delim, real_fp(stream));
+    ssize_t r = getdelim(&tmp, &tmpn, delim, real_fp(stream));
     int last_errno = errno;
     file_lock(file, 0);
     file_unlock(file, 1);
 
     if (r < 0) {
-        CALL_FUNC(free, tmp);
+        free(tmp);
         tmp = NULL;
         tmpn = 0;
         tvm_sig_leave();
@@ -20531,9 +19790,9 @@ retry:
     }
 
     if (!*lineptr || *n < (size_t)r + 1) {
-        char *newp = realloc(*lineptr, (size_t)r + 1);
+        char *newp = VMCALL(realloc, *lineptr, (size_t)r + 1);
         if (!newp) {
-            CALL_FUNC(free, tmp);
+            free(tmp);
             tvm_sig_leave();
             return -1;
         }
@@ -20542,7 +19801,7 @@ retry:
     }
 
     memcpy(*lineptr, tmp, (size_t)r + 1);
-    CALL_FUNC(free, tmp);
+    free(tmp);
     tvm_sig_leave();
 
     return r;
@@ -20566,7 +19825,7 @@ FUNCTION_DEFINE6(void *, mmap, void *, addr, size_t, length, int, prot, int, fla
     if (!file || !file->f_ops || !file->f_ops->f_mmap) {
         if (file)
             file_unlock(file, 0);
-        ret = CALL_FUNC(mmap, addr, length, prot, flags, (file ? file->f_rfd : -1), offset);
+        ret = mmap(addr, length, prot, flags, (file ? file->f_rfd : -1), offset);
 #ifdef TRACE_MMAP
         INFO("mmap %p-%p (mmap)", ret, (uintptr_t)ret + length);
 #endif
@@ -20590,10 +19849,10 @@ static void __getopt_msg(const char *a, const char *b, const char *c, size_t l)
 // #if !defined(WIN32) && !defined(_WIN32)
 // 	flockfile(f);
 // #endif
-	fputs(a, f);
-	fwrite(b, strlen(b), 1, f);
-	fwrite(c, 1, l, f);
-	fputc('\n', f);
+	VMCALL(fputs, a, f);
+	VMCALL(fwrite, b, strlen(b), 1, f);
+	VMCALL(fwrite, c, 1, l, f);
+	VMCALL(fputc, '\n', f);
 // #if !defined(WIN32) && !defined(_WIN32)
 // 	funlockfile(f);
 // #endif
@@ -20763,7 +20022,7 @@ static int __getopt_long_core(int argc, char *const *argv, const char *optstring
 			return '?';
 		}
 	}
-	return getopt(argc, argv, optstring);
+	return VMCALL(getopt, argc, argv, optstring);
 }
 
 static int __getopt_long(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx, int longonly)
@@ -20842,7 +20101,7 @@ FUNCTION_DEFINE2(char *, realpath, const char *, file_name, char *, resolved_nam
 
     // strlen + 1: the terminator (this used to allocate one byte short and
     // strcpy() wrote past the end of the guest's allocation)
-    char *ret = malloc(strlen(phys) + 1);
+    char *ret = VMCALL(malloc, strlen(phys) + 1);
     if (ret)
         strcpy(ret, phys);
     return ret;
@@ -20855,7 +20114,7 @@ FUNCTION_DEFINE1(int, chdir, const char *, path) {
     path = abs_path;
 
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (VMCALL(stat, path, &st) != 0) {
         return -1;
     }
 
@@ -20894,7 +20153,7 @@ FUNCTION_DEFINE1(int, fchdir, int, fildes) {
         return -1;
     }
 
-    return chdir(tmp);
+    return VMCALL(chdir, tmp);
 }
 
 // getcwd() returned the task's cwd string as chdir() had recorded it: the
@@ -20940,7 +20199,7 @@ FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
     }
 
     // getcwd(NULL, size) allocates (at least size bytes when size > 0)
-    char *ret = malloc(size > len ? size : len);
+    char *ret = VMCALL(malloc, size > len ? size : len);
     if (!ret)
         return NULL;
     memcpy(ret, path, len);
@@ -20948,21 +20207,21 @@ FUNCTION_DEFINE2(char *, getcwd, char *, buf, size_t, size) {
 }
 
 FUNCTION_DEFINE1(char *, getwd, char *, buf) {
-    return getcwd(buf, PATH_MAX);
+    return VMCALL(getcwd, buf, PATH_MAX);
 }
 
 static int bsearch_compar_emulator(const void *a, const void *b)
 {
     uint64_t ret;
     if (0 != emulator_call(&ret, (uint64_t)bsearch_compar, (uint64_t)a, (uint64_t)b, 0, 0, 0, 0))
-        err(1, "emulator_call(bsearch_compar)");
+        VMCALL(err, 1, "emulator_call(bsearch_compar)");
 
     return (int)ret;
 }
 
 FUNCTION_DEFINE5(void *, bsearch, const void *, key, const void *, base, size_t, nel, size_t, width, compar_t, compar) {
     bsearch_compar = compar;
-    void *ret = CALL_FUNC(bsearch, key, base, nel, width, bsearch_compar_emulator);
+    void *ret = (void *)bsearch(key, base, nel, width, bsearch_compar_emulator);
     bsearch_compar = NULL;
     return ret;
 }
@@ -20971,14 +20230,14 @@ static int qsort_compar_emulator(const void *a, const void *b)
 {
     uint64_t ret;
     if (0 != emulator_call(&ret, (uint64_t)qsort_compar, (uint64_t)a, (uint64_t)b, 0, 0, 0, 0))
-        err(1, "emulator_call(qsort_compar)");
+        VMCALL(err, 1, "emulator_call(qsort_compar)");
 
     return (int)ret;
 }
 
 FUNCTION_DEFINE_VOID4(qsort, void *, base, size_t, nel, size_t, width, compar_t, compar) {
     qsort_compar = compar;
-    CALL_FUNC(qsort, base, nel, width, qsort_compar_emulator);
+    qsort(base, nel, width, qsort_compar_emulator);
     qsort_compar = NULL;
 }
 
@@ -20988,7 +20247,7 @@ static void *vtimer_thread_entry(void *_arg)
     uint64_t pc = (uint64_t)(uintptr_t)a->func;
     uint64_t sigval_bits = 0;
     memcpy(&sigval_bits, &a->val, sizeof(a->val));
-    free(a); // current is set → intercepted free → tsk_ar
+    VMCALL(free, a); // the task's arena, as it was allocated
     emulator_call(NULL, pc, sigval_bits, 0, 0, 0, 0, 0);
     return NULL;
 }
@@ -21258,7 +20517,7 @@ FUNCTION_DEFINE3(int, setitimer, ITIMER_WHICH_T, which, const struct itimerval *
         }
         timer_t tid;
         struct sigevent sev = { .sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGALRM };
-        if (timer_create(CLOCK_MONOTONIC, &sev, &tid) != 0)
+        if (VMCALL(timer_create, CLOCK_MONOTONIC, &sev, &tid) != 0)
             return -1;
         current->tsk_itimer_real = (int)(intptr_t)tid;
     }
@@ -21267,7 +20526,7 @@ FUNCTION_DEFINE3(int, setitimer, ITIMER_WHICH_T, which, const struct itimerval *
     itimerval_to_itimerspec(new_value, &new_its);
 
     timer_t tid = (timer_t)(intptr_t)current->tsk_itimer_real;
-    if (timer_settime(tid, 0, &new_its, old_value ? &old_its : NULL) != 0)
+    if (VMCALL(timer_settime, tid, 0, &new_its, old_value ? &old_its : NULL) != 0)
         return -1;
 
     if (old_value)
@@ -21289,7 +20548,7 @@ FUNCTION_DEFINE2(int, getitimer, ITIMER_WHICH_T, which, struct itimerval *, curr
 
     struct itimerspec its;
     timer_t tid = (timer_t)(intptr_t)current->tsk_itimer_real;
-    if (timer_gettime(tid, &its) != 0)
+    if (VMCALL(timer_gettime, tid, &its) != 0)
         return -1;
 
     itimerspec_to_itimerval(&its, curr_value);
@@ -21309,7 +20568,7 @@ static int tvm_mknod(const char *pathname_abs, mode_t mode, dev_t dev)
     tvm_sig_enter();
     int ret = vfs_create_path(pathname_abs, &m);
     if (0 == ret)
-        ret = CALL_FUNC(mknod, m.path, mode & ~current->tsk_umask, dev);
+        ret = mknod(m.path, mode & ~current->tsk_umask, dev);
     tvm_sig_leave();
     return ret;
 }
@@ -21342,13 +20601,13 @@ FUNCTION_DEFINE1(int, epoll_create, int, size) {
     int r, f;
     
     tvm_sig_enter();
-    if (-1 == (r = CALL_FUNC(epoll_create, size))) {
+    if (-1 == (r = epoll_create(size))) {
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f = task_new_fd(current, r))) {
-        CALL_FUNC(close, r);
+        close(r);
         errno = EMFILE;
     }
 
@@ -21361,13 +20620,13 @@ FUNCTION_DEFINE1(int, epoll_create1, int, flags) {
     int r, f;
     
     tvm_sig_enter();
-    if (-1 == (r = CALL_FUNC(epoll_create1, flags))) {
+    if (-1 == (r = epoll_create1(flags))) {
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f = task_new_fd(current, r))) {
-        CALL_FUNC(close, r);
+        close(r);
         errno = EMFILE;
     }
 
@@ -21381,13 +20640,13 @@ FUNCTION_DEFINE2(int, timerfd_create, int, clockid, int, flags) {
     
     tvm_sig_enter();
 
-    if (-1 == (r = CALL_FUNC(timerfd_create, clockid, flags))) {
+    if (-1 == (r = timerfd_create(clockid, flags))) {
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f = task_new_fd(current, r))) {
-        CALL_FUNC(close, r);
+        close(r);
         errno = EMFILE;
     }
 
@@ -21409,13 +20668,13 @@ FUNCTION_DEFINE2(int, eventfd, unsigned int, initval, int, flags) {
 
     tvm_sig_enter();
 
-    if (-1 == (r = CALL_FUNC(eventfd, initval, flags))) {
+    if (-1 == (r = eventfd(initval, flags))) {
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f = task_new_fd(current, r))) {
-        CALL_FUNC(close, r);
+        close(r);
         errno = EMFILE;
     }
 
@@ -21431,11 +20690,11 @@ FUNCTION_DEFINE2(int, eventfd, unsigned int, initval, int, flags) {
 // eventfd_write), so the semantics are unchanged and the task's descriptor
 // and TVM's EINTR handling come with read()/write().
 FUNCTION_DEFINE2(int, eventfd_read, int, fd, eventfd_t *, value) {
-    return read(fd, value, sizeof(*value)) == sizeof(*value) ? 0 : -1;
+    return VMCALL(read, fd, value, sizeof(*value)) == sizeof(*value) ? 0 : -1;
 }
 
 FUNCTION_DEFINE2(int, eventfd_write, int, fd, eventfd_t, value) {
-    return write(fd, &value, sizeof(value)) == sizeof(value) ? 0 : -1;
+    return VMCALL(write, fd, &value, sizeof(value)) == sizeof(value) ? 0 : -1;
 }
 
 /*
@@ -21446,33 +20705,33 @@ FUNCTION_DEFINE2(int, eventfd_write, int, fd, eventfd_t, value) {
  * stream in place of a glibc FILE (fseeko64/ftello64: curl).
  */
 FUNCTION_DEFINE6(void *, mmap64, void *, addr, size_t, length, int, prot, int, flags, int, fd, off64_t, offset) {
-    return mmap(addr, length, prot, flags, fd, offset);
+    return VMCALL(mmap, addr, length, prot, flags, fd, offset);
 }
 
 FUNCTION_DEFINE2(int, statfs64, const char *, pathname, struct statfs64 *, buf) {
-    return statfs(pathname, (struct statfs *)buf);
+    return VMCALL(statfs, pathname, (struct statfs *)buf);
 }
 
 FUNCTION_DEFINE1(int, mkstemp64, char *, template) {
-    return mkstemp(template);
+    return VMCALL(mkstemp, template);
 }
 
 FUNCTION_DEFINE3(int, fseeko64, FILE *, stream, off64_t, offset, int, whence) {
-    return fseeko(stream, offset, whence);
+    return VMCALL(fseeko, stream, offset, whence);
 }
 
 FUNCTION_DEFINE1(off64_t, ftello64, FILE *, stream) {
-    return ftello(stream);
+    return VMCALL(ftello, stream);
 }
 
 FUNCTION_DEFINE3(int, posix_fallocate, int, fd, off_t, offset, off_t, len) {
     // returns the error number; an unknown descriptor reaches the host as
     // -1 (WITH_RFD), which answers EBADF
-    return CURRENT_RFD(fd, CALL_FUNC(posix_fallocate, __rfd, offset, len));
+    return CURRENT_RFD(fd, posix_fallocate(__rfd, offset, len));
 }
 
 FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len) {
-    return posix_fallocate(fd, offset, len);
+    return VMCALL(posix_fallocate, fd, offset, len);
 }
 
 /*
@@ -21493,10 +20752,8 @@ FUNCTION_DEFINE3(int, posix_fallocate64, int, fd, off64_t, offset, off64_t, len)
  *   functions at compile time by third_party/include-shim/
  *   tvm_stdio_unlocked.h, on every platform.)
  * - C99/C23 scanf: glibc's headers redirect fscanf to __isoc99_fscanf, or
- *   __isoc23_fscanf from 2.38 (git, toybox). This file's own
- *   fscanf/scanf/vfscanf are emitted under one of those names too, so a
- *   guest import only found them by symbol through dlsym, which works where
- *   TVM is the executable; register both spellings by name.
+ *   __isoc23_fscanf from 2.38 (git, toybox): both spellings are bound to
+ *   TVM's scanf family.
  * - Descriptors created outside the task table (accept4, memfd_create,
  *   inotify_init) and calls on task descriptors (fpathconf, ...).
  */
@@ -21504,80 +20761,80 @@ static void tvm_chk_fail(void)
 {
     // what glibc's __chk_fail does: a buffer overflow was caught
     static const char msg[] = "*** buffer overflow detected ***: terminated\n";
-    write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    abort();
+    VMCALL(write, STDERR_FILENO, msg, sizeof(msg) - 1);
+    VMCALL(abort);
 }
 
 FUNCTION_DEFINE_VA2(int, __printf_chk, int, flag, const char *, format) {
-    return vfprintf(stdout, format, __ap);
+    return VMCALL(vfprintf, stdout, format, __ap);
 }
 
 FUNCTION_DEFINE_VA3(int, __fprintf_chk, FILE *, stream, int, flag, const char *, format) {
-    return vfprintf(stream, format, __ap);
+    return VMCALL(vfprintf, stream, format, __ap);
 }
 
 FUNCTION_DEFINE3(int, __vprintf_chk, int, flag, const char *, format, va_list, ap) {
-    return vfprintf(stdout, format, ap);
+    return VMCALL(vfprintf, stdout, format, ap);
 }
 
 FUNCTION_DEFINE4(int, __vfprintf_chk, FILE *, stream, int, flag, const char *, format, va_list, ap) {
-    return vfprintf(stream, format, ap);
+    return VMCALL(vfprintf, stream, format, ap);
 }
 
 FUNCTION_DEFINE_VA3(int, __dprintf_chk, int, fd, int, flag, const char *, format) {
-    return vdprintf(fd, format, __ap);
+    return VMCALL(vdprintf, fd, format, __ap);
 }
 
 FUNCTION_DEFINE4(int, __vdprintf_chk, int, fd, int, flag, const char *, format, va_list, ap) {
-    return vdprintf(fd, format, ap);
+    return VMCALL(vdprintf, fd, format, ap);
 }
 
 FUNCTION_DEFINE5(size_t, __fread_chk, void *, ptr, size_t, ptrlen, size_t, size, size_t, n, FILE *, stream) {
     if (size && n > ptrlen / size)
         tvm_chk_fail();
-    return fread(ptr, size, n, stream);
+    return VMCALL(fread, ptr, size, n, stream);
 }
 
 FUNCTION_DEFINE5(size_t, __fread_unlocked_chk, void *, ptr, size_t, ptrlen, size_t, size, size_t, n, FILE *, stream) {
     if (size && n > ptrlen / size)
         tvm_chk_fail();
-    return fread(ptr, size, n, stream);
+    return VMCALL(fread, ptr, size, n, stream);
 }
 
 FUNCTION_DEFINE4(char *, __fgets_chk, char *, s, size_t, slen, int, n, FILE *, stream) {
     if (n > 0 && (size_t)n > slen)
         tvm_chk_fail();
-    return fgets(s, n, stream);
+    return VMCALL(fgets, s, n, stream);
 }
 
 FUNCTION_DEFINE4(char *, __fgets_unlocked_chk, char *, s, size_t, slen, int, n, FILE *, stream) {
     if (n > 0 && (size_t)n > slen)
         tvm_chk_fail();
-    return fgets(s, n, stream);
+    return VMCALL(fgets, s, n, stream);
 }
 
 FUNCTION_DEFINE4(size_t, fread_unlocked, void *, ptr, size_t, size, size_t, n, FILE *, stream) {
-    return fread(ptr, size, n, stream);
+    return VMCALL(fread, ptr, size, n, stream);
 }
 
 FUNCTION_DEFINE4(size_t, fwrite_unlocked, const void *, ptr, size_t, size, size_t, n, FILE *, stream) {
-    return fwrite(ptr, size, n, stream);
+    return VMCALL(fwrite, ptr, size, n, stream);
 }
 
 FUNCTION_DEFINE3(char *, fgets_unlocked, char *, s, int, n, FILE *, stream) {
-    return fgets(s, n, stream);
+    return VMCALL(fgets, s, n, stream);
 }
 
 FUNCTION_DEFINE2(int, fputs_unlocked, const char *, str, FILE *, stream) {
-    return fputs(str, stream);
+    return VMCALL(fputs, str, stream);
 }
 
 FUNCTION_DEFINE2(int, fputc_unlocked, int, c, FILE *, stream) {
-    return fputc(c, stream);
+    return VMCALL(fputc, c, stream);
 }
 
 FUNCTION_DEFINE1(int, fflush_unlocked, FILE *, stream) {
-    return fflush(stream);
+    return VMCALL(fflush, stream);
 }
 
 FUNCTION_DEFINE_VOID1(__fpurge, FILE *, stream) {
@@ -21588,53 +20845,55 @@ FUNCTION_DEFINE_VOID1(__fpurge, FILE *, stream) {
         return;
     }
     file_unlock(file, 0);
-    CALL_FUNC(__fpurge, real_fp(stream));
+    __fpurge(real_fp(stream));
     file_lock(file, 0);
     file_unlock(file, 1);
     tvm_sig_leave();
 }
 
-FUNCTION_METADATA(__isoc99_fscanf, &fscanf);
-FUNCTION_METADATA(__isoc99_scanf, &scanf);
-FUNCTION_METADATA(__isoc99_vfscanf, &vfscanf);
-FUNCTION_METADATA(__isoc23_fscanf, &fscanf);
-FUNCTION_METADATA(__isoc23_scanf, &scanf);
-FUNCTION_METADATA(__isoc23_vfscanf, &vfscanf);
+FUNCTION_METADATA(__isoc99_fscanf, &__tvm_fscanf);
+FUNCTION_METADATA(__isoc99_scanf, &__tvm_scanf);
+FUNCTION_METADATA(__isoc99_vfscanf, &__tvm_vfscanf);
+FUNCTION_METADATA(__isoc99_vscanf, &__tvm_vscanf);
+FUNCTION_METADATA(__isoc23_fscanf, &__tvm_fscanf);
+FUNCTION_METADATA(__isoc23_scanf, &__tvm_scanf);
+FUNCTION_METADATA(__isoc23_vfscanf, &__tvm_vfscanf);
+FUNCTION_METADATA(__isoc23_vscanf, &__tvm_vscanf);
 
 // _FORTIFY_SOURCE's open(): __open_2 checks that O_CREAT/O_TMPFILE came
 // with a mode, i.e. went to the variadic open instead.
 FUNCTION_DEFINE2(int, __open_2, const char *, pathname, int, flags) {
-    return open(pathname, flags);
+    return VMCALL(open, pathname, flags);
 }
 
 FUNCTION_DEFINE2(int, __open64_2, const char *, pathname, int, flags) {
-    return open(pathname, flags);
+    return VMCALL(open, pathname, flags);
 }
 
 FUNCTION_DEFINE4(int, accept4, int, sockfd, struct sockaddr *, addr, socklen_t *, addrlen, int, flags) {
     tvm_sig_enter();
-    int f = tvm_task_adopt_fd(CURRENT_RFD(sockfd, CALL_FUNC(accept4, __rfd, addr, addrlen, flags)));
+    int f = tvm_task_adopt_fd(CURRENT_RFD(sockfd, accept4(__rfd, addr, addrlen, flags)));
     tvm_sig_leave();
     return f;
 }
 
 FUNCTION_DEFINE2(int, memfd_create, const char *, name, unsigned int, flags) {
     tvm_sig_enter();
-    int f = tvm_task_adopt_fd(CALL_FUNC(memfd_create, name, flags));
+    int f = tvm_task_adopt_fd(memfd_create(name, flags));
     tvm_sig_leave();
     return f;
 }
 
 FUNCTION_DEFINE0(int, inotify_init) {
     tvm_sig_enter();
-    int f = tvm_task_adopt_fd(CALL_FUNC(inotify_init));
+    int f = tvm_task_adopt_fd(inotify_init());
     tvm_sig_leave();
     return f;
 }
 
 FUNCTION_DEFINE1(int, inotify_init1, int, flags) {
     tvm_sig_enter();
-    int f = tvm_task_adopt_fd(CALL_FUNC(inotify_init1, flags));
+    int f = tvm_task_adopt_fd(inotify_init1(flags));
     tvm_sig_leave();
     return f;
 }
@@ -21643,33 +20902,33 @@ FUNCTION_DEFINE3(int, inotify_add_watch, int, fd, const char *, pathname, uint32
     char pathname_abs[PATH_MAX];
     if (!normalize_path(NULL, pathname, pathname_abs))
         return -1;
-    return CURRENT_RFD(fd, CALL_FUNC(inotify_add_watch, __rfd, pathname_abs, mask));
+    return CURRENT_RFD(fd, inotify_add_watch(__rfd, pathname_abs, mask));
 }
 
 FUNCTION_DEFINE2(int, inotify_rm_watch, int, fd, int, wd) {
-    return CURRENT_RFD(fd, CALL_FUNC(inotify_rm_watch, __rfd, wd));
+    return CURRENT_RFD(fd, inotify_rm_watch(__rfd, wd));
 }
 
 FUNCTION_DEFINE5(int, recvmmsg, int, fd, struct mmsghdr *, msgvec, unsigned int, vlen, int, flags, struct timespec *, timeout) {
-    return CURRENT_RFD(fd, CALL_FUNC(recvmmsg, __rfd, msgvec, vlen, flags, timeout));
+    return CURRENT_RFD(fd, recvmmsg(__rfd, msgvec, vlen, flags, timeout));
 }
 
 FUNCTION_DEFINE4(int, sendmmsg, int, fd, struct mmsghdr *, msgvec, unsigned int, vlen, int, flags) {
-    return CURRENT_RFD(fd, CALL_FUNC(sendmmsg, __rfd, msgvec, vlen, flags));
+    return CURRENT_RFD(fd, sendmmsg(__rfd, msgvec, vlen, flags));
 }
 
 FUNCTION_DEFINE4(int, sync_file_range, int, fd, off64_t, offset, off64_t, nbytes, unsigned int, flags) {
-    return CURRENT_RFD(fd, CALL_FUNC(sync_file_range, __rfd, offset, nbytes, flags));
+    return CURRENT_RFD(fd, sync_file_range(__rfd, offset, nbytes, flags));
 }
 
 FUNCTION_DEFINE2(long, fpathconf, int, fd, int, name) {
-    return CURRENT_RFD(fd, CALL_FUNC(fpathconf, __rfd, name));
+    return CURRENT_RFD(fd, fpathconf(__rfd, name));
 }
 
 // utimensat's, the timevals as timespecs (what glibc's futimesat is)
 FUNCTION_DEFINE3(int, futimesat, int, dirfd, const char *, pathname, const struct timeval *, times) {
     if (!pathname)
-        return CURRENT_RFD(dirfd, CALL_FUNC(futimesat, __rfd, NULL, times));
+        return CURRENT_RFD(dirfd, futimesat(__rfd, NULL, times));
     struct timespec ts[2];
     return tvm_utimensat(dirfd, pathname, timeval_to_timespec(times, ts), 0);
 }
@@ -21679,11 +20938,11 @@ FUNCTION_DEFINE4(ssize_t, lgetxattr, const char *, pathname, const char *, name,
 }
 
 FUNCTION_DEFINE2(int, statvfs64, const char *, pathname, struct statvfs64 *, buf) {
-    return statvfs(pathname, (struct statvfs *)buf);
+    return VMCALL(statvfs, pathname, (struct statvfs *)buf);
 }
 
 FUNCTION_DEFINE2(int, fstatvfs64, int, fd, struct statvfs64 *, buf) {
-    return CURRENT_RFD(fd, CALL_FUNC(fstatvfs64, __rfd, buf));
+    return CURRENT_RFD(fd, fstatvfs64(__rfd, buf));
 }
 
 FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
@@ -21691,21 +20950,21 @@ FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
 
     tvm_sig_enter();
 
-    if (0 != CALL_FUNC(pipe2, r, flags)) {
+    if (0 != pipe2(r, flags)) {
         tvm_sig_leave();
         return -1;
     }
     
     if (-1 == (f[0] = task_new_fd(current, r[0]))) {
-        VERIFY(0 == CALL_FUNC(close, r[0]));
-        VERIFY(0 == CALL_FUNC(close, r[1]));
+        VERIFY(0 == close(r[0]));
+        VERIFY(0 == close(r[1]));
         tvm_sig_leave();
         return -1;
     }
 
     if (-1 == (f[1] = task_new_fd(current, r[1]))) {
-        VERIFY(0 == close(f[0]));
-        VERIFY(0 == CALL_FUNC(close, r[1]));
+        VERIFY(0 == VMCALL(close, f[0]));
+        VERIFY(0 == close(r[1]));
         tvm_sig_leave();
         return -1;
     }
@@ -21717,23 +20976,17 @@ FUNCTION_DEFINE2(int, pipe2, int *, pipefd, int, flags) {
 }
 
 FUNCTION_DEFINE2(int, fstatfs64, int, fd, struct statfs64 *, buf) {
-    return CURRENT_RFD(fd, CALL_FUNC(fstatfs64, __rfd, buf));
+    return CURRENT_RFD(fd, fstatfs64(__rfd, buf));
 }
 
 FUNCTION_DEFINE_VA2(int, open64, const char *, pathname, int, flags) {
     mode_t mode = va_arg(__ap, int);
-    if (!can_enter_tvm(NULL))
-        return CALL_FUNC(open64, pathname, flags, mode);
-
-    return open(pathname, flags, mode);
+    return VMCALL(open, pathname, flags, mode);
 }
 
 FUNCTION_DEFINE_VA3(int, openat64, int, dirfd, const char *, pathname, int, flags) {
     mode_t mode = va_arg(__ap, int);
-    if (!can_enter_tvm(NULL))
-        return CALL_FUNC(openat64, dirfd, pathname, flags, mode);
-
-    return openat(dirfd, pathname, flags | O_LARGEFILE, mode);
+    return VMCALL(openat, dirfd, pathname, flags | O_LARGEFILE, mode);
 }
 
 FUNCTION_DEFINE4(int, fstatat64, int, dirfd, const char *, pathname, struct stat64 *, statbuf, int, flags) {
@@ -21749,42 +21002,42 @@ FUNCTION_DEFINE4(int, fstatat64, int, dirfd, const char *, pathname, struct stat
 }
 
 FUNCTION_DEFINE3(off_t, lseek64, int, fd, off64_t, offset, int, whence) {
-    return CURRENT_RFD(fd, CALL_FUNC(lseek64, __rfd, offset, whence));
+    return CURRENT_RFD(fd, lseek64(__rfd, offset, whence));
 }
 
 FUNCTION_DEFINE2(int, ftruncate64, int, fd, off64_t, length) {
-    return CURRENT_RFD(fd, CALL_FUNC(ftruncate64, __rfd, length));
+    return CURRENT_RFD(fd, ftruncate64(__rfd, length));
 }
 
 FUNCTION_DEFINE1(struct dirent64 *, readdir64, DIR *, dir) {
-    return (struct dirent64 *)readdir(dir);
+    return (struct dirent64 *)VMCALL(readdir, dir);
 }
 
 FUNCTION_DEFINE2(FILE *, fopen64, const char *, pathname, const char *, mode) {
-    return fopen(pathname, mode);
+    return VMCALL(fopen, pathname, mode);
 }
 
 FUNCTION_DEFINE3(FILE *, freopen64, const char *, pathname, const char *, mode, FILE *, stream) {
-    return freopen(pathname, mode, stream);
+    return VMCALL(freopen, pathname, mode, stream);
 }
 
 FUNCTION_DEFINE2(int, stat64, const char *, pathname, struct stat64 *, statbuf) {
-    return stat(pathname, (struct stat *)statbuf);
+    return VMCALL(stat, pathname, (struct stat *)statbuf);
 }
 
 FUNCTION_DEFINE2(int, lstat64, const char *, pathname, struct stat64 *, statbuf) {
-    return lstat(pathname, (struct stat *)statbuf);
+    return VMCALL(lstat, pathname, (struct stat *)statbuf);
 }
 
 FUNCTION_DEFINE2(int, fstat64, int, fd, struct stat64 *, statbuf) {
-    return fstat(fd, (struct stat *)statbuf);
+    return VMCALL(fstat, fd, (struct stat *)statbuf);
 }
 
 FUNCTION_DEFINE0(char *, get_current_dir_name) {
-    char *pwd = getenv("PWD");
+    char *pwd = VMCALL(getenv, "PWD");
     if (pwd)
-        return strdup(pwd);
-    return getcwd(NULL, 0);
+        return VMCALL(strdup, pwd);
+    return VMCALL(getcwd, NULL, 0);
 }
 
 #elif defined(__APPLE__)
@@ -21796,29 +21049,29 @@ FUNCTION_DEFINE0(char *, get_current_dir_name) {
 static void CFDictionaryApplyFunction_emulator(const void *key, const void *value, void *context)
 {
     if (0 != emulator_call(NULL, (uint64_t)CFDictionaryApplyFunction_function, (uint64_t)key, (uint64_t)value, (uint64_t)context, 0, 0, 0))
-        err(1, "emulator_call(CFDictionaryApplyFunction_function)");
+        VMCALL(err, 1, "emulator_call(CFDictionaryApplyFunction_function)");
 }
 
 FUNCTION_DEFINE_VOID3(CFDictionaryApplyFunction, CFDictionaryRef, theDict, CFDictionaryApplierFunction CF_NOESCAPE, applier, void *, context) {
     CFDictionaryApplyFunction_function = applier;
-    CALL_FUNC(CFDictionaryApplyFunction, theDict, CFDictionaryApplyFunction_emulator, context);
+    CFDictionaryApplyFunction(theDict, CFDictionaryApplyFunction_emulator, context);
     CFDictionaryApplyFunction_function = NULL;
 }
 
 FUNCTION_DEFINE2(int, fileport_makeport, int, fd, fileport_t *, port) {
-    return CURRENT_RFD(fd, CALL_FUNC(fileport_makeport, __rfd, port));
+    return CURRENT_RFD(fd, fileport_makeport(__rfd, port));
 }
 
 FUNCTION_DEFINE1(int, fileport_makefd, fileport_t, port) {
     tvm_sig_enter();
-    int rfd = CALL_FUNC(fileport_makefd, port);
+    int rfd = fileport_makefd(port);
     if (rfd < 0) {
         tvm_sig_leave();
         return -1;
     }
     int vfd = task_new_fd(current, rfd);
     if (vfd < 0) {
-        VERIFY(0 == CALL_FUNC(close, rfd));
+        VERIFY(0 == close(rfd));
         errno = EMFILE;
     }
     tvm_sig_leave();

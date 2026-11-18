@@ -31,6 +31,8 @@ migrate_working_dir/
 .pub/
 /build/
 pubspec.lock
+# Local package overrides (e.g. frt from a checkout next to this repo)
+pubspec_overrides.yaml
 
 # Web related
 lib/generated_plugin_registrant.dart
