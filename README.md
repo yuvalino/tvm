@@ -27,9 +27,9 @@ SSH into an iPhone and run unsigned code in a shell with bash, vim, toybox, and 
 ![tvm demo screenshot](rsc/tvm-demo.gif)
 
 <p align="center">
-  <img alt="vim in tvm" src="rsc/screenshot-vim.jpg" width="32%" />
-  <img alt="neofetch in tvm" src="rsc/screenshot-neofetch.jpg" width="32%" />
-  <img alt="the tvm log tab" src="rsc/screenshot-tvm.jpg" width="32%" />
+  <img alt="vim in tvm" src="rsc/frames/iphone-1-vim.png" width="32%" />
+  <img alt="neofetch in tvm" src="rsc/frames/iphone-2-neofetch.png" width="32%" />
+  <img alt="the tvm log tab" src="rsc/frames/iphone-3-tvm.png" width="32%" />
 </p>
 
 ## What's TVM?
