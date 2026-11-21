@@ -34,11 +34,7 @@ class _TvmTabState extends State<TvmTab> with AutomaticKeepAliveClientMixin {
               padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
               child: Row(
                 children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(11),
-                    child: Image.asset('assets/logo.png',
-                        width: 46, height: 46, filterQuality: FilterQuality.none),
-                  ),
+                  const _Logo(),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(
@@ -133,6 +129,46 @@ class _Prompt extends StatelessWidget {
         ],
       ),
       style: TextStyle(fontFamily: TvmColors.mono, fontSize: 20),
+    );
+  }
+}
+
+/// The logo in the shape of an iOS app icon (a continuous-corner rounded
+/// square). logo.png has its navy frame baked in as a square, which a rounded
+/// clip cuts thin at the corners; so the frame is drawn here in that shape
+/// instead, and the image is clipped to just its cyan inside it.
+class _Logo extends StatelessWidget {
+  const _Logo();
+
+  static const size = 46.0;
+  // logo.png is 256 px with a 16 px frame
+  static const frame = size * 16 / 256;
+  // an iOS app icon's corner radius, of its size
+  static const radius = size * 0.225;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: ShapeDecoration(
+        color: const Color(0xFF00007F), // logo.png's frame
+        shape: RoundedSuperellipseBorder(
+            borderRadius: BorderRadius.circular(radius)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(frame),
+        child: ClipRSuperellipse(
+          borderRadius: BorderRadius.circular(radius - frame),
+          child: SizedBox.square(
+            dimension: size - 2 * frame,
+            child: OverflowBox(
+              maxWidth: size,
+              maxHeight: size,
+              child: Image.asset('assets/logo.png',
+                  width: size, height: size, filterQuality: FilterQuality.none),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
