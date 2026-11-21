@@ -17,12 +17,20 @@ SSH into an iPhone and run unsigned code in a shell with bash, vim, toybox, and 
 [Website](https://tvm.yuvalino.com) ·
 [Research paper](https://yuvalino.com/rage-against-the-sandbox)
 
+<a href="https://apps.apple.com/app/id6807127809"><img alt="Download on the App Store" src="https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us" height="48" /></a>
+
 <a href="https://discord.gg/kjkXcdByQm"><img alt="Join the tvm Discord community" src="https://img.shields.io/badge/Discord-5865F2?logo=discord&amp;logoColor=white" /></a>
 <a href="https://x.com/jachashx"><img alt="Follow Yuval on X" src="https://img.shields.io/badge/X-000000?logo=x&amp;logoColor=white" /></a>
 
 </div>
 
 ![tvm demo screenshot](rsc/tvm-demo.gif)
+
+<p align="center">
+  <img alt="vim in tvm" src="rsc/screenshot-vim.jpg" width="32%" />
+  <img alt="neofetch in tvm" src="rsc/screenshot-neofetch.jpg" width="32%" />
+  <img alt="the tvm log tab" src="rsc/screenshot-tvm.jpg" width="32%" />
+</p>
 
 ## What's TVM?
 
@@ -40,11 +48,9 @@ Three steps to a shell on your iPhone.
 
 **1. Get the app**
 
-Download [`tvm.ipa`](https://github.com/yuvalino/tvm/releases/latest/download/tvm.ipa) from the [latest release](https://github.com/yuvalino/tvm/releases/latest). It is unsigned, so sign and install it with [Sideloadly](https://sideloadly.io) (macOS / Windows): plug in the iPhone, drag `tvm.ipa` into Sideloadly, enter your Apple ID and click *Start*.
+Install [tvm from the App Store](https://apps.apple.com/app/id6807127809) and open it.
 
-On the iPhone, enable *Settings → Privacy & Security → Developer Mode* (iOS 16+, restarts the phone), then trust your Apple ID under *Settings → General → VPN & Device Management*, and open tvm.
-
-With a free Apple ID the app expires after 7 days; sideload it again to renew. Or [build it from source](#building-from-source).
+Or sideload it: download [`tvm.ipa`](https://github.com/yuvalino/tvm/releases/latest/download/tvm.ipa) from the [latest release](https://github.com/yuvalino/tvm/releases/latest). It is unsigned, so sign and install it with [Sideloadly](https://sideloadly.io) (macOS / Windows): plug in the iPhone, drag `tvm.ipa` into Sideloadly, enter your Apple ID and click *Start*. On the iPhone, enable *Settings → Privacy & Security → Developer Mode* (iOS 16+, restarts the phone), then trust your Apple ID under *Settings → General → VPN & Device Management*, and open tvm. With a free Apple ID a sideloaded app expires after 7 days; sideload it again to renew. Or [build it from source](#building-from-source).
 
 **2. Connect**
 
