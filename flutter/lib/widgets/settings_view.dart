@@ -1,5 +1,6 @@
 import 'package:flutter/cupertino.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../services/worker_controller.dart';
 import '../theme/tvm_colors.dart';
@@ -92,6 +93,30 @@ class _SettingsViewState extends State<SettingsView> {
         const _Header('ABOUT'),
         _Group([_Row(id: 'version', title: 'Version', value: version)]),
         const SizedBox(height: 24),
+        const Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            _Link(
+              id: 'website',
+              url: 'https://tvm.yuvalino.com',
+              child: BrandIcon(BrandIcon.globe,
+                  color: TvmColors.fg, viewBox: '2 2 20 20'),
+            ),
+            SizedBox(width: 16),
+            _Link(
+              id: 'discord',
+              url: 'https://discord.gg/kjkXcdByQm',
+              child: BrandIcon(BrandIcon.discord, color: TvmColors.fg),
+            ),
+            SizedBox(width: 16),
+            _Link(
+              id: 'github',
+              url: 'https://github.com/yuvalino/tvm',
+              child: BrandIcon(BrandIcon.github, color: TvmColors.fg),
+            ),
+          ],
+        ),
+        const SizedBox(height: 20),
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -260,6 +285,36 @@ class _Row extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// A round icon button that opens [url] outside the app (Safari, or the
+/// Discord / GitHub app when it is installed). Keyed `link-<id>`.
+class _Link extends StatelessWidget {
+  const _Link({required this.id, required this.url, required this.child});
+
+  final String id;
+  final String url;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      key: ValueKey('link-$id'),
+      onTap: () =>
+          launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication),
+      child: Container(
+        width: 48,
+        height: 48,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: TvmColors.card,
+          border: Border.all(color: TvmColors.line),
+          shape: BoxShape.circle,
+        ),
+        child: child,
       ),
     );
   }
