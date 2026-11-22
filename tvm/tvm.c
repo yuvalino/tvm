@@ -15458,9 +15458,15 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     }
 #endif
 
-    if (cmd == F_DUPFD) {
-        // TODO: F_DUPFD_CLOEXEC
-
+    // F_DUPFD_CLOEXEC: F_DUPFD with close-on-exec set on the new descriptor
+    // (Python duplicates every descriptor this way). Passed to the host it
+    // returned a host descriptor number, not one of the task's.
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+        int min = (int)(long)arg;  // an int, whatever the register's upper half
+        if (min < 0 || min >= MAX_FILES) {
+            errno = EINVAL;     // as POSIX has it (task_assign_file_locked panics)
+            return -1;
+        }
         tvm_sig_enter();
 
         task_lock(current);
@@ -15488,7 +15494,7 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         file_lock(newfile, 0);
 
         int fd;
-        if (-1 == (fd = task_assign_file_locked(current, newfile, (int)(long)arg))) {
+        if (-1 == (fd = task_assign_file_locked(current, newfile, min))) {
             task_unlock(current);
             file_unlock(newfile, 1);
             tvm_sig_leave();
@@ -15500,6 +15506,8 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         file_unlock(newfile, 1);
         tvm_sig_leave();
 
+        if (cmd == F_DUPFD_CLOEXEC)
+            (void)VMCALL(fcntl, fd, F_SETFD, FD_CLOEXEC);
         return fd;
     }
 
