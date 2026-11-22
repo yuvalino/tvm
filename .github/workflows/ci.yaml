@@ -22,7 +22,6 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: deps
       # autotools for the less and nano git trees (scripts/build_less.sh,
       # scripts/build_nano.sh generate their configure scripts)
@@ -66,7 +65,6 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: deps
       run: brew install ninja cmake gnu-sed autoconf automake gettext pkg-config
     - name: build
