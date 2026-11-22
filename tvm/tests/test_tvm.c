@@ -948,6 +948,70 @@ TEST(FDsFcntl) {
     ASSERT_EQ(nf2, 11);
 }
 
+// argv[1] is an F_DUPFD_CLOEXEC copy (closed by the exec), argv[2] an
+// F_DUPFD one (kept)
+PROG(dupfd_cloexec)
+{
+    if (argc != 3)
+        return 2;
+    if (-1 != fcntl(atoi(argv[1]), F_GETFD) || errno != EBADF)
+        return 3;
+    if (-1 == fcntl(atoi(argv[2]), F_GETFD))
+        return 4;
+    return 0;
+}
+
+// F_DUPFD_CLOEXEC is F_DUPFD with close-on-exec on the copy: a descriptor
+// of the task's (not the host's number), the original's flag untouched
+TEST(FDsDupfdCloexec) {
+    int pp[2];
+    ASSERT_EQ(0, pipe(pp));
+
+    int c = fcntl(pp[1], F_DUPFD_CLOEXEC, 40);
+    ASSERT_EQ(1, c >= 40);
+    ASSERT_EQ(FD_CLOEXEC, fcntl(c, F_GETFD) & FD_CLOEXEC);
+    ASSERT_EQ(0, fcntl(pp[1], F_GETFD) & FD_CLOEXEC);
+
+    int d = fcntl(pp[1], F_DUPFD, 40);
+    ASSERT_EQ(1, d > c);
+    ASSERT_EQ(0, fcntl(d, F_GETFD) & FD_CLOEXEC);
+
+    // the copy is the same pipe
+    char b = 0;
+    ASSERT_EQ(1, write(c, "x", 1));
+    ASSERT_EQ(1, read(pp[0], &b, 1));
+    ASSERT_EQ('x', b);
+
+    // a minimum out of range is EINVAL, a closed descriptor EBADF
+    errno = 0;
+    ASSERT_EQ(-1, fcntl(pp[1], F_DUPFD_CLOEXEC, -1));
+    ASSERT_EQ(EINVAL, errno);
+    errno = 0;
+    ASSERT_EQ(-1, fcntl(pp[1], F_DUPFD, 1 << 20));
+    ASSERT_EQ(EINVAL, errno);
+    close(d);
+    errno = 0;
+    ASSERT_EQ(-1, fcntl(d, F_DUPFD_CLOEXEC, 0));
+    ASSERT_EQ(EBADF, errno);
+
+    d = fcntl(pp[1], F_DUPFD, 40);
+    ASSERT_NEQ(-1, d);
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        char cs[16], ds[16];
+        snprintf(cs, sizeof(cs), "%d", c);
+        snprintf(ds, sizeof(ds), "%d", d);
+        setenv("TVM_TEST_PROG", "dupfd_cloexec", 1);
+        execl(self_exe, self_exe, cs, ds, NULL);
+        _exit(1);
+    }
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
 TEST(FDsCloseOnExit) {
     int pp[2];
     ASSERT_EQ(0, pipe(pp));
