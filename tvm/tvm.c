@@ -18030,15 +18030,9 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
     }
 #endif
 
-    // F_DUPFD_CLOEXEC: F_DUPFD with close-on-exec set on the new descriptor
-    // (Python duplicates every descriptor this way). Passed to the host it
-    // returned a host descriptor number, not one of the task's.
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        int min = (int)(long)arg;  // an int, whatever the register's upper half
-        if (min < 0 || min >= MAX_FILES) {
-            errno = EINVAL;     // as POSIX has it (task_assign_file_locked panics)
-            return -1;
-        }
+    if (cmd == F_DUPFD) {
+        // TODO: F_DUPFD_CLOEXEC
+
         tvm_sig_enter();
 
         task_lock(current);
@@ -18078,8 +18072,6 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         file_unlock(newfile, 1);
         tvm_sig_leave();
 
-        if (cmd == F_DUPFD_CLOEXEC)
-            (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
         return fd;
     }
 
@@ -23624,9 +23616,12 @@ static int tvm_spawn(pid_t *pidp, const char *path, const posix_spawn_file_actio
         for (int i = 0; fa && i < fa->count; i++)
             if (fa->acts[i].fd >= hi)
                 hi = fa->acts[i].fd + 1;
-        if (p[1] < hi) {
-            int w = fcntl(p[1], F_DUPFD_CLOEXEC, hi);
+        // (F_DUPFD and F_SETFD: TVM has no F_DUPFD_CLOEXEC yet, and an
+        // F_DUPFD minimum past the table panics)
+        if (p[1] < hi && hi < MAX_FILES) {
+            int w = fcntl(p[1], F_DUPFD, hi);
             if (w != -1) {
+                (void)fcntl(w, F_SETFD, FD_CLOEXEC);
                 close(p[1]);
                 p[1] = w;
             }
