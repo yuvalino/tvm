@@ -29,6 +29,25 @@ jobs:
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
+    - name: debug task-only abort
+      continue-on-error: true
+      timeout-minutes: 5
+      shell: bash
+      run: |
+        grep -m1 "model name" /proc/cpuinfo
+        grep -m1 flags /proc/cpuinfo
+        uname -a
+        /lib64/ld-linux-x86-64.so.2 --version | head -1
+        r=0; timeout 60 ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 30 -k FreeHostPointerAbortsTaskOnly > /tmp/fa.log 2>&1 || r=$?
+        echo "rc=$r"
+        cat /tmp/fa.log
+        line=$(grep "DEBUG invalid stop: found" /tmp/fa.log | head -1)
+        fname=$(sed -E 's/.*fname=([^ ]*).*/\1/' <<<"$line")
+        off=$(sed -E 's/.*off=(0x[0-9a-f]*).*/\1/' <<<"$line")
+        echo "fname=$fname off=$off"
+        if [ -f "$fname" ]; then
+          objdump -d -l --start-address=$((off-0x60)) --stop-address=$((off+0x20)) "$fname"
+        fi
     - name: test_tvm
       timeout-minutes: 5
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30

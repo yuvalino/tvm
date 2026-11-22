@@ -10287,6 +10287,21 @@ int emulator_step(struct emulator_context *ec)
     pc = emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_PC);
     if (ec->ec_ss->ess_intr == ESS_INTR_UNSPEC) {
         INFO("emulator_step: invalid stop pc=%p err=%d (%s)", (void *)pc, err, uc_strerror(err));
+        {
+            uint8_t b[16] = {0};
+            uc_err rerr = uc_mem_read(ec->ec_curr_engine->ee_uc, pc, b, sizeof(b));
+            struct ulinker_dladdr_info dli;
+            memset(&dli, 0, sizeof(dli));
+            int found = ulinker_dladdr(ec->ec_ulinker, (void *)pc, &dli, 0);
+            INFO("DEBUG invalid stop: read=%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                 rerr, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+            INFO("DEBUG invalid stop: found=%d fname=%s fbase=%p off=%#lx emu=%d sname=%s saddr=%p",
+                 found, dli.udli_fname ? dli.udli_fname : "-", dli.udli_fbase,
+                 (unsigned long)(pc - (uint64_t)dli.udli_fbase), dli.udli_femu,
+                 dli.udli_sname ? dli.udli_sname : "-", dli.udli_saddr);
+            INFO("DEBUG invalid stop: sp=%p tid=%d pid=%d",
+                 (void *)emulator_saved_state_read_reg(ec->ec_ss, ESS_REG_SP), __gettid(), getpid());
+        }
         goto out;
     }
 
