@@ -22,7 +22,6 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: deps
       # autotools for the less and nano git trees (scripts/build_less.sh,
       # scripts/build_nano.sh generate their configure scripts)
@@ -30,6 +29,32 @@ jobs:
     - name: build
       timeout-minutes: 10
       run: python3 build.py -t tvm_exe test_tvm test_rmem initrd_cli
+    - name: debug task-only abort
+      continue-on-error: true
+      timeout-minutes: 5
+      shell: bash
+      run: |
+        grep -m1 "model name" /proc/cpuinfo
+        grep -m1 flags /proc/cpuinfo
+        uname -a
+        /lib64/ld-linux-x86-64.so.2 --version | head -1
+        gcc -v
+        gcc -Q --help=target | grep -E -- "-march=|-mtune=|-mavx |-mavx2 |-misa"
+        echo | gcc -dM -E - | grep -E "__AVX__|__AVX2__|__x86_64_v|__BMI2__" || true
+        dpkg --print-architecture; dpkg -s gcc-15 cpp-15 libc6 | grep -E "^Package|^Architecture|^Version"
+        apt-config dump | grep -i -E "variant|isa" || true
+        ls /etc/apt/apt.conf.d/; cat /etc/apt/apt.conf.d/* 2>/dev/null | grep -i -E "variant|amd64v" || true
+        objdump -d --start-address=0x$(nm output/linux-x64/bin/test_tvm | grep " _test_FreeHostPointerAbortsTaskOnly$" | cut -d" " -f1) output/linux-x64/bin/test_tvm | head -120
+        r=0; timeout 60 ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 30 -k FreeHostPointerAbortsTaskOnly > /tmp/fa.log 2>&1 || r=$?
+        echo "rc=$r"
+        cat /tmp/fa.log
+        line=$(grep "DEBUG invalid stop: found" /tmp/fa.log | head -1)
+        fname=$(sed -E 's/.*fname=([^ ]*).*/\1/' <<<"$line")
+        off=$(sed -E 's/.*off=(0x[0-9a-f]*).*/\1/' <<<"$line")
+        echo "fname=$fname off=$off"
+        if [ -f "$fname" ]; then
+          objdump -d -l --start-address=$((off-0x60)) --stop-address=$((off+0x20)) "$fname"
+        fi
     - name: test_tvm
       timeout-minutes: 5
       run: ./output/linux-x64/bin/tvm ./output/linux-x64/bin/test_tvm -t 30
@@ -66,7 +91,6 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
-        token: ${{ secrets.SUBMODULE_TOKEN }}
     - name: deps
       run: brew install ninja cmake gnu-sed autoconf automake gettext pkg-config
     - name: build

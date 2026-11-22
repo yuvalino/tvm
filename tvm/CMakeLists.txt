@@ -66,6 +66,12 @@ endif()
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_executable(test_tvm tests/test_tvm.c)
     target_compile_options(test_tvm PRIVATE -g)
+    # test_tvm runs under the emulator, whose x86 decoder has no AVX; compilers
+    # that default higher (Ubuntu 26.04's amd64v3 gcc is x86-64-v3) emit ymm
+    # stores it stops on (UC_ERR_INSN_INVALID).
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+        target_compile_options(test_tvm PRIVATE -march=x86-64)
+    endif()
     target_link_libraries(test_tvm PRIVATE pthread)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(test_tvm PRIVATE util)
