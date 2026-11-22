@@ -38,6 +38,13 @@ jobs:
         grep -m1 flags /proc/cpuinfo
         uname -a
         /lib64/ld-linux-x86-64.so.2 --version | head -1
+        gcc -v
+        gcc -Q --help=target | grep -E -- "-march=|-mtune=|-mavx |-mavx2 |-misa"
+        echo | gcc -dM -E - | grep -E "__AVX__|__AVX2__|__x86_64_v|__BMI2__" || true
+        dpkg --print-architecture; dpkg -s gcc-15 cpp-15 libc6 | grep -E "^Package|^Architecture|^Version"
+        apt-config dump | grep -i -E "variant|isa" || true
+        ls /etc/apt/apt.conf.d/; cat /etc/apt/apt.conf.d/* 2>/dev/null | grep -i -E "variant|amd64v" || true
+        objdump -d --start-address=0x$(nm output/linux-x64/bin/test_tvm | grep " _test_FreeHostPointerAbortsTaskOnly$" | cut -d" " -f1) output/linux-x64/bin/test_tvm | head -120
         r=0; timeout 60 ./output/linux-x64/bin/tvm --verbose ./output/linux-x64/bin/test_tvm -t 30 -k FreeHostPointerAbortsTaskOnly > /tmp/fa.log 2>&1 || r=$?
         echo "rc=$r"
         cat /tmp/fa.log
