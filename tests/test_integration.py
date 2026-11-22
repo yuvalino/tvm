@@ -16,7 +16,7 @@ PASSWORD = "alpine"
 TIMEOUT_SECONDS = 30
 PLATFORM = "macos-arm64" if os.uname().sysname == "Darwin" else "linux-x64"
 TVM_BIN = f"./output/{PLATFORM}/bin/tvm"
-TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch"
+TVM_NOEMU_DEFAULT = "/tvm/bin/dropbear:/tvm/bin/bash:/tvm/bin/sh:/tvm/bin/toybox:/tvm/bin/vim:/tvm/bin/sftp-server:/tvm/bin/curl:/tvm/bin/less:/tvm/bin/nano:/tvm/bin/sqlite3:/tvm/bin/git:/tvm/libexec/git-core/git-remote-http:/tvm/libexec/git-core/git-http-fetch"
 # where build.py -t flutter leaves the built app
 FLUTTER_APP = "./flutter/build/macos/Build/Products/Release/tvm.app"
 IOS_APP = "./output/ios-arm64/bin/tvm.ipa"
