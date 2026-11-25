@@ -15489,6 +15489,18 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
             return -1;
         }
 
+        // close-on-exec before the copy is in the task's table: a fork in
+        // another thread copies the table (under the task's lock), and a copy
+        // marked only after it is there would reach that child unmarked and
+        // leak into its exec
+        if (cmd == F_DUPFD_CLOEXEC && -1 == fcntl(newfile->f_rfd, F_SETFD, FD_CLOEXEC)) {
+            int e = errno;
+            file_unlock(newfile, 1);
+            tvm_sig_leave();
+            errno = e;
+            return -1;
+        }
+
         file_unlock(newfile, 0);
         task_lock(current);
         file_lock(newfile, 0);
@@ -15506,8 +15518,6 @@ FUNCTION_DEFINE_VA2(int, fcntl, int, fd, int, cmd/*, ...  arg */ ) {
         file_unlock(newfile, 1);
         tvm_sig_leave();
 
-        if (cmd == F_DUPFD_CLOEXEC)
-            (void)VMCALL(fcntl, fd, F_SETFD, FD_CLOEXEC);
         return fd;
     }
 
