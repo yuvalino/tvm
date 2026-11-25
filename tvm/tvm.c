@@ -157,7 +157,8 @@ int sigtimedwait(const sigset_t *restrict, siginfo_t *restrict, const struct tim
  * "the things you need the most are the things you never have" - T.S.
  */
 
-#define panic(Msg, ...) do { char __MSG[0x1000] = {0}; snprintf(__MSG, sizeof(__MSG), Msg, ##__VA_ARGS__); __panic(__MSG, __FILE__, __LINE__); } while (0)
+__attribute__((format(printf, 3, 4))) static int ksnprintf(char *buf, size_t len, const char *fmt, ...);
+#define panic(Msg, ...) do { char __MSG[0x1000] = {0}; ksnprintf(__MSG, sizeof(__MSG), Msg, ##__VA_ARGS__); __panic(__MSG, __FILE__, __LINE__); } while (0)  // ksnprintf: see kvsnprintf
 __attribute__((noreturn)) static void __panic(const char *m, const char *f, int l);
 
 #define VERIFY(Expression) do { if (!(Expression)) { panic("VERIFY( " #Expression " )"); } } while (0)
@@ -177,6 +178,185 @@ __attribute__((noreturn)) static void __panic(const char *m, const char *f, int 
         (type *)((char *)__mptr - offsetof(type,member));})
 
 static long g_tz_offset; // seconds east of UTC, cached at startup
+
+// The kernel log's formatter: snprintf's conversions as the log uses them
+// (flags - 0 + space #, width and precision with *, length hh h l ll z j t,
+// conversions d i u o x X p s c %), with no libc. The log formats from signal
+// handlers, and libc's snprintf is not async-signal-safe there: it takes the
+// locale lock (localeconv_l), and a signal handled while the interrupted
+// code held it (setlocale, getenv's locale lookup) took it again --
+// libplatform aborts on a recursive os_unfair_lock, which killed the whole
+// VM (SIGKILL). Returns the length written (snprintf returns the length it
+// would have written, which INFO passed on to log_write past a truncation).
+static int kvsnprintf(char *buf, size_t len, const char *fmt, va_list ap)
+{
+    size_t n = 0;
+#define KPUT(c) do { char __c = (c); if (n + 1 < len) buf[n] = __c; n++; } while (0)  // c once: callers pass tmp[--k]
+    for (const char *f = fmt; *f; f++) {
+        if (*f != '%') {
+            KPUT(*f);
+            continue;
+        }
+        f++;
+        int left = 0, zero = 0, plus = 0, space = 0, alt = 0;
+        for (;; f++) {
+            if (*f == '-') left = 1;
+            else if (*f == '0') zero = 1;
+            else if (*f == '+') plus = 1;
+            else if (*f == ' ') space = 1;
+            else if (*f == '#') alt = 1;
+            else break;
+        }
+        int width = 0;
+        if (*f == '*') {
+            width = va_arg(ap, int);
+            if (width < 0) {
+                left = 1;
+                width = -width;
+            }
+            f++;
+        } else {
+            while (*f >= '0' && *f <= '9')
+                width = width * 10 + (*f++ - '0');
+        }
+        int prec = -1;
+        if (*f == '.') {
+            f++;
+            prec = 0;
+            if (*f == '*') {
+                prec = va_arg(ap, int);
+                f++;
+            } else {
+                while (*f >= '0' && *f <= '9')
+                    prec = prec * 10 + (*f++ - '0');
+            }
+        }
+        int lng = 0;    // 0 int, 1 long, 2 long long, 3 size_t, 4 intmax_t, 5 ptrdiff_t
+        if (*f == 'h') {
+            f++;
+            if (*f == 'h')
+                f++;
+        } else if (*f == 'l') {
+            f++;
+            lng = 1;
+            if (*f == 'l') {
+                f++;
+                lng = 2;
+            }
+        } else if (*f == 'z') {
+            f++;
+            lng = 3;
+        } else if (*f == 'j') {
+            f++;
+            lng = 4;
+        } else if (*f == 't') {
+            f++;
+            lng = 5;
+        }
+
+        char tmp[72];
+        int k = 0;              // tmp holds the digits reversed
+        const char *str = NULL;
+        int slen = 0;
+        const char *prefix = "";
+        int is_num = 1;
+        switch (*f) {
+        case 'd': case 'i': {
+            long long v = lng == 1 ? va_arg(ap, long) : lng == 2 ? va_arg(ap, long long) :
+                          lng == 3 ? (long long)va_arg(ap, ssize_t) : lng == 4 ? (long long)va_arg(ap, intmax_t) :
+                          lng == 5 ? (long long)va_arg(ap, ptrdiff_t) : va_arg(ap, int);
+            unsigned long long u = v < 0 ? -(unsigned long long)v : (unsigned long long)v;
+            do { tmp[k++] = '0' + (int)(u % 10); u /= 10; } while (u);
+            prefix = v < 0 ? "-" : plus ? "+" : space ? " " : "";
+            break;
+        }
+        case 'u': case 'o': case 'x': case 'X': case 'p': {
+            unsigned long long u;
+            if (*f == 'p')
+                u = (unsigned long long)(uintptr_t)va_arg(ap, void *);
+            else
+                u = lng == 1 ? va_arg(ap, unsigned long) : lng == 2 ? va_arg(ap, unsigned long long) :
+                    lng == 3 ? (unsigned long long)va_arg(ap, size_t) : lng == 4 ? (unsigned long long)va_arg(ap, uintmax_t) :
+                    lng == 5 ? (unsigned long long)va_arg(ap, ptrdiff_t) : va_arg(ap, unsigned int);
+            unsigned base = (*f == 'o') ? 8 : (*f == 'u') ? 10 : 16;
+            const char *digits = (*f == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+            do { tmp[k++] = digits[u % base]; u /= base; } while (u);
+            if (*f == 'p' || (alt && (*f == 'x' || *f == 'X')))
+                prefix = (*f == 'X') ? "0X" : "0x";
+            else if (alt && *f == 'o')
+                prefix = "0";
+            break;
+        }
+        case 's':
+            str = va_arg(ap, const char *);
+            if (!str)
+                str = "(null)";
+            while (str[slen] && (prec < 0 || slen < prec))
+                slen++;
+            is_num = 0;
+            break;
+        case 'c':
+            tmp[0] = (char)va_arg(ap, int);
+            str = tmp;
+            slen = 1;
+            is_num = 0;
+            break;
+        case '%':
+            KPUT('%');
+            continue;
+        default:        // not one the log uses: out as written
+            KPUT('%');
+            if (!*f)
+                f--;
+            else
+                KPUT(*f);
+            continue;
+        }
+
+        int plen = 0;
+        while (prefix[plen])
+            plen++;
+        int body = is_num ? (k > prec ? k : prec) : slen;
+        int pad = width - plen - body;
+        if (pad < 0)
+            pad = 0;
+        int zpad = is_num && zero && !left && prec < 0;
+        if (!left && !zpad)
+            for (int i = 0; i < pad; i++)
+                KPUT(' ');
+        for (int i = 0; i < plen; i++)
+            KPUT(prefix[i]);
+        if (is_num) {
+            if (zpad)
+                for (int i = 0; i < pad; i++)
+                    KPUT('0');
+            for (int i = k; i < prec; i++)
+                KPUT('0');
+            while (k)
+                KPUT(tmp[--k]);
+        } else {
+            for (int i = 0; i < slen; i++)
+                KPUT(str[i]);
+        }
+        if (left)
+            for (int i = 0; i < pad; i++)
+                KPUT(' ');
+    }
+#undef KPUT
+    if (len)
+        buf[n < len ? n : len - 1] = 0;
+    return (int)(n < len ? n : (len ? len - 1 : 0));
+}
+
+__attribute__((format(printf, 3, 4)))
+static int ksnprintf(char *buf, size_t len, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = kvsnprintf(buf, len, fmt, ap);
+    va_end(ap);
+    return n;
+}
 
 static void format_time(char *buf, size_t buflen)
 {
@@ -204,7 +384,7 @@ static void format_time(char *buf, size_t buflen)
     int mon = mp + (mp < 10 ? 3 : -9);
     if (mon <= 2) y++;
 
-    snprintf(buf, buflen,
+    ksnprintf(buf, buflen,
         "%04d-%02d-%02d %02d:%02d:%02d.%03d",
         (int)y, mon, day, hour, min, sec, ms);
 }
@@ -212,11 +392,15 @@ static void format_time(char *buf, size_t buflen)
 static int g_outfd = STDOUT_FILENO;  // kernel log fd; -1 = logging disabled
 static void log_write(const char *buf, int n);
 
+// ksnprintf, not snprintf: INFO runs in signal handlers (see kvsnprintf).
+// Nothing is formatted with logging disabled.
 #define INFO(Msg, ...) do { \
+    if (g_outfd < 0) \
+        break; \
     char __ts[32]; \
     format_time(__ts, sizeof(__ts)); \
     char __msgbuf[0x1000]; \
-    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
+    int __num = ksnprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
     log_write(__msgbuf, __num); \
 } while (0)
 
@@ -12011,7 +12195,7 @@ static void rmem_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
     char __msgbuf[0x1000];
-    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
+    int __num = ksnprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
     log_write(__msgbuf, __num);
 }
 
@@ -12019,7 +12203,7 @@ static void ulinker_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
     char __msgbuf[0x1000];
-    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
+    int __num = ksnprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
     log_write(__msgbuf, __num);
 }
 

@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <locale.h>
 #include <dirent.h>
 #include <limits.h>
 #include <utime.h>
@@ -418,6 +419,45 @@ TEST(SignalsHandler) {
     // child died , but parent will live!
     ASSERT_EQ(0, raise(SIGFPE));
     ASSERT_EQ(1, sigged);
+}
+
+// A signal handled while the task is inside libc's locale code: TVM's signal
+// dispatch logged the signal with snprintf, which takes libc's locale lock
+// (localeconv_l) -- held already by the interrupted setlocale, so libplatform
+// aborted on the recursive os_unfair_lock, a SIGKILL of the whole VM. The
+// dispatch logs without libc now, and formats nothing with logging off.
+static volatile sig_atomic_t locale_sigs;
+static void count_locale_sig(int signo) {
+    (void)signo;
+    locale_sigs++;
+}
+
+TEST(SignalDuringSetlocale) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        signal(SIGUSR1, count_locale_sig);
+        PHASE_SET(1);
+        struct timeval start, now;
+        gettimeofday(&start, NULL);
+        do {
+            setlocale(LC_ALL, "");
+            setlocale(LC_ALL, "C");
+            gettimeofday(&now, NULL);
+        } while ((now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec) < 2000000);
+        _exit(locale_sigs > 0 ? 0 : 2);
+    }
+
+    PHASE_WAIT(1);
+    int s;
+    pid_t r;
+    while (0 == (r = waitpid(p, &s, WNOHANG))) {
+        kill(p, SIGUSR1);
+        usleep(50);
+    }
+    ASSERT_EQ(p, r);
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
 static int testhandlersig = 0;
