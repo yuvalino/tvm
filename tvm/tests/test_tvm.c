@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <locale.h>
 #include <dirent.h>
 #include <limits.h>
 #include <utime.h>
@@ -418,6 +419,43 @@ TEST(SignalsHandler) {
     // child died , but parent will live!
     ASSERT_EQ(0, raise(SIGFPE));
     ASSERT_EQ(1, sigged);
+}
+
+// A task ended by a signal inside setlocale: TVM ends the task's thread in
+// the signal handler, and libc's locale lock (shared by every task) stayed
+// owned by the exited thread. The next snprintf of any task took it and
+// libplatform aborted the VM ("os_unfair_lock is corrupt, or owner thread
+// exited without unlocking"). setlocale runs with signals deferred now.
+TEST(SignalKillDuringSetlocale) {
+    for (int i = 0; i < 200; i++) {
+        int pp[2];
+        ASSERT_EQ(0, pipe(pp));
+        pid_t p = fork();
+        ASSERT_NEQ(p, -1);
+        if (!p) {
+            close(pp[0]);
+            if (1 != write(pp[1], "r", 1))
+                _exit(2);
+            for (;;) {
+                setlocale(LC_ALL, "");
+                setlocale(LC_ALL, "C");
+            }
+        }
+        close(pp[1]);
+        char c;
+        ASSERT_EQ(1, read(pp[0], &c, 1));
+        close(pp[0]);
+        usleep(i % 20 * 50);
+        ASSERT_EQ(0, kill(p, SIGTERM));
+        int s;
+        ASSERT_EQ(p, waitpid(p, &s, 0));
+        ASSERT_EQ(WIFSIGNALED(s), 1);
+        ASSERT_EQ(WTERMSIG(s), SIGTERM);
+        // takes the locale lock (localeconv_l)
+        char buf[16];
+        int w = snprintf(buf, sizeof(buf), "%d", 100 + i % 10);
+        ASSERT_EQ(3, w);
+    }
 }
 
 static int testhandlersig = 0;
