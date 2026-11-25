@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <locale.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -18453,6 +18454,21 @@ FUNCTION_DEFINE3(int, sigtimedwait, const sigset_t *, set, siginfo_t *, info, co
     if (info)
         *info = local_info;
     return s;
+}
+
+// The host's setlocale, with signals deferred: it holds libc's locale lock
+// (reading the environment under it), shared by every task, and a task
+// ended by a signal inside it (terminate_current_locked ends the thread
+// there) left the lock owned by an exited thread. The next snprintf of any
+// task took it in localeconv_l and libplatform aborted the VM ("os_unfair_lock
+// is corrupt, or owner thread exited without unlocking", SIGKILL). toybox
+// calls setlocale first thing, so a SIGTERM right after the exec (startd
+// stopping a service) landed in it.
+FUNCTION_DEFINE2(char *, setlocale, int, category, const char *, locale) {
+    tvm_sig_enter();
+    char *ret = setlocale(category, locale);
+    tvm_sig_leave();
+    return ret;
 }
 
 FUNCTION_DEFINE1(char *, getenv, const char *, name) {
