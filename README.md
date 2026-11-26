@@ -261,6 +261,7 @@ unpatched upstream unless noted), and their licenses.
 | Program | Description | License |
 |---|---|---|
 | [unicorn](https://www.unicorn-engine.org/) | CPU emulator, linked into libtvm (TCI interpreter mode, no JIT) | GPLv2 |
+| [printf](https://github.com/eyalroz/printf) | eyalroz/printf 6.4.0, vendored as `tvm/printf.c` and `tvm/printf.h` (not a submodule; one line changed: `printf.c` includes `printf.h` from beside it): the kernel log's formatter, linked into libtvm. It uses no libc, so the log can format inside signal handlers. | MIT |
 | [dropbear](https://github.com/mkj/dropbear) | SSH server, client, and `scp` | MIT-style (see its LICENSE) |
 | [bash](https://www.gnu.org/software/bash/) | GNU Bourne-Again Shell 5.3, the login shell and `/tvm/bin/sh` (configured via cache variables and `-D` overrides only; see `scripts/build_bash.sh`). Readline's terminal handling through the bundled ncurses and terminfo database. | GPLv3 |
 | [toybox](http://landley.net/toybox/) | Unix utilities (`ls`, `cat`, `grep`, `id`, etc.) | 0BSD |
