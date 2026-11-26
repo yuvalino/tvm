@@ -55,6 +55,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <dirent.h>
+#include "printf.h"  // the kernel log's formatter (ksnprintf)
 
 #if defined(__APPLE__)
 #include <util.h>
@@ -157,7 +158,8 @@ int sigtimedwait(const sigset_t *restrict, siginfo_t *restrict, const struct tim
  * "the things you need the most are the things you never have" - T.S.
  */
 
-#define panic(Msg, ...) do { char __MSG[0x1000] = {0}; snprintf(__MSG, sizeof(__MSG), Msg, ##__VA_ARGS__); __panic(__MSG, __FILE__, __LINE__); } while (0)
+__attribute__((format(printf, 3, 4))) static int ksnprintf(char *buf, size_t len, const char *fmt, ...);
+#define panic(Msg, ...) do { char __MSG[0x1000] = {0}; ksnprintf(__MSG, sizeof(__MSG), Msg, ##__VA_ARGS__); __panic(__MSG, __FILE__, __LINE__); } while (0)  // ksnprintf: not libc's, see there
 __attribute__((noreturn)) static void __panic(const char *m, const char *f, int l);
 
 #define VERIFY(Expression) do { if (!(Expression)) { panic("VERIFY( " #Expression " )"); } } while (0)
@@ -177,6 +179,35 @@ __attribute__((noreturn)) static void __panic(const char *m, const char *f, int 
         (type *)((char *)__mptr - offsetof(type,member));})
 
 static long g_tz_offset; // seconds east of UTC, cached at startup
+
+// The kernel log's formatter: printf.c (eyalroz/printf), which uses no libc.
+// The log formats from signal handlers, and libc's snprintf is not
+// async-signal-safe there: it takes the locale lock (localeconv_l), and a
+// signal handled while the interrupted code held it (setlocale, getenv's
+// locale lookup) took it again -- libplatform aborts on a recursive
+// os_unfair_lock, which killed the whole VM (SIGKILL). Returns the length
+// written (vsnprintf_ returns the length it would have written, which INFO
+// would pass on to log_write past a truncation).
+__attribute__((format(printf, 3, 4)))
+static int ksnprintf(char *buf, size_t len, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf_(buf, len, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        n = 0;
+    if ((size_t)n >= len)
+        n = len ? (int)len - 1 : 0;
+    return n;
+}
+
+// printf.c's printf_ writes through putchar_, which the library leaves to
+// its user; TVM calls only vsnprintf_.
+void putchar_(char c)
+{
+    (void)c;
+}
 
 static void format_time(char *buf, size_t buflen)
 {
@@ -204,7 +235,7 @@ static void format_time(char *buf, size_t buflen)
     int mon = mp + (mp < 10 ? 3 : -9);
     if (mon <= 2) y++;
 
-    snprintf(buf, buflen,
+    ksnprintf(buf, buflen,
         "%04d-%02d-%02d %02d:%02d:%02d.%03d",
         (int)y, mon, day, hour, min, sec, ms);
 }
@@ -212,11 +243,15 @@ static void format_time(char *buf, size_t buflen)
 static int g_outfd = STDOUT_FILENO;  // kernel log fd; -1 = logging disabled
 static void log_write(const char *buf, int n);
 
+// ksnprintf, not snprintf: INFO runs in signal handlers (see ksnprintf).
+// Nothing is formatted with logging disabled.
 #define INFO(Msg, ...) do { \
+    if (g_outfd < 0) \
+        break; \
     char __ts[32]; \
     format_time(__ts, sizeof(__ts)); \
     char __msgbuf[0x1000]; \
-    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
+    int __num = ksnprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): %s: " Msg "\n", __ts, __gettid(), __FUNCTION__, ##__VA_ARGS__); \
     log_write(__msgbuf, __num); \
 } while (0)
 
@@ -12011,7 +12046,7 @@ static void rmem_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
     char __msgbuf[0x1000];
-    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
+    int __num = ksnprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): RMEM: %s", __ts, __gettid(), msg);
     log_write(__msgbuf, __num);
 }
 
@@ -12019,7 +12054,7 @@ static void ulinker_print_cb(char *msg) {
     char __ts[32];
     format_time(__ts, sizeof(__ts));
     char __msgbuf[0x1000];
-    int __num = snprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
+    int __num = ksnprintf(__msgbuf, sizeof(__msgbuf), "%s Kernel(%d): ulinker: %s", __ts, __gettid(), msg);
     log_write(__msgbuf, __num);
 }
 

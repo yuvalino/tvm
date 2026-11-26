@@ -3,7 +3,11 @@ add_library(tvm_static STATIC
     rmem.c
     ulinker.c
     tvm.c
+    printf.c
 )
+# printf.c: eyalroz/printf 6.4.0 (MIT), the kernel log's formatter (tvm.c,
+# ksnprintf). Hidden: libtvm.dylib does not export it.
+set_source_files_properties(printf.c PROPERTIES COMPILE_OPTIONS -fvisibility=hidden)
 set_target_properties(tvm_static PROPERTIES OUTPUT_NAME tvm)
 target_include_directories(tvm_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(tvm_static PRIVATE -g -fPIC)

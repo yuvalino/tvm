@@ -89,6 +89,7 @@ target_link_libraries(tvm_bridge PRIVATE
   "${TVM_OBJECTS_DIR}/tvm.c.o"
   "${TVM_OBJECTS_DIR}/rmem.c.o"
   "${TVM_OBJECTS_DIR}/ulinker.c.o"
+  "${TVM_OBJECTS_DIR}/printf.c.o"
   "${INITRD_OBJ}"
   -Wl,--start-group
   "${TVM_OUTPUT}/lib/libunicorn-static.a"
